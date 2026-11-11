@@ -10,6 +10,7 @@ import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.item.Rarity;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -79,7 +80,22 @@ public final class ItemScanner {
                 hasEmc = false;
                 value = 0L;
             }
-            snapshots.add(new ItemSnapshot(key, id, id.getNamespace(), id.getPath(), hasEmc, value));
+            List<String> tagPaths;
+            Rarity rarity;
+            try {
+                tagPaths = stack.getTags()
+                        .map(tag -> tag.location().toString())
+                        .distinct()
+                        .sorted()
+                        .toList();
+                rarity = stack.getRarity();
+            } catch (RuntimeException e) {
+                // Tag/rarity lookup is best-effort: a single item must not abort the whole scan.
+                LOGGER.warn("读取物品 {} 的标签或稀有度失败，按空标签与 COMMON 处理", id, e);
+                tagPaths = List.of();
+                rarity = Rarity.COMMON;
+            }
+            snapshots.add(ItemSnapshot.of(key, hasEmc, value, tagPaths, rarity));
         }
 
         if (skippedEmpty > 0 || skippedIgnored > 0 || skippedUnregistered > 0) {

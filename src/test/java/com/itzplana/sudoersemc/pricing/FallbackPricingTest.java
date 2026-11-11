@@ -17,8 +17,8 @@ import org.junit.jupiter.api.Test;
 /**
  * 兜底定价链优先级测试。
  *
- * <p>必须严格遵循 {@code EXISTING → EXTERNAL_BASELINE → TAG → RARITY → TIER → FALLBACK}。
- * 注意：稀有度定价只要启用就总会给出数值，因此层级规则只会在稀有度定价关闭时才会生效。</p>
+ * <p>必须严格遵循 {@code EXISTING → EXTERNAL_BASELINE → 排除检查 → TAG → TIER → RARITY → FALLBACK}。
+ * 层级排除先于所有定价；纯倍率层级规则返回空，因此不会阻断稀有度定价。</p>
  */
 class FallbackPricingTest {
 
@@ -210,5 +210,45 @@ class FallbackPricingTest {
         FallbackPricing pricing = pricing(PricingSettings.defaults());
 
         assertThrows(NullPointerException.class, () -> pricing.price(null));
+    }
+
+    @Test
+    void tierFixedValueBeatsRarity() {
+        TierPricing tierPricing = new TierPricing(List.of(
+                new TierPricing.TierRule(
+                        TierPricing.Type.EXACT_ID, "sudoersemc:high_tier", 1.0D, 4096L, false)));
+        FallbackPricing pricing = new FallbackPricing(
+                tagPricing(), RarityPricing.defaults(), tierPricing, PricingSettings.defaults());
+
+        FallbackPricing.PricedValue value = pricing.price(new FallbackPricing.PricingRequest(
+                item("high_tier"), List.of(), Rarity.COMMON, 0L, 0L)).orElseThrow();
+
+        assertEquals(4096L, value.value(), "TIER 固定值应先于 RARITY 生效");
+        assertEquals(PriceSource.TIER, value.source());
+    }
+
+    @Test
+    void excludedItemStaysUnpricedEvenWithTagsAndRarity() {
+        FallbackPricing pricing = pricing(PricingSettings.defaults());
+
+        Optional<FallbackPricing.PricedValue> value = pricing.price(new FallbackPricing.PricingRequest(
+                item("pig_spawn_egg"), List.of("forge:ingots/iron"), Rarity.EPIC, 0L, 0L));
+
+        assertTrue(value.isEmpty(), "排除项必须先于 TAG 与 RARITY 生效");
+    }
+
+    @Test
+    void pureMultiplierTierRuleDoesNotBlockRarity() {
+        TierPricing tierPricing = new TierPricing(List.of(
+                new TierPricing.TierRule(
+                        TierPricing.Type.PATH_CONTAINS, "special", 2.0D, null, false)));
+        FallbackPricing pricing = new FallbackPricing(
+                tagPricing(), RarityPricing.defaults(), tierPricing, PricingSettings.defaults());
+
+        FallbackPricing.PricedValue value = pricing.price(new FallbackPricing.PricingRequest(
+                item("special_thing"), List.of(), Rarity.COMMON, 0L, 0L)).orElseThrow();
+
+        assertEquals(16L, value.value(), "纯倍率规则不产生固定值，应继续落到 RARITY");
+        assertEquals(PriceSource.RARITY, value.source());
     }
 }

@@ -131,4 +131,36 @@ class TagPricingTest {
                 () -> pricing.baseValues().put(MaterialCategory.INGOT, 1L));
         assertFalse(pricing.baseValues().isEmpty());
     }
+
+    @Test
+    void defaultsExposeConservativeMaterialAnchors() {
+        TagPricing pricing = TagPricing.defaults();
+
+        assertEquals(256L, pricing.baseValues().get(MaterialCategory.INGOT));
+        assertEquals(28L, pricing.baseValues().get(MaterialCategory.NUGGET));
+        assertEquals(2304L, pricing.baseValues().get(MaterialCategory.STORAGE_BLOCK));
+        assertEquals(512L, pricing.baseValues().get(MaterialCategory.GEM));
+        assertEquals(64L, pricing.baseValues().get(MaterialCategory.DUST));
+        assertEquals(128L, pricing.baseValues().get(MaterialCategory.RAW_MATERIAL));
+        assertEquals(256L, pricing.baseValues().get(MaterialCategory.PLATE));
+        assertEquals(128L, pricing.baseValues().get(MaterialCategory.ROD));
+        assertEquals(128L, pricing.baseValues().get(MaterialCategory.ORE));
+        assertTrue(pricing.overrides().isEmpty(), "默认配置不得包含按物品覆盖");
+    }
+
+    @Test
+    void defaultsPriceCommonForgeMaterialTags() {
+        TagPricing pricing = TagPricing.defaults();
+
+        assertEquals(256L, pricing.price(item("iron_ingot"),
+                List.of("forge:ingots/iron")).orElseThrow());
+        assertEquals(2304L, pricing.price(item("iron_block"),
+                List.of("forge:storage_blocks/iron")).orElseThrow());
+    }
+
+    @Test
+    void defaultsYieldNoPriceForUnknownTags() {
+        assertTrue(TagPricing.defaults()
+                .price(item("mystery"), List.of("forge:logs/oak")).isEmpty());
+    }
 }

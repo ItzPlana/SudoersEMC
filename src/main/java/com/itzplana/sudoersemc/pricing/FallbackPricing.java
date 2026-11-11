@@ -4,7 +4,6 @@ import com.itzplana.sudoersemc.core.ItemKey;
 import com.itzplana.sudoersemc.core.PriceSource;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import net.minecraft.world.item.Rarity;
@@ -16,9 +15,10 @@ import net.minecraft.world.item.Rarity;
  * <ol>
  *   <li>{@link PriceSource#EXISTING}：物品已有 EMC，且大于 0；</li>
  *   <li>{@link PriceSource#EXTERNAL_BASELINE}：外部基线值大于 0；</li>
+ *   <li>排除检查：层级规则明确排除的物品直接终止，不参与后续任何定价；</li>
  *   <li>{@link PriceSource#TAG}：命中材料标签基准值（受 {@link PricingSettings#useTagPricing()} 控制）；</li>
- *   <li>{@link PriceSource#RARITY}：按稀有度取值（受 {@link PricingSettings#useRarityPricing()} 控制）；</li>
  *   <li>{@link PriceSource#TIER}：命中层级固定值（受 {@link PricingSettings#useTierPricing()} 控制）；</li>
+ *   <li>{@link PriceSource#RARITY}：按稀有度取值（受 {@link PricingSettings#useRarityPricing()} 控制）；</li>
  *   <li>{@link PriceSource#FALLBACK}：通用兜底值（受
  *       {@link PricingSettings#useFallbackForUnsolvable()} 控制）。</li>
  * </ol>
@@ -26,9 +26,8 @@ import net.minecraft.world.item.Rarity;
  * <p>层级规则返回 {@code Optional.of(0L)} 表示“明确排除”。此时本类直接返回
  * {@link Optional#empty()}，绝不把被排除的物品当成免费物品。任何情况下都不会返回负值。</p>
  *
- * <p>注意：稀有度定价只要启用就总会给出数值（见 {@link RarityPricing#price}），因此层级规则
- * 只会在稀有度定价关闭时才会生效；这是上述优先级顺序的直接结果。层级倍率规则不会单独产生
- * 价格，需要缩放的调用方应自行使用 {@link TierPricing#multiplierFor}。</p>
+ * <p>层级规则的纯倍率规则不会单独产生价格：{@link TierPricing#price} 对它返回空，定价链会
+ * 继续尝试稀有度与通用兜底值。需要缩放的调用方应自行使用 {@link TierPricing#multiplierFor}。</p>
  */
 public final class FallbackPricing {
 
@@ -105,14 +104,14 @@ public final class FallbackPricing {
     }
 
     /**
-     * 使用空标签配置、默认稀有度定价与默认层级规则创建定价链。
+     * 使用默认标签锚点、默认稀有度定价与默认层级规则创建定价链。
      *
      * @param settings 定价开关与通用兜底值
      * @return 可直接使用的兜底定价链
      */
     public static FallbackPricing withDefaults(PricingSettings settings) {
         return new FallbackPricing(
-                new TagPricing(Map.of(), Map.of()),
+                TagPricing.defaults(),
                 RarityPricing.defaults(),
                 TierPricing.defaults(),
                 settings
@@ -120,10 +119,12 @@ public final class FallbackPricing {
     }
 
     /**
-     * 按 {@code EXISTING → EXTERNAL_BASELINE → TAG → RARITY → TIER → FALLBACK} 的顺序定价。
+     * 按 {@code EXISTING → EXTERNAL_BASELINE → 排除检查 → TAG → TIER → RARITY → FALLBACK}
+     * 的顺序定价。
      *
      * <p>只有“启用且命中”的步骤才会产生结果；层级规则的排除标记（{@code 0L}）会立即终止
-     * 整个定价链并返回 {@link Optional#empty()}，而不是继续尝试通用兜底值。</p>
+     * 整个定价链并返回 {@link Optional#empty()}，而不是继续尝试通用兜底值。纯倍率层级规则
+     * 返回空，因此不会阻断后续的稀有度定价。</p>
      *
      * @param request 定价请求
      * @return 命中的价格与来源，未定价时为空
@@ -157,13 +158,6 @@ public final class FallbackPricing {
             }
         }
 
-        if (settings.useRarityPricing()) {
-            long rarityValue = rarityPricing.price(request.rarity());
-            String rarityName = request.rarity() == null ? "UNKNOWN" : request.rarity().name();
-            return Optional.of(new PricedValue(
-                    item, rarityValue, PriceSource.RARITY, "rarity:" + rarityName));
-        }
-
         if (settings.useTierPricing()) {
             Optional<Long> tierValue = tierPricing.price(item);
             if (tierValue.isPresent()) {
@@ -174,6 +168,13 @@ public final class FallbackPricing {
                 }
                 return Optional.of(new PricedValue(item, value, PriceSource.TIER, "tier-rule"));
             }
+        }
+
+        if (settings.useRarityPricing()) {
+            long rarityValue = rarityPricing.price(request.rarity());
+            String rarityName = request.rarity() == null ? "UNKNOWN" : request.rarity().name();
+            return Optional.of(new PricedValue(
+                    item, rarityValue, PriceSource.RARITY, "rarity:" + rarityName));
         }
 
         if (settings.useFallbackForUnsolvable()) {

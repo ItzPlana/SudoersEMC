@@ -36,7 +36,6 @@ import java.util.concurrent.atomic.AtomicReference;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.item.Rarity;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -446,7 +445,7 @@ public final class ScanPipeline {
             Optional<FallbackPricing.PricedValue> priced;
             try {
                 priced = fallbackPricing.price(new FallbackPricing.PricingRequest(
-                        item, List.of(), Rarity.COMMON, 0L, 0L));
+                        item, itemSnapshot.tagPaths(), itemSnapshot.rarity(), 0L, 0L));
             } catch (RuntimeException failure) {
                 LOGGER.warn("兜底定价失败，跳过物品 {}", item, failure);
                 continue;

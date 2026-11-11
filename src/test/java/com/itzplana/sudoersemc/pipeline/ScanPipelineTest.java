@@ -34,6 +34,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.world.item.Rarity;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -342,6 +343,45 @@ class ScanPipelineTest {
         assertEquals(0, result.solvedByRecipe());
         assertEquals(0, result.applied());
         assertEquals(0, store.size());
+    }
+
+    @Test
+    void taggedSnapshotProducesTagCandidate() {
+        GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("generated_tag.json"));
+        ItemSnapshot tagged = ItemSnapshot.of(RESULT, false, 0L,
+                List.of("forge:ingots/iron"), Rarity.COMMON);
+        PipelineSnapshot snapshot = snapshot(List.of(tagged), List.of(), Map.of());
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null,
+                FallbackPricing.withDefaults(PricingSettings.defaults()));
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1, result.solvedByFallback());
+        assertEquals(1, result.applied());
+        GeneratedEmcEntry staged = store.snapshotAll().get(RESULT);
+        assertNotNull(staged);
+        assertEquals(256L, staged.value(), "forge:ingots/iron 应命中默认 INGOT 锚点");
+        assertEquals(PriceSource.TAG, staged.source());
+    }
+
+    @Test
+    void rareSnapshotWithoutTagsProducesRarityCandidate() {
+        GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("generated_rarity.json"));
+        ItemSnapshot rare = ItemSnapshot.of(RESULT, false, 0L, List.of(), Rarity.RARE);
+        PipelineSnapshot snapshot = snapshot(List.of(rare), List.of(), Map.of());
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null,
+                FallbackPricing.withDefaults(PricingSettings.defaults()));
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1, result.solvedByFallback());
+        assertEquals(1, result.applied());
+        GeneratedEmcEntry staged = store.snapshotAll().get(RESULT);
+        assertNotNull(staged);
+        assertEquals(256L, staged.value(), "RARE 稀有度应使用默认 256 基准值");
+        assertEquals(PriceSource.RARITY, staged.source());
     }
 
     /**

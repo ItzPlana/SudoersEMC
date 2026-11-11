@@ -20,6 +20,7 @@ import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
 import com.itzplana.sudoersemc.storage.OverflowResetLog;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
 import com.itzplana.sudoersemc.storage.SudoersemcPaths;
+import com.itzplana.sudoersemc.task.AutoScanPolicy;
 import com.itzplana.sudoersemc.task.BatchProcessor;
 import com.itzplana.sudoersemc.task.ScanManager;
 import com.mojang.logging.LogUtils;
@@ -301,6 +302,41 @@ public final class Sudoersemc {
                     store.size(),
                     OptionalIntegrationManager.isProjectEAvailable() ? "detected" : "absent");
         }
+
+        boolean enabled;
+        boolean alwaysRescan;
+        try {
+            enabled = SudoersemcConfig.GENERAL_ENABLED.get();
+            alwaysRescan = SudoersemcConfig.GENERAL_ALWAYS_RESCAN.get();
+        } catch (RuntimeException e) {
+            // 配置尚未加载或读取失败时退回安全默认值，绝不阻止服务器启动。
+            LOGGER.warn("SudoersEMC 无法读取自动扫描配置，使用默认值（启用自动扫描、不强制重扫）", e);
+            enabled = true;
+            alwaysRescan = false;
+        }
+
+        ScanStateStore stateStore = scanStateStore;
+        long lastScanEpochMillis = stateStore == null ? 0L : stateStore.lastScanEpochMillis();
+        int generatedEntryCount = store == null ? 0 : store.size();
+
+        if (!enabled) {
+            LOGGER.info("SudoersEMC 自动扫描已禁用（general.enabled=false）");
+        } else if (AutoScanPolicy.shouldScan(
+                enabled, alwaysRescan, lastScanEpochMillis, generatedEntryCount)) {
+            ScanManager manager = scanManager;
+            if (manager == null) {
+                LOGGER.warn("SudoersEMC 自动扫描已请求，但扫描调度器尚未就绪（common setup 未完成）");
+            } else if (manager.requestScan()) {
+                LOGGER.info("SudoersEMC 自动扫描已请求（alwaysRescan={}，上次扫描={}，已生成条目={}）",
+                        alwaysRescan, lastScanEpochMillis, generatedEntryCount);
+            } else {
+                LOGGER.info("SudoersEMC 自动扫描被拒绝：已有扫描正在运行");
+            }
+        } else {
+            LOGGER.info("SudoersEMC 自动扫描被拒绝（已有缓存状态：上次扫描={}，已生成条目={}）",
+                    lastScanEpochMillis, generatedEntryCount);
+        }
+
         SmokeTestHook.onServerStarted(event);
     }
 
