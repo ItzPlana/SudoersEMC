@@ -1,0 +1,86 @@
+package com.itzplana.sudoersemc.diagnostic;
+
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Map;
+import java.util.Optional;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+/**
+ * {@link ReportManager} 的单元测试。
+ *
+ * <p>验证纯文本报告的写入/读取往返、覆盖写入、缺失文件处理，以及报告文件确实位于调用方
+ * 指定的数据目录中。</p>
+ */
+class ReportManagerTest {
+
+    @TempDir
+    Path tempDir;
+
+    private static DiagnosticReport report(long totalRegisteredItems) {
+        return new DiagnosticReport(
+                totalRegisteredItems,
+                0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L,
+                Map.of());
+    }
+
+    @Test
+    void writeThenReadRoundTrip() {
+        ReportManager manager = new ReportManager(tempDir);
+        DiagnosticReport report = report(1234L);
+
+        manager.writeReport(report);
+
+        Optional<String> text = manager.readLastReport();
+        assertTrue(text.isPresent());
+        assertEquals(report.formatText(), text.orElseThrow());
+    }
+
+    @Test
+    void readLastReportIsEmptyWhenFileAbsent() {
+        ReportManager manager = new ReportManager(tempDir);
+
+        assertTrue(manager.readLastReport().isEmpty());
+        assertFalse(Files.exists(manager.reportFile()));
+    }
+
+    @Test
+    void writingOverExistingReportReplacesIt() {
+        ReportManager manager = new ReportManager(tempDir);
+
+        manager.writeReport(report(1111L));
+        manager.writeReport(report(2222L));
+
+        String text = manager.readLastReport().orElseThrow();
+        assertTrue(text.contains("2222"));
+        assertFalse(text.contains("1111"));
+        assertTrue(text.contains("SudoersEMC 诊断报告"));
+    }
+
+    @Test
+    void reportFileLivesInSuppliedDirectory() {
+        ReportManager manager = new ReportManager(tempDir);
+
+        assertEquals(tempDir.resolve(ReportManager.FILE_NAME), manager.reportFile());
+        assertEquals(tempDir, manager.reportFile().getParent());
+
+        manager.writeReport(report(1L));
+
+        assertTrue(Files.isRegularFile(manager.reportFile()));
+        assertTrue(Files.exists(tempDir.resolve(ReportManager.FILE_NAME)));
+    }
+
+    @Test
+    void writeReportIgnoresNull() {
+        ReportManager manager = new ReportManager(tempDir);
+
+        assertDoesNotThrow(() -> manager.writeReport(null));
+        assertFalse(Files.exists(manager.reportFile()));
+    }
+}
