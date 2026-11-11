@@ -1,12 +1,19 @@
 package com.itzplana.sudoersemc;
 
+import com.itzplana.sudoersemc.command.CommandService;
+import com.itzplana.sudoersemc.command.SudoemcCommands;
 import com.itzplana.sudoersemc.config.SudoersemcConfig;
 import com.itzplana.sudoersemc.diagnostic.SmokeTestHook;
 import com.itzplana.sudoersemc.integration.GeneratedEmcMapper;
 import com.itzplana.sudoersemc.integration.OptionalIntegrationManager;
 import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
+import com.itzplana.sudoersemc.storage.ScanStateStore;
+import com.itzplana.sudoersemc.task.BatchProcessor;
+import com.itzplana.sudoersemc.task.ScanManager;
 import com.mojang.logging.LogUtils;
 import net.minecraftforge.common.MinecraftForge;
+import net.minecraftforge.event.RegisterCommandsEvent;
+import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.event.server.ServerStartedEvent;
 import net.minecraftforge.event.server.ServerStoppingEvent;
 import net.minecraftforge.eventbus.api.IEventBus;
@@ -16,11 +23,10 @@ import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
 import org.slf4j.Logger;
 
 /**
- * SudoersEMC entry point.
+ * SudoersEMC 模组入口。
  *
- * <p>Phase 1 wiring: persistence, ProjectE integration detection, and the ProjectE
- * {@code @EMCMapper} that publishes owned values. Scanning and pricing engines are added in later
- * phases.</p>
+ * <p>负责组装各层：配置注册、持久化加载、ProjectE 集成探测、扫描调度器与命令服务。
+ * 具体的扫描、求解与定价逻辑分散在各自包中，本类只做接线，不含业务规则。</p>
  */
 @Mod(Sudoersemc.MODID)
 public final class Sudoersemc {
@@ -28,17 +34,24 @@ public final class Sudoersemc {
     public static final String MODID = "sudoersemc";
     public static final Logger LOGGER = LogUtils.getLogger();
 
+    /** 单 tick 分配给扫描工作的时间预算，1 毫秒。 */
+    private static final long TICK_BUDGET_NANOS = 1_000_000L;
+
     private static volatile GeneratedEntryStore entryStore;
+    private static volatile ScanStateStore scanStateStore;
+    private static volatile ScanManager scanManager;
 
     public Sudoersemc() {
         IEventBus modEventBus = FMLJavaModLoadingContext.get().getModEventBus();
         modEventBus.addListener(this::onCommonSetup);
 
+        MinecraftForge.EVENT_BUS.addListener(this::onRegisterCommands);
+        MinecraftForge.EVENT_BUS.addListener(this::onServerTick);
         MinecraftForge.EVENT_BUS.addListener(this::onServerStarted);
         MinecraftForge.EVENT_BUS.addListener(this::onServerStopping);
         MinecraftForge.EVENT_BUS.addListener(SmokeTestHook::onServerTick);
 
-        // Must be registered during mod construction, before configs are loaded.
+        // 必须在构造阶段注册，Forge 之后才会加载配置。
         SudoersemcConfig.register();
 
         LOGGER.info("SudoersEMC is loading");
@@ -50,21 +63,72 @@ public final class Sudoersemc {
             store.load();
             entryStore = store;
 
-            // The sink must exist before the integration manager can create a provider.
+            ScanStateStore stateStore = new ScanStateStore();
+            stateStore.load();
+            scanStateStore = stateStore;
+
+            // 落盘文件必须就绪，集成管理器才能创建 provider。
             OptionalIntegrationManager.setSink(store);
             OptionalIntegrationManager.init();
 
-            // GeneratedEmcMapper implements a ProjectE interface, so its class may only be
-            // initialized when ProjectE is actually present. The guard is what keeps the mod
-            // loadable on servers that do not have ProjectE installed.
+            // GeneratedEmcMapper 实现了 ProjectE 接口，只有确认 ProjectE 存在才能初始化它的类。
+            // 这个守卫是「未安装 ProjectE 也能正常启动」的关键。
             if (OptionalIntegrationManager.isProjectEAvailable()) {
                 GeneratedEmcMapper.setSource(store);
                 GeneratedEmcMapper.setManualValues(OptionalIntegrationManager.manualValues());
                 LOGGER.info("SudoersEMC wired its generated-value mapper into ProjectE");
             }
 
+            scanManager = createScanManager();
+            SudoemcCommands.setService(new CommandService(
+                    scanManager,
+                    new com.itzplana.sudoersemc.diagnostic.ReportManager(),
+                    store,
+                    stateStore));
+
             LOGGER.info("SudoersEMC common setup complete ({} generated entries loaded)", store.size());
         });
+    }
+
+    /**
+     * 创建扫描调度器。
+     *
+     * <p>采集与应用回调目前只统计数量，真实管线在后续集成阶段接入求解器与定价链路。
+     * 这样做的目的是让调度骨架先跑通 tick 驱动与进度上报，避免一次性引入大量未验证逻辑。</p>
+     */
+    private static ScanManager createScanManager() {
+        int itemsPerTick;
+        boolean adaptive;
+        try {
+            itemsPerTick = SudoersemcConfig.PERFORMANCE_ITEMS_PER_TICK.get();
+            adaptive = SudoersemcConfig.PERFORMANCE_ADAPTIVE_BATCH_SIZING.get();
+        } catch (RuntimeException e) {
+            // 配置尚未加载时退回保守默认值，绝不因为读取配置失败而阻止模组启动。
+            LOGGER.warn("SudoersEMC 无法读取性能配置，使用默认值 100 / 自适应开启", e);
+            itemsPerTick = 100;
+            adaptive = true;
+        }
+        BatchProcessor processor = new BatchProcessor(Math.max(1, itemsPerTick), adaptive);
+        return new ScanManager(
+                processor,
+                () -> new ScanManager.SnapshotData("待接入真实扫描", 0, 0),
+                data -> LOGGER.debug("SudoersEMC 扫描应用阶段：{}", data.label()),
+                TICK_BUDGET_NANOS);
+    }
+
+    private void onRegisterCommands(RegisterCommandsEvent event) {
+        event.getDispatcher().register(SudoemcCommands.register());
+        LOGGER.debug("SudoersEMC registered /sudoemc command tree");
+    }
+
+    private void onServerTick(TickEvent.ServerTickEvent event) {
+        if (event.phase != TickEvent.Phase.END) {
+            return;
+        }
+        ScanManager manager = scanManager;
+        if (manager != null && manager.isRunning()) {
+            manager.tick();
+        }
     }
 
     private void onServerStarted(ServerStartedEvent event) {
@@ -82,12 +146,30 @@ public final class Sudoersemc {
         if (store != null) {
             store.saveIfDirty();
         }
+        ScanStateStore stateStore = scanStateStore;
+        if (stateStore != null) {
+            stateStore.saveIfDirty();
+        }
     }
 
     /**
-     * @return the live entry store, or {@code null} before common setup has completed
+     * @return 当前生效的生成条目存储，common setup 完成前为 {@code null}
      */
     public static GeneratedEntryStore entryStore() {
         return entryStore;
+    }
+
+    /**
+     * @return 扫描状态存储，common setup 完成前为 {@code null}
+     */
+    public static ScanStateStore scanStateStore() {
+        return scanStateStore;
+    }
+
+    /**
+     * @return 扫描调度器，common setup 完成前为 {@code null}
+     */
+    public static ScanManager scanManager() {
+        return scanManager;
     }
 }
