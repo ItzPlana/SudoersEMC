@@ -1,0 +1,36 @@
+# Gradle
+.gradle/
+build/
+out/
+run/
+run-data/
+logs/
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.classpath
+.project
+.settings/
+bin/
+.vscode/
+
+# Agents
+.snow/
+ROLE.md
+AGENTS.md
+CLAUDE.md
+.claude/
+.codex/
+.commandcode/
+
+# Sources
+ProjectE-Resources/
+
+# Internal working documents
+docs/
+
+# OS
+.DS_Store
