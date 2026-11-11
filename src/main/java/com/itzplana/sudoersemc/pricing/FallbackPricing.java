@@ -143,6 +143,13 @@ public final class FallbackPricing {
                     item, externalBaseline, PriceSource.EXTERNAL_BASELINE, "external-baseline"));
         }
 
+        // 排除语义与价格优先级是两件事：排除表示「拒绝定价」，不是「价格来源」。
+        // 稀有度定价对任何输入都会返回值，若把排除检查放在它之后，层级排除规则将永远不可达，
+        // 导致 spawn egg、命令方块等物品被误定价。因此排除检查必须先于所有定价步骤。
+        if (settings.useTierPricing() && isExcluded(item)) {
+            return Optional.empty();
+        }
+
         if (settings.useTagPricing()) {
             Optional<Long> tagValue = tagPricing.price(item, request.tagPaths());
             if (tagValue.isPresent()) {
@@ -175,5 +182,17 @@ public final class FallbackPricing {
         }
 
         return Optional.empty();
+    }
+
+    /**
+     * 判断物品是否被层级规则明确排除。
+     *
+     * <p>{@link TierPricing#price} 用 {@code Optional.of(0L)} 表示「明确排除」。这里单独抽出来，
+     * 是因为排除与定价是两种语义：排除必须在任何定价步骤之前生效，否则会被总会返回值的
+     * 稀有度定价遮蔽。</p>
+     */
+    private boolean isExcluded(ItemKey item) {
+        Optional<Long> tierValue = tierPricing.price(item);
+        return tierValue.isPresent() && tierValue.get() <= 0L;
     }
 }

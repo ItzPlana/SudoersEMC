@@ -3,14 +3,29 @@ package com.itzplana.sudoersemc;
 import com.itzplana.sudoersemc.command.CommandService;
 import com.itzplana.sudoersemc.command.SudoemcCommands;
 import com.itzplana.sudoersemc.config.SudoersemcConfig;
+import com.itzplana.sudoersemc.diagnostic.ReportManager;
 import com.itzplana.sudoersemc.diagnostic.SmokeTestHook;
 import com.itzplana.sudoersemc.integration.GeneratedEmcMapper;
 import com.itzplana.sudoersemc.integration.OptionalIntegrationManager;
+import com.itzplana.sudoersemc.pipeline.PipelineSnapshot;
+import com.itzplana.sudoersemc.pipeline.ScanPipeline;
+import com.itzplana.sudoersemc.pricing.FallbackPricing;
+import com.itzplana.sudoersemc.pricing.PricingSettings;
+import com.itzplana.sudoersemc.safety.CreativeItemProtection;
+import com.itzplana.sudoersemc.safety.LargeDropProtection;
+import com.itzplana.sudoersemc.safety.OverflowPipeline;
+import com.itzplana.sudoersemc.safety.OverflowProtection;
+import com.itzplana.sudoersemc.solver.SolveSettings;
 import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
+import com.itzplana.sudoersemc.storage.OverflowResetLog;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
+import com.itzplana.sudoersemc.storage.SudoersemcPaths;
 import com.itzplana.sudoersemc.task.BatchProcessor;
 import com.itzplana.sudoersemc.task.ScanManager;
 import com.mojang.logging.LogUtils;
+import java.util.Map;
+import java.util.Set;
+import net.minecraft.server.MinecraftServer;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.RegisterCommandsEvent;
 import net.minecraftforge.event.TickEvent;
@@ -20,6 +35,7 @@ import net.minecraftforge.eventbus.api.IEventBus;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.event.lifecycle.FMLCommonSetupEvent;
 import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
+import net.minecraftforge.server.ServerLifecycleHooks;
 import org.slf4j.Logger;
 
 /**
@@ -40,6 +56,7 @@ public final class Sudoersemc {
     private static volatile GeneratedEntryStore entryStore;
     private static volatile ScanStateStore scanStateStore;
     private static volatile ScanManager scanManager;
+    private static volatile ScanPipeline scanPipeline;
 
     public Sudoersemc() {
         IEventBus modEventBus = FMLJavaModLoadingContext.get().getModEventBus();
@@ -79,10 +96,14 @@ public final class Sudoersemc {
                 LOGGER.info("SudoersEMC wired its generated-value mapper into ProjectE");
             }
 
-            scanManager = createScanManager();
+            ReportManager reportManager = new ReportManager();
+            ScanPipeline pipeline = createScanPipeline(store, stateStore, reportManager);
+            scanPipeline = pipeline;
+
+            scanManager = createScanManager(pipeline);
             SudoemcCommands.setService(new CommandService(
                     scanManager,
-                    new com.itzplana.sudoersemc.diagnostic.ReportManager(),
+                    reportManager,
                     store,
                     stateStore));
 
@@ -91,12 +112,106 @@ public final class Sudoersemc {
     }
 
     /**
-     * 创建扫描调度器。
+     * 创建真实扫描管线。
      *
-     * <p>采集与应用回调目前只统计数量，真实管线在后续集成阶段接入求解器与定价链路。
-     * 这样做的目的是让调度骨架先跑通 tick 驱动与进度上报，避免一次性引入大量未验证逻辑。</p>
+     * <p>所有安全层与定价策略都从配置构造；任意配置读取失败都会退回该组件的安全默认值，绝不阻止
+     * 模组启动。ProjectE 后端通过 {@link OptionalIntegrationManager} 探测，未安装时管线仍然可以
+     * 仅依靠配方与兜底定价工作。</p>
+     *
+     * @param store         生成值存储
+     * @param stateStore    扫描状态存储
+     * @param reportManager 诊断报告管理器
+     * @return 可直接交给扫描调度器使用的管线
      */
-    private static ScanManager createScanManager() {
+    private static ScanPipeline createScanPipeline(GeneratedEntryStore store,
+                                                   ScanStateStore stateStore,
+                                                   ReportManager reportManager) {
+        OverflowProtection.Settings overflowSettings;
+        try {
+            overflowSettings = SudoersemcConfig.overflowSettings();
+        } catch (RuntimeException e) {
+            // 配置尚未加载或跨字段校验失败时，使用自带默认值。
+            LOGGER.warn("SudoersEMC 无法读取溢出保护配置，使用默认值", e);
+            overflowSettings = new OverflowProtection.Settings();
+        }
+        OverflowPipeline overflowPipeline = new OverflowPipeline(
+                new OverflowProtection(overflowSettings),
+                new OverflowResetLog(SudoersemcPaths.file("overflow_resets.json")));
+
+        LargeDropProtection.Settings dropSettings;
+        try {
+            dropSettings = new LargeDropProtection.Settings(
+                    SudoersemcConfig.SAFETY_LARGE_DROP_PROTECTION.get(),
+                    SudoersemcConfig.SAFETY_MAX_ALLOWED_DROP_RATIO.get(),
+                    Set.of(),
+                    Set.of());
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法读取大幅降价保护配置，使用默认值", e);
+            dropSettings = LargeDropProtection.Settings.defaults();
+        }
+        LargeDropProtection dropProtection = new LargeDropProtection(dropSettings);
+
+        boolean protectCreativeOnly;
+        try {
+            protectCreativeOnly = SudoersemcConfig.SAFETY_PROTECT_CREATIVE_ONLY_ITEMS.get();
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法读取创造物品保护配置，默认启用保护", e);
+            protectCreativeOnly = true;
+        }
+        CreativeItemProtection creativeProtection = new CreativeItemProtection(
+                new CreativeItemProtection.Settings(
+                        protectCreativeOnly, Set.of(), Map.of(), Set.of()));
+
+        PricingSettings pricingSettings;
+        try {
+            pricingSettings = new PricingSettings(
+                    SudoersemcConfig.FALLBACK_USE_TAG_PRICING.get(),
+                    SudoersemcConfig.FALLBACK_USE_RARITY_PRICING.get(),
+                    true,
+                    SudoersemcConfig.FALLBACK_USE_FALLBACK_FOR_UNSOLVABLE.get(),
+                    PricingSettings.DEFAULT_GENERIC_FALLBACK_VALUE);
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法读取兜底定价配置，使用默认值", e);
+            pricingSettings = PricingSettings.defaults();
+        }
+        FallbackPricing fallbackPricing = FallbackPricing.withDefaults(pricingSettings);
+
+        SolveSettings solveSettings;
+        try {
+            solveSettings = new SolveSettings(
+                    Math.max(1, SudoersemcConfig.RECIPE_MAX_RECIPE_PASSES.get()),
+                    SudoersemcConfig.RECIPE_ALLOW_RECIPE_VALUE_INCREASE.get(),
+                    SolveSettings.DEFAULT_MINIMUM_EMC,
+                    SolveSettings.DEFAULT_MAX_ALTERNATIVE_COSTS);
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法读取配方求解配置，使用默认值", e);
+            solveSettings = SolveSettings.defaults();
+        }
+
+        ScanPipeline pipeline = new ScanPipeline(
+                store,
+                stateStore,
+                reportManager,
+                dropProtection,
+                creativeProtection,
+                overflowPipeline,
+                fallbackPricing,
+                solveSettings);
+        pipeline.setEmcProvider(OptionalIntegrationManager.provider().orElse(null));
+        return pipeline;
+    }
+
+    /**
+     * 创建扫描调度器并接入真实管线。
+     *
+     * <p>接线采用“采集暂存、应用取出”的方式：采集回调在服务器线程完成注册表与配方读取后把
+     * {@link PipelineSnapshot} 暂存到管线中，应用回调再取出求解并写入存储。这样既满足
+     * {@link ScanManager} 跨 tick 的阶段划分，也避免闭包数组带来的隐式状态。</p>
+     *
+     * @param pipeline 真实扫描管线
+     * @return 已接线的扫描调度器
+     */
+    private static ScanManager createScanManager(ScanPipeline pipeline) {
         int itemsPerTick;
         boolean adaptive;
         try {
@@ -111,9 +226,57 @@ public final class Sudoersemc {
         BatchProcessor processor = new BatchProcessor(Math.max(1, itemsPerTick), adaptive);
         return new ScanManager(
                 processor,
-                () -> new ScanManager.SnapshotData("待接入真实扫描", 0, 0),
-                data -> LOGGER.debug("SudoersEMC 扫描应用阶段：{}", data.label()),
+                () -> collectSnapshot(pipeline),
+                data -> applySnapshot(pipeline),
                 TICK_BUDGET_NANOS);
+    }
+
+    /**
+     * 采集阶段回调：读取当前服务器并生成不可变快照。
+     *
+     * <p>服务器尚未就绪时返回空快照，避免调度器因为空指针进入失败状态。</p>
+     */
+    private static ScanManager.SnapshotData collectSnapshot(ScanPipeline pipeline) {
+        MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
+        if (server == null) {
+            LOGGER.warn("SudoersEMC 扫描请求到达时服务器尚未就绪，本轮采集空快照");
+            PipelineSnapshot empty = PipelineSnapshot.empty();
+            pipeline.stash(empty);
+            return new ScanManager.SnapshotData("服务器未就绪", 0, 0);
+        }
+
+        PipelineSnapshot snapshot = pipeline.collect(server);
+        pipeline.stash(snapshot);
+        return new ScanManager.SnapshotData(
+                "真实扫描管线", snapshot.itemCount(), snapshot.recipeCount());
+    }
+
+    /**
+     * 应用阶段回调：求解暂存快照、请求 ProjectE 重映射并落盘。
+     *
+     * <p>所有步骤都在服务器线程执行。重映射失败只记录警告，不会阻止已经生成的条目写入磁盘。</p>
+     */
+    private static void applySnapshot(ScanPipeline pipeline) {
+        pipeline.applyStashed();
+
+        MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
+        if (server != null) {
+            try {
+                OptionalIntegrationManager.provider()
+                        .ifPresent(provider -> provider.requestRemap(server));
+            } catch (RuntimeException e) {
+                LOGGER.warn("SudoersEMC 请求 ProjectE 重映射失败，已生成条目仍会保存", e);
+            }
+        }
+
+        GeneratedEntryStore store = entryStore;
+        if (store != null) {
+            store.saveIfDirty();
+        }
+        ScanStateStore stateStore = scanStateStore;
+        if (stateStore != null) {
+            stateStore.saveIfDirty();
+        }
     }
 
     private void onRegisterCommands(RegisterCommandsEvent event) {
@@ -171,5 +334,12 @@ public final class Sudoersemc {
      */
     public static ScanManager scanManager() {
         return scanManager;
+    }
+
+    /**
+     * @return 真实扫描管线，common setup 完成前为 {@code null}
+     */
+    public static ScanPipeline scanPipeline() {
+        return scanPipeline;
     }
 }

@@ -44,6 +44,9 @@ minecraft {
             if (project.hasProperty('smokeQuery')) {
                 property 'sudoersemc.smokeQuery', 'true'
             }
+            if (project.hasProperty('pipelineScan')) {
+                property 'sudoersemc.pipelineScan', 'true'
+            }
         }
     }
 }

@@ -182,8 +182,10 @@ public final class RecipeScanner {
         if (output == null) {
             return null;
         }
-        List<RecipeOutput> remainders = convertStacks(recipe.getRemainingItems(null));
-        return new RecipeSnapshot(id, kind, inputs, List.of(output), remainders,
+        // 容器余量（桶、空瓶等）需要真实的 CraftingContainer 才能计算。扫描阶段没有可用容器，
+        // 因此这里显式降级为「无余量」：配方仍然参与定价，只是不抵扣返还物。
+        // 绝不因为拿不到余量就把整条配方标记为失败——那会丢失大量可定价配方。
+        return new RecipeSnapshot(id, kind, inputs, List.of(output), List.of(),
                 false, java.util.Map.of());
     }
 
