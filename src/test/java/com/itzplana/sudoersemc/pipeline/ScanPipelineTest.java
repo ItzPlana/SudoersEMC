@@ -346,6 +346,121 @@ class ScanPipelineTest {
     }
 
     @Test
+    void ownershipSeparationRefreshesOwnedEntriesOnly() {
+        ItemSnapshot owned = ItemSnapshot.of(RESULT, true, 5L,
+                List.of("forge:ingots/iron"), Rarity.RARE);
+        ItemSnapshot manual = ItemSnapshot.of(DUST, true, 50L,
+                List.of("forge:dusts"), Rarity.UNCOMMON);
+        ItemSnapshot clean = ItemSnapshot.of(INGOT, false, 0L);
+
+        ScanPipeline.OwnershipSeparation separation = ScanPipeline.separateOwnedEntries(
+                List.of(owned, manual, clean), key -> key.equals(RESULT));
+
+        assertEquals(1, separation.refreshedOwned());
+        assertEquals(List.of(RESULT, DUST, INGOT),
+                separation.items().stream().map(ItemSnapshot::key).toList());
+
+        ItemSnapshot refreshed = separation.items().get(0);
+        assertFalse(refreshed.hasExistingEmc());
+        assertEquals(0L, refreshed.existingValue());
+        assertEquals(owned.tagPaths(), refreshed.tagPaths());
+        assertEquals(Rarity.RARE, refreshed.rarity());
+
+        assertEquals(manual, separation.items().get(1), "非自有条目必须保持原样");
+        assertEquals(clean, separation.items().get(2), "无既有值条目必须保持原样");
+        assertFalse(separation.existingValues().containsKey(RESULT), "自有值必须从既有值中移除");
+        assertEquals(50L, separation.existingValues().get(DUST));
+        assertFalse(separation.existingValues().containsKey(INGOT));
+    }
+
+    @Test
+    void ownedRecipeValueIsRefreshedFromRecipe() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_owned_recipe.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 5L, PriceSource.RECIPE, null, true, 0L));
+
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 10L), item(RESULT, 5L)),
+                List.of(recipe(INGOT, RESULT)),
+                Map.of(INGOT, 10L, RESULT, 5L));
+        ScanPipeline pipeline = pipeline(store, null, null, null, null, null, disabledFallback());
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1, result.solvedByRecipe());
+        assertEquals(1, result.applied());
+        GeneratedEmcEntry staged = store.snapshotAll().get(RESULT);
+        assertNotNull(staged);
+        assertEquals(10L, staged.value(), "自有值必须随配方输入刷新");
+        assertEquals(PriceSource.RECIPE, staged.source());
+        assertTrue(staged.owned());
+    }
+
+    @Test
+    void ownedFallbackValueIsRefreshed() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_owned_fallback.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 5L, PriceSource.RECIPE, null, true, 0L));
+
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(RESULT, 5L)), List.of(), Map.of(RESULT, 5L));
+        ScanPipeline pipeline = pipeline(store, null, null, null, null, null, genericFallback(7L));
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1, result.solvedByFallback());
+        assertEquals(1, result.applied());
+        GeneratedEmcEntry staged = store.snapshotAll().get(RESULT);
+        assertNotNull(staged);
+        assertEquals(7L, staged.value(), "自有值必须允许兜底定价刷新");
+        assertEquals(PriceSource.FALLBACK, staged.source());
+        assertTrue(staged.owned());
+    }
+
+    @Test
+    void ownedLargeDropRemainsQuarantined() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_owned_drop.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 1_000L, PriceSource.RECIPE, null, true, 0L));
+        LargeDropProtection dropProtection =
+                new LargeDropProtection(LargeDropProtection.Settings.defaults());
+
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(RESULT, 1_000L)), List.of(), Map.of(RESULT, 1_000L));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, dropProtection, null, null, genericFallback(7L));
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1, result.solvedByFallback());
+        assertEquals(1, result.quarantined());
+        assertEquals(0, result.applied());
+        assertEquals(1_000L, store.snapshotAll().get(RESULT).value(),
+                "自有条目的大幅降价仍应被隔离，旧值不得被覆盖");
+    }
+
+    @Test
+    void externalValueRemainsProtected() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_external.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 50L, PriceSource.EXISTING, null, false, 0L));
+
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(RESULT, 50L)), List.of(), Map.of(RESULT, 50L));
+        ScanPipeline pipeline = pipeline(store, null, null, null, null, null, genericFallback(7L));
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(0, result.solvedByFallback());
+        assertEquals(0, result.applied());
+        assertEquals(1, store.size());
+        GeneratedEmcEntry existing = store.snapshotAll().get(RESULT);
+        assertNotNull(existing);
+        assertEquals(50L, existing.value(), "非自有值不得被兜底定价覆盖");
+        assertFalse(existing.owned());
+    }
+
+    @Test
     void taggedSnapshotProducesTagCandidate() {
         GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("generated_tag.json"));
         ItemSnapshot tagged = ItemSnapshot.of(RESULT, false, 0L,

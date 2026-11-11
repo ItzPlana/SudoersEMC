@@ -26,6 +26,7 @@ import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
 import com.itzplana.sudoersemc.task.ScanFingerprint;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -33,6 +34,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Predicate;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.item.ItemStack;
@@ -251,6 +253,84 @@ public final class ScanPipeline {
     }
 
     /**
+     * 把存储中归 SudoersEMC 所有的物品从“已有 EMC”中分离出来。
+     *
+     * <p>返回的物品快照保持输入顺序；自有条目会被重建为不含既有值的形式，标签与稀有度原样
+     * 保留，后续求解与兜底定价因此可以重新计算它们。非自有条目保持原样，其既有值继续写入
+     * {@code existingValues}，确保手工值或外部后端值不会被覆盖。</p>
+     *
+     * @param items 本次扫描到的物品快照，不能为 {@code null}
+     * @param owned 归属判定；返回 {@code true} 表示该物品由 SudoersEMC 所有
+     * @return 分离后的物品、既有值与刷新数量
+     */
+    static OwnershipSeparation separateOwnedEntries(List<ItemSnapshot> items,
+                                                    Predicate<ItemKey> owned) {
+        List<ItemSnapshot> separated = new ArrayList<>(items.size());
+        Map<ItemKey, Long> existingValues = new TreeMap<>();
+        int refreshedOwned = 0;
+        for (ItemSnapshot item : items) {
+            ItemKey key = item.key();
+            if (owned.test(key)) {
+                if (item.hasExistingEmc() || item.existingValue() > 0L) {
+                    refreshedOwned++;
+                }
+                separated.add(ItemSnapshot.of(key, false, 0L, item.tagPaths(), item.rarity()));
+                continue;
+            }
+            separated.add(item);
+            if (item.hasExistingEmc()) {
+                existingValues.put(key, item.existingValue());
+            }
+        }
+        return new OwnershipSeparation(separated, existingValues, refreshedOwned);
+    }
+
+    /**
+     * 在应用阶段执行归属分离。
+     *
+     * <p>分离放在应用阶段而不是采集阶段：采集只如实记录后端观察到的状态，是否归 SudoersEMC
+     * 所有由持久化存储决定。这样即使调用方直接构造带既有值的快照，也会在写入前正确刷新
+     * 自有条目；干跑模式没有存储，保持原始语义不变。</p>
+     *
+     * @param snapshot 采集结果，不能为 {@code null}
+     * @return 分离后的快照；无需刷新时返回原实例
+     */
+    private PipelineSnapshot applyOwnershipSeparation(PipelineSnapshot snapshot) {
+        if (store == null) {
+            return snapshot;
+        }
+        OwnershipSeparation separation = separateOwnedEntries(snapshot.items(), store::isOwned);
+        if (separation.refreshedOwned() == 0) {
+            return snapshot;
+        }
+        LOGGER.debug("SudoersEMC 归属分离刷新了 {} 个自有条目，本轮将重新求解其数值",
+                separation.refreshedOwned());
+        return new PipelineSnapshot(
+                separation.items(),
+                snapshot.recipes(),
+                separation.existingValues(),
+                snapshot.unsupportedRecipes(),
+                snapshot.invalidRecipes(),
+                snapshot.failedRecipes());
+    }
+
+    /**
+     * 归属分离结果。
+     *
+     * @param items          分离后的物品快照，保持输入顺序
+     * @param existingValues 仍然受保护的非自有既有值，按键升序排列
+     * @param refreshedOwned 被清除既有值的自有条目数量
+     */
+    record OwnershipSeparation(List<ItemSnapshot> items, Map<ItemKey, Long> existingValues,
+                               int refreshedOwned) {
+
+        OwnershipSeparation {
+            items = List.copyOf(items);
+            existingValues = Collections.unmodifiableMap(new TreeMap<>(existingValues));
+        }
+    }
+
+    /**
      * 求解快照并为可定价物品写入生成值。
      *
      * <p>本方法不访问注册表，只使用快照中的纯数据。处理顺序固定为：</p>
@@ -260,6 +340,11 @@ public final class ScanPipeline {
      *   <li>每个候选值先经过大幅降价保护，再经过溢出保护，最后才写入存储；</li>
      *   <li>更新扫描指纹、写出诊断报告并返回汇总结果。</li>
      * </ol>
+     *
+     * <p><strong>归属分离：</strong>应用阶段会先把存储中 {@code owned=true} 的条目对应物品
+     * 视为没有既有 EMC，并从既有值映射中移除。采集阶段仍如实记录后端观察到的值，因为
+     * {@link ItemScanner} 无法区分 ProjectE 原生值与 SudoersEMC 自己写回的值；只有在这里
+     * 依据持久化存储的归属信息做一次分离，自有值才能随配方变化刷新，外部值仍然受到保护。</p>
      *
      * <p>存储为 {@code null} 时进入干跑模式：计数与报告照常生成，但不会产生任何持久化写入。</p>
      *
@@ -271,6 +356,7 @@ public final class ScanPipeline {
         long startedAtNanos = System.nanoTime();
 
         try {
+            data = applyOwnershipSeparation(data);
             SolveContext context = new SolveContext(data.existingValues());
             SolveResult solveResult = new RecipeSolver().solve(
                     data.recipes(), context, EvaluatorRegistry.defaults(), solveSettings);

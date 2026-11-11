@@ -19,7 +19,6 @@ import com.itzplana.sudoersemc.solver.SolveSettings;
 import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
 import com.itzplana.sudoersemc.storage.OverflowResetLog;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
-import com.itzplana.sudoersemc.storage.SudoersemcPaths;
 import com.itzplana.sudoersemc.task.AutoScanPolicy;
 import com.itzplana.sudoersemc.task.BatchProcessor;
 import com.itzplana.sudoersemc.task.ScanManager;
@@ -37,6 +36,7 @@ import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.event.lifecycle.FMLCommonSetupEvent;
 import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
 import net.minecraftforge.server.ServerLifecycleHooks;
+import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 
 /**
@@ -58,6 +58,7 @@ public final class Sudoersemc {
     private static volatile ScanStateStore scanStateStore;
     private static volatile ScanManager scanManager;
     private static volatile ScanPipeline scanPipeline;
+    private static volatile OverflowResetLog overflowResetLog;
 
     public Sudoersemc() {
         IEventBus modEventBus = FMLJavaModLoadingContext.get().getModEventBus();
@@ -84,6 +85,8 @@ public final class Sudoersemc {
             ScanStateStore stateStore = new ScanStateStore();
             stateStore.load();
             scanStateStore = stateStore;
+            OverflowResetLog overflowLog = new OverflowResetLog();
+            overflowResetLog = overflowLog;
 
             // 落盘文件必须就绪，集成管理器才能创建 provider。
             OptionalIntegrationManager.setSink(store);
@@ -98,7 +101,7 @@ public final class Sudoersemc {
             }
 
             ReportManager reportManager = new ReportManager();
-            ScanPipeline pipeline = createScanPipeline(store, stateStore, reportManager);
+            ScanPipeline pipeline = createScanPipeline(store, stateStore, reportManager, overflowLog);
             scanPipeline = pipeline;
 
             scanManager = createScanManager(pipeline);
@@ -122,11 +125,13 @@ public final class Sudoersemc {
      * @param store         生成值存储
      * @param stateStore    扫描状态存储
      * @param reportManager 诊断报告管理器
+     * @param overflowLog   溢出审计日志；{@code null} 时新建一个仅本次使用的实例
      * @return 可直接交给扫描调度器使用的管线
      */
     private static ScanPipeline createScanPipeline(GeneratedEntryStore store,
                                                    ScanStateStore stateStore,
-                                                   ReportManager reportManager) {
+                                                   ReportManager reportManager,
+                                                   @Nullable OverflowResetLog overflowLog) {
         OverflowProtection.Settings overflowSettings;
         try {
             overflowSettings = SudoersemcConfig.overflowSettings();
@@ -135,9 +140,10 @@ public final class Sudoersemc {
             LOGGER.warn("SudoersEMC 无法读取溢出保护配置，使用默认值", e);
             overflowSettings = new OverflowProtection.Settings();
         }
+        OverflowResetLog auditLog = overflowLog == null ? new OverflowResetLog() : overflowLog;
         OverflowPipeline overflowPipeline = new OverflowPipeline(
                 new OverflowProtection(overflowSettings),
-                new OverflowResetLog(SudoersemcPaths.file("overflow_resets.json")));
+                auditLog);
 
         LargeDropProtection.Settings dropSettings;
         try {
@@ -348,6 +354,10 @@ public final class Sudoersemc {
         ScanStateStore stateStore = scanStateStore;
         if (stateStore != null) {
             stateStore.saveIfDirty();
+        }
+        OverflowResetLog resetLog = overflowResetLog;
+        if (resetLog != null) {
+            resetLog.save();
         }
     }
 
