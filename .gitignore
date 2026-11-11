@@ -17,20 +17,8 @@ logs/
 bin/
 .vscode/
 
-# Agents
-.snow/
-ROLE.md
-AGENTS.md
-CLAUDE.md
-.claude/
-.codex/
-.commandcode/
-
-# Sources
+# Reference sources kept outside version control
 ProjectE-Resources/
-
-# Internal working documents
-docs/
 
 # OS
 .DS_Store
