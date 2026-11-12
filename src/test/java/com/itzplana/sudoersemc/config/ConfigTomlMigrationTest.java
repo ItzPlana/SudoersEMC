@@ -153,7 +153,7 @@ class ConfigTomlMigrationTest {
     }
 
     @Test
-    void nonPositiveSchemaVersionIsRetained() throws IOException {
+    void negativeSchemaVersionIsRetained() throws IOException {
         Path negative = tempDir.resolve("negative-version.toml");
         String negativeText = """
                 schemaVersion = -1
@@ -166,15 +166,23 @@ class ConfigTomlMigrationTest {
                 ConfigTomlMigration.migrate(negative);
         assertEquals(ConfigTomlMigration.Status.FAILED_RETAINED, negativeOutcome.status());
         assertEquals(negativeText, Files.readString(negative, StandardCharsets.UTF_8));
-
-        Path zero = tempDir.resolve("zero-version.toml");
-        String zeroText = "schemaVersion = 0\n";
-        Files.writeString(zero, zeroText, StandardCharsets.UTF_8);
-        ConfigTomlMigration.MigrationOutcome zeroOutcome = ConfigTomlMigration.migrate(zero);
-        assertEquals(ConfigTomlMigration.Status.FAILED_RETAINED, zeroOutcome.status());
-        assertEquals(zeroText, Files.readString(zero, StandardCharsets.UTF_8));
         assertEquals(0, countBackups(negative));
-        assertEquals(0, countBackups(zero));
+    }
+
+    @Test
+    void zeroSchemaVersionIsTreatedAsLegacyAndMigrated() throws IOException {
+        Path zero = tempDir.resolve("zero-version.toml");
+        Files.writeString(zero, "schemaVersion = 0\n", StandardCharsets.UTF_8);
+
+        ConfigTomlMigration.MigrationOutcome outcome = ConfigTomlMigration.migrate(zero);
+
+        assertEquals(ConfigTomlMigration.Status.MIGRATED, outcome.status());
+        assertNotNull(outcome.backup());
+        try (CommentedFileConfig toml = load(zero)) {
+            assertEquals(2, ((Number) toml.get("schemaVersion")).intValue());
+            assertEquals(999_999L, ((Number) toml.get("overflow.threshold")).longValue());
+            assertEquals("owned_only", toml.get("overflow.overwriteScope"));
+        }
     }
 
     @Test

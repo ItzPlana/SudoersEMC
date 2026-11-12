@@ -338,10 +338,10 @@ public final class ConfigTomlMigration {
      * 严格读取 {@code schemaVersion}：
      *
      * <ul>
-     *   <li>键不存在 → legacy 1；</li>
+     *   <li>键不存在或值为 0 → legacy 1（0 是 spec 下界，按未知版本抬到当前版本）；</li>
      *   <li>正整数且不超过 {@link Integer#MAX_VALUE} → 有效版本；</li>
      *   <li>数值超过 int 上限 → {@link VersionStatus#TOO_HIGH}，入口返回 REFUSED_NEWER；</li>
-     *   <li>0/负数、非数字字符串、布尔/数组/小数等非法类型 → {@link VersionStatus#INVALID}，
+     *   <li>负数、非数字字符串、布尔/数组/小数等非法类型 → {@link VersionStatus#INVALID}，
      *       入口返回 FAILED_RETAINED。</li>
      * </ul>
      *
@@ -362,7 +362,13 @@ public final class ConfigTomlMigration {
                 return new VersionRead(VersionStatus.INVALID, -1);
             }
             BigInteger integer = decimal.toBigIntegerExact();
-            if (integer.signum() <= 0) {
+            if (integer.signum() == 0) {
+                // spec 下界是 0；0 表示“未知/legacy”，按缺失键处理并抬到当前版本，
+                // 同时避免 Forge 对 0 报警。
+                return new VersionRead(VersionStatus.MISSING,
+                        ConfigMigrations.LEGACY_SCHEMA_VERSION);
+            }
+            if (integer.signum() < 0) {
                 return new VersionRead(VersionStatus.INVALID, -1);
             }
             if (integer.compareTo(BigInteger.valueOf(Integer.MAX_VALUE)) > 0) {

@@ -16,10 +16,14 @@ import com.itzplana.sudoersemc.pricing.PricingSettings;
 import com.itzplana.sudoersemc.pricing.RarityPricing;
 import com.itzplana.sudoersemc.pricing.TagPricing;
 import com.itzplana.sudoersemc.pricing.TierPricing;
+import com.itzplana.sudoersemc.core.OverflowScope;
 import com.itzplana.sudoersemc.safety.LargeDropProtection;
+import com.itzplana.sudoersemc.safety.OverflowPipeline;
+import com.itzplana.sudoersemc.safety.OverflowProtection;
 import com.itzplana.sudoersemc.scanner.ItemSnapshot;
 import com.itzplana.sudoersemc.solver.SolveSettings;
 import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
+import com.itzplana.sudoersemc.storage.OverflowResetLog;
 import com.itzplana.sudoersemc.storage.QuarantinedDropsStore;
 import com.itzplana.sudoersemc.task.ScanFingerprint;
 import java.nio.file.Path;
@@ -145,6 +149,65 @@ class Phase25ExternalBaselinePipelineTest {
     }
 
     @Test
+    void baselineAboveOverflowThresholdIsDiscarded() {
+        GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("overflow-high.json"));
+        FakeBaseline baseline = FakeBaseline.of(Map.of(STONE, 5000L));
+        ScanPipeline pipeline = new ScanPipeline(store, null, null, null, null,
+                overflowPipeline(1000L), disabledFallback(), SolveSettings.defaults());
+        pipeline.setExternalBaselineSource(baseline);
+
+        PipelineResult result = pipeline.solveAndApply(snapshot(STONE));
+
+        assertEquals(0, result.applied());
+        assertEquals(0, store.size());
+    }
+
+    @Test
+    void baselineBelowOverflowThresholdIsAccepted() {
+        GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("overflow-low.json"));
+        FakeBaseline baseline = FakeBaseline.of(Map.of(STONE, 5000L));
+        ScanPipeline pipeline = new ScanPipeline(store, null, null, null, null,
+                overflowPipeline(10000L), disabledFallback(), SolveSettings.defaults());
+        pipeline.setExternalBaselineSource(baseline);
+
+        PipelineResult result = pipeline.solveAndApply(snapshot(STONE));
+
+        assertEquals(1, result.applied());
+        assertEquals(5000L, store.snapshotAll().get(STONE).value());
+        assertEquals(PriceSource.EXTERNAL_BASELINE, store.snapshotAll().get(STONE).source());
+    }
+
+    @Test
+    void manualDetectorSupplierFailureSkipsFallbackRound() {
+        GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("manual-broken.json"));
+        ScanPipeline pipeline = pipeline(store, null, genericFallback(50L),
+                SolveSettings.defaults(), ExternalBaselineSource.unavailable());
+        pipeline.setManualValueDetectorSupplier(() -> {
+            throw new IllegalStateException("simulated manual detector failure");
+        });
+
+        PipelineResult result = pipeline.solveAndApply(snapshot(STONE));
+
+        assertEquals(0, result.applied(), "判定器不可用时不得产生任何兜底候选");
+        assertEquals(0, store.size());
+    }
+
+    @Test
+    void manualDetectorPredicateFailureProtectsItem() {
+        GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("manual-throw.json"));
+        ScanPipeline pipeline = pipeline(store, null, genericFallback(50L),
+                SolveSettings.defaults(), ExternalBaselineSource.unavailable());
+        pipeline.setManualValueDetectorSupplier(() -> item -> {
+            throw new IllegalStateException("simulated per-item failure");
+        });
+
+        PipelineResult result = pipeline.solveAndApply(snapshot(STONE));
+
+        assertEquals(0, result.applied(), "单物品判定异常必须 fail-closed 跳过该物品");
+        assertEquals(0, store.size());
+    }
+
+    @Test
     void unavailableBaselineKeepsDefaultBehaviour() {
         GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("unavailable.json"));
         ScanPipeline pipeline = pipeline(store, null, disabledFallback(),
@@ -165,10 +228,22 @@ class Phase25ExternalBaselinePipelineTest {
                 TierPricing.defaults(),
                 PricingSettings.defaults());
     }
-
     private static FallbackPricing disabledFallback() {
         return FallbackPricing.withDefaults(
                 new PricingSettings(false, false, false, false, 0L));
+    }
+
+    private static FallbackPricing genericFallback(long value) {
+        return FallbackPricing.withDefaults(
+                new PricingSettings(false, false, false, true, value));
+    }
+
+    private OverflowPipeline overflowPipeline(long threshold) {
+        return new OverflowPipeline(
+                new OverflowProtection(new OverflowProtection.Settings(
+                        true, threshold, 100L, 900L, 10, 5,
+                        OverflowScope.OWNED_ONLY, false, 42L)),
+                new OverflowResetLog(tempDir.resolve("overflow-log-" + threshold + ".json")));
     }
 
     private static ScanPipeline pipeline(GeneratedEntryStore store,

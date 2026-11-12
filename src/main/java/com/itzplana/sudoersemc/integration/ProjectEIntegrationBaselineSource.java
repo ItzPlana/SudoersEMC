@@ -17,6 +17,7 @@ import java.util.Map;
 import java.util.OptionalLong;
 import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BooleanSupplier;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.packs.resources.Resource;
@@ -59,7 +60,23 @@ public final class ProjectEIntegrationBaselineSource implements ExternalBaseline
     private volatile Map<ItemKey, Long> values = Map.of();
     private volatile List<String> fingerprint = UNAVAILABLE_FINGERPRINT;
     private final AtomicLong lookupCalls = new AtomicLong();
+    private final BooleanSupplier backendAvailabilityProbe;
     private volatile long lastWarningAtMillis;
+
+    public ProjectEIntegrationBaselineSource() {
+        this(() -> OptionalIntegrationManager.provider()
+                .filter(EmcProvider::isAvailable)
+                .isPresent());
+    }
+
+    /**
+     * 测试/嵌入式构造器：注入后端可用性判定。
+     */
+    ProjectEIntegrationBaselineSource(@Nullable BooleanSupplier backendAvailabilityProbe) {
+        this.backendAvailabilityProbe = backendAvailabilityProbe == null
+                ? () -> false
+                : backendAvailabilityProbe;
+    }
 
     @Override
     public String id() {
@@ -255,9 +272,9 @@ public final class ProjectEIntegrationBaselineSource implements ExternalBaseline
      * ProjectE 仅“存在 jar”还不够：EMC API/provider 必须真的初始化成功。provider 为空时
      * 读取 baseline 只会产生无法生效的值，因此按不可用处理。
      */
-    private static boolean isProjectEBackendAvailable() {
+    boolean isProjectEBackendAvailable() {
         try {
-            return OptionalIntegrationManager.provider().isPresent();
+            return backendAvailabilityProbe.getAsBoolean();
         } catch (Throwable failure) {
             return false;
         }

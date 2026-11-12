@@ -50,6 +50,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.function.Predicate;
@@ -154,6 +155,7 @@ public final class ScanPipeline {
     private volatile int lastOwnershipExternalModifications;
     private volatile int lastOwnershipReleased;
     private volatile int lastResolverApplied;
+    private final AtomicBoolean manualDetectorFailureWarned = new AtomicBoolean(false);
 
     private volatile EmcProvider emcProvider;
     private volatile OverflowScope overflowScope = OverflowScope.OWNED_ONLY;
@@ -1110,15 +1112,32 @@ public final class ScanPipeline {
         try {
             return manualValueDetectorSupplier.get();
         } catch (RuntimeException failure) {
-            LOGGER.warn("SudoersEMC 读取手工值判定器失败，本轮跳过手工值检测", failure);
+            if (manualDetectorFailureWarned.compareAndSet(false, true)) {
+                LOGGER.warn("SudoersEMC 读取手工值判定器失败，本轮跳过手工值检测", failure);
+            }
             return null;
         }
     }
 
     private static boolean isManuallySet(Predicate<ItemKey> detector, ItemKey item) {
+        return isManuallySet(detector, item, false);
+    }
+
+    /**
+     * 手工值判定。
+     *
+     * <p>owned 外部修改检测路径保持 fail-open（异常视为“未手动”，只影响检测范围）；兜底定价
+     * 路径必须 fail-closed（异常视为“手动”，宁可不定价也不能覆盖管理员固定值）。</p>
+     */
+    private static boolean isManuallySet(Predicate<ItemKey> detector, ItemKey item,
+                                         boolean failClosed) {
         try {
             return detector.test(item);
         } catch (RuntimeException failure) {
+            if (failClosed) {
+                LOGGER.debug("手工值判定异常，按手动值保护处理：{}", item, failure);
+                return true;
+            }
             return false;
         }
     }
@@ -1657,6 +1676,36 @@ public final class ScanPipeline {
     }
 
     /**
+     * 丢弃严格超过溢出阈值的 resolver/baseline 值。
+     *
+     * <p>外部值最终写入时本来就会经过溢出保护，但候选值会先写入 seeds 并向配方上游传播；
+     * 若允许一个异常高的外部值进入 seeds，会在最终保护之前污染整条配方链。因此这里在写入
+     * 候选/seeds 之前就拒绝它，并继续尝试 TAG/RARITY/FALLBACK。</p>
+     */
+    private long capBaselineForOverflow(ItemKey item, long baseline) {
+        if (baseline <= 0L || overflowPipeline == null) {
+            return baseline;
+        }
+        try {
+            var settings = overflowPipeline.protection().settings();
+            if (!settings.enabled()) {
+                return baseline;
+            }
+            if (baseline > settings.threshold()) {
+                if (DebugLog.isEnabled()) {
+                    DebugLog.log("fallback", () -> "baseline-over-threshold item=" + item
+                            + " baseline=" + baseline + " threshold=" + settings.threshold());
+                }
+                return 0L;
+            }
+        } catch (RuntimeException failure) {
+            LOGGER.warn("检查外部基线溢出阈值失败，丢弃该基线：{}", item, failure);
+            return 0L;
+        }
+        return baseline;
+    }
+
+    /**
      * 从 {@link ItemKey} 重建一个用于 resolver 的堆叠。变体 SNBT 无法解析时返回空堆叠。
      */
     private static ItemStack stackFor(ItemKey key) {
@@ -1741,6 +1790,17 @@ public final class ScanPipeline {
         int added = 0;
         long minimumEmc = solveSettings.minimumEmc();
         Predicate<ItemKey> manualDetector = manualDetector();
+        if (manualDetector == null) {
+            // 手工值判定器不可用时绝不能 fail-open：否则 TAG/RARITY/baseline 可能覆盖管理员
+            // 在 ProjectE 手动文件中固定的值。整轮兜底直接跳过，配方候选仍可正常应用。
+            if (manualDetectorFailureWarned.compareAndSet(false, true)) {
+                LOGGER.warn("SudoersEMC 手工值判定器不可用，本轮跳过全部兜底候选以避免覆盖手动值");
+            }
+            if (DebugLog.isEnabled()) {
+                DebugLog.log("fallback", "manual-detector-unavailable round-aborted");
+            }
+            return 0;
+        }
         int index = 0;
         for (ItemSnapshot itemSnapshot : snapshot.items()) {
             ItemKey item = itemSnapshot.key();
@@ -1750,7 +1810,7 @@ public final class ScanPipeline {
             }
             // 手动值优先于任何自动来源：即使该物品没有 owned 条目，也不能被 baseline/TAG/RARITY
             // 重新接管。判定器在每轮开头创建一次，避免逐物品执行文件 stat。
-            if (manualDetector != null && isManuallySet(manualDetector, item)) {
+            if (isManuallySet(manualDetector, item, true)) {
                 if (DebugLog.isEnabled()) {
                     DebugLog.headOrSampled("fallback", index, 20L, 500L,
                             () -> "skip manual-protected item=" + item);
@@ -1799,6 +1859,9 @@ public final class ScanPipeline {
                     baseline = 0L;
                 }
             }
+            // resolver 与 PEI baseline 都是外部输入：超过溢出阈值的高值绝不能先写入 seeds，
+            // 否则会在最终溢出保护之前污染上游配方。丢弃后继续走 TAG/RARITY/FALLBACK。
+            baseline = capBaselineForOverflow(item, baseline);
 
             if (fallbackPricing == null) {
                 if (baseline <= 0L || baseline < minimumEmc) {

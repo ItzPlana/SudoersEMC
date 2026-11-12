@@ -68,6 +68,22 @@ class ProjectEIntegrationBaselineSourceTest {
     }
 
     @Test
+    void providerUnavailableLeavesBaselineEmpty() {
+        ProjectEIntegrationBaselineSource unavailableBackend =
+                new ProjectEIntegrationBaselineSource(() -> false);
+        assertFalse(unavailableBackend.isProjectEBackendAvailable());
+        assertFalse(unavailableBackend.isAvailable());
+        unavailableBackend.prepare(null);
+        assertFalse(unavailableBackend.isAvailable());
+        assertTrue(unavailableBackend.lookup(item("minecraft:iron_ingot")).isEmpty());
+        assertEquals(0, unavailableBackend.entryCount());
+
+        ProjectEIntegrationBaselineSource availableBackend =
+                new ProjectEIntegrationBaselineSource(() -> true);
+        assertTrue(availableBackend.isProjectEBackendAvailable());
+    }
+
+    @Test
     void fingerprintChangesWithValues() {
         List<String> first = ProjectEIntegrationBaselineSource.fingerprintFor(
                 Map.of(item("minecraft:iron_ingot"), 256L));

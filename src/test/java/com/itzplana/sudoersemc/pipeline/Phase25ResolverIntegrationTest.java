@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.itzplana.sudoersemc.core.ItemKey;
+import com.itzplana.sudoersemc.core.OverflowScope;
 import com.itzplana.sudoersemc.core.PriceSource;
 import com.itzplana.sudoersemc.pricing.FallbackPricing;
 import com.itzplana.sudoersemc.pricing.MaterialCategory;
@@ -15,6 +16,8 @@ import com.itzplana.sudoersemc.pricing.TagPricing;
 import com.itzplana.sudoersemc.pricing.TierPricing;
 import com.itzplana.sudoersemc.resolver.NbtMaterialResolver;
 import com.itzplana.sudoersemc.resolver.ResolverRegistry;
+import com.itzplana.sudoersemc.safety.OverflowPipeline;
+import com.itzplana.sudoersemc.safety.OverflowProtection;
 import com.itzplana.sudoersemc.scanner.ItemSnapshot;
 import com.itzplana.sudoersemc.scanner.RecipeInput;
 import com.itzplana.sudoersemc.scanner.RecipeKind;
@@ -23,6 +26,7 @@ import com.itzplana.sudoersemc.scanner.RecipeSnapshot;
 import com.itzplana.sudoersemc.scanner.IngredientOption;
 import com.itzplana.sudoersemc.solver.SolveSettings;
 import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
+import com.itzplana.sudoersemc.storage.OverflowResetLog;
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -125,6 +129,21 @@ class Phase25ResolverIntegrationTest {
     }
 
     @Test
+    void resolverValueAboveOverflowThresholdIsDiscarded() {
+        GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("resolver-overflow.json"));
+        ResolverRegistry registry = ResolverRegistry.defaults();
+        registry.register(new StubResolver(true, OptionalLong.of(5000L), null));
+        ScanPipeline pipeline = new ScanPipeline(store, null, null, null, null,
+                overflowPipeline(1000L), disabledFallback(), SolveSettings.defaults());
+        pipeline.setResolverRegistry(registry);
+
+        PipelineResult result = pipeline.solveAndApply(snapshot(STONE, List.of()));
+
+        assertEquals(0, result.applied());
+        assertEquals(0, store.size());
+    }
+
+    @Test
     void resolverRegistrationOrderWins() {
         StubResolver first = new StubResolver(true, OptionalLong.of(10L), null);
         StubResolver second = new StubResolver(true, OptionalLong.of(20L), null);
@@ -167,6 +186,14 @@ class Phase25ResolverIntegrationTest {
                 RarityPricing.defaults(),
                 TierPricing.defaults(),
                 new PricingSettings(true, false, false, false, 0L));
+    }
+
+    private OverflowPipeline overflowPipeline(long threshold) {
+        return new OverflowPipeline(
+                new OverflowProtection(new OverflowProtection.Settings(
+                        true, threshold, 100L, 900L, 10, 5,
+                        OverflowScope.OWNED_ONLY, false, 42L)),
+                new OverflowResetLog(tempDir.resolve("overflow-log-" + threshold + ".json")));
     }
 
     private static PipelineSnapshot snapshot(ItemKey key, List<String> tags) {
