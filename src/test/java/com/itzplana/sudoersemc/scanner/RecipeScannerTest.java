@@ -34,6 +34,7 @@ import org.junit.jupiter.api.Test;
 class RecipeScannerTest {
 
     private static final ResourceLocation RECIPE_ID = new ResourceLocation("sudoersemc_test", "recipe");
+    private static final ResourceLocation STONE_ID = new ResourceLocation("minecraft", "stone");
     private final RecipeScanner scanner = new RecipeScanner();
 
     @BeforeAll
@@ -129,6 +130,39 @@ class RecipeScannerTest {
 
         assertNotNull(output);
         assertNull(output.outputNbt(), "空标签不应产生空的 SNBT 字符串");
+    }
+
+    @Test
+    void zeroDamageOnlyTagIsNormalizedToPlainItem() {
+        ItemStack stack = new ItemStack(Items.STONE);
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 0);
+        stack.setTag(tag);
+
+        RecipeOutput output = RecipeScanner.convertStack(stack);
+
+        assertNotNull(output);
+        assertNull(output.outputNbt(), "仅 Damage:0 不应生成配方输出 NBT");
+        assertEquals(ItemKey.of(STONE_ID), output.item(), "仅 Damage:0 不应产生伪变体身份");
+    }
+
+    @Test
+    void nonDamageableNbtOutputUsesVariantIdentityAndKeepsRawNbt() {
+        ItemStack stack = new ItemStack(Items.STONE);
+        CompoundTag display = new CompoundTag();
+        display.putString("Name", "{\"text\":\"只影响展示\"}");
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Marker", 7);
+        tag.put("display", display);
+        stack.setTag(tag);
+
+        RecipeOutput output = RecipeScanner.convertStack(stack);
+
+        assertNotNull(output);
+        assertEquals(ItemKey.of(STONE_ID, "{Marker:7}"), output.item(),
+                "求解与变体扫描必须使用同一规范化身份");
+        assertEquals(tag.toString(), output.outputNbt(),
+                "注册 ProjectE 仍需要包含 display 的原始 SNBT");
     }
 
     private static TagKey<Item> unboundTag() {

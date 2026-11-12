@@ -22,10 +22,12 @@ import com.itzplana.sudoersemc.safety.OverflowPipeline;
 import com.itzplana.sudoersemc.safety.OverflowProtection;
 import com.itzplana.sudoersemc.safety.OverflowReset;
 import com.itzplana.sudoersemc.scanner.IngredientOption;
+import com.itzplana.sudoersemc.scanner.ItemScanner;
 import com.itzplana.sudoersemc.scanner.ItemSnapshot;
 import com.itzplana.sudoersemc.scanner.RecipeInput;
 import com.itzplana.sudoersemc.scanner.RecipeKind;
 import com.itzplana.sudoersemc.scanner.RecipeOutput;
+import com.itzplana.sudoersemc.scanner.RecipeScanner;
 import com.itzplana.sudoersemc.scanner.RecipeSnapshot;
 import com.itzplana.sudoersemc.solver.SolveSettings;
 import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
@@ -43,6 +45,7 @@ import java.util.stream.Stream;
 import net.minecraft.SharedConstants;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.Bootstrap;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Rarity;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -789,6 +792,114 @@ class ScanPipelineTest {
 
         assertTrue(result.applied() >= 2, "干跑模式仍需统计基础物品与变体");
         assertFalse(result.appliedToStore());
+    }
+
+    @Test
+    void collectSnapshotDataReadsPipelineVariantConfig() {
+        ScanPipeline pipeline = pipeline(null, null, null, null, null, null, disabledFallback());
+        ItemSnapshot stoneBase = ItemSnapshot.of(STONE, false, 0L);
+        List<RecipeSnapshot> recipes = new ArrayList<>();
+        for (int damage = 1; damage <= 5; damage++) {
+            recipes.add(recipeWithNbt(STONE, "{Damage:" + damage + "}"));
+        }
+        RecipeScanner.ScanResult scanResult = new RecipeScanner.ScanResult(recipes, 0, 0, 0);
+
+        pipeline.setNbtVariantsEnabled(false);
+        PipelineSnapshot disabled = pipeline.collectSnapshotData(List.of(stoneBase), scanResult, null);
+        assertTrue(disabled.items().stream().noneMatch(item -> item.key().hasVariant()),
+                "nbt.scanNbtVariants=false 必须经由管线字段阻止变体生成");
+
+        pipeline.setNbtVariantsEnabled(true);
+        pipeline.setMaxNbtVariantsPerItem(2);
+        PipelineSnapshot limited = pipeline.collectSnapshotData(List.of(stoneBase), scanResult, null);
+        assertEquals(3, limited.items().size(), "基础物品 + 两个变体");
+        assertEquals(2, limited.items().stream().filter(item -> item.key().hasVariant()).count(),
+                "nbt.maxNbtVariantsPerItem 必须经由管线字段生效");
+    }
+
+    @Test
+    void collectSnapshotDataQueriesExactNbtEmcForVariants() {
+        ItemSnapshot stoneBase = ItemSnapshot.of(STONE, false, 0L);
+        RecipeSnapshot recipe = recipeWithNbt(STONE, "{Damage:3}");
+        ItemScanner.EmcQuery query = new ItemScanner.EmcQuery() {
+            @Override
+            public boolean hasValue(ItemStack stack) {
+                return false;
+            }
+
+            @Override
+            public long getValue(ItemStack stack) {
+                return 0L;
+            }
+
+            @Override
+            public long getExactValue(ItemStack stack) {
+                return stack.getTag() != null && stack.getTag().getInt("Damage") == 3 ? 50L : 0L;
+            }
+        };
+        ScanPipeline pipeline = pipeline(null, null, null, null, null, null, disabledFallback());
+
+        PipelineSnapshot snapshot = pipeline.collectSnapshotData(
+                List.of(stoneBase), new RecipeScanner.ScanResult(List.of(recipe), 0, 0, 0), query);
+
+        ItemKey variantKey = ItemKey.of(STONE_ID, "{Damage:3}");
+        ItemSnapshot variant = snapshot.items().stream()
+                .filter(item -> item.key().equals(variantKey))
+                .findFirst()
+                .orElseThrow();
+        assertTrue(variant.hasExistingEmc(), "该 NBT 自身已有精确 EMC 时必须标记既有值");
+        assertEquals(50L, variant.existingValue());
+        assertEquals(50L, snapshot.existingValues().get(variantKey));
+    }
+
+    @Test
+    void variantRecipeValueUsesVariantIdentityAndPersistsRawNbt() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_variant_recipe.json"));
+        ItemKey variant = ItemKey.of(STONE_ID, "{Marker:7}");
+        String raw = "{Marker:7,display:{Name:\"only display\"}}";
+        RecipeSnapshot recipe = recipeWithNbt(variant, raw);
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 5L), ItemSnapshot.of(variant, false, 0L)),
+                List.of(recipe),
+                Map.of(INGOT, 5L));
+        ScanPipeline pipeline = pipeline(store, null, null, null, null, null, disabledFallback());
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1, result.solvedByRecipe(), "求解器必须直接看到带 variantHash 的输出键");
+        assertEquals(1, result.applied());
+        GeneratedEmcEntry entry = store.snapshotAll().get(variant);
+        assertNotNull(entry, "变体必须按其规范化身份持久化");
+        assertEquals(5L, entry.value());
+        assertEquals(List.of(raw), store.snapshotOwnedVariantNbts().get(variant),
+                "原始 SNBT 必须随条目保存，供 ProjectE 精确匹配");
+
+        store.save();
+        GeneratedEntryStore reloaded = new GeneratedEntryStore(store.file());
+        reloaded.load();
+        assertEquals(List.of(raw), reloaded.snapshotOwnedVariantNbts().get(variant),
+                "重启后仍必须保留原始 NBT 注册信息");
+    }
+
+    @Test
+    void disabledVariantScanDoesNotPriceVariantRecipeOutputsEndToEnd() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_variant_disabled_e2e.json"));
+        ItemKey variant = ItemKey.of(STONE_ID, "{Damage:5}");
+        RecipeSnapshot recipe = recipeWithNbt(variant, "{Damage:5}");
+        ScanPipeline pipeline = pipeline(store, null, null, null, null, null, disabledFallback());
+        pipeline.setNbtVariantsEnabled(false);
+
+        PipelineSnapshot collected = pipeline.collectSnapshotData(
+                List.of(item(INGOT, 5L), ItemSnapshot.of(STONE, false, 0L)),
+                new RecipeScanner.ScanResult(List.of(recipe), 0, 0, 0),
+                null);
+        PipelineResult result = pipeline.solveAndApply(collected);
+
+        assertEquals(0, result.solvedByRecipe(), "关闭变体扫描后，带 NBT 的配方输出不得绕过采集门禁");
+        assertTrue(store.snapshotAll().keySet().stream().noneMatch(ItemKey::hasVariant),
+                "关闭变体扫描后不得写入任何 variantHash 条目");
     }
 
     /**

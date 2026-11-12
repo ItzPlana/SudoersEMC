@@ -126,5 +126,17 @@ public final class ItemScanner {
         boolean hasValue(ItemStack stack);
 
         long getValue(ItemStack stack);
+
+        /**
+         * 查询完整 NBT 的精确 EMC 值，不回退基础物品。
+         *
+         * <p>默认实现退回 {@link #getValue(ItemStack)}，供没有精确 NBT 概念的后端使用。</p>
+         *
+         * @param stack 待查询堆叠
+         * @return 精确 NBT 映射值；没有专属映射时返回 {@code 0}
+         */
+        default long getExactValue(ItemStack stack) {
+            return getValue(stack);
+        }
     }
 }
