@@ -2,29 +2,39 @@ package com.itzplana.sudoersemc.resolver;
 
 import com.itzplana.sudoersemc.core.ItemKey;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.StringTag;
 import net.minecraft.nbt.Tag;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.world.item.Item;
 import org.jetbrains.annotations.Nullable;
 
 /**
  * 把物品堆叠的 NBT 规范化为确定性的 SNBT 字符串，供 {@link ItemKey#variantHash()} 使用。
  *
  * <p>规范化会递归删除所有层级中的纯展示字段（{@code display}、{@code RepairCost}、
- * {@code HideFlags}、{@code CustomModelData}、{@code EnchantmentGlintOverride}），并对
+ * {@code HideFlags}、{@code CustomModelData}、{@code EnchantmentGlintOverride}）以及
+ * ProjectE 在查询时动态叠加的 {@code StoredEMC}/{@code stored_emc}，并对
  * {@code AttributeModifiers} 的每个条目移除 {@code UUID}。删除这些字段后，仅仅因为随机
- * UUID、自定义名称或提示文本不同而变化的物品会被视为同一个经济变体。</p>
+ * UUID、自定义名称、提示文本或存储 EMC 不同而变化的物品会被视为同一个经济变体。</p>
  *
- * <p>经济相关数据必须保留，包括 {@code Damage}、{@code Enchantments}、
- * {@code StoredEnchantments}、{@code Potion}/{@code CustomPotionEffects}、
- * {@code BlockEntityTag}（容器内容）、{@code Items}、{@code stored_emc} 与
- * {@code SkullOwner}。所有复合标签的键都会按字典序排序，因此相同的标签无论插入顺序如何
- * 都会得到完全相同的字符串。返回值是合法的 SNBT，可直接交给
+ * <p>经济相关数据必须保留，包括 {@code Enchantments}、{@code StoredEnchantments}、
+ * {@code Potion}/{@code CustomPotionEffects}、{@code BlockEntityTag}（容器内容）、
+ * {@code Items} 与 {@code SkullOwner}。{@link #keyFor(ResourceLocation, CompoundTag)}
+ * 还会对可损坏物品剥离顶层的 {@code Damage}：ProjectE 的 {@code DamageProcessor} 在
+ * 查询时按耐久动态折价，把每个耐久值都枚举成独立变体会造成变体爆炸与重复折价。
+ * {@link #normalize(CompoundTag)} 不知道物品类型，因此保留 {@code Damage}，仅用于
+ * 无法确定物品身份的嵌套数据。所有复合标签的键都会按字典序排序，因此相同的标签无论插入
+ * 顺序如何都会得到完全相同的字符串。返回值是合法的 SNBT，可直接交给
  * {@code TagParser.parseTag}。清洗后没有任何剩余字段时返回 {@code null}，表示普通物品。</p>
+ *
+ * <p>已知限制：{@code Enchantments}/{@code StoredEnchantments}/{@code AttributeModifiers}
+ * 等语义无序列表仍按原有顺序参与哈希；列表顺序不同的等价物品会得到不同变体。</p>
  */
 public final class VariantNormalizer {
 
@@ -33,10 +43,15 @@ public final class VariantNormalizer {
             "RepairCost",
             "HideFlags",
             "CustomModelData",
-            "EnchantmentGlintOverride"
+            "EnchantmentGlintOverride",
+            // ProjectE 的 StoredEMCProcessor 在查询阶段按 IItemEmcHolder 动态叠加；
+            // 连续存储量不能进入变体身份，否则每个存储值都会产生一个新变体。
+            "StoredEMC",
+            "stored_emc"
     );
 
     private static final String ATTRIBUTE_MODIFIERS = "AttributeModifiers";
+    private static final String DAMAGE = "Damage";
     private static final String UUID = "UUID";
 
     private VariantNormalizer() {
@@ -48,14 +63,21 @@ public final class VariantNormalizer {
      * <p>该方法不会修改传入的标签；返回的字符串可安全地长期保存。嵌套的复合标签与列表
      * 也会递归清洗，因此容器内容中物品的自定义名称不会影响容器变体的身份。</p>
      *
+     * <p>该方法不知道物品类型，因此不会剥离 {@code Damage}；构建可损坏物品的变体身份
+     * 请使用 {@link #keyFor(ResourceLocation, CompoundTag)}。</p>
+     *
      * @param tag 原始物品标签，允许为 {@code null}
      * @return 规范化的 SNBT；清洗后没有经济相关数据时返回 {@code null}
      */
     public static @Nullable String normalize(@Nullable CompoundTag tag) {
+        return normalize(tag, false);
+    }
+
+    private static @Nullable String normalize(@Nullable CompoundTag tag, boolean stripTopLevelDamage) {
         if (tag == null || tag.isEmpty()) {
             return null;
         }
-        CompoundTag sanitized = sanitizeCompound(tag);
+        CompoundTag sanitized = sanitizeCompound(tag, stripTopLevelDamage);
         if (sanitized.isEmpty()) {
             return null;
         }
@@ -67,18 +89,25 @@ public final class VariantNormalizer {
     /**
      * 为指定物品构建带有规范化变体哈希的物品键。
      *
+     * <p>可损坏物品（例如剑、工具）的顶层 {@code Damage} 会被剥离：ProjectE 的
+     * {@code DamageProcessor} 在 EMC 查询时按剩余耐久折价。若把每个耐久值都作为独立
+     * 变体写入映射，既会占满变体上限，又会在查询时被再次折价。</p>
+     *
      * @param itemId 物品注册 id
      * @param tag    原始物品标签，允许为 {@code null}
      * @return 带有变体哈希的物品键；没有可保留数据时返回普通物品键
      */
     public static ItemKey keyFor(ResourceLocation itemId, @Nullable CompoundTag tag) {
-        return ItemKey.of(itemId, normalize(tag));
+        Objects.requireNonNull(itemId, "itemId");
+        Item item = BuiltInRegistries.ITEM.getOptional(itemId).orElse(null);
+        boolean stripTopLevelDamage = item != null && item.canBeDepleted();
+        return ItemKey.of(itemId, normalize(tag, stripTopLevelDamage));
     }
 
-    private static CompoundTag sanitizeCompound(CompoundTag source) {
+    private static CompoundTag sanitizeCompound(CompoundTag source, boolean stripTopLevelDamage) {
         CompoundTag result = new CompoundTag();
         for (String key : source.getAllKeys()) {
-            if (STRIPPED_KEYS.contains(key)) {
+            if (STRIPPED_KEYS.contains(key) || (stripTopLevelDamage && DAMAGE.equals(key))) {
                 continue;
             }
             Tag value = source.get(key);
@@ -106,7 +135,7 @@ public final class VariantNormalizer {
             for (int i = 0; i < list.size(); i++) {
                 Tag element = list.get(i);
                 if (element instanceof CompoundTag entry) {
-                    CompoundTag sanitized = sanitizeCompound(entry);
+                    CompoundTag sanitized = sanitizeCompound(entry, false);
                     sanitized.remove(UUID);
                     result.add(sanitized);
                 } else {
@@ -116,7 +145,7 @@ public final class VariantNormalizer {
             return result;
         }
         if (tag instanceof CompoundTag compound) {
-            CompoundTag sanitized = sanitizeCompound(compound);
+            CompoundTag sanitized = sanitizeCompound(compound, false);
             sanitized.remove(UUID);
             return sanitized;
         }
@@ -125,7 +154,7 @@ public final class VariantNormalizer {
 
     private static Tag sanitizeTag(Tag tag) {
         if (tag instanceof CompoundTag compound) {
-            return sanitizeCompound(compound);
+            return sanitizeCompound(compound, false);
         }
         if (tag instanceof ListTag list) {
             ListTag result = new ListTag();

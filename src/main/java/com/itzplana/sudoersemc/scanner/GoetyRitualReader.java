@@ -20,9 +20,10 @@ import org.slf4j.LoggerFactory;
  * Reads Goety ritual recipes through reflection.
  *
  * <p>Goety is an optional dependency, so this class must never link against Goety types. Everything
- * is resolved lazily by name; when Goety is absent, or a method signature changes, the reader
- * silently degrades to {@link #unavailable()} and ritual recipes are reported as unsupported.
- * A failure is logged exactly once per method so a broken integration cannot spam the log.</p>
+ * is resolved lazily by name. When Goety is absent, or a required accessor is missing or throws,
+ * the reader fails closed and the affected ritual recipes are reported as unsupported instead of
+ * being priced from partial data. A failure is logged exactly once per accessor so a broken
+ * integration cannot spam the log.</p>
  *
  * <p>Verified against Goety 2.5.60.6 (MC 1.20.1, Forge 47.3.22):</p>
  * <ul>
@@ -50,11 +51,12 @@ public final class GoetyRitualReader {
     private static volatile boolean activationFailed;
     private static volatile boolean ritualTypeFailed;
     private static volatile boolean resultFailed;
+    private static volatile boolean ingredientsFailed;
 
     private final boolean readActivationItem;
     private final boolean readRitualType;
 
-    private GoetyRitualReader(boolean readActivationItem, boolean readRitualType) {
+    GoetyRitualReader(boolean readActivationItem, boolean readRitualType) {
         this.readActivationItem = readActivationItem;
         this.readRitualType = readRitualType;
     }
@@ -128,20 +130,41 @@ public final class GoetyRitualReader {
         if (!RITUAL_ID.equals(recipe.getType() == null ? null : BuiltInRegistries.RECIPE_TYPE.getKey(recipe.getType()))) {
             return null;
         }
+        return describeRitual(recipe, id);
+    }
 
-        List<RecipeInput> inputs = new ArrayList<>();
+    /**
+     * Describes a recipe that is already known to be a Goety ritual. Fail-closed: every field that
+     * contributes to the cost must be readable, otherwise the whole ritual is reported as
+     * unsupported instead of being priced with missing inputs.
+     *
+     * <p>Package-private so the reflection bridge can be exercised by unit tests without Goety.</p>
+     */
+    @Nullable
+    RecipeSnapshot describeRitual(Recipe<?> recipe, ResourceLocation id) {
         NonNullList<Ingredient> ingredients = readIngredients(recipe);
-        if (ingredients != null) {
-            inputs.addAll(convert(ingredients));
+        if (ingredients == null) {
+            return null;
         }
-        Ingredient activation = readActivationItem(recipe);
-        if (activation != null) {
-            // The activation item is consumed once the ritual completes, so it is a real cost.
-            inputs.addAll(convert(NonNullList.of(Ingredient.EMPTY, activation)));
+        List<RecipeInput> convertedIngredients = convert(ingredients);
+        if (convertedIngredients == null) {
+            return null;
         }
+        List<RecipeInput> inputs = new ArrayList<>(convertedIngredients);
         if (inputs.isEmpty()) {
             return null;
         }
+
+        Ingredient activation = readActivationItem(recipe);
+        if (activation == null) {
+            return null;
+        }
+        List<RecipeInput> activationInputs = convert(NonNullList.of(Ingredient.EMPTY, activation));
+        if (activationInputs == null || activationInputs.isEmpty()) {
+            return null;
+        }
+        // The activation item is consumed once the ritual completes, so it is a real cost.
+        inputs.addAll(activationInputs);
 
         ItemStack result = readResult(recipe);
         if (result == null || result.isEmpty()) {
@@ -154,13 +177,15 @@ public final class GoetyRitualReader {
         RecipeOutput output = new RecipeOutput(ItemKey.of(resultId), Math.max(1, result.getCount()));
 
         String ritualType = readRitualType(recipe);
-        Map<String, String> attributes = ritualType == null
-                ? Map.of()
-                : Map.of(GoetyRitualEvaluatorAttributes.TYPE, ritualType);
+        if (ritualType == null) {
+            // GoetyRitualEvaluator only prices goety:craft rituals, so a snapshot without the
+            // subtype could never be evaluated. Report it as unsupported while scanning.
+            return null;
+        }
 
         return new RecipeSnapshot(id, RecipeKind.GOETY_RITUAL, inputs, List.of(output), List.of(),
                 // The dark altar and its pedestals are catalysts and are never part of `inputs`.
-                true, attributes);
+                true, Map.of(GoetyRitualEvaluatorAttributes.TYPE, ritualType));
     }
 
     @Nullable
@@ -173,7 +198,7 @@ public final class GoetyRitualReader {
                 return typed;
             }
         } catch (Throwable t) {
-            logOnce("ingredients", t);
+            logIngredientsFailure(t);
         }
         return null;
     }
@@ -189,7 +214,7 @@ public final class GoetyRitualReader {
         } catch (Throwable t) {
             if (!activationFailed) {
                 activationFailed = true;
-                LOGGER.warn("Goety ritual activation item could not be read; rituals will be skipped", t);
+                LOGGER.warn("Goety ritual activation item could not be read; ritual recipes will be treated as unsupported", t);
             }
             return null;
         }
@@ -206,7 +231,7 @@ public final class GoetyRitualReader {
         } catch (Throwable t) {
             if (!ritualTypeFailed) {
                 ritualTypeFailed = true;
-                LOGGER.warn("Goety ritual type could not be read; rituals will be skipped", t);
+                LOGGER.warn("Goety ritual type could not be read; ritual recipes will be treated as unsupported", t);
             }
             return null;
         }
@@ -228,7 +253,14 @@ public final class GoetyRitualReader {
         }
     }
 
-    private static List<RecipeInput> convert(NonNullList<Ingredient> ingredients) {
+    /**
+     * Converts ritual ingredients. Fail-closed: a slot that cannot be converted makes the whole
+     * ritual unsupported, otherwise a partially priced ritual would understate its real cost.
+     *
+     * @return the converted slots, or {@code null} when any non-empty slot cannot be read
+     */
+    @Nullable
+    static List<RecipeInput> convert(NonNullList<Ingredient> ingredients) {
         List<RecipeInput> converted = new ArrayList<>();
         for (Ingredient ingredient : ingredients) {
             if (ingredient == null || ingredient.isEmpty()) {
@@ -238,11 +270,11 @@ public final class GoetyRitualReader {
             try {
                 stacks = ingredient.getItems();
             } catch (RuntimeException e) {
-                continue;
+                return null;
             }
             List<ItemKey> candidates = new ArrayList<>(stacks.length);
             for (ItemStack stack : stacks) {
-                if (stack.isEmpty()) {
+                if (stack.isEmpty() || IngredientStacks.isEmptyTagPlaceholder(stack)) {
                     continue;
                 }
                 ResourceLocation itemId = BuiltInRegistries.ITEM.getKey(stack.getItem());
@@ -250,16 +282,20 @@ public final class GoetyRitualReader {
                     candidates.add(ItemKey.of(itemId));
                 }
             }
-            if (!candidates.isEmpty()) {
-                converted.add(RecipeInput.of(new IngredientOption(candidates)));
+            if (candidates.isEmpty()) {
+                return null;
             }
+            converted.add(RecipeInput.of(new IngredientOption(candidates)));
         }
         return converted;
     }
 
-    private static void logOnce(String what, Throwable cause) {
-        // Uses the debug channel: a partially readable ritual must not look like a crash.
-        LOGGER.debug("Goety ritual {} could not be read", what, cause);
+    private static void logIngredientsFailure(Throwable cause) {
+        if (!ingredientsFailed) {
+            ingredientsFailed = true;
+            // Uses the debug channel: a partially readable ritual must not look like a crash.
+            LOGGER.debug("Goety ritual ingredients could not be read; ritual recipes will be treated as unsupported", cause);
+        }
     }
 
     /** Attribute keys shared with {@link com.itzplana.sudoersemc.solver.GoetyRitualEvaluator}. */
