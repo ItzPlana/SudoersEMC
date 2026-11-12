@@ -917,6 +917,18 @@ class ScanPipelineTest {
     }
 
     @Test
+    void defaultZeroDamageRecipeOutputProducesNoVariantEntries() {
+        ItemSnapshot stoneBase = ItemSnapshot.of(STONE, false, 0L);
+        RecipeSnapshot zeroDamageRecipe = recipeWithNbt(STONE, "{Damage:0}");
+
+        assertEquals("{Damage:0}", zeroDamageRecipe.outputs().get(0).outputNbt(),
+                "非空 SNBT 必须原样保留，归一化交给 VariantNormalizer");
+        assertTrue(ScanPipeline.collectVariantSnapshots(
+                        List.of(stoneBase), List.of(zeroDamageRecipe), true, 100).isEmpty(),
+                "仅含默认 Damage:0 的标签不得产生伪变体");
+    }
+
+    @Test
     void creativeExclusionPreventsRecipeCandidate() {
         GeneratedEntryStore store = new GeneratedEntryStore(
                 tempDir.resolve("generated_recipe_excluded.json"));
@@ -955,9 +967,29 @@ class ScanPipelineTest {
     }
 
     @Test
-    void staleOwnedEntryIsRetiredWhenNoCandidateIsProduced() {
+    void staleOwnedEntryIsRetiredWhenOtherItemsArePriced() {
         GeneratedEntryStore store = new GeneratedEntryStore(
                 tempDir.resolve("generated_stale_owned.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 128L, PriceSource.RECIPE, null, true, 0L));
+
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 5L), item(GEAR, 0L), item(RESULT, 0L)),
+                List.of(recipe(INGOT, GEAR)),
+                Map.of(INGOT, 5L));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null, disabledFallback());
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1, result.applied(), "本轮仍需为其它物品生成候选");
+        assertNull(store.snapshotAll().get(RESULT), "不再参与定价的自有条目必须被清理");
+        assertNotNull(store.snapshotAll().get(GEAR), "本轮参与定价的物品必须保留");
+    }
+
+    @Test
+    void staleOwnedEntryIsKeptWhenNoCandidateIsProduced() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_stale_no_candidate.json"));
         store.stage(new GeneratedEmcEntry(RESULT, 128L, PriceSource.RECIPE, null, true, 0L));
 
         PipelineSnapshot snapshot = snapshot(List.of(item(RESULT, 0L)), List.of(), Map.of());
@@ -967,23 +999,127 @@ class ScanPipelineTest {
         PipelineResult result = pipeline.solveAndApply(snapshot);
 
         assertEquals(0, result.applied());
-        assertNull(store.snapshotAll().get(RESULT), "不再参与定价的自有条目必须被清理");
-        assertEquals(0, store.size());
+        assertNotNull(store.snapshotAll().get(RESULT),
+                "本轮没有任何候选时不得把自有条目当作陈旧条目清理");
     }
 
     @Test
-    void manualEntryIsNotRetiredWhenNoCandidateIsProduced() {
+    void staleOwnedEntryIsKeptWhenSolveRecipesDisabled() {
         GeneratedEntryStore store = new GeneratedEntryStore(
-                tempDir.resolve("generated_manual_kept.json"));
-        store.stage(new GeneratedEmcEntry(RESULT, 128L, PriceSource.EXISTING, null, false, 0L));
+                tempDir.resolve("generated_stale_solve_disabled.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 128L, PriceSource.RECIPE, null, true, 0L));
 
-        PipelineSnapshot snapshot = snapshot(List.of(item(RESULT, 0L)), List.of(), Map.of());
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 5L), item(RESULT, 0L)),
+                List.of(recipe(INGOT, GEAR)),
+                Map.of(INGOT, 5L));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null, disabledFallback());
+        pipeline.setSolveRecipesEnabled(false);
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(0, result.applied());
+        assertNotNull(store.snapshotAll().get(RESULT),
+                "配方求解禁用时本轮没有参与定价不代表自有条目陈旧");
+    }
+
+    @Test
+    void staleOwnedEntryIsKeptWhenSnapshotHasNoItems() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_stale_empty_snapshot.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 128L, PriceSource.RECIPE, null, true, 0L));
+
+        PipelineSnapshot snapshot = snapshot(
+                List.of(), List.of(recipe(INGOT, GEAR)), Map.of(INGOT, 5L));
         ScanPipeline pipeline = pipeline(
                 store, null, null, null, null, null, disabledFallback());
 
         PipelineResult result = pipeline.solveAndApply(snapshot);
 
+        assertEquals(1, result.applied(), "配方求解仍可为其它物品生成候选");
+        assertNotNull(store.snapshotAll().get(RESULT),
+                "空物品快照不得触发自有条目清理");
+    }
+
+    @Test
+    void ownedEntryListedInExistingValuesIsKept() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_owned_existing.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 128L, PriceSource.RECIPE, null, true, 0L));
+
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 5L), item(GEAR, 0L), item(RESULT, 0L)),
+                List.of(recipe(INGOT, GEAR)),
+                Map.of(INGOT, 5L, RESULT, 64L));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null, disabledFallback());
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1, result.applied());
+        GeneratedEmcEntry kept = store.snapshotAll().get(RESULT);
+        assertNotNull(kept, "既在 existingValues 中的自有条目不得被清理");
+        assertEquals(128L, kept.value());
+    }
+
+    @Test
+    void specialValueOverridesTierExclusionInFallbackPricing() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_special_value.json"));
+        ItemKey spawnEgg = ItemKey.of(SPAWN_EGG_ID);
+        CreativeItemProtection protection = new CreativeItemProtection(
+                new CreativeItemProtection.Settings(
+                        true, Set.of(), Map.of(SPAWN_EGG_ID, 42L), Set.of()));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, protection, null, disabledFallback());
+
+        PipelineResult result = pipeline.solveAndApply(
+                snapshot(List.of(item(spawnEgg, 0L)), List.of(), Map.of()));
+
+        assertEquals(1, result.solvedByFallback(),
+                "safety.creativeItemSpecialValues 必须优先于层级排除");
+        assertEquals(1, result.applied());
+        GeneratedEmcEntry written = store.snapshotAll().get(spawnEgg);
+        assertNotNull(written);
+        assertEquals(42L, written.value());
+    }
+
+    @Test
+    void explicitExclusionStillOverridesSpecialValue() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_explicit_over_special.json"));
+        CreativeItemProtection protection = new CreativeItemProtection(
+                new CreativeItemProtection.Settings(
+                        true, Set.of(RESULT_ID), Map.of(RESULT_ID, 42L), Set.of()));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, protection, null, disabledFallback());
+
+        PipelineResult result = pipeline.solveAndApply(
+                snapshot(List.of(item(RESULT, 0L)), List.of(), Map.of()));
+
+        assertEquals(0, result.solvedByFallback());
         assertEquals(0, result.applied());
+        assertTrue(store.snapshotAll().isEmpty(),
+                "显式排除必须仍然优先于特殊固定值");
+    }
+
+    @Test
+    void manualEntryIsNotRetiredWhenOtherItemsArePriced() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_manual_kept.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 128L, PriceSource.EXISTING, null, false, 0L));
+
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 5L), item(GEAR, 0L), item(RESULT, 0L)),
+                List.of(recipe(INGOT, GEAR)),
+                Map.of(INGOT, 5L));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null, disabledFallback());
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1, result.applied());
         GeneratedEmcEntry kept = store.snapshotAll().get(RESULT);
         assertNotNull(kept, "非自有条目绝不能被清理");
         assertEquals(128L, kept.value());

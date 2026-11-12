@@ -700,8 +700,11 @@ public final class ScanPipeline {
      *
      * <p>物品被新配置排除、配方被移除或物品从注册表消失后，旧的自有值不应继续生效。判定口径：
      * 条目 {@code owned=true}，且既不在本轮最终候选中，也不在本轮 {@code existingValues} 中，
-     * 即视为完全没有参与定价。非自有条目（手动配置或外部后端写入）永远不会删除。干跑模式
-     * （{@code store == null}）或空快照（例如服务器尚未就绪）直接跳过，避免误删全部条目。</p>
+     * 即视为完全没有参与定价。非自有条目（手动配置或外部后端写入）永远不会删除。</p>
+     *
+     * <p>以下情况直接跳过，避免把“本轮没有计算”误判成“条目陈旧”：干跑模式
+     * （{@code store == null}）、配方求解被禁用、本轮没有任何候选，或快照没有任何物品
+     * （例如服务器尚未就绪）。</p>
      *
      * @param snapshot       本轮采集结果
      * @param pricedKeys     本轮选出的候选物品集合
@@ -711,6 +714,14 @@ public final class ScanPipeline {
     private int retireStaleOwnedEntries(PipelineSnapshot snapshot, Set<ItemKey> pricedKeys,
                                         Map<ItemKey, Long> existingValues) {
         if (store == null) {
+            return 0;
+        }
+        if (!solveRecipesEnabled) {
+            LOGGER.debug("配方求解已禁用，跳过陈旧自有条目清理");
+            return 0;
+        }
+        if (pricedKeys.isEmpty()) {
+            LOGGER.debug("本轮没有任何候选，跳过陈旧自有条目清理");
             return 0;
         }
         if (snapshot.items().isEmpty()) {
@@ -854,32 +865,58 @@ public final class ScanPipeline {
     }
 
     /**
-     * 判断物品是否被排除规则明确拒绝自动定价。
+     * 判断物品是否被排除规则明确拒绝自动定价（配方路径）。
      *
-     * <p>配方路径与兜底路径共用本方法，避免两处逻辑漂移：</p>
+     * <p>配方候选没有特殊固定值语义，因此两类排除都直接生效：</p>
      * <ul>
      *   <li>{@link TierPricing#price} 返回 {@code Optional.of(0L)} 表示层级规则明确排除；</li>
      *   <li>{@link CreativeItemProtection#decide} 返回 {@code priceable=false} 表示创造物品保护排除。</li>
      * </ul>
      *
+     * <p>兜底路径需要让 {@code safety.creativeItemSpecialValues} 的固定值优先于层级排除，
+     * 因此那里先取得 {@link CreativeItemProtection.Decision}，再单独调用 {@link #isTierExcluded}。</p>
+     *
      * <p>变体的 {@link ItemKey} 与基础物品共享物品 id，因此排除规则天然覆盖全部 NBT 变体。</p>
      *
      * @param item 待判定物品身份
-     * @return {@code true} 表示该物品不得进入候选或写入存储
+     * @return {@code true} 表示该物品不得进入配方候选
      */
     private boolean isExcludedFromPricing(ItemKey item) {
         if (item == null) {
             return false;
         }
+        if (isTierExcluded(item)) {
+            return true;
+        }
         try {
-            Optional<Long> tierValue = tierPricing.price(item);
-            if (tierValue.isPresent() && tierValue.get() <= 0L) {
-                return true;
-            }
             CreativeItemProtection.Decision decision = creativeProtection.decide(item, true, true);
             return !decision.priceable();
         } catch (RuntimeException failure) {
             LOGGER.warn("排除规则判定失败，按排除处理：{}", item, failure);
+            return true;
+        }
+    }
+
+    /**
+     * 判断物品是否被层级定价规则明确排除。
+     *
+     * <p>{@link TierPricing#price} 返回 {@code Optional.of(0L)}（或其它非正值）时视为明确排除。
+     * 兜底路径只在没有特殊固定值时调用本方法，从而保持
+     * {@code safety.creativeItemSpecialValues} 对层级排除项的优先级；显式排除与创造命名空间
+     * 仍由 {@link CreativeItemProtection} 判定。</p>
+     *
+     * @param item 待判定物品身份
+     * @return {@code true} 表示层级规则明确拒绝自动定价
+     */
+    private boolean isTierExcluded(ItemKey item) {
+        if (item == null) {
+            return false;
+        }
+        try {
+            Optional<Long> tierValue = tierPricing.price(item);
+            return tierValue.isPresent() && tierValue.get() <= 0L;
+        } catch (RuntimeException failure) {
+            LOGGER.warn("层级排除判定失败，按排除处理：{}", item, failure);
             return true;
         }
     }
@@ -939,8 +976,9 @@ public final class ScanPipeline {
      * 为仍无种子的物品追加兜底候选，并把命中值并入种子。
      *
      * <p>只处理既不在既有 EMC 中、也不在当前种子中的物品。创造物品保护决定物品是否允许自动
-     * 定价；固定值优先于兜底定价链。兜底链返回非正值、低于最小 EMC 或空结果时不产生候选。
-     * 命中值同时写入 {@code seeds}，使下一轮配方求解能够把兜底价格传播到上游中间产物。</p>
+     * 定价；特殊固定值优先于层级排除与兜底定价链，但显式排除与创造命名空间仍然优先。
+     * 兜底链返回非正值、低于最小 EMC 或空结果时不产生候选。命中值同时写入 {@code seeds}，
+     * 使下一轮配方求解能够把兜底价格传播到上游中间产物。</p>
      *
      * @return 本轮新增的兜底候选数量
      */
@@ -953,11 +991,6 @@ public final class ScanPipeline {
             if (seeds.containsKey(item) || snapshot.existingValues().containsKey(item)) {
                 continue;
             }
-            if (isExcludedFromPricing(item)) {
-                LOGGER.debug("物品 {} 被排除规则命中，跳过兜底定价", item);
-                continue;
-            }
-
             CreativeItemProtection.Decision decision;
             try {
                 decision = creativeProtection.decide(item, false, false);
@@ -966,6 +999,11 @@ public final class ScanPipeline {
                 continue;
             }
             if (!decision.priceable()) {
+                LOGGER.debug("物品 {} 被创造物品保护排除，跳过兜底定价", item);
+                continue;
+            }
+            if (decision.specialValue() <= 0L && isTierExcluded(item)) {
+                LOGGER.debug("物品 {} 被层级排除规则命中，跳过兜底定价", item);
                 continue;
             }
 

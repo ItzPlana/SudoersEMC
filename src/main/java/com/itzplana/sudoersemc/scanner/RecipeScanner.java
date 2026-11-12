@@ -303,14 +303,9 @@ public final class RecipeScanner {
             if (tag == null || tag.isEmpty()) {
                 return null;
             }
-            String snbt = tag.toString();
-            if (snbt == null) {
-                return null;
-            }
-            // 某些实现可能把空 CompoundTag 序列化成 "{}" 或带空白的等价形式；
-            // 去除全部空白后仍为 "{}" 时按无 NBT 处理，避免下游生成伪变体。
-            String compact = snbt.replaceAll("\\s+", "");
-            return compact.isEmpty() || "{}".equals(compact) ? null : snbt;
+            // 非空 CompoundTag 的 toString() 至少包含一个键，不会返回 null，也不会得到 "{}"；
+            // 空 SNBT 的防御性归一由 RecipeOutput 构造器统一负责，避免下游生成伪变体。
+            return tag.toString();
         } catch (RuntimeException failure) {
             LOGGER.debug("序列化配方输出 NBT 失败，按无 NBT 处理", failure);
             return null;

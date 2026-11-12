@@ -8,6 +8,7 @@ import java.util.TreeMap;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
+import net.minecraft.nbt.NumericTag;
 import net.minecraft.nbt.StringTag;
 import net.minecraft.nbt.Tag;
 import net.minecraft.resources.ResourceLocation;
@@ -29,9 +30,11 @@ import org.jetbrains.annotations.Nullable;
  * 还会对可损坏物品剥离顶层的 {@code Damage}：ProjectE 的 {@code DamageProcessor} 在
  * 查询时按耐久动态折价，把每个耐久值都枚举成独立变体会造成变体爆炸与重复折价。
  * {@link #normalize(CompoundTag)} 不知道物品类型，因此保留 {@code Damage}，仅用于
- * 无法确定物品身份的嵌套数据。所有复合标签的键都会按字典序排序，因此相同的标签无论插入
- * 顺序如何都会得到完全相同的字符串。返回值是合法的 SNBT，可直接交给
- * {@code TagParser.parseTag}。清洗后没有任何剩余字段时返回 {@code null}，表示普通物品。</p>
+ * 无法确定物品身份的嵌套数据；但清洗后只剩默认 {@code Damage:0} 时视为没有经济数据，
+ * 避免配方输出 {@code {Damage:0}} 生成伪变体。所有复合标签的键都会按字典序排序，因此相同的
+ * 标签无论插入顺序如何都会得到完全相同的字符串。返回值是合法的 SNBT，可直接交给
+ * {@code TagParser.parseTag}。清洗后没有任何剩余字段，或只剩默认 {@code Damage:0} 时
+ * 返回 {@code null}，表示普通物品。</p>
  *
  * <p>已知限制：{@code Enchantments}/{@code StoredEnchantments}/{@code AttributeModifiers}
  * 等语义无序列表仍按原有顺序参与哈希；列表顺序不同的等价物品会得到不同变体。</p>
@@ -63,7 +66,8 @@ public final class VariantNormalizer {
      * <p>该方法不会修改传入的标签；返回的字符串可安全地长期保存。嵌套的复合标签与列表
      * 也会递归清洗，因此容器内容中物品的自定义名称不会影响容器变体的身份。</p>
      *
-     * <p>该方法不知道物品类型，因此不会剥离 {@code Damage}；构建可损坏物品的变体身份
+     * <p>该方法不知道物品类型，因此不会剥离非默认的 {@code Damage}；但清洗后只剩默认
+     * {@code Damage:0} 时按无经济数据处理并返回 {@code null}。构建可损坏物品的变体身份
      * 请使用 {@link #keyFor(ResourceLocation, CompoundTag)}。</p>
      *
      * @param tag 原始物品标签，允许为 {@code null}
@@ -78,12 +82,28 @@ public final class VariantNormalizer {
             return null;
         }
         CompoundTag sanitized = sanitizeCompound(tag, stripTopLevelDamage);
-        if (sanitized.isEmpty()) {
+        if (sanitized.isEmpty() || isOnlyDefaultDamage(sanitized)) {
             return null;
         }
         StringBuilder out = new StringBuilder();
         writeCompound(sanitized, out);
         return out.toString();
+    }
+
+    /**
+     * 判断清洗后的标签是否只剩默认的 {@code Damage:0}。
+     *
+     * <p>配方输出常把 {@code {Damage:0}} 当作“无 NBT”写回；默认伤害值不携带任何经济信息，
+     * 若保留会为普通物品生成伪变体 {@code variantHash={Damage:0}}。只有标签中仅有该字段且
+     * 数值为 0 时才视为空；若还存在附魔、容器内容等经济字段，仍保留 {@code Damage}，
+     * 维持与旧版本一致的变体身份。</p>
+     */
+    private static boolean isOnlyDefaultDamage(CompoundTag sanitized) {
+        if (sanitized.size() != 1) {
+            return false;
+        }
+        Tag damage = sanitized.get(DAMAGE);
+        return damage instanceof NumericTag numeric && numeric.getAsDouble() == 0.0D;
     }
 
     /**
