@@ -144,8 +144,8 @@ class ScanPipelineTest {
         assertEquals(0, store.size());
 
         String report = Files.readString(reportManager.reportFile());
-        assertTrue(hasCounterLine(report, "已有 EMC", 1L),
-                "诊断报告应记录一个已有 EMC 的物品");
+        assertTrue(hasCounterLine(report, "受保护的非自有既有值", 1L),
+                "诊断报告应记录一个受保护的非自有既有值");
     }
 
     @Test
@@ -284,6 +284,56 @@ class ScanPipelineTest {
         assertTrue(Files.isRegularFile(auditFile), "扫描应用后审计日志必须已原子落盘");
         OverflowResetLog persisted = new OverflowResetLog(auditFile);
         assertEquals(1, persisted.entries().size(), "本轮溢出重置必须在扫描结束时持久化");
+    }
+
+    @Test
+    void overflowAuditCapacityDropsAreReported() throws IOException {
+        ReportManager reportManager = new ReportManager(tempDir);
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_overflow_dropped.json"));
+        OverflowProtection.Settings overflowSettings = new OverflowProtection.Settings(
+                true, 100L, 1L, 10L, 10, 5, OverflowScope.OWNED_ONLY, false, 42L);
+        OverflowResetLog resetLog = new OverflowResetLog(
+                tempDir.resolve("overflow_resets_dropped.json"), 1);
+        OverflowPipeline overflowPipeline =
+                new OverflowPipeline(new OverflowProtection(overflowSettings), resetLog);
+
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(RESULT, 0L), item(DUST, 0L)), List.of(), Map.of());
+        ScanPipeline pipeline = pipeline(
+                store, null, reportManager, null, null, overflowPipeline, genericFallback(200L));
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(2, result.overflowResets());
+        assertEquals(2, result.applied());
+        assertEquals(1L, overflowPipeline.auditDroppedCount(), "容量上限丢弃必须可观测");
+        assertEquals(1L, resetLog.droppedEntries());
+
+        String report = Files.readString(reportManager.reportFile());
+        assertTrue(hasCounterLine(report, "overflowAuditDropped", 1L),
+                "诊断报告必须暴露审计日志容量丢弃数");
+    }
+
+    @Test
+    void staleOwnedEntriesAreExposedInReport() throws IOException {
+        ReportManager reportManager = new ReportManager(tempDir);
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_stale_owned.json"));
+        store.stage(new GeneratedEmcEntry(DUST, 5L, PriceSource.RECIPE, null, true, 0L));
+
+        PipelineSnapshot snapshot = snapshot(List.of(item(RESULT, 0L)), List.of(), Map.of());
+        ScanPipeline pipeline = pipeline(store, null, reportManager, null, null, null,
+                genericFallback(7L));
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1, result.applied());
+        assertTrue(store.snapshotAll().containsKey(DUST),
+                "诊断暴露不得擅自删除或迁移 stale owned 记录");
+        String report = Files.readString(reportManager.reportFile());
+        assertTrue(hasCounterLine(report, "staleOwnedEntries", 1L),
+                "诊断报告必须暴露本轮未刷新的自有条目数");
     }
 
     @Test
@@ -513,10 +563,54 @@ class ScanPipelineTest {
         assertEquals(PriceSource.RECIPE, blockEntry.source());
 
         String report = Files.readString(reportManager.reportFile());
-        assertTrue(hasCounterLine(report, "已有 EMC", 0L),
+        assertTrue(hasCounterLine(report, "受保护的非自有既有值", 0L),
                 "分离后标准字段只统计非自有值");
         assertTrue(hasCounterLine(report, "ownedRefreshed", 3L),
                 "诊断报告必须单独暴露本轮刷新的自有条目数");
+    }
+
+    @Test
+    void ownedSecondaryOutputIsSeededForDownstreamRecipe() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_owned_byproduct.json"));
+        ItemKey source = ItemKey.of(new ResourceLocation("sudoersemc", "iron_ore_seed"));
+        ItemKey primary = ItemKey.of(new ResourceLocation("sudoersemc", "iron_ingot_byproduct"));
+        ItemKey nugget = ItemKey.of(new ResourceLocation("sudoersemc", "iron_nugget"));
+        ItemKey block = ItemKey.of(new ResourceLocation("sudoersemc", "iron_block_from_nugget"));
+        store.stage(new GeneratedEmcEntry(nugget, 1L, PriceSource.RECIPE, null, true, 0L));
+        store.stage(new GeneratedEmcEntry(block, 1L, PriceSource.RECIPE, null, true, 0L));
+
+        ItemSnapshot nuggetSnapshot = ItemSnapshot.of(
+                nugget, true, 1L, List.of("forge:nuggets/iron"), Rarity.COMMON);
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(source, 63L), item(primary, 0L), nuggetSnapshot, item(block, 1L)),
+                List.of(
+                        RecipeSnapshot.of(
+                                new ResourceLocation("sudoersemc", "ingot_with_nugget_byproduct"),
+                                RecipeKind.SHAPED,
+                                List.of(RecipeInput.of(IngredientOption.of(source))),
+                                List.of(RecipeOutput.of(primary), RecipeOutput.of(nugget))),
+                        recipe(new ResourceLocation("sudoersemc", "block_from_nugget"), nugget, block)),
+                Map.of(source, 63L, nugget, 1L, block, 1L));
+        ScanPipeline pipeline = pipeline(store, null, null, null, null, null,
+                FallbackPricing.withDefaults(PricingSettings.defaults()));
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(2, result.solvedByRecipe());
+        assertEquals(1, result.solvedByFallback());
+        assertEquals(0, result.unresolved());
+
+        GeneratedEmcEntry nuggetEntry = store.snapshotAll().get(nugget);
+        assertNotNull(nuggetEntry);
+        assertEquals(7L, nuggetEntry.value(),
+                "自有副产物必须按 NUGGET 标签兜底预置，供下游配方使用");
+        assertEquals(PriceSource.TAG, nuggetEntry.source());
+
+        GeneratedEmcEntry blockEntry = store.snapshotAll().get(block);
+        assertNotNull(blockEntry);
+        assertEquals(7L, blockEntry.value(), "下游配方必须消费副产物的本轮预置值");
+        assertEquals(PriceSource.RECIPE, blockEntry.source());
     }
 
     @Test

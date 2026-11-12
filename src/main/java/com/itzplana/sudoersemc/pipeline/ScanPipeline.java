@@ -16,10 +16,10 @@ import com.itzplana.sudoersemc.safety.OwnershipManager;
 import com.itzplana.sudoersemc.safety.PriceDropDecision;
 import com.itzplana.sudoersemc.scanner.ItemScanner;
 import com.itzplana.sudoersemc.scanner.ItemSnapshot;
-import com.itzplana.sudoersemc.scanner.RecipeOutput;
 import com.itzplana.sudoersemc.scanner.RecipeScanner;
 import com.itzplana.sudoersemc.scanner.RecipeSnapshot;
 import com.itzplana.sudoersemc.solver.EvaluatorRegistry;
+import com.itzplana.sudoersemc.solver.EvaluationPolicy;
 import com.itzplana.sudoersemc.solver.RecipeSolver;
 import com.itzplana.sudoersemc.solver.SolveContext;
 import com.itzplana.sudoersemc.solver.SolveResult;
@@ -630,9 +630,10 @@ public final class ScanPipeline {
         PipelineSnapshot data = separation.snapshot();
         SolveContext context = new SolveContext(data.existingValues());
         SolveResult solveResult;
+        EvaluationPolicy evaluationPolicy = EvaluationPolicy.defaults();
         if (solveRecipesEnabled) {
-            seedOwnedFallbackValues(data, separation.ownedItems(), context);
-            solveResult = new RecipeSolver().solve(
+            seedOwnedFallbackValues(data, separation.ownedItems(), context, evaluationPolicy);
+            solveResult = new RecipeSolver(evaluationPolicy).solve(
                     data.recipes(), context, EvaluatorRegistry.defaults(), solveSettings);
         } else {
             solveResult = new SolveResult(
@@ -659,6 +660,7 @@ public final class ScanPipeline {
 
         Map<ItemKey, GeneratedEmcEntry> previousEntries =
                 store == null ? Map.of() : store.snapshotAll();
+        int staleOwned = countStaleOwned(previousEntries, data, candidates);
         int overflowBefore = overflowPipeline == null ? 0 : overflowPipeline.resetsApplied();
 
         int applied = 0;
@@ -709,6 +711,7 @@ public final class ScanPipeline {
         int overflowResets = overflowPipeline == null
                 ? 0
                 : Math.max(0, overflowPipeline.resetsApplied() - overflowBefore);
+        long auditDropped = overflowPipeline == null ? 0L : overflowPipeline.auditDroppedCount();
         int unresolved = solveResult.unresolvedItems().size();
         long durationMillis = elapsedMillis(computation.startedAtNanos());
 
@@ -719,7 +722,8 @@ public final class ScanPipeline {
         boolean appliedToStore = store != null;
         updateScanState(data, durationMillis, applied, unresolved);
         writeDiagnosticReport(data, solveResult, applied, quarantined, overflowResets,
-                durationMillis, appliedToStore, sourceCounts, computation.refreshedOwned());
+                durationMillis, appliedToStore, sourceCounts, computation.refreshedOwned(),
+                auditDropped, staleOwned);
 
         return new PipelineResult(
                 computation.solvedByRecipe(),
@@ -877,26 +881,27 @@ public final class ScanPipeline {
     /**
      * 把自有叶子条目的兜底价预置到求解上下文中。
      *
-     * <p>叶子条目指本轮没有任何配方产出的自有物品。它们的旧值已被归属分离清除，若等到求解
-     * 结束才做兜底定价，依赖它们的多级配方产物在本轮就看不到新值。预置值只参与输入查找，
-     * 不会让 {@link SolveContext#hasSeedValue(ItemKey)} 返回 {@code true}，因此配方仍可覆盖
-     * 同一物品的预置值。</p>
+     * <p>叶子条目指本轮没有任何“实际会被发布的配方输出”的自有物品。默认
+     * {@link EvaluationPolicy#defaults()} 只发布主输出，副产物不会被求解器写值，因此仅作为
+     * 副产物出现的自有物品也必须按叶子处理。它们的旧值已被归属分离清除，若等到求解结束才做
+     * 兜底定价，依赖它们的多级配方产物在本轮就看不到新值。预置值只参与输入查找，不会让
+     * {@link SolveContext#hasSeedValue(ItemKey)} 返回 {@code true}，因此配方仍可覆盖同一物品
+     * 的预置值。</p>
      *
      * @param snapshot   已完成归属分离的快照
      * @param ownedItems 自有物品键集合
      * @param context    本次求解上下文
+     * @param policy     与求解器一致的发布策略
      * @return 实际预置的条目数量
      */
     private int seedOwnedFallbackValues(PipelineSnapshot snapshot, Set<ItemKey> ownedItems,
-                                        SolveContext context) {
+                                        SolveContext context, EvaluationPolicy policy) {
         if (ownedItems.isEmpty()) {
             return 0;
         }
         Set<ItemKey> recipeOutputs = new HashSet<>();
         for (RecipeSnapshot recipe : snapshot.recipes()) {
-            for (RecipeOutput output : recipe.outputs()) {
-                recipeOutputs.add(output.item());
-            }
+            recipeOutputs.addAll(RecipeSolver.publicationTargets(recipe, policy));
         }
 
         int seeded = 0;
@@ -1143,13 +1148,15 @@ public final class ScanPipeline {
     private void writeDiagnosticReport(PipelineSnapshot snapshot, SolveResult solveResult,
                                        int applied, int quarantined, int overflowResets,
                                        long durationMillis, boolean appliedToStore,
-                                       Map<String, Long> sourceCounts, int refreshedOwned) {
+                                       Map<String, Long> sourceCounts, int refreshedOwned,
+                                       long auditDropped, int staleOwned) {
         if (!generateReportsEnabled || reportManager == null) {
             return;
         }
         try {
             reportManager.writeReport(buildReport(snapshot, solveResult, quarantined,
-                    overflowResets, durationMillis, appliedToStore, sourceCounts, refreshedOwned));
+                    overflowResets, durationMillis, appliedToStore, sourceCounts, refreshedOwned,
+                    auditDropped, staleOwned));
         } catch (RuntimeException failure) {
             LOGGER.warn("写入诊断报告失败，本轮结果仍然有效", failure);
         }
@@ -1164,7 +1171,8 @@ public final class ScanPipeline {
     private static DiagnosticReport buildReport(PipelineSnapshot snapshot, SolveResult solveResult,
                                                 int quarantined, int overflowResets,
                                                 long durationMillis, boolean appliedToStore,
-                                                Map<String, Long> sourceCounts, int refreshedOwned) {
+                                                Map<String, Long> sourceCounts, int refreshedOwned,
+                                                long auditDropped, int staleOwned) {
         Map<String, Long> extraCounters = new LinkedHashMap<>();
         extraCounters.put("unsupportedRecipes", (long) snapshot.unsupportedRecipes());
         extraCounters.put("invalidRecipes", (long) snapshot.invalidRecipes());
@@ -1174,6 +1182,8 @@ public final class ScanPipeline {
         extraCounters.put("solverConverged", solveResult.converged() ? 1L : 0L);
         extraCounters.put("overflowResets", (long) overflowResets);
         extraCounters.put("ownedRefreshed", (long) refreshedOwned);
+        extraCounters.put("overflowAuditDropped", auditDropped);
+        extraCounters.put("staleOwnedEntries", (long) staleOwned);
         extraCounters.put("dryRun", appliedToStore ? 0L : 1L);
 
         return new DiagnosticReport(
@@ -1190,6 +1200,44 @@ public final class ScanPipeline {
                 durationMillis,
                 usedHeapBytes(),
                 extraCounters);
+    }
+
+    /**
+     * 统计本轮未被刷新的自有条目数量。
+     *
+     * <p>包括两类：物品已不在本次扫描快照中（例如注册表移除或被忽略），以及物品仍在扫描
+     * 结果中但本轮没有产生任何候选值（例如配方/标签变化后不再可定价）。本方法只用于诊断
+     * 暴露，不会自动删除或迁移记录；删除玩家数据需要明确的业务语义，留待后续阶段。</p>
+     *
+     * @param previousEntries 应用前的存储快照
+     * @param snapshot        本轮扫描快照
+     * @param candidates      本轮构建的候选值
+     * @return 未被刷新的自有条目数量
+     */
+    private static int countStaleOwned(Map<ItemKey, GeneratedEmcEntry> previousEntries,
+                                       PipelineSnapshot snapshot, List<Candidate> candidates) {
+        if (previousEntries.isEmpty()) {
+            return 0;
+        }
+        Set<ItemKey> scannedItems = new HashSet<>();
+        for (ItemSnapshot item : snapshot.items()) {
+            scannedItems.add(item.key());
+        }
+        Set<ItemKey> refreshedItems = new HashSet<>();
+        for (Candidate candidate : candidates) {
+            refreshedItems.add(candidate.item());
+        }
+        int stale = 0;
+        for (Map.Entry<ItemKey, GeneratedEmcEntry> entry : previousEntries.entrySet()) {
+            GeneratedEmcEntry value = entry.getValue();
+            if (value == null || !value.owned()) {
+                continue;
+            }
+            if (!scannedItems.contains(entry.getKey()) || !refreshedItems.contains(entry.getKey())) {
+                stale++;
+            }
+        }
+        return stale;
     }
 
     /**

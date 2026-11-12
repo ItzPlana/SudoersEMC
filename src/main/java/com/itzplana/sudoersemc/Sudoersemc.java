@@ -412,7 +412,7 @@ public final class Sudoersemc {
         }
         OverflowResetLog resetLog = overflowResetLog;
         if (resetLog != null) {
-            resetLog.save();
+            resetLog.saveIfDirty();
         }
         QuarantinedDropsStore dropsStore = quarantinedDropsStore;
         if (dropsStore != null) {

@@ -144,4 +144,16 @@ public final class OverflowPipeline {
             return recordedResets.get();
         }
     }
+
+    /**
+     * @return 审计日志因容量上限累计丢弃的最旧记录数；读取失败时返回 0
+     */
+    public long auditDroppedCount() {
+        try {
+            return log.droppedEntries();
+        } catch (RuntimeException e) {
+            LOGGER.warn("读取溢出审计丢弃计数失败", e);
+            return 0L;
+        }
+    }
 }
