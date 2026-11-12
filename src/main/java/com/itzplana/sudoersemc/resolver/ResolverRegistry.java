@@ -2,7 +2,6 @@ package com.itzplana.sudoersemc.resolver;
 
 import com.itzplana.sudoersemc.diagnostic.DebugLog;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.OptionalLong;
@@ -66,18 +65,20 @@ public final class ResolverRegistry {
     }
 
     /**
-     * 返回稳定的注册表指纹：按类名排序的 {@code resolver:<class>} 列表。
+     * 返回稳定的注册表指纹：按注册顺序排列的 {@code resolver[index]:<class>} 列表。
      *
-     * <p>新增/移除 resolver 会改变扫描基线指纹，从而允许下一次启动触发重扫。</p>
+     * <p>解析结果取决于注册顺序（第一个返回值大于 0 的解析器获胜），因此顺序变化必须
+     * 改变扫描基线指纹并触发重扫；新增/移除 resolver 同样会改变指纹。</p>
      *
-     * @return 不可变、已排序的指纹条目
+     * @return 不可变、按注册顺序排列的指纹条目
      */
     public List<String> fingerprintEntries() {
         List<String> entries = new ArrayList<>(resolvers.size());
+        int index = 0;
         for (NbtMaterialResolver resolver : resolvers) {
-            entries.add("resolver:" + resolver.getClass().getName());
+            entries.add("resolver[" + index + "]:" + resolver.getClass().getName());
+            index++;
         }
-        Collections.sort(entries);
         return List.copyOf(entries);
     }
 

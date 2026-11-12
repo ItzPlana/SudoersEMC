@@ -1,6 +1,7 @@
 package com.itzplana.sudoersemc.resolver;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -123,6 +124,51 @@ class ResolverRegistryTest {
     void nullRegistrationIsRejected() {
         ResolverRegistry registry = ResolverRegistry.defaults();
         assertThrows(NullPointerException.class, () -> registry.register(null));
+    }
+
+    @Test
+    void fingerprintEncodesRegistrationOrder() {
+        ResolverRegistry alphaFirst = ResolverRegistry.defaults();
+        alphaFirst.register(new AlphaResolver());
+        alphaFirst.register(new BetaResolver());
+
+        ResolverRegistry betaFirst = ResolverRegistry.defaults();
+        betaFirst.register(new BetaResolver());
+        betaFirst.register(new AlphaResolver());
+
+        assertEquals(2, alphaFirst.fingerprintEntries().size());
+        assertTrue(alphaFirst.fingerprintEntries().get(0).startsWith("resolver[0]:"));
+        assertTrue(alphaFirst.fingerprintEntries().get(0).endsWith("AlphaResolver"));
+        assertTrue(alphaFirst.fingerprintEntries().get(1).startsWith("resolver[1]:"));
+        assertTrue(alphaFirst.fingerprintEntries().get(1).endsWith("BetaResolver"));
+        assertNotEquals(alphaFirst.fingerprintEntries(), betaFirst.fingerprintEntries(),
+                "注册顺序变化必须改变指纹以触发重扫");
+    }
+
+    private static final class AlphaResolver implements NbtMaterialResolver {
+
+        @Override
+        public boolean supports(ItemStack stack) {
+            return false;
+        }
+
+        @Override
+        public OptionalLong resolve(ItemStack stack) {
+            return OptionalLong.empty();
+        }
+    }
+
+    private static final class BetaResolver implements NbtMaterialResolver {
+
+        @Override
+        public boolean supports(ItemStack stack) {
+            return false;
+        }
+
+        @Override
+        public OptionalLong resolve(ItemStack stack) {
+            return OptionalLong.empty();
+        }
     }
 
     private static final class StubResolver implements NbtMaterialResolver {

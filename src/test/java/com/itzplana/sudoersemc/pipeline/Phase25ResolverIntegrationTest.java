@@ -167,7 +167,7 @@ class Phase25ResolverIntegrationTest {
         List<String> registered = registry.fingerprintEntries();
 
         assertNotEquals(empty, registered);
-        assertTrue(registered.get(0).startsWith("resolver:"));
+        assertTrue(registered.get(0).startsWith("resolver[0]:"));
     }
 
     private ScanPipeline pipeline(GeneratedEntryStore store, FallbackPricing pricing) {

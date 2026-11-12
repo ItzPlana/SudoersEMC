@@ -630,6 +630,32 @@ public final class ScanPipeline {
     }
 
     /**
+     * 返回本次扫描结束时可输出的 {@link DebugLog#summary()}。
+     *
+     * <p>调试日志关闭或没有任何统计时返回空，生产路径因此保持零开销。包内可见便于单元
+     * 测试验证 summary 已接线，而不是只存在于 {@link DebugLog} 内部。</p>
+     *
+     * @return 非空的限流统计汇总
+     */
+    static Optional<String> debugSummary() {
+        if (!DebugLog.isEnabled()) {
+            return Optional.empty();
+        }
+        String summary = DebugLog.summary();
+        return summary.isEmpty() ? Optional.empty() : Optional.of(summary);
+    }
+
+    private static void logDebugSummary() {
+        try {
+            debugSummary().ifPresent(summary ->
+                    LOGGER.info("SudoersEMC 扫描调试日志汇总：{}", summary));
+        } catch (Throwable failure) {
+            // 诊断汇总失败绝不能覆盖扫描结果或原始异常。
+            LOGGER.debug("输出调试日志汇总失败", failure);
+        }
+    }
+
+    /**
      * 采集一次扫描所需的全部数据。
      *
      * <p><strong>必须由服务器线程调用。</strong>本方法读取物品注册表与配方管理器，并把实时对象
@@ -1428,6 +1454,9 @@ public final class ScanPipeline {
             // 失败也要留下部分报告；报告层自身保证不抛出异常。
             writePartialReport(data, diagnostics, false, "扫描失败");
             return PipelineResult.zeroed(durationMillis);
+        } finally {
+            // 扫描结束（正常/取消/失败）都输出一次限流统计，避免 summary 只有测试在调用。
+            logDebugSummary();
         }
     }
 

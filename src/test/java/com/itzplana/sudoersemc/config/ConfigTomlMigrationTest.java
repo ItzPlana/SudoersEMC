@@ -107,9 +107,10 @@ class ConfigTomlMigrationTest {
         assertEquals(ConfigTomlMigration.Status.REFUSED_NEWER, outcome.status());
         assertEquals(3, outcome.fromVersion());
         assertEquals(3, outcome.toVersion());
-        assertNull(outcome.backup());
+        assertNotNull(outcome.backup());
         assertArrayEquals(before, Files.readAllBytes(file));
-        assertEquals(0, countBackups(file));
+        assertArrayEquals(before, Files.readAllBytes(outcome.backup()));
+        assertEquals(1, countBackups(file));
         assertFalse(Files.exists(temp(file)));
     }
 
@@ -128,8 +129,10 @@ class ConfigTomlMigrationTest {
         ConfigTomlMigration.MigrationOutcome outcome = ConfigTomlMigration.migrate(file);
 
         assertEquals(ConfigTomlMigration.Status.REFUSED_NEWER, outcome.status());
+        assertNotNull(outcome.backup());
         assertArrayEquals(before, Files.readAllBytes(file));
-        assertEquals(0, countBackups(file));
+        assertArrayEquals(before, Files.readAllBytes(outcome.backup()));
+        assertEquals(1, countBackups(file));
         assertFalse(Files.exists(temp(file)));
     }
 
@@ -148,7 +151,33 @@ class ConfigTomlMigrationTest {
 
         assertEquals(ConfigTomlMigration.Status.FAILED_RETAINED, outcome.status());
         assertEquals(text, Files.readString(file, StandardCharsets.UTF_8));
-        assertEquals(0, countBackups(file));
+        assertNotNull(outcome.backup());
+        assertEquals(text, Files.readString(outcome.backup(), StandardCharsets.UTF_8));
+        assertEquals(1, countBackups(file));
+        assertFalse(Files.exists(temp(file)));
+    }
+
+    @Test
+    void quotedNumericSchemaVersionIsRetainedInsteadOfTreatedAsFutureNoOp() throws IOException {
+        Path file = tempDir.resolve("quoted-version.toml");
+        String text = """
+                schemaVersion = "2"
+                futureKey = "keep"
+
+                [overflow]
+                threshold = 5
+                """;
+        Files.writeString(file, text, StandardCharsets.UTF_8);
+
+        ConfigTomlMigration.MigrationOutcome outcome = ConfigTomlMigration.migrate(file);
+
+        // 字符串不是数值：Forge 的 IntValue 随后会把 "2" 纠正为默认 1，因此必须 fail-closed。
+        assertEquals(ConfigTomlMigration.Status.FAILED_RETAINED, outcome.status());
+        assertEquals(-1, outcome.fromVersion());
+        assertNotNull(outcome.backup());
+        assertEquals(text, Files.readString(file, StandardCharsets.UTF_8));
+        assertEquals(text, Files.readString(outcome.backup(), StandardCharsets.UTF_8));
+        assertEquals(1, countBackups(file));
         assertFalse(Files.exists(temp(file)));
     }
 
@@ -166,7 +195,9 @@ class ConfigTomlMigrationTest {
                 ConfigTomlMigration.migrate(negative);
         assertEquals(ConfigTomlMigration.Status.FAILED_RETAINED, negativeOutcome.status());
         assertEquals(negativeText, Files.readString(negative, StandardCharsets.UTF_8));
-        assertEquals(0, countBackups(negative));
+        assertNotNull(negativeOutcome.backup());
+        assertEquals(negativeText, Files.readString(negativeOutcome.backup(), StandardCharsets.UTF_8));
+        assertEquals(1, countBackups(negative));
     }
 
     @Test
@@ -195,13 +226,16 @@ class ConfigTomlMigrationTest {
 
         assertEquals(ConfigTomlMigration.Status.FAILED_RETAINED, outcome.status());
         assertEquals(text, Files.readString(broken, StandardCharsets.UTF_8));
-        assertEquals(0, countBackups(broken));
+        assertNotNull(outcome.backup());
+        assertEquals(text, Files.readString(outcome.backup(), StandardCharsets.UTF_8));
+        assertEquals(1, countBackups(broken));
         assertFalse(Files.exists(temp(broken)));
 
         Path empty = tempDir.resolve("empty.toml");
         Files.writeString(empty, "", StandardCharsets.UTF_8);
         ConfigTomlMigration.MigrationOutcome emptyOutcome = ConfigTomlMigration.migrate(empty);
         assertEquals(ConfigTomlMigration.Status.FAILED_RETAINED, emptyOutcome.status());
+        assertNotNull(emptyOutcome.backup(), "失败路径也必须尽力备份原文件");
         assertEquals("", Files.readString(empty, StandardCharsets.UTF_8));
         assertFalse(Files.exists(temp(empty)));
     }
@@ -219,6 +253,7 @@ class ConfigTomlMigrationTest {
         ConfigTomlMigration.MigrationOutcome outcome = ConfigTomlMigration.migrate(file, ops);
 
         assertEquals(ConfigTomlMigration.Status.FAILED_RETAINED, outcome.status());
+        assertNull(outcome.backup(), "注入的备份操作返回 null 时应如实报告");
         assertEquals(original, Files.readString(file, StandardCharsets.UTF_8));
         assertFalse(Files.exists(temp(file)));
     }
