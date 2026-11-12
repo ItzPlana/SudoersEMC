@@ -15,8 +15,9 @@ import net.minecraft.resources.ResourceLocation;
  * <p>只有降价才可能触发隔离；持平与涨价永远放行。阈值比较使用严格大于：降幅恰好等于
  * {@link Settings#maxAllowedDropRatio()} 时仍然放行。</p>
  *
- * <p>本类只做决策，不保存任何 EMC 数值。{@link #approve(ItemKey)} 只会移除该物品当前的
- * 隔离记录，不会修改、放宽或重写任何已存储的数值。</p>
+ * <p>本类只做决策，不保存任何 EMC 数值。{@link #approve(ItemKey)} 返回本次被移除的具体决策，
+ * 调用方只能应用这些决策；{@link #approvedItems()} / {@link #isApproved(ItemKey)} 仅用于
+ * 历史诊断，绝不能作为放行未来降价的依据。</p>
  */
 public final class LargeDropProtection {
 
@@ -74,7 +75,8 @@ public final class LargeDropProtection {
      * @param item          物品身份，用于检查豁免规则
      * @param previousValue 记录中的旧值，必须 {@code >= 0}
      * @param proposedValue 拟写入的新值，必须 {@code >= 0}
-     * @return 判定结果；超过阈值的降价会同时写入隔离列表
+     * @return 判定结果；超过阈值的降价会同时写入隔离列表。同一物品只保留最新一次隔离决策，
+     *         重复判定不会使列表增长
      */
     public PriceDropDecision evaluate(ItemKey item, long previousValue, long proposedValue) {
         Objects.requireNonNull(item, "item");
@@ -116,6 +118,7 @@ public final class LargeDropProtection {
             PriceDropDecision decision = PriceDropDecision.quarantined(
                     previousValue, proposedValue, dropRatio, "drop-exceeds-threshold");
             synchronized (lock) {
+                quarantine.removeIf(entry -> entry.item().equals(item));
                 quarantine.add(new QuarantinedDecision(item, decision));
             }
             return decision;
@@ -125,7 +128,7 @@ public final class LargeDropProtection {
     }
 
     /**
-     * @return 自构造以来被隔离的全部决策的不可变副本，按隔离发生的先后顺序排列
+     * @return 每个物品最新一次被隔离的决策的不可变副本，按最近一次隔离发生的先后顺序排列
      */
     public List<PriceDropDecision> quarantined() {
         synchronized (lock) {
@@ -159,18 +162,27 @@ public final class LargeDropProtection {
     /**
      * 管理员显式批准某个物品。
      *
-     * <p>批准只会移除该物品当前的全部隔离记录并把物品加入 {@link #approvedItems()}；它不会
-     * 修改任何已存储的 EMC 值，也不会让未来的降价自动获得豁免——每次新的降价仍会独立判定。</p>
+     * <p>批准只会移除该物品当前的最新隔离记录，并把被移除的决策返回给调用方；它不会修改
+     * 任何已存储的 EMC 值。调用方必须只应用返回列表中的决策（列表为空表示没有待批准决策）。
+     * {@link #approvedItems()} 仅记录审批历史，未来的降价仍会独立判定，绝不能据此自动放行。</p>
      *
      * @param item 被批准物品；{@code null} 会被忽略
+     * @return 本次被移除的决策，按加入隔离区的顺序排列；没有待批准决策时为空列表
      */
-    public void approve(ItemKey item) {
+    public List<PriceDropDecision> approve(ItemKey item) {
         if (item == null) {
-            return;
+            return List.of();
         }
         synchronized (lock) {
-            approvedItems.add(item);
+            List<PriceDropDecision> approved = new ArrayList<>();
+            for (QuarantinedDecision entry : quarantine) {
+                if (entry.item().equals(item)) {
+                    approved.add(entry.decision());
+                }
+            }
             quarantine.removeIf(entry -> entry.item().equals(item));
+            approvedItems.add(item);
+            return List.copyOf(approved);
         }
     }
 
@@ -183,7 +195,7 @@ public final class LargeDropProtection {
         }
     }
 
-    /** @return 该物品是否曾被管理员显式批准 */
+    /** @return 该物品是否曾被管理员显式批准；仅用于诊断，绝不能作为放行条件 */
     public boolean isApproved(ItemKey item) {
         if (item == null) {
             return false;
