@@ -9,11 +9,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.itzplana.sudoersemc.command.CommandResult;
+import com.itzplana.sudoersemc.command.CommandService;
 import com.itzplana.sudoersemc.core.GeneratedEmcEntry;
 import com.itzplana.sudoersemc.core.ItemKey;
 import com.itzplana.sudoersemc.core.OverflowScope;
 import com.itzplana.sudoersemc.core.PriceSource;
 import com.itzplana.sudoersemc.diagnostic.ReportManager;
+import com.itzplana.sudoersemc.integration.ProjectEManualValues;
 import com.itzplana.sudoersemc.pricing.FallbackPricing;
 import com.itzplana.sudoersemc.pricing.PricingSettings;
 import com.itzplana.sudoersemc.safety.CreativeItemProtection;
@@ -288,6 +291,51 @@ class ScanPipelineTest {
         assertFalse(drop.approved());
         assertTrue(drop.timestamp() > 0L);
         assertTrue(quarantineStore.isDirty(), "记录后必须等待统一落盘");
+    }
+
+    @Test
+    void approvedDropBecomesBaselineOnNextScan() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_approve_rescan.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 1_000L, PriceSource.RECIPE, null, true, 0L));
+        QuarantinedDropsStore quarantineStore = new QuarantinedDropsStore(
+                tempDir.resolve(QuarantinedDropsStore.FILE_NAME));
+        LargeDropProtection dropProtection =
+                new LargeDropProtection(LargeDropProtection.Settings.defaults());
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 100L), item(RESULT, 0L)),
+                List.of(recipe(INGOT, RESULT)),
+                Map.of(INGOT, 100L));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, dropProtection, null, null, disabledFallback());
+        pipeline.setQuarantinedDropsStore(quarantineStore);
+
+        PipelineResult first = pipeline.solveAndApply(snapshot);
+        assertEquals(1, first.quarantined());
+        assertEquals(1_000L, store.get(RESULT).value(), "隔离后旧值必须保留");
+
+        CommandService service = new CommandService(
+                null, null, store, null, null, quarantineStore,
+                null,
+                new ProjectEManualValues(tempDir.resolve("ProjectE").resolve("custom_emc.json")),
+                true, () -> key -> false, () -> 1L, () -> 999_999L);
+        CommandResult approved = service.approve(RESULT_ID.toString());
+
+        assertTrue(approved.success(), approved.joinLines());
+        GeneratedEmcEntry approvedEntry = store.get(RESULT);
+        assertNotNull(approvedEntry);
+        assertEquals(100L, approvedEntry.value());
+        assertEquals(PriceSource.APPROVED, approvedEntry.source());
+        assertTrue(quarantineStore.entries().get(0).applied());
+
+        PipelineResult second = pipeline.solveAndApply(snapshot);
+        assertEquals(0, second.quarantined(), "同值候选不应被再次隔离");
+        assertEquals(1, second.applied());
+        assertEquals(1L, second.extraCounter(PriceSource.APPROVED.name(), 0L),
+                "重扫必须统计到上一轮落盘的 APPROVED 条目");
+        assertEquals(100L, store.get(RESULT).value());
+        assertEquals(PriceSource.RECIPE, store.get(RESULT).source(),
+                "重扫会按正常定价重新求解并覆盖 APPROVED 来源（已知边界）");
     }
 
     @Test
