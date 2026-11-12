@@ -47,6 +47,7 @@ public final class ScanStateStore {
     private long lastScanDurationMillis;
     private int lastSolvedCount;
     private int lastUnresolvedCount;
+    private int lastSolverRounds;
 
     /** 文件由不支持的（更高）版本写入时为 true，用于阻止覆盖。 */
     private volatile boolean unsupportedSchemaVersion;
@@ -121,6 +122,7 @@ public final class ScanStateStore {
                 lastScanDurationMillis = Math.max(0L, dto.lastScanDurationMillis);
                 lastSolvedCount = Math.max(0, dto.lastSolvedCount);
                 lastUnresolvedCount = Math.max(0, dto.lastUnresolvedCount);
+                lastSolverRounds = Math.max(0, dto.lastSolverRounds);
             } catch (RuntimeException e) {
                 clearStateLocked();
                 LOGGER.warn("加载扫描状态 {} 失败，按空状态处理", file, e);
@@ -172,6 +174,7 @@ public final class ScanStateStore {
                 dto.lastScanDurationMillis = lastScanDurationMillis;
                 dto.lastSolvedCount = lastSolvedCount;
                 dto.lastUnresolvedCount = lastUnresolvedCount;
+                dto.lastSolverRounds = lastSolverRounds;
 
                 if (backupPending && !JsonFileIO.backupIfExists(file)) {
                     dirty.set(true);
@@ -202,6 +205,23 @@ public final class ScanStateStore {
      * @param unresolvedCount 本次仍未解析的物品数量
      */
     public void update(ScanFingerprint fingerprint, long durationMillis, int solvedCount, int unresolvedCount) {
+        update(fingerprint, durationMillis, solvedCount, unresolvedCount, 0);
+    }
+
+    /**
+     * 记录一次扫描的结果（含多轮求解轮数）并标记为待保存。
+     *
+     * <p>扫描时刻取当前系统时间；耗时、计数与轮数中的负数会被归零。{@code fingerprint} 为
+     * {@code null} 时忽略本次调用，因为缺少指纹的状态无法用于增量判断。</p>
+     *
+     * @param fingerprint     本次扫描使用的输入指纹
+     * @param durationMillis  本次扫描耗时毫秒数
+     * @param solvedCount     本次已解析物品数量
+     * @param unresolvedCount 本次仍未解析的物品数量
+     * @param solverRounds    本次多轮收敛实际执行的求解轮数；{@code 0} 表示调用方未提供
+     */
+    public void update(ScanFingerprint fingerprint, long durationMillis, int solvedCount,
+                       int unresolvedCount, int solverRounds) {
         if (fingerprint == null) {
             return;
         }
@@ -212,6 +232,7 @@ public final class ScanStateStore {
                 lastScanDurationMillis = Math.max(0L, durationMillis);
                 lastSolvedCount = Math.max(0, solvedCount);
                 lastUnresolvedCount = Math.max(0, unresolvedCount);
+                lastSolverRounds = Math.max(0, solverRounds);
                 dirty.set(true);
             }
         } catch (RuntimeException e) {
@@ -332,6 +353,13 @@ public final class ScanStateStore {
         }
     }
 
+    /** @return 上一次扫描实际执行的求解轮数；旧版本文件或从未记录时为 0 */
+    public int lastSolverRounds() {
+        synchronized (lock) {
+            return lastSolverRounds;
+        }
+    }
+
     /** @return 是否存在尚未写盘的更新 */
     public boolean isDirty() {
         return dirty.get();
@@ -349,6 +377,7 @@ public final class ScanStateStore {
         lastScanDurationMillis = 0L;
         lastSolvedCount = 0;
         lastUnresolvedCount = 0;
+        lastSolverRounds = 0;
     }
 
     /**
@@ -361,6 +390,7 @@ public final class ScanStateStore {
         long lastScanDurationMillis;
         int lastSolvedCount;
         int lastUnresolvedCount;
+        int lastSolverRounds;
     }
 
     /** 五个输入通道的磁盘表示。 */

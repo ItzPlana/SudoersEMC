@@ -27,6 +27,8 @@ import net.minecraft.world.item.crafting.Recipe;
 import net.minecraft.world.item.crafting.RecipeSerializer;
 import net.minecraft.world.item.crafting.RecipeType;
 import net.minecraft.world.level.Level;
+import net.minecraftforge.fml.ModList;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -127,7 +129,17 @@ class GoetyRitualReaderTest {
     }
 
     @Test
+    void recipeTypeLinkageErrorSkipsRecipeWithoutThrowing() {
+        FakeAccess access = new FakeAccess();
+
+        assertNull(reader(access).describe(recipeWithFailingType(), RECIPE_ID),
+                "类型闸门必须隔离 LinkageError，不能让整轮扫描失败");
+        assertEquals(0, access.calls, "类型闸门失败必须在读取字段之前返回");
+    }
+
+    @Test
     void goetyAbsentMakesReaderUnavailableWithoutThrowing() {
+        assumeGoetyAbsent();
         assertFalse(GoetyRitualReader.available());
         assertFalse(GoetyRitualReader.available(), "解析结果必须缓存且幂等");
     }
@@ -141,6 +153,7 @@ class GoetyRitualReaderTest {
 
     @Test
     void recipeScannerWithGoetyStaysEmptyWithoutGoety() {
+        assumeGoetyAbsent();
         assertTrue(RecipeScanner.withGoety().isEmpty());
     }
 
@@ -261,6 +274,26 @@ class GoetyRitualReaderTest {
         assertEquals(3, parsed.getInt("Damage"));
     }
 
+    // ---------------------------------------------------------------- 访问器异常防御
+
+    @Test
+    void accessRuntimeExceptionSkipsRecipeWithoutThrowing() {
+        GoetyRitualReader reader = GoetyRitualReader.withAccess(
+                throwingAccess(new IllegalStateException("boom")));
+
+        assertNull(reader.describeReadable(new Object(), RECIPE_ID),
+                "访问器运行时异常必须降级为字段读取失败");
+    }
+
+    @Test
+    void accessLinkageErrorSkipsRecipeWithoutThrowing() {
+        GoetyRitualReader reader = GoetyRitualReader.withAccess(
+                throwingAccess(new NoClassDefFoundError("goety:missing")));
+
+        assertNull(reader.describeReadable(new Object(), RECIPE_ID),
+                "访问器 LinkageError 必须降级为字段读取失败");
+    }
+
     // ---------------------------------------------------------------- 日志限流
 
     @Test
@@ -300,7 +333,69 @@ class GoetyRitualReaderTest {
         return GoetyRitualReader.withAccess(access);
     }
 
+    private static void assumeGoetyAbsent() {
+        Assumptions.assumeFalse(isGoetyLoaded(), "本测试只验证未安装 Goety 的降级路径");
+    }
+
+    private static boolean isGoetyLoaded() {
+        try {
+            ModList modList = ModList.get();
+            return modList != null && modList.isLoaded("goety");
+        } catch (Throwable failure) {
+            // 单元测试 JVM 未初始化 Forge 时按未安装处理。
+            return false;
+        }
+    }
+
+    private static GoetyRitualAccess throwingAccess(Throwable failure) {
+        return new GoetyRitualAccess() {
+
+            @Override
+            public boolean available() {
+                return true;
+            }
+
+            @Override
+            public GoetyRitualAccess.FieldRead<List<Ingredient>> ingredients(Object recipe) {
+                throw rethrow(failure);
+            }
+
+            @Override
+            public GoetyRitualAccess.FieldRead<Ingredient> activationItem(Object recipe) {
+                throw rethrow(failure);
+            }
+
+            @Override
+            public GoetyRitualAccess.FieldRead<String> ritualType(Object recipe) {
+                throw rethrow(failure);
+            }
+
+            @Override
+            public GoetyRitualAccess.FieldRead<ItemStack> result(Object recipe) {
+                throw rethrow(failure);
+            }
+        };
+    }
+
+    private static RuntimeException rethrow(Throwable failure) {
+        if (failure instanceof RuntimeException runtime) {
+            throw runtime;
+        }
+        if (failure instanceof Error error) {
+            throw error;
+        }
+        throw new IllegalStateException(failure);
+    }
+
     private static Recipe<CraftingContainer> craftingRecipe() {
+        return recipe(false);
+    }
+
+    private static Recipe<CraftingContainer> recipeWithFailingType() {
+        return recipe(true);
+    }
+
+    private static Recipe<CraftingContainer> recipe(boolean failingType) {
         return new Recipe<CraftingContainer>() {
 
             @Override
@@ -335,6 +430,9 @@ class GoetyRitualReaderTest {
 
             @Override
             public RecipeType<?> getType() {
+                if (failingType) {
+                    throw new NoClassDefFoundError("goety:missing");
+                }
                 return RecipeType.CRAFTING;
             }
         };

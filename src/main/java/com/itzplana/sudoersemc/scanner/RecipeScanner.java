@@ -1,6 +1,7 @@
 package com.itzplana.sudoersemc.scanner;
 
 import com.itzplana.sudoersemc.core.ItemKey;
+import com.itzplana.sudoersemc.resolver.VariantNormalizer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -93,7 +94,8 @@ public final class RecipeScanner {
             ids = manager.getRecipeIds().toList();
         } catch (RuntimeException e) {
             LOGGER.warn("Could not enumerate recipe ids", e);
-            return new ScanResult(List.of(), 0, 0, 1,
+            // 枚举失败时不能把“一条失败配方”当成真实统计：配方总数此时未知。
+            return new ScanResult(List.of(), 0, 0, 0, true,
                     List.of("recipe-manager: " + failureText(e)));
         }
 
@@ -106,7 +108,7 @@ public final class RecipeScanner {
             Optional<? extends Recipe<?>> maybeRecipe;
             try {
                 maybeRecipe = manager.byKey(id);
-            } catch (RuntimeException e) {
+            } catch (RuntimeException | LinkageError e) {
                 failed++;
                 addFailureDetail(failedDetails, id, e);
                 continue;
@@ -127,7 +129,9 @@ public final class RecipeScanner {
                     continue;
                 }
                 snapshots.add(snapshot);
-            } catch (RuntimeException e) {
+            } catch (RuntimeException | LinkageError e) {
+                // 可选模组的配方类可能在加载/链接阶段失败（NoClassDefFoundError 等）；
+                // 只跳过该条配方，不能让整轮扫描失去全部数据。
                 failed++;
                 addFailureDetail(failedDetails, id, e);
                 LOGGER.debug("Failed to describe recipe {}; skipping it", id, e);
@@ -149,7 +153,7 @@ public final class RecipeScanner {
      * 总数，因此报告可以显示“已记录 X / 共 Y 条”。</p>
      */
     private static void addFailureDetail(List<String> details, ResourceLocation id,
-                                         RuntimeException failure) {
+                                         Throwable failure) {
         if (details.size() >= MAX_FAILED_DETAILS) {
             return;
         }
@@ -336,6 +340,11 @@ public final class RecipeScanner {
     /**
      * 把输出堆叠转换为不可变产物，并保留其 SNBT。
      *
+     * <p>输出身份与变体扫描共用 {@link VariantNormalizer#keyFor(ResourceLocation, CompoundTag)}：
+     * 只有经济相关字段会进入 {@link ItemKey#variantHash()}，展示字段、可损坏物品的
+     * {@code Damage} 等不会产生额外变体。原始 SNBT 单独保存在 {@link RecipeOutput#outputNbt()}，
+     * 供后续注册 ProjectE 的精确 NBT key。</p>
+     *
      * <p>该方法为包级可见，便于单元测试直接验证 SNBT 保留与空标签语义。</p>
      */
     @Nullable
@@ -347,22 +356,41 @@ public final class RecipeScanner {
         if (id == null) {
             return null;
         }
-        return new RecipeOutput(ItemKey.of(id), Math.max(1, stack.getCount()), serializeTag(stack));
+        CompoundTag tag = effectiveVariantTag(stack);
+        ItemKey key = tag == null ? ItemKey.of(id) : VariantNormalizer.keyFor(id, tag);
+        return new RecipeOutput(key, Math.max(1, stack.getCount()), serializeTag(tag));
+    }
+
+    /**
+     * 读取参与变体身份计算的标签，并把“仅 {@code Damage:0}”归一为无 NBT。
+     *
+     * <p>可损坏物品默认携带 {@code Damage:0}，它只表示“未受损”，不是经济变体；
+     * 若保留该标签，非可损坏物品还会产生无意义的 {@code {Damage:0}} 伪变体。</p>
+     */
+    @Nullable
+    private static CompoundTag effectiveVariantTag(ItemStack stack) {
+        CompoundTag tag = stack.getTag();
+        if (tag == null || tag.isEmpty()) {
+            return null;
+        }
+        if (tag.size() == 1 && tag.contains("Damage") && tag.getInt("Damage") == 0) {
+            return null;
+        }
+        return tag;
     }
 
     /**
      * 把输出堆叠的 NBT 序列化为 SNBT。
      *
-     * <p>没有标签时返回 {@code null}；序列化失败时记录调试日志并返回 {@code null}，
-     * 绝不因为单个损坏的标签中断整轮配方扫描。</p>
+     * <p>没有标签、空标签或仅 {@code Damage:0} 时返回 {@code null}；序列化失败时记录调试日志
+     * 并返回 {@code null}，绝不因为单个损坏的标签中断整轮配方扫描。</p>
      */
     @Nullable
-    private static String serializeTag(ItemStack stack) {
+    private static String serializeTag(@Nullable CompoundTag tag) {
+        if (tag == null || tag.isEmpty()) {
+            return null;
+        }
         try {
-            CompoundTag tag = stack.getTag();
-            if (tag == null || tag.isEmpty()) {
-                return null;
-            }
             String snbt = tag.toString();
             if (snbt == null) {
                 return null;
@@ -383,16 +411,15 @@ public final class RecipeScanner {
     }
 
     /**
-     * Outcome of one recipe scan.
-     *
      * @param recipes             every usable snapshot
      * @param unsupported         recipes whose type this build cannot evaluate
      * @param invalid             recipes missing an id, inputs or outputs
      * @param failed              recipes that threw while being described
+     * @param enumerationFailed   是否在枚举配方 id 时整体失败；为 {@code true} 时总数未知
      * @param failedRecipeDetails 失败配方的可读明细；最多保留 {@link RecipeScanner#MAX_FAILED_DETAILS} 条
      */
     public record ScanResult(List<RecipeSnapshot> recipes, int unsupported, int invalid, int failed,
-                             List<String> failedRecipeDetails) {
+                             boolean enumerationFailed, List<String> failedRecipeDetails) {
 
         public ScanResult {
             recipes = List.copyOf(recipes);
@@ -402,12 +429,24 @@ public final class RecipeScanner {
         }
 
         /**
-         * 兼容旧调用点的构造器：不携带失败明细。
+         * 兼容 Phase 22 早期调用点的构造器：不携带枚举失败标志。
          */
-        public ScanResult(List<RecipeSnapshot> recipes, int unsupported, int invalid, int failed) {
-            this(recipes, unsupported, invalid, failed, List.of());
+        public ScanResult(List<RecipeSnapshot> recipes, int unsupported, int invalid, int failed,
+                          List<String> failedRecipeDetails) {
+            this(recipes, unsupported, invalid, failed, false, failedRecipeDetails);
         }
 
+        /**
+         * 兼容旧调用点的构造器：不携带枚举失败标志与失败明细。
+         */
+        public ScanResult(List<RecipeSnapshot> recipes, int unsupported, int invalid, int failed) {
+            this(recipes, unsupported, invalid, failed, false, List.of());
+        }
+
+        /**
+         * @return 已分类的配方总数；配方枚举失败时返回 0，调用方必须优先检查
+         *         {@link #enumerationFailed()} 而不能把 0 当作“世界中没有配方”
+         */
         public int total() {
             return recipes.size() + unsupported + invalid + failed;
         }
