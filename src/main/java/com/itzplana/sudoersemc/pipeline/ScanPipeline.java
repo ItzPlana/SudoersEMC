@@ -65,9 +65,10 @@ import org.slf4j.LoggerFactory;
  * 创造物品保护使用安全默认值，兜底定价与溢出保护在缺失时直接跳过。这样单元测试可以在没有完整
  * 运行时环境的情况下验证管线主干。</p>
  *
- * <p><strong>异常契约：</strong>{@link #collect(MinecraftServer)} 与
- * {@link #solveAndApply(PipelineSnapshot)} 都不会向调用方抛出异常。任何失败都会记录日志并返回
- * 空快照或全零结果，保证服务器主循环与 {@code ScanManager} 状态机不会被单次扫描拖垮。</p>
+ * <p><strong>异常契约：</strong>{@link #collect(MinecraftServer)} 在服务器未就绪或采集失败时
+ * 抛出 {@link IllegalStateException}，由 {@code ScanManager} 转为 {@code FAILED}，绝不把失败
+ * 伪装成“成功的空扫描”；{@link #solveAndApply(PipelineSnapshot)} 仍不向调用方抛出异常，
+ * 任何未预期失败记录日志后返回全零结果，保证服务器主循环不被单次扫描拖垮。</p>
  */
 public final class ScanPipeline {
 
@@ -158,13 +159,18 @@ public final class ScanPipeline {
      * 转换为不可变的 {@link ItemSnapshot} / {@link RecipeSnapshot}。返回后所有数据都可以安全地
      * 脱离服务器线程处理。</p>
      *
+     * <p>服务器未就绪、注册表/配方扫描失败或出现未预期异常时抛出
+     * {@link IllegalStateException}。调用方（{@code ScanManager}）会把它转换为扫描失败，
+     * 从而避免用空快照覆盖上一次有效的扫描状态。</p>
+     *
      * @param server 当前服务器实例，允许为 {@code null}
-     * @return 采集结果；任何失败或服务器未就绪时返回空快照
+     * @return 本次采集的不可变快照
+     * @throws IllegalStateException 服务器未就绪或采集过程失败时抛出
      */
     public PipelineSnapshot collect(@Nullable MinecraftServer server) {
         if (server == null) {
-            LOGGER.warn("SudoersEMC 扫描采集被调用时服务器尚未就绪，返回空快照");
-            return PipelineSnapshot.empty();
+            LOGGER.warn("SudoersEMC 扫描采集被调用时服务器尚未就绪，本次扫描失败");
+            throw new IllegalStateException("扫描采集失败：服务器尚未就绪");
         }
 
         try {
@@ -221,8 +227,8 @@ public final class ScanPipeline {
                     scanResult.invalid(),
                     scanResult.failed());
         } catch (Throwable failure) {
-            LOGGER.error("SudoersEMC 扫描采集失败，本轮按空快照处理", failure);
-            return PipelineSnapshot.empty();
+            LOGGER.error("SudoersEMC 扫描采集失败", failure);
+            throw new IllegalStateException("SudoersEMC 扫描采集失败", failure);
         }
     }
 

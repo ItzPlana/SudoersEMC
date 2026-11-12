@@ -172,6 +172,17 @@ debugLogging = false
 generateReports = true
 ```
 
+### 自动扫描开关
+
+`[general] enabled` 是扫描服务总开关：设为 `false` 时不会创建扫描调度器，服务器启动自动扫描与手动 `/sudoemc rescan-all` 都不可用。
+`alwaysRescan = true` 仅在自动扫描启用时生效；开启后每次服务器启动都会忽略缓存重新扫描。
+
+### 标签兜底定价的风险
+
+`fallback.useTagPricing = true` 时，未定价物品会按材料标签类别使用默认锚点（默认按铁系取值）。
+标签只表示材料关系，不保证同一类别内不同材料的真实价值相同；在 ProjectE 已为廉价可再生产材料定价、但未为对应块/锭定价的模组包中，可能出现 EMC 套利。
+当前版本尚未提供按材料/标签的覆盖配置；如发现异常定价，建议关闭 `useTagPricing`，或先用 ProjectE 手动 EMC 值（`custom_emc.json`）覆盖相关材料，使 EXISTING 优先命中。
+
 ### 溢出保护
 
 当某个 EMC 值**严格大于** `threshold` 时，它会被替换为 `[resetMin, resetMax]` 区间内的加权随机值：
