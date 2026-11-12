@@ -11,6 +11,8 @@ import net.minecraft.commands.arguments.ResourceLocationArgument;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
 import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * {@code /sudoemc} 命令的 Brigadier 注册薄层。
@@ -24,6 +26,8 @@ import org.jetbrains.annotations.Nullable;
  * 每个子命令都会输出“命令服务尚未初始化”并返回 0，而不是抛出空指针异常。</p>
  */
 public final class SudoemcCommands {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger("sudoersemc/command/SudoemcCommands");
 
     /** 命令根节点名称。 */
     public static final String ROOT_LITERAL = "sudoemc";
@@ -86,7 +90,7 @@ public final class SudoemcCommands {
         send(source, "/sudoemc reload - 重新加载配置");
         send(source, "/sudoemc report - 查看上一次诊断报告");
         send(source, "/sudoemc explain <item> - 解释 EMC 定价与备选成本");
-        send(source, "/sudoemc approve <item> - 批准隔离降价记录（不修改 EMC）");
+        send(source, "/sudoemc approve <item> - 批准隔离降价记录（默认立即应用降价值）");
         send(source, "/sudoemc cancel - 取消当前扫描");
         return Command.SINGLE_SUCCESS;
     }
@@ -104,6 +108,8 @@ public final class SudoemcCommands {
      */
     private static int approve(CommandContext<CommandSourceStack> context) {
         String item = StringArgumentType.getString(context, "item");
+        // 审计要求：记录谁批准了哪条隔离记录；前后值与结果由 CommandService 记录。
+        LOGGER.info("管理员 {} 执行 /sudoemc approve {}", context.getSource().getTextName(), item);
         return execute(context.getSource(), commandService -> commandService.approve(item));
     }
 

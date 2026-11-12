@@ -52,10 +52,12 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
     /**
      * 当前磁盘 schema 版本。
      *
-     * <p>版本 1 不包含备选成本；版本 2 为每个条目新增 {@code alternatives} 数组。读取时兼容
-     * 版本 1，但只会写出当前版本；更高版本仍然拒绝覆盖。</p>
+     * <p>版本 1 不包含备选成本；版本 2 为每个条目新增 {@code alternatives} 数组；版本 3 新增
+     * {@code APPROVED} 来源，旧构建不认识该来源会跳过条目并在下次保存时丢弃，因此必须 bump
+     * schema 让旧构建整体拒绝加载/覆盖。读取时兼容版本 1..3，只会写出当前版本；更高版本
+     * 仍然拒绝覆盖。</p>
      */
-    public static final int SCHEMA_VERSION = 2;
+    public static final int SCHEMA_VERSION = 3;
 
     /** File name inside {@link SudoersemcPaths#dataDir()}. */
     public static final String FILE_NAME = "generated_entries.json";
@@ -94,7 +96,7 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
      * Loads the backing file into memory.
      *
      * <p>文件缺失：空状态且无警告。JSON 损坏：空状态并记录警告，原始字节保留到下次覆盖前
-     * 备份。{@code schemaVersion} 为 1 时按无备选成本加载，为 2 时读取备选成本；更高或非法
+     * 备份。{@code schemaVersion} 为 1 时按无备选成本加载，为 2/3 时读取备选成本；更高或非法
      * 的版本不加载任何条目，且 {@link #save()} 拒绝覆盖原文件。单条格式错误的记录会被跳过。</p>
      */
     public void load() {
@@ -118,7 +120,7 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
                     LOGGER.warn("Could not parse {}; starting with an empty generated-entry set", file);
                     return;
                 }
-                // 版本 1 是旧格式（没有备选成本），版本 2 是当前格式。两者都可读，
+                // 版本 1 是旧格式（没有备选成本），版本 2/3 含备选成本。三者都可读，
                 // 但只会写出当前版本；更高或非法的版本保持原文件不动。
                 if (dto.schemaVersion < 1 || dto.schemaVersion > SCHEMA_VERSION) {
                     unsupportedSchemaVersion = true;
@@ -418,7 +420,7 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
     /**
      * 磁盘文档。字段顺序固定，保证 Gson 每次写出的字节顺序一致。
      *
-     * <p>{@code schemaVersion=2} 时每个条目额外写出 {@code alternatives} 数组；版本 1 的旧
+     * <p>{@code schemaVersion>=2} 时每个条目额外写出 {@code alternatives} 数组；版本 1 的旧
      * 文件没有该字段，读取时按空列表处理。</p>
      */
     static final class EntriesFileDto {

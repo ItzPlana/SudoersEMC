@@ -215,7 +215,8 @@ public final class Sudoersemc {
                         OptionalIntegrationManager.manualValues(),
                         approveAppliesImmediately(),
                         exclusionDetectorSupplier(),
-                        Sudoersemc::minimumEmcForApproval);
+                        Sudoersemc::minimumEmcForApproval,
+                        Sudoersemc::overflowThresholdForApproval);
                 SudoemcCommands.setService(commandService);
                 LOGGER.warn("SudoersEMC 初始运行时组件构建失败，已保留可重载的命令服务，等待配置修正");
             }
@@ -366,7 +367,8 @@ public final class Sudoersemc {
                 OptionalIntegrationManager.manualValues(),
                 approveAppliesImmediately(),
                 () -> pipeline::isExcludedFromPricing,
-                Sudoersemc::minimumEmcForApproval);
+                Sudoersemc::minimumEmcForApproval,
+                Sudoersemc::overflowThresholdForApproval);
         return new RuntimeComponents(
                 newFallbackPricing,
                 newSolveSettings,
@@ -597,6 +599,23 @@ public final class Sudoersemc {
     private static boolean approveAppliesImmediately() {
         return readBoolean("safety.approveAppliesImmediately",
                 SudoersemcConfig.SAFETY_APPROVE_APPLIES_IMMEDIATELY, true);
+    }
+
+    /**
+     * 读取审批应用允许的最高 EMC。
+     *
+     * <p>溢出保护关闭时返回 {@link Long#MAX_VALUE}（与扫描行为一致，不再限制）；读取失败时
+     * 回退到内置阈值 {@link OverflowProtection#DEFAULT_THRESHOLD}，宁可拒绝也不绕过保护。</p>
+     */
+    private static long overflowThresholdForApproval() {
+        try {
+            OverflowProtection.Settings settings = SudoersemcConfig.overflowSettings();
+            return settings.enabled() ? settings.threshold() : Long.MAX_VALUE;
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法读取 overflow 配置，审批应用使用默认阈值 "
+                    + OverflowProtection.DEFAULT_THRESHOLD, e);
+            return OverflowProtection.DEFAULT_THRESHOLD;
+        }
     }
 
     /**

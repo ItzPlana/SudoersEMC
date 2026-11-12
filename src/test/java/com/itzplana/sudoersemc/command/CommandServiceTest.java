@@ -52,11 +52,19 @@ class CommandServiceTest {
     }
 
     private QuarantinedDropsStore quarantineStoreWith(ResourceLocation itemId) {
+        return quarantineStoreWith(itemId, 100L, 10L, false, false);
+    }
+
+    private QuarantinedDropsStore quarantineStoreWith(ResourceLocation itemId,
+                                                      long previousValue,
+                                                      long proposedValue,
+                                                      boolean approved,
+                                                      boolean applied) {
         QuarantinedDropsStore store = new QuarantinedDropsStore(
                 tempDir.resolve(QuarantinedDropsStore.FILE_NAME));
         store.record(new QuarantinedDropsStore.QuarantinedDrop(
-                ItemKey.of(itemId), 100L, 10L, 0.9D,
-                "drop-exceeds-threshold", 1_730_000_000_000L, false));
+                ItemKey.of(itemId), previousValue, proposedValue, 0.9D,
+                "drop-exceeds-threshold", 1_730_000_000_000L, approved, applied));
         return store;
     }
 
@@ -78,11 +86,23 @@ class CommandServiceTest {
                                                   boolean applyEnabled,
                                                   Predicate<ItemKey> exclusion,
                                                   long minimumEmc) {
+        return approvalService(entries, quarantine, manual, applyEnabled, exclusion,
+                minimumEmc, Long.MAX_VALUE);
+    }
+
+    private static CommandService approvalService(GeneratedEntryStore entries,
+                                                  QuarantinedDropsStore quarantine,
+                                                  ProjectEManualValues manual,
+                                                  boolean applyEnabled,
+                                                  Predicate<ItemKey> exclusion,
+                                                  long minimumEmc,
+                                                  long overflowThreshold) {
         return new CommandService(
                 null, null, entries, null, null, quarantine, null, manual,
                 applyEnabled,
                 exclusion == null ? null : () -> exclusion,
-                () -> minimumEmc);
+                () -> minimumEmc,
+                () -> overflowThreshold);
     }
 
     private static DiagnosticReport sampleReport() {
@@ -461,9 +481,118 @@ class CommandServiceTest {
         CommandResult second = service.approve("minecraft:stone");
 
         assertTrue(second.success());
-        assertTrue(second.joinLines().contains("未重复应用"));
+        assertTrue(second.joinLines().contains("仅记录审批状态"),
+                "审计模式重复批准必须说明只记录状态: " + second.joinLines());
         assertTrue(quarantineStore.entries().get(0).approved());
+        assertFalse(quarantineStore.entries().get(0).applied());
         assertEquals(0, entryStore.size());
+    }
+
+    @Test
+    void approveHistoricalApprovedButNotAppliedRecordApplies() {
+        QuarantinedDropsStore quarantineStore =
+                quarantineStoreWith(STONE, 100L, 10L, true, false);
+        GeneratedEntryStore entryStore = new GeneratedEntryStore(
+                tempDir.resolve(GeneratedEntryStore.FILE_NAME));
+        CommandService service = approvalService(
+                entryStore, quarantineStore, noManualValues(), true, key -> false, 1L);
+
+        CommandResult result = service.approve("minecraft:stone");
+
+        assertTrue(result.success(), "Phase 21 遗留的 approved=true 记录必须可应用: "
+                + result.joinLines());
+        GeneratedEmcEntry applied = entryStore.snapshotAll().get(ItemKey.of(STONE));
+        assertNotNull(applied);
+        assertEquals(10L, applied.value());
+        assertEquals(PriceSource.APPROVED, applied.source());
+        assertTrue(quarantineStore.entries().get(0).approved());
+        assertTrue(quarantineStore.entries().get(0).applied());
+    }
+
+    @Test
+    void approveAfterAuditModeCanApplyWhenReenabled() {
+        QuarantinedDropsStore quarantineStore = quarantineStoreWith(STONE);
+        GeneratedEntryStore entryStore = new GeneratedEntryStore(
+                tempDir.resolve(GeneratedEntryStore.FILE_NAME));
+        CommandService auditService = approvalService(
+                entryStore, quarantineStore, noManualValues(), false, null, 1L);
+
+        assertTrue(auditService.approve("minecraft:stone").success());
+        assertFalse(quarantineStore.entries().get(0).applied());
+        assertEquals(0, entryStore.size());
+
+        // 模拟重启后重新加载隔离记录，再把开关切回 true。
+        QuarantinedDropsStore reloaded = new QuarantinedDropsStore(quarantineStore.file());
+        reloaded.load();
+        CommandService applyService = approvalService(
+                entryStore, reloaded, noManualValues(), true, key -> false, 1L);
+
+        CommandResult result = applyService.approve("minecraft:stone");
+
+        assertTrue(result.success(), "审计模式记录在开关恢复后必须可应用: " + result.joinLines());
+        assertTrue(result.joinLines().contains("来源 APPROVED"));
+        GeneratedEmcEntry applied = entryStore.snapshotAll().get(ItemKey.of(STONE));
+        assertNotNull(applied);
+        assertEquals(10L, applied.value());
+        assertTrue(reloaded.entries().get(0).applied());
+    }
+
+    @Test
+    void approveReconcilesAppliedFlagWhenEntryAlreadyPersisted() {
+        QuarantinedDropsStore quarantineStore =
+                quarantineStoreWith(STONE, 100L, 10L, true, false);
+        GeneratedEntryStore entryStore = new GeneratedEntryStore(
+                tempDir.resolve(GeneratedEntryStore.FILE_NAME));
+        assertTrue(entryStore.stage(new GeneratedEmcEntry(
+                ItemKey.of(STONE), 10L, PriceSource.APPROVED, null, true, 1L)));
+        CommandService service = approvalService(
+                entryStore, quarantineStore, noManualValues(), true, key -> false, 1L);
+
+        CommandResult result = service.approve("minecraft:stone");
+
+        assertTrue(result.success());
+        assertTrue(result.joinLines().contains("未重复应用"));
+        assertEquals(10L, entryStore.snapshotAll().get(ItemKey.of(STONE)).value());
+        assertTrue(quarantineStore.entries().get(0).applied(),
+                "崩溃窗口后再次 approve 必须补齐 applied 标记");
+    }
+
+    @Test
+    void approveRefusesValueAboveOverflowThreshold() {
+        QuarantinedDropsStore quarantineStore =
+                quarantineStoreWith(STONE, 1_000_000L, 1_000L, false, false);
+        GeneratedEntryStore entryStore = new GeneratedEntryStore(
+                tempDir.resolve(GeneratedEntryStore.FILE_NAME));
+        CommandService service = approvalService(
+                entryStore, quarantineStore, noManualValues(), true, key -> false, 1L, 999L);
+
+        CommandResult result = service.approve("minecraft:stone");
+
+        assertFalse(result.success());
+        assertTrue(result.joinLines().contains("溢出阈值"), result.joinLines());
+        assertTrue(entryStore.snapshotAll().isEmpty());
+        assertFalse(quarantineStore.entries().get(0).approved());
+    }
+
+    @Test
+    void approveDoesNotMarkApprovedWhenEntrySaveFails() throws Exception {
+        QuarantinedDropsStore quarantineStore = quarantineStoreWith(STONE);
+        // 让目标文件本身是目录：save() 无法原子替换，dirty 会保持 true。
+        Path blockedFile = tempDir.resolve("blocked-generated-entries");
+        Files.createDirectories(blockedFile);
+        Files.writeString(blockedFile.resolve("blocker"), "x", StandardCharsets.UTF_8);
+        GeneratedEntryStore entryStore = new GeneratedEntryStore(blockedFile);
+        CommandService service = approvalService(
+                entryStore, quarantineStore, noManualValues(), true, key -> false, 1L);
+
+        CommandResult result = service.approve("minecraft:stone");
+
+        assertFalse(result.success());
+        assertTrue(result.joinLines().contains("写入磁盘失败"), result.joinLines());
+        assertTrue(entryStore.snapshotAll().isEmpty(), "写入失败后必须回滚内存中的条目");
+        assertFalse(quarantineStore.entries().get(0).approved(),
+                "数值未落盘时绝不能标记批准");
+        assertFalse(quarantineStore.entries().get(0).applied());
     }
 
     @Test

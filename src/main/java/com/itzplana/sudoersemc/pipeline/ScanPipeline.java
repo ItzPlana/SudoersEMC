@@ -1297,6 +1297,14 @@ public final class ScanPipeline {
 
             Map<ItemKey, GeneratedEmcEntry> previousEntries =
                     store == null ? Map.of() : store.snapshotAll();
+            // 在应用循环覆盖这些条目之前统计 APPROVED 数量；下一次扫描重新求解后来源会变化，
+            // 因此这个计数代表“扫描开始时仍生效的已批准值”，用于诊断报告展示。
+            long approvedEntriesAtStart = 0L;
+            for (GeneratedEmcEntry previous : previousEntries.values()) {
+                if (previous != null && previous.source() == PriceSource.APPROVED) {
+                    approvedEntriesAtStart++;
+                }
+            }
             int overflowBefore = overflowPipeline == null ? 0 : overflowPipeline.resetsApplied();
 
             int applied = 0;
@@ -1393,6 +1401,9 @@ public final class ScanPipeline {
                     lastOwnershipReleased, diagnostics);
             extraCounters.put("solverCacheHits", (long) lastSolverCacheHits);
             extraCounters.put("solverCacheMisses", (long) lastSolverCacheMisses);
+            // DiagnosticReport.sourceBreakdown()/generatedTotal() 读取同名键，必须在此接线；
+            // 否则 APPROVED 计数恒为 0，报告与真实来源分布不一致。
+            extraCounters.put(PriceSource.APPROVED.name(), approvedEntriesAtStart);
             addExternalBaselineCounters(extraCounters, externalBaselineApplied);
             if (cancelledDuringApply) {
                 extraCounters.put("scanCancelled", 1L);

@@ -420,6 +420,31 @@ class ScanPipelineTest {
     }
 
     @Test
+    void approvedEntriesAreReportedInDiagnostics() throws IOException {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_approved.json"));
+        assertTrue(store.stage(new GeneratedEmcEntry(
+                RESULT, 10L, PriceSource.APPROVED, null, true, 0L)));
+        ReportManager reports = new ReportManager(tempDir);
+        // 让 RESULT 作为已有 EMC 保留，避免被陈旧条目清理删除。
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(RESULT, 10L)), List.of(), Map.of(RESULT, 10L));
+        ScanPipeline pipeline = pipeline(
+                store, null, reports, null, null, null, disabledFallback());
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1L, result.extraCounters().get(PriceSource.APPROVED.name()),
+                "诊断计数器必须记录扫描开始时仍生效的 APPROVED 条目");
+        assertEquals(0L, result.sourceTotal(),
+                "APPROVED 是上一轮遗留来源，不属于本轮求解来源计数");
+        String report = Files.readString(reports.reportFile());
+        assertTrue(report.lines().anyMatch(
+                        line -> line.startsWith("已批准应用") && line.endsWith(": 1")),
+                "报告必须输出已批准应用计数:\n" + report);
+    }
+
+    @Test
     void stashedSnapshotIsAppliedOnlyOnce() {
         GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("generated_stash.json"));
         ScanPipeline pipeline = pipeline(store, null, null, null, null, null, genericFallback(7L));

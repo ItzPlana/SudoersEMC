@@ -73,7 +73,7 @@ class GeneratedEntryStoreTest {
     }
 
     @Test
-    void schemaVersionTwoRoundTripPreservesAlternativeCosts() throws IOException {
+    void currentSchemaRoundTripPreservesAlternativeCosts() throws IOException {
         Path file = tempDir.resolve(GeneratedEntryStore.FILE_NAME);
         GeneratedEntryStore store = new GeneratedEntryStore(file);
         long timestamp = 1_730_000_000_000L;
@@ -84,8 +84,8 @@ class GeneratedEntryStoreTest {
         store.save();
 
         String json = Files.readString(file, StandardCharsets.UTF_8);
-        assertEquals(2, GeneratedEntryStore.SCHEMA_VERSION);
-        assertTrue(json.contains("\"schemaVersion\": 2"));
+        assertEquals(3, GeneratedEntryStore.SCHEMA_VERSION);
+        assertTrue(json.contains("\"schemaVersion\": 3"));
         assertTrue(json.contains("\"alternatives\""));
 
         GeneratedEntryStore reloaded = new GeneratedEntryStore(file);
@@ -386,6 +386,8 @@ class GeneratedEntryStoreTest {
 
         String json = Files.readString(file, StandardCharsets.UTF_8);
         assertTrue(json.contains("\"source\": \"APPROVED\""));
+        assertTrue(json.contains("\"schemaVersion\": 3"),
+                "APPROVED 来源要求当前 schema 为 3，旧构建必须整体拒绝加载");
 
         GeneratedEntryStore reloaded = new GeneratedEntryStore(file);
         reloaded.load();

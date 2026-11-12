@@ -157,7 +157,8 @@ public record DiagnosticReport(
     }
 
     /**
-     * @return 所有通过定价来源求解出的物品数量之和，即配方、外部基线、标签、稀有度、层级与兜底相加
+     * @return 所有通过定价来源求解出的物品数量之和，即配方、外部基线、标签、稀有度、层级、
+     *         兜底与扫描开始时观察到的已批准条目相加
      */
     public long generatedTotal() {
         return itemsSolvedByRecipe
@@ -165,7 +166,8 @@ public record DiagnosticReport(
                 + itemsSolvedByTag
                 + itemsSolvedByRarity
                 + itemsSolvedByTier
-                + itemsSolvedByFallback;
+                + itemsSolvedByFallback
+                + counter(PriceSource.APPROVED.name(), 0L);
     }
 
     /**
@@ -173,8 +175,8 @@ public record DiagnosticReport(
      *
      * <p>顺序固定为 {@code RECIPE → EXTERNAL_BASELINE → TAG → RARITY → TIER → FALLBACK →
      * APPROVED}，与枚举声明顺序无关，这样同一份数据在任何构建中都会产生相同的键顺序。值为 0
-     * 的来源不会出现在结果里。{@code APPROVED} 的数量来自额外计数器同名键，通常由下一次扫描
-     * 观察到已批准条目后写入。</p>
+     * 的来源不会出现在结果里。{@code APPROVED} 的数量来自额外计数器同名键，由
+     * {@code ScanPipeline} 在应用阶段开始时统计生成条目存储中的 {@code APPROVED} 条目后写入。</p>
      *
      * @return 不可变的“来源名称 → 数量”映射
      */
@@ -213,6 +215,7 @@ public record DiagnosticReport(
         appendLine(text, "稀有度定价", Long.toString(itemsSolvedByRarity));
         appendLine(text, "层级定价", Long.toString(itemsSolvedByTier));
         appendLine(text, "兜底定价", Long.toString(itemsSolvedByFallback));
+        appendLine(text, "已批准应用", Long.toString(counter(PriceSource.APPROVED.name(), 0L)));
         appendLine(text, "未解析物品", Long.toString(unresolvedItems));
         appendLine(text, "隔离的降价", Long.toString(quarantinedDrops));
         appendLine(text, "失败配方", Long.toString(failedRecipes));

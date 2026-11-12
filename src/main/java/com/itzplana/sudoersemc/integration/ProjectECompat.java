@@ -115,14 +115,14 @@ public final class ProjectECompat implements EmcProvider {
     }
 
     @Override
-    public void requestRemap(@Nullable MinecraftServer server) {
+    public boolean requestRemap(@Nullable MinecraftServer server) {
         if (server == null) {
             LOGGER.warn("Cannot request a ProjectE EMC remap: no server instance is available");
-            return;
+            return false;
         }
         if (!server.isSameThread()) {
             LOGGER.warn("Refusing to request a ProjectE EMC remap off the server thread; call requestRemap on the server thread");
-            return;
+            return false;
         }
 
         // Pick up administrator edits before the mapping pass reads them.
@@ -131,8 +131,10 @@ public final class ProjectECompat implements EmcProvider {
         try {
             server.reloadResources(server.getPackRepository().getSelectedIds());
             LOGGER.info("Requested a ProjectE EMC remap through a server resource reload");
+            return true;
         } catch (Throwable t) {
             LOGGER.warn("Failed to request a ProjectE EMC remap", t);
+            return false;
         }
     }
 

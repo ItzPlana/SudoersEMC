@@ -45,6 +45,9 @@ public interface EmcProvider {
 
     /**
      * Requests a backend EMC recalculation. Must be called on the server thread.
+     *
+     * @return {@code true} 只有在请求确实被后端接受时才返回 true；缺少服务器实例、调用线程
+     *         不合法或后端拒绝时返回 false
      */
-    void requestRemap(MinecraftServer server);
+    boolean requestRemap(MinecraftServer server);
 }
