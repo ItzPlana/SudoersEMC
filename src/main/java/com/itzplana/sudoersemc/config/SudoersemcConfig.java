@@ -119,8 +119,9 @@ public final class SudoersemcConfig {
                 .define("useFallbackForUnsolvable", true);
         FALLBACK_USE_TAG_PRICING = BUILDER.comment(
                         "Derive values from item tags and material relationships.",
-                        "Category anchors are iron-based; cheap renewable materials may be overvalued",
-                        "when ProjectE has no explicit value for the matching block/ingot.")
+                        "Category anchors are conservative low-tier floors (INGOT 64, STORAGE_BLOCK 576),",
+                        "not per-material values; cheap renewable materials can still be overvalued",
+                        "relative to ProjectE values. Use ProjectE custom values for exact pricing.")
                 .define("useTagPricing", true);
         FALLBACK_USE_RARITY_PRICING = BUILDER.comment("Derive values from item rarity.")
                 .define("useRarityPricing", true);

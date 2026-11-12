@@ -402,7 +402,7 @@ class ScanPipelineTest {
         assertEquals(1, result.applied());
         GeneratedEmcEntry staged = store.snapshotAll().get(RESULT);
         assertNotNull(staged);
-        assertEquals(256L, staged.value(), "forge:ingots/iron 应命中默认 INGOT 锚点");
+        assertEquals(64L, staged.value(), "forge:ingots/iron 应命中默认 INGOT 保守锚点");
         assertEquals(PriceSource.TAG, staged.source());
     }
 
