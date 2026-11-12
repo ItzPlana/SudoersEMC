@@ -5,25 +5,31 @@ import java.util.Objects;
 /**
  * 由服务器 tick 驱动的单次扫描状态机。
  *
- * <p>一次扫描的生命周期为：请求扫描 → 采集快照 → 求解配方 → 应用结果 → 持久化 → 完成。
- * 每次 {@link #tick()} 最多推进一步当前阶段，并根据 {@link BatchProcessor} 的建议批量
- * 增加已处理数量。</p>
+ * <p>一次扫描的生命周期为：请求扫描 → 分片采集快照 → 求解配方 → 应用结果 → 持久化 → 完成。
+ * 采集阶段通过 {@link SnapshotCollector#begin()} 创建 {@link CollectSession}，每个 tick 只调用
+ * 一次 {@link CollectSession#step(int)} 推进一个批次；会话自行维护游标并返回本批实际处理量与
+ * 是否完成。批量由 {@link BatchProcessor} 根据上一批实际耗时与 {@link #tickBudgetNanos} 自适应
+ * 决定，因此采集工作量按配置上限跨 tick 推进，而不是在一个 tick 内完成全量遍历。</p>
  *
- * <p><strong>阶段边界：</strong>本类只负责调度与进度记账。当前版本的
- * {@link SnapshotCollector#collect()} 仍是一次性全量采集，其执行时间不受
- * {@code tickBudgetNanos} 约束。真正把采集与求解拆成可中断分片的工作由后续管线阶段
- * （真实扫描管线与增量采集会话）实现；接入真实扫描器时必须由采集实现自行控制单 tick
- * 工作量。本类不承诺单个 tick 内的实际工作上限。</p>
+ * <p><strong>阶段范围（Phase 7）：</strong>本类只提供状态机、分片采集协议与批量记账组件，
+ * 不包含生产接线。本分支没有 {@code ScanPipeline}，{@code Sudoersemc} 也未创建或驱动
+ * {@code ScanManager}。生产接线从 Phase 11 开始（命令/生命周期代码注册 tick 驱动，并注入
+ * 占位采集器），真实管线采集与持久化在 Phase 12 接入，生产级分片采集实现
+ * （{@code ScanCollector}）在 Phase 27 落地。因此本阶段不能单独构成可运行的扫描路径。</p>
  *
- * <p><strong>线程约定：</strong>快照采集（{@link SnapshotCollector}）、结果应用
- * （{@link ResultApplier}）与指纹提供器（{@link FingerprintSupplier}）必须在服务器线程
- * 执行，因为真实实现会读取 Minecraft 注册表、配方管理器或写入 EMC 后端。只有不接触游戏
- * 状态的纯计算才可以移到工作线程。{@link #tick()}、{@link #requestScan()} 与
- * {@link #reset()} 同样只能由服务器线程调用，因此本类没有为这些方法加锁。回调内重入
- * {@link #tick()} 会被忽略；回调内调用 {@link #requestScan()} 返回 {@code false}；
- * 回调内调用 {@link #reset()} 会抛出 {@link IllegalStateException}。
- * {@link #progress()} 通过 {@code volatile} 字段发布，其他线程可以安全读取最近一次完整
- * 进度；{@link #cancel()} 也可以从其他线程调用，实际取消会在下一次 tick 被观察到。</p>
+ * <p><strong>线程约定：</strong>快照采集（{@link SnapshotCollector} 与 {@link CollectSession}）、
+ * 结果应用（{@link ResultApplier}）与指纹提供器（{@link FingerprintSupplier}）必须在服务器
+ * 线程执行，因为真实实现会读取 Minecraft 注册表、配方管理器或写入 EMC 后端。只有不接触游戏
+ * 状态的纯计算才可以移到工作线程。{@link #tick()}、{@link #requestScan()} 与 {@link #reset()}
+ * 同样只能由服务器线程调用，因此本类没有为这些方法加锁。回调内重入 {@link #tick()} 会被忽略；
+ * 回调内调用 {@link #requestScan()} 返回 {@code false}；回调内调用 {@link #reset()} 会抛出
+ * {@link IllegalStateException}。{@link #progress()} 通过 {@code volatile} 字段发布，其他线程
+ * 可以安全读取最近一次完整进度；{@link #cancel()} 也可以从其他线程调用，实际取消会在下一次
+ * tick 被观察到。</p>
+ *
+ * <p><strong>持久化：</strong>本阶段 {@code saveStep()} 只把阶段推进到
+ * {@link ScanPhase#COMPLETED}，不访问磁盘。Phase 12 的应用回调负责把结果写入
+ * {@code GeneratedEntryStore} / {@code ScanStateStore} 并调用 {@code saveIfDirty()}。</p>
  *
  * <p>任何回调抛出的运行时异常都会被捕获并转换为 {@link ScanPhase#FAILED}，异常消息写入
  * 进度细节，绝不允许异常穿透 tick 循环破坏服务器主循环。</p>
@@ -31,29 +37,98 @@ import java.util.Objects;
 public final class ScanManager {
 
     /**
-     * 采集阶段回调，必须在服务器线程执行。
+     * 分片采集会话工厂，必须在服务器线程执行。
+     *
+     * <p>每次扫描开始时调用一次 {@link #begin()} 创建新会话；会话持有本次采集的游标，
+     * {@link ScanManager} 在每个 tick 调用一次 {@link CollectSession#step(int)} 推进有限
+     * 工作量，直到会话报告完成。{@code begin()} 只应建立游标与计划总量，不得执行全量遍历。</p>
      */
     @FunctionalInterface
     public interface SnapshotCollector {
 
         /**
-         * 采集一次扫描所需的完整快照。
+         * 开始一次分片采集。
          *
-         * <p>当前接口是一次性调用，调用期间不会收到 tick 预算或截止时间；实现方如需避免
-         * 长停顿，应在后续管线阶段改用分片采集会话，或自行保证调用足够轻量。</p>
+         * @return 新的采集会话，不能为 {@code null}
+         */
+        CollectSession begin();
+    }
+
+    /**
+     * 由采集实现维护游标的分片采集会话，所有方法必须在服务器线程调用。
+     *
+     * <p>实现方必须保证 {@link #step(int)} 最多处理 {@code maxItems} 个工作单元；单次调用
+     * 允许因为阶段切换而不处理任何元素，但不得在一次调用内完成全量遍历。
+     * {@link #itemCount()} 与 {@link #recipeCount()} 是计划总量，用于进度显示；
+     * {@link #processedItems()} 与 {@link #processedRecipes()} 必须随 {@code step} 单调递增，
+     * 并在全部工作完成时返回 {@code true}。</p>
+     */
+    public interface CollectSession {
+
+        /**
+         * @return 计划检查的物品数量，未知时为 0
+         */
+        int itemCount();
+
+        /**
+         * @return 计划处理的配方数量，未知时为 0
+         */
+        int recipeCount();
+
+        /**
+         * @return 已处理的物品数量
+         */
+        int processedItems();
+
+        /**
+         * @return 已处理的配方数量
+         */
+        int processedRecipes();
+
+        /**
+         * @return 是否已经完成（包括取消后的部分完成）
+         */
+        boolean isDone();
+
+        /**
+         * 推进最多 {@code maxItems} 个工作单元。
+         *
+         * @param maxItems 本次允许处理的最大单元数；必须大于等于 1
+         * @return 本批实际处理量与完成标志
+         */
+        StepResult step(int maxItems);
+
+        /**
+         * 返回本次采集的最终快照。只在 {@link #isDone()} 为 {@code true} 时调用。
          *
          * @return 非空快照数据
          */
-        SnapshotData collect();
+        SnapshotData finish();
+    }
+
+    /**
+     * 单个采集批次的结果。
+     *
+     * @param actualProcessed 本批实际处理的工作单元数，必须非负且不超过请求的 {@code maxItems}
+     * @param done            会话是否在本次调用后完成
+     */
+    public record StepResult(int actualProcessed, boolean done) {
+
+        public StepResult {
+            if (actualProcessed < 0) {
+                throw new IllegalArgumentException(
+                        "actualProcessed 必须 >= 0，实际为 " + actualProcessed);
+            }
+        }
     }
 
     /**
      * 当前扫描输入的指纹提供器，必须在服务器线程执行。
      *
-     * <p>启用后，{@link ScanManager} 会在采集前后与应用前各取一次指纹：采集期间发生变化
-     * 会直接让扫描失败；采集后到应用前发生变化（例如 {@code /reload} 或注册表变动）会拒绝
-     * 应用过期结果并把扫描转为 {@link ScanPhase#FAILED}。未提供该回调时跳过一致性校验，
-     * 仅用于不接触游戏状态的单元测试或过渡接线。</p>
+     * <p>启用后，{@link ScanManager} 会在采集开始时与采集完成时各取一次指纹，并在应用前
+     * 再取一次：采集期间发生变化会直接让扫描失败；采集后到应用前发生变化（例如 {@code /reload}
+     * 或注册表变动）会拒绝应用过期结果并把扫描转为 {@link ScanPhase#FAILED}。未提供该回调时
+     * 跳过一致性校验，仅用于不接触游戏状态的单元测试或过渡接线。</p>
      */
     @FunctionalInterface
     public interface FingerprintSupplier {
@@ -82,8 +157,8 @@ public final class ScanManager {
      * 回调之间传递的最小数据载体。
      *
      * <p>当前阶段只携带标签、物品数量与配方数量，使 {@link ScanManager} 保持对 Minecraft
-     * 的零依赖。Phase 9+ 接入真实流水线时，可以通过泛型化或子类承载更丰富的快照内容，
-     * 而无需让状态机本身引用游戏类型。</p>
+     * 的零依赖。Phase 12 接入真实流水线（{@code ScanPipeline}）时，可以通过泛型化或子类
+     * 承载更丰富的快照内容，而无需让状态机本身引用游戏类型。</p>
      *
      * @param label       快照来源或批次的中文标签
      * @param itemCount   采集到的物品数量，不得为负
@@ -112,6 +187,8 @@ public final class ScanManager {
     private volatile boolean cancelRequested;
 
     private SnapshotData snapshot;
+    private CollectSession collectSession;
+    private ScanFingerprint collectFingerprintBefore;
     private ScanFingerprint collectedFingerprint;
     private long lastBatchNanos;
     private boolean ticking;
@@ -119,16 +196,18 @@ public final class ScanManager {
     /**
      * 创建一个不做快照一致性校验的调度器。
      *
-     * <p>该构造器等价于传入 {@code null} 指纹提供器，仅用于兼容尚未接线的过渡阶段或纯
-     * 单元测试。生产接线应使用带 {@link FingerprintSupplier} 的构造器，避免在配方重载后
-     * 把过期结果写入 EMC。</p>
+     * @deprecated 该构造器把 {@link FingerprintSupplier} 固定为 {@code null}，会静默跳过
+     *         采集前后与应用前的指纹校验，只适用于不接触游戏状态的单元测试或过渡接线。
+     *         生产接线必须使用带 {@link FingerprintSupplier} 的五参构造器，否则 {@code /reload}
+     *         后可能把基于旧配方的结果写入 EMC。计划在后续阶段移除本构造器。
      *
      * @param batchProcessor  批量决策器，不能为 {@code null}
-     * @param collector       快照采集回调，不能为 {@code null}
+     * @param collector       分片采集会话工厂，不能为 {@code null}
      * @param applier         结果应用回调，不能为 {@code null}
      * @param tickBudgetNanos 每 tick 的时间预算（纳秒），不得为负；只用于批量决策，
-     *                        不会中断或限制 {@link SnapshotCollector#collect()} 的执行
+     *                        不会中断 {@link CollectSession#step(int)} 的执行
      */
+    @Deprecated(since = "0.1.0", forRemoval = false)
     public ScanManager(BatchProcessor batchProcessor,
                        SnapshotCollector collector,
                        ResultApplier applier,
@@ -139,15 +218,16 @@ public final class ScanManager {
     /**
      * 创建带快照一致性校验的调度器。
      *
-     * <p>{@code fingerprintSupplier} 会在采集前后与应用前被调用，且必须返回非 {@code null}
-     * 的指纹。采集期间指纹变化或应用前指纹与采集时不一致都会让本次扫描进入
+     * <p>{@code fingerprintSupplier} 会在采集开始时与采集完成时各调用一次，并在应用前
+     * 再次调用。采集期间指纹变化或应用前指纹与采集时不一致都会让本次扫描进入
      * {@link ScanPhase#FAILED}，从而避免把基于旧注册表/配方的结果写入 EMC。</p>
      *
      * @param batchProcessor      批量决策器，不能为 {@code null}
-     * @param collector           快照采集回调，不能为 {@code null}
+     * @param collector           分片采集会话工厂，不能为 {@code null}
      * @param applier             结果应用回调，不能为 {@code null}
      * @param tickBudgetNanos     每 tick 的时间预算（纳秒），不得为负
-     * @param fingerprintSupplier 输入指纹提供器；{@code null} 表示跳过一致性校验
+     * @param fingerprintSupplier 输入指纹提供器；生产接线必须提供非 {@code null} 实现，
+     *                            {@code null} 仅用于不接触游戏状态的单元测试并会跳过全部校验
      */
     public ScanManager(BatchProcessor batchProcessor,
                        SnapshotCollector collector,
@@ -168,7 +248,7 @@ public final class ScanManager {
      * 请求开始一次新扫描。
      *
      * <p>已有扫描处于活动状态时返回 {@code false}，因此重复请求不会创建第二个扫描。
-     * 成功请求会清空上一次的快照、指纹与取消标志，并把进度重置为
+     * 成功请求会清空上一次的快照、采集会话、指纹与取消标志，并把进度重置为
      * {@link ScanPhase#COLLECTING_SNAPSHOT}。扫描完成、取消或失败后可以再次请求。</p>
      *
      * <p>本方法只能在服务器线程调用。若在 {@link #tick()} 的回调内调用，将直接返回
@@ -182,6 +262,8 @@ public final class ScanManager {
         }
         cancelRequested = false;
         snapshot = null;
+        collectSession = null;
+        collectFingerprintBefore = null;
         collectedFingerprint = null;
         lastBatchNanos = 0L;
         long now = System.currentTimeMillis();
@@ -225,13 +307,15 @@ public final class ScanManager {
      * 推进一次扫描状态机。
      *
      * <p>非活动状态下直接返回，不调用任何回调，也不消耗批量预算。取消标志优先于阶段推进。
-     * 采集阶段只调用一次采集器；随后按建议批量累加已处理数量。求解阶段同样按批量推进。
-     * 应用阶段调用一次应用器后进入持久化，持久化阶段完成后转入
-     * {@link ScanPhase#COMPLETED}。</p>
+     * 采集阶段在首个 tick 创建 {@link CollectSession}，之后每个 tick 只调用一次
+     * {@link CollectSession#step(int)}，因此采集必然按批次跨 tick 推进；会话返回完成标志后
+     * 才进入求解阶段。求解阶段按批量推进进度；应用与持久化各调用一次对应回调。</p>
      *
-     * <p>本方法只能由服务器线程调用。回调内重入调用会被直接忽略，防止递归采集。采集器与
-     * 应用器的实际执行时间不受 {@code tickBudgetNanos} 约束；预算只影响随后的进度步长和
-     * 自适应批量。</p>
+     * <p>本方法只能由服务器线程调用。回调内重入调用会被直接忽略，防止递归采集。批量由
+     * {@link BatchProcessor#nextBatchSize(long, long)} 根据上一批实际耗时与
+     * {@code tickBudgetNanos} 计算；{@code tickBudgetNanos} 不是抢占式超时，采集实现必须
+     * 自行保证单次 {@code step} 不超过传入的批量上限。实际处理量会回写给
+     * {@link BatchProcessor#recordBatch(int, long)}，不会用建议批量冒充实际工作量。</p>
      *
      * <p>回调抛出的 {@link RuntimeException} 会被捕获并转为 {@link ScanPhase#FAILED}，
      * 细节字段保存异常消息（无消息时退化为异常类名）。本方法不会向外传播这些异常。</p>
@@ -263,10 +347,11 @@ public final class ScanManager {
         ScanPhase phase = current.phase();
         int batch = batchProcessor.nextBatchSize(lastBatchNanos, tickBudgetNanos);
         long startedNanos = System.nanoTime();
+        int actualProcessed = 0;
         try {
             switch (phase) {
-                case COLLECTING_SNAPSHOT -> collectStep(batch);
-                case SOLVING -> solveStep(batch);
+                case COLLECTING_SNAPSHOT -> actualProcessed = collectStep(batch);
+                case SOLVING -> actualProcessed = solveStep(batch);
                 case APPLYING -> applyStep();
                 case SAVING -> saveStep();
                 default -> {
@@ -278,17 +363,17 @@ public final class ScanManager {
             progress = failed.advance(ScanPhase.FAILED, failed.processed(), failed.total(),
                     failureDetail(e));
         } finally {
-            // 只有采集/求解真正按批量处理元素，应用与持久化耗时不得污染自适应样本。
-            if (phase == ScanPhase.COLLECTING_SNAPSHOT || phase == ScanPhase.SOLVING) {
+            // 只有采集/求解真正处理了元素才记入自适应样本；应用与持久化的耗时不得污染样本。
+            if (actualProcessed > 0) {
                 long elapsedNanos = System.nanoTime() - startedNanos;
                 lastBatchNanos = elapsedNanos;
-                batchProcessor.recordBatch(batch, elapsedNanos);
+                batchProcessor.recordBatch(actualProcessed, elapsedNanos);
             }
         }
     }
 
     /**
-     * 把状态机恢复到空闲，并清除取消标志、快照、指纹与计时样本。
+     * 把状态机恢复到空闲，并清除取消标志、快照、采集会话、指纹与计时样本。
      *
      * <p>可在运行中调用；后续 {@link #tick()} 将不再推进旧扫描。批量决策器的自适应基准
      * 不会被重置，以便下一次扫描沿用已经学到的批量。</p>
@@ -304,51 +389,113 @@ public final class ScanManager {
         }
         cancelRequested = false;
         snapshot = null;
+        collectSession = null;
+        collectFingerprintBefore = null;
         collectedFingerprint = null;
         lastBatchNanos = 0L;
         progress = ScanProgress.idle();
     }
 
     /**
-     * 采集阶段：首次进入时调用采集器，随后按批量推进物品数量。
+     * 采集阶段：首个 tick 创建分片会话，之后每个 tick 只推进一个批次。
      *
-     * <p>若配置了指纹提供器，采集前后会各取一次指纹；两次不一致说明采集期间输入已经变化，
-     * 本次快照不可信，直接让扫描失败。</p>
+     * <p>会话在 {@link CollectSession#step(int)} 中按 {@code batch} 上限处理有限工作量；
+     * {@link ScanManager} 不会在一次 tick 内循环调用到完成，因此多物品扫描必然跨越多个
+     * tick。采集开始时取一次指纹，会话完成后取第二次指纹并比较；两次不一致说明采集期间
+     * 输入已经变化，本次快照不可信，直接让扫描失败。</p>
+     *
+     * @return 本 tick 实际处理的元素数量，用于自适应批量记账
      */
-    private void collectStep(int batch) {
-        if (snapshot == null) {
+    private int collectStep(int batch) {
+        if (collectSession == null) {
             ScanFingerprint before = currentFingerprint();
-            SnapshotData collected = collector.collect();
-            if (collected == null) {
-                throw new IllegalStateException("快照采集器返回 null");
+            CollectSession session = collector.begin();
+            if (session == null) {
+                throw new IllegalStateException("快照采集器返回 null 会话");
             }
-            ScanFingerprint after = currentFingerprint();
-            if (before != null && !after.equalsFingerprint(before)) {
-                throw new IllegalStateException("快照采集期间扫描输入发生变化，已放弃本次结果");
-            }
-            snapshot = collected;
-            collectedFingerprint = after;
-            progress = progress.advance(ScanPhase.COLLECTING_SNAPSHOT, 0, collected.itemCount(),
-                    "已采集 " + collected.itemCount() + " 个物品快照");
+            collectSession = session;
+            collectFingerprintBefore = before;
+            publishCollectProgress(batch);
         }
 
-        ScanProgress current = progress;
-        int total = current.total();
-        if (total <= 0) {
-            beginSolving();
+        if (collectSession.isDone()) {
+            finishCollection();
+            return 0;
+        }
+
+        StepResult result = collectSession.step(batch);
+        if (result == null) {
+            throw new IllegalStateException("快照采集会话 step 返回 null");
+        }
+        if (result.actualProcessed() > batch) {
+            throw new IllegalStateException(
+                    "快照采集会话超出单批预算：请求 " + batch
+                            + "，实际 " + result.actualProcessed());
+        }
+        publishCollectProgress(batch);
+        if (result.done() || collectSession.isDone()) {
+            finishCollection();
+        }
+        return result.actualProcessed();
+    }
+
+    /**
+     * 发布采集进度：物品未完成时显示物品进度，之后显示配方进度。
+     */
+    private void publishCollectProgress(int batch) {
+        CollectSession session = collectSession;
+        if (session == null) {
             return;
         }
-
-        int next = (int) Math.min((long) total, (long) current.processed() + batch);
-        progress = current.advance(ScanPhase.COLLECTING_SNAPSHOT, next, total,
-                "采集快照 " + next + "/" + total);
-        if (next >= total) {
-            beginSolving();
+        int itemTotal = session.itemCount();
+        int recipeTotal = session.recipeCount();
+        int processedItems = session.processedItems();
+        int processedRecipes = session.processedRecipes();
+        if (processedItems < itemTotal) {
+            progress = progress.advance(ScanPhase.COLLECTING_SNAPSHOT, processedItems, itemTotal,
+                    "采集物品 " + processedItems + "/" + itemTotal + "（批 " + batch + "）");
+        } else if (processedRecipes < recipeTotal) {
+            progress = progress.advance(ScanPhase.COLLECTING_SNAPSHOT, processedRecipes, recipeTotal,
+                    "采集配方 " + processedRecipes + "/" + recipeTotal + "（批 " + batch + "）");
+        } else if (itemTotal == 0 && recipeTotal == 0) {
+            progress = progress.advance(ScanPhase.COLLECTING_SNAPSHOT, 0, 0,
+                    "汇总快照（批 " + batch + "）");
+        } else {
+            progress = progress.advance(ScanPhase.COLLECTING_SNAPSHOT, 1, 1,
+                    "汇总快照（批 " + batch + "）");
         }
     }
 
     /**
-     * 物品采集完成后转入配方求解，并把总量切换为配方数量。
+     * 结束采集：校验采集期间的指纹一致性，取得最终快照并转入求解阶段。
+     */
+    private void finishCollection() {
+        CollectSession session = collectSession;
+        if (session == null) {
+            throw new IllegalStateException("采集阶段缺少会话");
+        }
+        ScanFingerprint after = currentFingerprint();
+        if (collectFingerprintBefore != null
+                && !collectFingerprintBefore.equalsFingerprint(after)) {
+            collectSession = null;
+            throw new IllegalStateException("快照采集期间扫描输入发生变化，已放弃本次结果");
+        }
+        SnapshotData collected = session.finish();
+        if (collected == null) {
+            collectSession = null;
+            throw new IllegalStateException("快照采集器返回 null 快照");
+        }
+        snapshot = collected;
+        collectedFingerprint = after;
+        collectSession = null;
+        collectFingerprintBefore = null;
+        progress = progress.advance(ScanPhase.COLLECTING_SNAPSHOT, collected.itemCount(),
+                collected.itemCount(), "已采集 " + collected.itemCount() + " 个物品快照");
+        beginSolving();
+    }
+
+    /**
+     * 物品/配方快照采集完成后转入求解阶段，并把总量切换为配方数量。
      */
     private void beginSolving() {
         SnapshotData data = snapshot;
@@ -358,8 +505,13 @@ public final class ScanManager {
 
     /**
      * 求解阶段：按批量推进配方数量，完成后进入应用阶段。
+     *
+     * <p>Phase 7 尚未接入真实求解器；本阶段只按 {@code batch} 推进进度记账，不会执行
+     * 配方计算。真实求解在 Phase 12 的管线中接入。</p>
+     *
+     * @return 本 tick 推进的实际配方数量，用于自适应批量记账
      */
-    private void solveStep(int batch) {
+    private int solveStep(int batch) {
         SnapshotData data = snapshot;
         if (data == null) {
             throw new IllegalStateException("求解阶段缺少快照数据");
@@ -369,14 +521,16 @@ public final class ScanManager {
         ScanProgress current = progress;
         if (total <= 0) {
             progress = current.advance(ScanPhase.APPLYING, 0, 0, "没有需要求解的配方");
-            return;
+            return 0;
         }
 
         int next = (int) Math.min((long) total, (long) current.processed() + batch);
+        int actual = next - current.processed();
         progress = current.advance(ScanPhase.SOLVING, next, total, "求解配方 " + next + "/" + total);
         if (next >= total) {
             progress = progress.advance(ScanPhase.APPLYING, 0, 0, "开始应用结果");
         }
+        return actual;
     }
 
     /**
@@ -393,8 +547,11 @@ public final class ScanManager {
     }
 
     /**
-     * 持久化阶段：本状态机只发布完成状态。实际的状态/结果落盘由后续阶段接入
-     * {@code ScanStateStore} 与管线应用回调完成。
+     * 持久化阶段：本阶段只发布完成状态，不访问磁盘。
+     *
+     * <p>Phase 7 没有存储接线；Phase 12 的管线应用回调负责写入生成值/扫描状态并调用
+     * {@code saveIfDirty()}。因此当前状态机的 {@link ScanPhase#COMPLETED} 仅表示内存流程
+     * 结束，不代表已经落盘。</p>
      */
     private void saveStep() {
         progress = progress.advance(ScanPhase.COMPLETED, 0, 0, "扫描已完成");
