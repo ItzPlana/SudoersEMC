@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.BooleanSupplier;
 import net.minecraft.resources.ResourceLocation;
 import org.jetbrains.annotations.Nullable;
 
@@ -39,6 +40,7 @@ public final class CommandService {
     private final @Nullable GeneratedEntryStore entryStore;
     private final @Nullable ScanStateStore scanStateStore;
     private final @Nullable ReloadAction reloadAction;
+    private final @Nullable BooleanSupplier scanRequestAction;
 
     /**
      * 创建不执行真实配置重载的命令服务。
@@ -55,7 +57,7 @@ public final class CommandService {
                           @Nullable ReportManager reportManager,
                           @Nullable GeneratedEntryStore entryStore,
                           @Nullable ScanStateStore scanStateStore) {
-        this(scanManager, reportManager, entryStore, scanStateStore, null);
+        this(scanManager, reportManager, entryStore, scanStateStore, null, null);
     }
 
     /**
@@ -70,18 +72,37 @@ public final class CommandService {
                           @Nullable GeneratedEntryStore entryStore,
                           @Nullable ScanStateStore scanStateStore,
                           @Nullable ReloadAction reloadAction) {
+        this(scanManager, reportManager, entryStore, scanStateStore, reloadAction, null);
+    }
+
+    /**
+     * @param scanManager       扫描状态机，可为 {@code null}
+     * @param reportManager     诊断报告管理器，可为 {@code null}
+     * @param entryStore        已生成条目的存储，可为 {@code null}
+     * @param scanStateStore    上一次扫描状态的存储，可为 {@code null}
+     * @param reloadAction      真实配置重载动作，可为 {@code null}（视为不可用）
+     * @param scanRequestAction 扫描请求动作；生产接线传入与重建共享运行时锁的入口，
+     *                          {@code null} 时退回直接调用 {@code scanManager.requestScan()}
+     */
+    public CommandService(@Nullable ScanManager scanManager,
+                          @Nullable ReportManager reportManager,
+                          @Nullable GeneratedEntryStore entryStore,
+                          @Nullable ScanStateStore scanStateStore,
+                          @Nullable ReloadAction reloadAction,
+                          @Nullable BooleanSupplier scanRequestAction) {
         this.scanManager = scanManager;
         this.reportManager = reportManager;
         this.entryStore = entryStore;
         this.scanStateStore = scanStateStore;
         this.reloadAction = reloadAction;
+        this.scanRequestAction = scanRequestAction;
     }
 
     /**
      * 查询当前扫描状态与上一次扫描结果。
      *
-     * <p>输出固定五个字段：阶段、当前阶段进度、是否运行中、上次耗时与上次结果。扫描服务
-     * 缺失时只返回一行“扫描服务不可用”。</p>
+     * <p>输出阶段、当前阶段进度、是否运行中、非空时的阶段详情，以及上次耗时与上次结果。
+     * 扫描失败时阶段详情会保留失败原因。扫描服务缺失时只返回一行“扫描服务不可用”。</p>
      *
      * @return 状态文本；永不抛出异常
      */
@@ -96,10 +117,13 @@ public final class CommandService {
             }
 
             long percent = Math.round(progress.fraction() * 100.0D);
-            List<String> lines = new ArrayList<>(5);
+            List<String> lines = new ArrayList<>(6);
             lines.add("扫描状态: " + progress.phase().label());
             lines.add("进度    : " + progress.processed() + "/" + progress.total() + " (" + percent + "%)");
             lines.add("运行中  : " + (progress.isRunning() ? "是" : "否"));
+            if (!progress.detail().isBlank()) {
+                lines.add("详情    : " + progress.detail());
+            }
             appendLastScanLines(lines);
             return CommandResult.ok(lines);
         } catch (RuntimeException e) {
@@ -120,7 +144,9 @@ public final class CommandService {
             if (scanManager.isRunning()) {
                 return CommandResult.failure(DUPLICATE_SCAN);
             }
-            boolean started = scanManager.requestScan();
+            boolean started = scanRequestAction == null
+                    ? scanManager.requestScan()
+                    : scanRequestAction.getAsBoolean();
             if (!started) {
                 return CommandResult.failure(DUPLICATE_SCAN);
             }

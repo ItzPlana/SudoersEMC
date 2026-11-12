@@ -250,12 +250,15 @@ generateReports = true
 不会放宽配置合法性。`OverflowProtection.Settings` 即使关闭也会构造采样器并强制这些不变量，
 因此校验器必须在关闭时继续拒绝非法区间，否则非法配置会在组件重建时抛异常。
 
-接线方式：`SudoersemcConfig.onConfigLoading` / `onConfigReloading` 会从当前 Forge 值构造
-`ConfigValidator.Values`，调用 `ConfigValidator.validate(...)`，再交给
-`ConfigWatcher.fireReload(...)`。校验通过时重建并缓存不可变快照（`overflowSettings()` 返回该
-快照）；失败时 `fireReload` 不通知监听器，上一份有效快照继续生效，首次加载即非法时使用内置
-安全默认值。事件可能由配置加载线程触发，处理器只读取配置并交换 volatile 不可变快照，不访问
-服务器或世界状态。
+接线方式：`SudoersemcConfig.onConfigLoading` / `onConfigReloading` 在 `SNAPSHOT_LOCK` 内
+一次性读取全部运行时消费键，构造 `ConfigValidator.Values` 并调用 `ConfigValidator.validate(...)`；
+校验通过后发布带 generation 的不可变 `RuntimeConfigSnapshot`，再交给 `ConfigWatcher.fireReload(...)`。
+配置事件监听器只把重建请求调度到服务器线程（`MinecraftServer.execute`），不直接替换组件。
+`Sudoersemc.rebuildRuntimeFromConfig` 在 `RUNTIME_LOCK` 内检查扫描状态并一次性发布新的
+`ScanPipeline` / `ScanManager` / `CommandService`；所有组件只消费同一份快照，不会混用两个配置
+版本。扫描进行中返回 `DEFER`，扫描结束后由服务器 tick 重试；命令重载与 `requestScan` 共用同一
+把运行时锁，旧调度器会被 `retire()`，不会留下仍可启动扫描的孤儿 manager。校验失败时
+`fireReload` 不通知监听器，上一份有效快照继续生效；首次加载即非法时使用内置保守默认快照。
 
 ### 警告条件
 

@@ -3,7 +3,9 @@ package com.itzplana.sudoersemc;
 import com.itzplana.sudoersemc.command.CommandService;
 import com.itzplana.sudoersemc.command.SudoemcCommands;
 import com.itzplana.sudoersemc.config.ConfigValidationResult;
+import com.itzplana.sudoersemc.config.ConfigWatcher;
 import com.itzplana.sudoersemc.config.ReloadDecision;
+import com.itzplana.sudoersemc.config.RuntimeConfigSnapshot;
 import com.itzplana.sudoersemc.config.SudoersemcConfig;
 import com.itzplana.sudoersemc.diagnostic.ReportManager;
 import com.itzplana.sudoersemc.diagnostic.SmokeTestHook;
@@ -29,7 +31,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.function.BooleanSupplier;
 import net.minecraft.server.MinecraftServer;
-import net.minecraftforge.common.ForgeConfigSpec;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.RegisterCommandsEvent;
 import net.minecraftforge.event.TickEvent;
@@ -37,6 +38,7 @@ import net.minecraftforge.event.server.ServerStartedEvent;
 import net.minecraftforge.event.server.ServerStoppingEvent;
 import net.minecraftforge.eventbus.api.IEventBus;
 import net.minecraftforge.fml.common.Mod;
+import net.minecraftforge.fml.event.config.ModConfigEvent;
 import net.minecraftforge.fml.event.lifecycle.FMLCommonSetupEvent;
 import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
 import net.minecraftforge.server.ServerLifecycleHooks;
@@ -65,7 +67,30 @@ public final class Sudoersemc {
     private static volatile OverflowResetLog overflowResetLog;
     private static volatile ReportManager reportManager;
     private static volatile CommandService commandService;
+
+    /**
+     * 运行时组件替换与扫描请求共用的锁。
+     *
+     * <p>重建在“检查扫描状态 → 发布新组件 → 退役旧调度器”期间持有本锁；
+     * {@link #requestScanSynchronized()} 在同一把锁内完成“检查当前调度器 → 请求扫描”，
+     * 因此不会出现命令线程在旧 manager 上启动扫描后，重建把旧 manager 遗弃的窗口。</p>
+     */
+    private static final Object RUNTIME_LOCK = new Object();
+
+    /** 配置快照监听器；只在完整配置通过校验后触发。 */
+    private static final ConfigWatcher CONFIG_WATCHER = SudoersemcConfig.configWatcher();
+
+    static {
+        CONFIG_WATCHER.register(result -> scheduleRuntimeRebuild("config-event"));
+    }
+
     private static volatile boolean pendingReload;
+    private static volatile boolean pendingReloadFromCommand;
+
+    /** 已应用到运行时组件的快照代次，用于去重同一配置事件产生的多次重建请求。 */
+    private static volatile long appliedSnapshotGeneration;
+
+    private static volatile ReloadDecision lastReloadDecision = ReloadDecision.REJECT;
 
     public Sudoersemc() {
         IEventBus modEventBus = FMLJavaModLoadingContext.get().getModEventBus();
@@ -79,6 +104,9 @@ public final class Sudoersemc {
 
         // 必须在构造阶段注册，Forge 之后才会加载配置。
         SudoersemcConfig.register();
+        // 配置类的 loading/reloading 监听器先捕获快照并更新校验结果；本监听器再把
+        // 运行时重建调度回服务器线程。
+        modEventBus.addListener(Sudoersemc::onModConfigEvent);
 
         LOGGER.info("SudoersEMC is loading");
     }
@@ -108,17 +136,11 @@ public final class Sudoersemc {
             }
 
             reportManager = new ReportManager();
-            ScanPipeline pipeline = createScanPipeline(store, stateStore, reportManager, overflowLog);
-            scanPipeline = pipeline;
-
-            scanManager = createScanManagerIfEnabled(pipeline, SudoersemcConfig.GENERAL_ENABLED::get);
-            commandService = new CommandService(
-                    scanManager,
-                    reportManager,
-                    store,
-                    stateStore,
-                    Sudoersemc::reloadConfig);
-            SudoemcCommands.setService(commandService);
+            ReloadDecision initial = rebuildRuntimeFromConfig("common-setup");
+            if (initial == ReloadDecision.REJECT) {
+                LOGGER.warn("SudoersEMC 初始配置未通过校验，已使用保守默认值启动；"
+                        + "修正配置后可通过 /sudoemc reload 或配置事件热重载");
+            }
 
             LOGGER.info("SudoersEMC common setup complete ({} generated entries loaded)", store.size());
         });
@@ -137,93 +159,59 @@ public final class Sudoersemc {
      * @param overflowLog   溢出审计日志；{@code null} 时新建一个仅本次使用的实例
      * @return 可直接交给扫描调度器使用的管线
      */
-    private static ScanPipeline createScanPipeline(GeneratedEntryStore store,
-                                                   ScanStateStore stateStore,
-                                                   ReportManager reportManager,
-                                                   @Nullable OverflowResetLog overflowLog) {
-        OverflowProtection.Settings overflowSettings;
-        try {
-            overflowSettings = SudoersemcConfig.overflowSettings();
-        } catch (RuntimeException e) {
-            // 配置尚未加载或跨字段校验失败时，使用自带默认值。
-            LOGGER.warn("SudoersEMC 无法读取溢出保护配置，使用默认值", e);
-            overflowSettings = new OverflowProtection.Settings();
-        }
+    private static RuntimeComponents createRuntimeComponents(GeneratedEntryStore store,
+                                                              ScanStateStore stateStore,
+                                                              ReportManager reports,
+                                                              @Nullable OverflowResetLog overflowLog,
+                                                              RuntimeConfigSnapshot snapshot) {
         OverflowResetLog auditLog = overflowLog == null ? new OverflowResetLog() : overflowLog;
         OverflowPipeline overflowPipeline = new OverflowPipeline(
-                new OverflowProtection(overflowSettings),
+                new OverflowProtection(snapshot.overflowSettings()),
                 auditLog);
-
-        LargeDropProtection.Settings dropSettings;
-        try {
-            dropSettings = new LargeDropProtection.Settings(
-                    SudoersemcConfig.SAFETY_LARGE_DROP_PROTECTION.get(),
-                    sanitizeMaxAllowedDropRatio(
-                            SudoersemcConfig.SAFETY_MAX_ALLOWED_DROP_RATIO.get()),
-                    Set.of(),
-                    Set.of());
-        } catch (RuntimeException e) {
-            LOGGER.warn("SudoersEMC 无法读取大幅降价保护配置，使用默认值", e);
-            dropSettings = LargeDropProtection.Settings.defaults();
-        }
-        LargeDropProtection dropProtection = new LargeDropProtection(dropSettings);
-
-        boolean protectCreativeOnly;
-        try {
-            protectCreativeOnly = SudoersemcConfig.SAFETY_PROTECT_CREATIVE_ONLY_ITEMS.get();
-        } catch (RuntimeException e) {
-            LOGGER.warn("SudoersEMC 无法读取创造物品保护配置，默认启用保护", e);
-            protectCreativeOnly = true;
-        }
-        CreativeItemProtection creativeProtection = new CreativeItemProtection(
-                new CreativeItemProtection.Settings(
-                        protectCreativeOnly, Set.of(), Map.of(), Set.of()));
-
-        PricingSettings pricingSettings;
-        try {
-            pricingSettings = new PricingSettings(
-                    SudoersemcConfig.FALLBACK_USE_TAG_PRICING.get(),
-                    SudoersemcConfig.FALLBACK_USE_RARITY_PRICING.get(),
-                    true,
-                    SudoersemcConfig.FALLBACK_USE_FALLBACK_FOR_UNSOLVABLE.get(),
-                    PricingSettings.DEFAULT_GENERIC_FALLBACK_VALUE);
-        } catch (RuntimeException e) {
-            LOGGER.warn("SudoersEMC 无法读取兜底定价配置，使用默认值", e);
-            pricingSettings = PricingSettings.defaults();
-        }
-        FallbackPricing fallbackPricing = FallbackPricing.withDefaults(pricingSettings);
-
-        SolveSettings solveSettings;
-        try {
-            solveSettings = new SolveSettings(
-                    Math.max(1, SudoersemcConfig.RECIPE_MAX_RECIPE_PASSES.get()),
-                    SudoersemcConfig.RECIPE_ALLOW_RECIPE_VALUE_INCREASE.get(),
-                    SolveSettings.DEFAULT_MINIMUM_EMC,
-                    SolveSettings.DEFAULT_MAX_ALTERNATIVE_COSTS);
-        } catch (RuntimeException e) {
-            LOGGER.warn("SudoersEMC 无法读取配方求解配置，使用默认值", e);
-            solveSettings = SolveSettings.defaults();
-        }
+        LargeDropProtection dropProtection =
+                new LargeDropProtection(snapshot.dropProtectionSettings());
+        CreativeItemProtection creativeProtection =
+                new CreativeItemProtection(snapshot.creativeProtectionSettings());
+        FallbackPricing fallbackPricing = FallbackPricing.withDefaults(snapshot.pricingSettings());
 
         ScanPipeline pipeline = new ScanPipeline(
                 store,
                 stateStore,
-                reportManager,
+                reports,
                 dropProtection,
                 creativeProtection,
                 overflowPipeline,
                 fallbackPricing,
-                solveSettings);
+                snapshot.solveSettings());
         pipeline.setEmcProvider(OptionalIntegrationManager.provider().orElse(null));
 
-        // 使用已经通过 ConfigValidator 校验的不可变快照，避免二次读取原始配置造成
-        // 事实来源漂移；配置未加载时该快照已是安全默认值（OWNED_ONLY + false）。
-        applyOverflowSettings(pipeline, overflowSettings);
-        applyRuntimeSwitches(
-                pipeline,
-                readBoolean("recipe.solveRecipes", SudoersemcConfig.RECIPE_SOLVE_RECIPES, true),
-                readBoolean("diagnostic.generateReports", SudoersemcConfig.DIAGNOSTIC_GENERATE_REPORTS, true));
-        return pipeline;
+        applyOverflowSettings(pipeline, snapshot.overflowSettings());
+        applyRuntimeSwitches(pipeline, snapshot.solveRecipes(), snapshot.generateReports());
+
+        ScanManager manager;
+        if (snapshot.generalEnabled()) {
+            manager = createScanManager(
+                    pipeline, snapshot.itemsPerTick(), snapshot.adaptiveBatchSizing());
+        } else {
+            LOGGER.info("SudoersEMC [general] enabled = false：不创建扫描调度器，自动扫描已关闭");
+            manager = null;
+        }
+        CommandService service = new CommandService(
+                manager,
+                reports,
+                store,
+                stateStore,
+                Sudoersemc::reloadConfig,
+                Sudoersemc::requestScanSynchronized);
+        return new RuntimeComponents(pipeline, manager, service);
+    }
+
+    /**
+     * 一组尚未发布的运行时组件。调用方在全部构建成功后一次性发布。
+     */
+    private record RuntimeComponents(ScanPipeline pipeline,
+                                     @Nullable ScanManager scanManager,
+                                     CommandService commandService) {
     }
 
     /**
@@ -263,23 +251,6 @@ public final class Sudoersemc {
     }
 
     /**
-     * 读取一个布尔配置开关；读取失败时记录警告并返回给定默认值。
-     *
-     * @param key      配置键名，仅用于日志
-     * @param value    Forge 配置值
-     * @param fallback 读取失败时的默认值
-     * @return 配置值或默认值
-     */
-    private static boolean readBoolean(String key, ForgeConfigSpec.BooleanValue value, boolean fallback) {
-        try {
-            return value.get();
-        } catch (RuntimeException e) {
-            LOGGER.warn("SudoersEMC 无法读取 {} 配置，使用默认值 {}", key, fallback, e);
-            return fallback;
-        }
-    }
-
-    /**
      * 把配置中的最大允许降幅夹到 {@link LargeDropProtection.Settings} 接受的 {@code (0.0, 1.0]} 区间。
      *
      * <p>配置边界已经拒绝 0.0，但旧配置文件、手工编辑或未来迁移仍可能绕过边界检查。这里再做一次
@@ -297,27 +268,20 @@ public final class Sudoersemc {
     }
 
     /**
-     * 创建扫描调度器并接入真实管线。
+     * 用已校验快照中的性能参数创建扫描调度器并接入真实管线。
      *
      * <p>接线采用“采集暂存、应用取出”的方式：采集回调在服务器线程完成注册表与配方读取后把
      * {@link PipelineSnapshot} 暂存到管线中，应用回调再取出求解并写入存储。这样既满足
      * {@link ScanManager} 跨 tick 的阶段划分，也避免闭包数组带来的隐式状态。</p>
      *
-     * @param pipeline 真实扫描管线
+     * @param pipeline      真实扫描管线
+     * @param itemsPerTick  已校验的每 tick 处理上限
+     * @param adaptive      已校验的自适应批量开关
      * @return 已接线的扫描调度器
      */
-    private static ScanManager createScanManager(ScanPipeline pipeline) {
-        int itemsPerTick;
-        boolean adaptive;
-        try {
-            itemsPerTick = SudoersemcConfig.PERFORMANCE_ITEMS_PER_TICK.get();
-            adaptive = SudoersemcConfig.PERFORMANCE_ADAPTIVE_BATCH_SIZING.get();
-        } catch (RuntimeException e) {
-            // 配置尚未加载时退回保守默认值，绝不因为读取配置失败而阻止模组启动。
-            LOGGER.warn("SudoersEMC 无法读取性能配置，使用默认值 100 / 自适应开启", e);
-            itemsPerTick = 100;
-            adaptive = true;
-        }
+    private static ScanManager createScanManager(ScanPipeline pipeline,
+                                                 int itemsPerTick,
+                                                 boolean adaptive) {
         BatchProcessor processor = new BatchProcessor(Math.max(1, itemsPerTick), adaptive);
         return new ScanManager(
                 processor,
@@ -381,8 +345,8 @@ public final class Sudoersemc {
     /**
      * 按 {@code [general] enabled} 决定是否创建扫描调度器。
      *
-     * <p>配置尚未加载或读取失败时沿用与 {@link #createScanManager(ScanPipeline)} 相同的容错策略：
-     * 记录警告并按启用处理，绝不因为读取开关失败而让模组失去扫描能力。</p>
+     * <p>配置尚未加载或读取失败时按启用处理，并使用保守的性能默认值创建调度器；
+     * 绝不因为读取开关失败而让模组失去扫描能力。</p>
      *
      * @param enabledSupplier 开关读取器；测试可注入固定值
      * @return 启用时返回新的调度器，关闭时返回 {@code null}
@@ -409,7 +373,7 @@ public final class Sudoersemc {
             LOGGER.info("SudoersEMC [general] enabled = false：不创建扫描调度器，自动扫描已关闭");
             return null;
         }
-        return createScanManager(pipeline);
+        return createScanManager(pipeline, 100, true);
     }
 
     /**
@@ -498,7 +462,11 @@ public final class Sudoersemc {
      * 已有扫描在进行中时保持现状。</p>
      */
     private void requestStartupScanIfConfigured() {
-        if (!shouldRequestScanOnStart(SudoersemcConfig.GENERAL_ALWAYS_RESCAN::get)) {
+        RuntimeConfigSnapshot active = SudoersemcConfig.activeSnapshot();
+        boolean alwaysRescan = active != null
+                ? active.alwaysRescan()
+                : shouldRequestScanOnStart(SudoersemcConfig.GENERAL_ALWAYS_RESCAN::get);
+        if (!alwaysRescan) {
             return;
         }
         ScanManager manager = scanManager;
@@ -506,7 +474,7 @@ public final class Sudoersemc {
             LOGGER.info("SudoersEMC [general] alwaysRescan = true，但扫描调度器未启用，跳过启动扫描");
             return;
         }
-        if (manager.requestScan()) {
+        if (requestScanSynchronized()) {
             LOGGER.info("SudoersEMC [general] alwaysRescan = true：已请求启动扫描");
         } else {
             LOGGER.info("SudoersEMC [general] alwaysRescan = true，但已有扫描在进行中，跳过启动扫描");
@@ -517,62 +485,243 @@ public final class Sudoersemc {
      * 处理 {@code /sudoemc reload}：重读配置文件并重建受配置影响的运行时组件。
      *
      * <p>扫描进行中时不读取文件，只登记延迟重载；扫描结束后由服务器 tick 调用
-     * {@link #applyConfigReload()}。这样可以避免在扫描中途替换 {@link ScanManager}
-     * 导致进度或取消标志丢失。</p>
+     * {@link #applyConfigReload()}。命令入口与重建共享 {@link #RUNTIME_LOCK}，不再仅依赖
+     * 方法级 {@code synchronized}。</p>
      *
      * @return 命令层用于生成回执的处理决策
      */
-    private static synchronized ReloadDecision reloadConfig() {
-        ScanManager manager = scanManager;
-        if (manager != null && manager.isRunning()) {
-            pendingReload = true;
-            LOGGER.info("SudoersEMC 扫描进行中，配置重载已延后到扫描结束");
-            return ReloadDecision.DEFER;
+    private static ReloadDecision reloadConfig() {
+        synchronized (RUNTIME_LOCK) {
+            ScanManager manager = scanManager;
+            if (manager != null && manager.isRunning()) {
+                pendingReload = true;
+                pendingReloadFromCommand = true;
+                lastReloadDecision = ReloadDecision.DEFER;
+                LOGGER.info("SudoersEMC 扫描进行中，配置重载已延后到扫描结束");
+                return ReloadDecision.DEFER;
+            }
         }
         return applyConfigReload();
     }
 
     /**
-     * 从磁盘重读配置，校验通过后重建扫描管线、调度器与命令服务。
+     * 从磁盘重读配置，校验通过后使用单一快照重建扫描管线、调度器与命令服务。
      *
-     * <p>配置读取或跨字段校验失败时不会替换任何运行时组件，返回
-     * {@link ReloadDecision#REJECT}；成功时使用新配置重建 {@link ScanPipeline}、{@link ScanManager}
-     * 并重新注入 {@link CommandService}，同时清理旧调度器，避免残留取消标志。</p>
+     * <p>配置读取、跨字段校验或快照捕获失败时不会替换任何运行时组件，返回
+     * {@link ReloadDecision#REJECT}；成功时 {@link #rebuildRuntimeFromConfig(String)} 在
+     * {@link #RUNTIME_LOCK} 内一次性发布新组件并退役旧调度器。</p>
      */
-    private static synchronized ReloadDecision applyConfigReload() {
-        pendingReload = false;
+    private static ReloadDecision applyConfigReload() {
         ConfigValidationResult validation = SudoersemcConfig.reloadFromDisk();
         if (!validation.valid()) {
+            pendingReload = false;
+            pendingReloadFromCommand = false;
+            lastReloadDecision = ReloadDecision.REJECT;
             LOGGER.warn("SudoersEMC 配置重载被拒绝，保留上一份有效配置：\n{}", validation.format());
             return ReloadDecision.REJECT;
         }
+        ReloadDecision decision = rebuildRuntimeFromConfig("command");
+        if (decision == ReloadDecision.REJECT) {
+            pendingReload = false;
+            pendingReloadFromCommand = false;
+        }
+        return decision;
+    }
 
-        try {
-            ScanPipeline rebuiltPipeline = createScanPipeline(
-                    entryStore, scanStateStore, reportManager, overflowResetLog);
-            ScanManager rebuilt = createScanManagerIfEnabled(
-                    rebuiltPipeline, SudoersemcConfig.GENERAL_ENABLED::get);
-            CommandService rebuiltService = new CommandService(
-                    rebuilt,
-                    reportManager,
-                    entryStore,
-                    scanStateStore,
-                    Sudoersemc::reloadConfig);
-            ScanManager previous = scanManager;
-            scanPipeline = rebuiltPipeline;
-            scanManager = rebuilt;
-            commandService = rebuiltService;
-            SudoemcCommands.setService(rebuiltService);
-            if (previous != null) {
-                previous.cancel();
-                previous.reset();
-            }
-            LOGGER.info("SudoersEMC 配置已重新加载并生效");
-            return ReloadDecision.APPLY_NOW;
-        } catch (RuntimeException failure) {
-            LOGGER.warn("SudoersEMC 应用新配置失败，保留旧运行时组件", failure);
+    /**
+     * 依据当前已校验快照重建全部运行时组件。
+     *
+     * <p>调用者可以是 common setup、命令线程或 {@code server.execute(...)} 派发的服务器
+     * 线程任务。组件先在锁外从不可变快照构建；随后在 {@link #RUNTIME_LOCK} 内重新检查扫描
+     * 状态并一次性发布。扫描进行中时只登记延迟重建，绝不替换正在 tick 的调度器。</p>
+     *
+     * @param reason 触发原因，仅用于日志
+     * @return 立即生效、延迟到扫描结束或拒绝
+     */
+    static ReloadDecision rebuildRuntimeFromConfig(String reason) {
+        String label = reason == null || reason.isBlank() ? "unknown" : reason;
+        GeneratedEntryStore store = entryStore;
+        ScanStateStore stateStore = scanStateStore;
+        ReportManager reports = reportManager;
+        if (store == null || stateStore == null || reports == null) {
+            LOGGER.debug("SudoersEMC 配置重建跳过（{}）：common setup 尚未完成", label);
+            lastReloadDecision = ReloadDecision.REJECT;
             return ReloadDecision.REJECT;
         }
+
+        ResolvedSnapshot resolved = resolveSnapshot(label);
+        RuntimeConfigSnapshot snapshot = resolved.snapshot();
+
+        RuntimeComponents components;
+        try {
+            components = createRuntimeComponents(
+                    store, stateStore, reports, overflowResetLog, snapshot);
+        } catch (RuntimeException failure) {
+            LOGGER.warn("SudoersEMC 构建运行时组件失败（{}），保留旧组件", label, failure);
+            lastReloadDecision = ReloadDecision.REJECT;
+            return ReloadDecision.REJECT;
+        }
+
+        synchronized (RUNTIME_LOCK) {
+            ScanManager current = scanManager;
+            if (current != null && current.isRunning()) {
+                pendingReload = true;
+                lastReloadDecision = ReloadDecision.DEFER;
+                LOGGER.info("SudoersEMC 扫描进行中，配置重建已延后（{}），将在扫描结束后应用", label);
+                return ReloadDecision.DEFER;
+            }
+            if (scanPipeline != null && snapshot.generation() <= appliedSnapshotGeneration) {
+                LOGGER.debug("SudoersEMC 配置快照 generation={} 不新于已应用 generation={}，"
+                                + "跳过重复或过期重建（{}）",
+                        snapshot.generation(), appliedSnapshotGeneration, label);
+                pendingReload = false;
+                pendingReloadFromCommand = false;
+                return lastReloadDecision == ReloadDecision.REJECT
+                        ? ReloadDecision.REJECT : ReloadDecision.APPLY_NOW;
+            }
+
+            scanPipeline = components.pipeline();
+            scanManager = components.scanManager();
+            commandService = components.commandService();
+            SudoemcCommands.setService(commandService);
+            appliedSnapshotGeneration = snapshot.generation();
+            pendingReload = false;
+            pendingReloadFromCommand = false;
+            if (current != null) {
+                current.retire();
+            }
+            lastReloadDecision = resolved.valid()
+                    ? ReloadDecision.APPLY_NOW : ReloadDecision.REJECT;
+            if (resolved.valid()) {
+                LOGGER.info("SudoersEMC 运行时组件已重建（{}，generation={}）",
+                        label, snapshot.generation());
+            } else {
+                LOGGER.warn("SudoersEMC 初始配置无效，已使用保守默认快照构建运行时组件（{}）", label);
+            }
+            return lastReloadDecision;
+        }
+    }
+
+    /**
+     * 配置事件到达后的重建入口。
+     *
+     * <p>此方法可能运行在 Forge 配置加载线程，只负责把重建请求投递到服务器线程；
+     * 服务器不存在时设置挂起标记，由首次 tick 处理。</p>
+     */
+    private static void scheduleRuntimeRebuild(String reason) {
+        String label = reason == null || reason.isBlank() ? "config-event" : reason;
+        if (entryStore == null || scanStateStore == null || reportManager == null) {
+            LOGGER.debug("SudoersEMC 配置事件早于 common setup（{}），跳过重建", label);
+            return;
+        }
+        MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
+        if (server == null) {
+            pendingReload = true;
+            pendingReloadFromCommand = false;
+            LOGGER.info("SudoersEMC 服务器尚未就绪，配置重建已挂起（{}）", label);
+            return;
+        }
+        server.execute(() -> {
+            if (!server.isRunning()) {
+                LOGGER.debug("SudoersEMC 服务器已停止，跳过挂起的配置重建（{}）", label);
+                return;
+            }
+            try {
+                rebuildRuntimeFromConfig(label);
+            } catch (RuntimeException failure) {
+                LOGGER.warn("SudoersEMC 服务器线程配置重建失败（{}），保留旧组件", label, failure);
+            }
+        });
+    }
+
+    /**
+     * 处理 {@code ModConfigEvent.Loading/Reloading}。
+     *
+     * <p>{@link SudoersemcConfig} 的监听器先完成快照捕获与校验；这里只读取校验结果并在
+     * 通过时调度服务器线程重建。配置事件本身永远不会直接替换运行时组件。</p>
+     */
+    private static void onModConfigEvent(ModConfigEvent event) {
+        if (event == null || event.getConfig() == null
+                || event.getConfig().getSpec() != SudoersemcConfig.SPEC) {
+            return;
+        }
+        if (!SudoersemcConfig.lastValidationResult().valid()) {
+            LOGGER.warn("SudoersEMC 配置事件校验未通过，保留现有运行时组件");
+            return;
+        }
+        scheduleRuntimeRebuild("config-event");
+    }
+
+    /**
+     * 在扫描结束后执行一次延迟重建。
+     *
+     * <p>命令触发的延迟重载需要重新读取磁盘；配置事件触发的延迟重载直接使用已经捕获并
+     * 校验过的快照。</p>
+     */
+    private static void processPendingReload() {
+        if (!pendingReload) {
+            return;
+        }
+        ScanManager manager = scanManager;
+        if (manager != null && manager.isRunning()) {
+            return;
+        }
+        ReloadDecision decision = pendingReloadFromCommand
+                ? applyConfigReload()
+                : rebuildRuntimeFromConfig("pending-scan-end");
+        if (decision == ReloadDecision.REJECT) {
+            pendingReload = false;
+            pendingReloadFromCommand = false;
+            LOGGER.warn("SudoersEMC 延迟配置重载失败，已清除待处理标记并继续使用旧组件");
+        }
+    }
+
+    /**
+     * 在运行时锁内请求一次扫描。
+     *
+     * <p>重建在发布新组件期间持有同一把锁，因此本方法不会在即将被退役的旧 manager 上启动
+     * 扫描；旧 manager 的 {@link ScanManager#retire()} 也会拒绝之后到达的请求。</p>
+     *
+     * @return 成功启动返回 {@code true}；没有调度器或已有扫描返回 {@code false}
+     */
+    static boolean requestScanSynchronized() {
+        synchronized (RUNTIME_LOCK) {
+            ScanManager current = scanManager;
+            if (current == null || current.isRunning()) {
+                return false;
+            }
+            boolean started = current.requestScan();
+            if (started && scanManager != current) {
+                current.cancel();
+                return false;
+            }
+            return started;
+        }
+    }
+
+    /**
+     * 解析本次重建应使用的单一快照。
+     *
+     * <p>优先使用配置事件已经发布的有效快照；首次加载尚未产生快照时尝试现场捕获一次，
+     * 仍失败则退回保守默认值。无论哪条路径，调用方拿到的都是一个完整不可变快照。</p>
+     */
+    private static ResolvedSnapshot resolveSnapshot(String reason) {
+        RuntimeConfigSnapshot snapshot = SudoersemcConfig.activeSnapshot();
+        if (snapshot != null) {
+            return new ResolvedSnapshot(snapshot, true);
+        }
+        SudoersemcConfig.SnapshotCapture capture = SudoersemcConfig.captureSnapshot();
+        if (capture.hasSnapshot()) {
+            return new ResolvedSnapshot(capture.snapshot(), true);
+        }
+        LOGGER.warn("SudoersEMC 没有可用配置快照（{}），使用保守默认值构建运行时组件", reason);
+        return new ResolvedSnapshot(RuntimeConfigSnapshot.safeDefaults(), false);
+    }
+
+    /**
+     * 一次快照解析结果；{@code valid=false} 表示使用了保守默认值。
+     */
+    private record ResolvedSnapshot(RuntimeConfigSnapshot snapshot, boolean valid) {
     }
 
     private void onRegisterCommands(RegisterCommandsEvent event) {
@@ -591,12 +740,16 @@ public final class Sudoersemc {
         if (pendingReload) {
             ScanManager current = scanManager;
             if (current == null || !current.isRunning()) {
-                applyConfigReload();
+                processPendingReload();
             }
         }
     }
 
     private void onServerStarted(ServerStartedEvent event) {
+        // 配置事件可能早于服务器就绪；先应用挂起重载，再用新组件决定是否自动扫描。
+        if (pendingReload) {
+            processPendingReload();
+        }
         ScanManager manager = scanManager;
         if (manager != null) {
             manager.reset();
@@ -611,9 +764,12 @@ public final class Sudoersemc {
                     OptionalIntegrationManager.isProjectEAvailable() ? "detected" : "absent");
         }
 
-        StartupScanSettings scanSettings = StartupScanSettings.read(
-                SudoersemcConfig.GENERAL_ENABLED::get,
-                SudoersemcConfig.GENERAL_ALWAYS_RESCAN::get);
+        RuntimeConfigSnapshot active = SudoersemcConfig.activeSnapshot();
+        StartupScanSettings scanSettings = active == null
+                ? StartupScanSettings.read(
+                        SudoersemcConfig.GENERAL_ENABLED::get,
+                        SudoersemcConfig.GENERAL_ALWAYS_RESCAN::get)
+                : new StartupScanSettings(active.generalEnabled(), active.alwaysRescan());
         boolean enabled = scanSettings.enabled();
         boolean alwaysRescan = scanSettings.alwaysRescan();
 
@@ -627,7 +783,7 @@ public final class Sudoersemc {
                 enabled, alwaysRescan, lastScanEpochMillis, generatedEntryCount)) {
             if (manager == null) {
                 LOGGER.warn("SudoersEMC 自动扫描已请求，但扫描调度器尚未就绪（common setup 未完成）");
-            } else if (manager.requestScan()) {
+            } else if (requestScanSynchronized()) {
                 LOGGER.info("SudoersEMC 自动扫描已请求（alwaysRescan={}，上次扫描={}，已生成条目={}）",
                         alwaysRescan, lastScanEpochMillis, generatedEntryCount);
             } else {
@@ -656,6 +812,7 @@ public final class Sudoersemc {
             resetLog.save();
         }
         pendingReload = false;
+        pendingReloadFromCommand = false;
         // 不保留指向旧世界的命令服务；下一次 ServerStartedEvent 会重新注入。
         SudoemcCommands.setService(null);
     }

@@ -80,6 +80,27 @@ class CommandServiceTest {
     }
 
     @Test
+    void statusShowsFailureDetail() {
+        ScanManager manager = new ScanManager(
+                new BatchProcessor(1, false),
+                () -> {
+                    throw new IllegalStateException("采集失败原因");
+                },
+                data -> { },
+                1_000_000L);
+        assertTrue(manager.requestScan());
+        manager.tick();
+
+        CommandService service = new CommandService(manager, null, null, null);
+        CommandResult result = service.status();
+
+        assertTrue(result.success());
+        assertTrue(result.joinLines().contains("扫描状态: 失败"), result.joinLines());
+        assertTrue(result.joinLines().contains("详情    : 采集失败原因"),
+                "FAILED 原因必须通过 /sudoemc status 的详情行保留");
+    }
+
+    @Test
     void statusUsesScanStateStoreForLastScanSummary() {
         ScanStateStore stateStore = new ScanStateStore(tempDir.resolve(ScanStateStore.FILE_NAME));
         stateStore.update(ScanFingerprint.of(null, null, null, null, null), 1234L, 56, 7);

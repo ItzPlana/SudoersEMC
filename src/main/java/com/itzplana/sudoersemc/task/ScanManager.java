@@ -237,6 +237,7 @@ public final class ScanManager {
 
     private volatile ScanProgress progress = ScanProgress.idle();
     private volatile boolean cancelRequested;
+    private volatile boolean retired;
 
     private SnapshotData snapshot;
     private CollectSession collectSession;
@@ -309,7 +310,7 @@ public final class ScanManager {
      * @return 成功开始返回 {@code true}；已有扫描在运行或处于 tick 回调内返回 {@code false}
      */
     public boolean requestScan() {
-        if (ticking || isRunning()) {
+        if (retired || ticking || isRunning()) {
             return false;
         }
         cancelRequested = false;
@@ -373,7 +374,7 @@ public final class ScanManager {
      * 细节字段保存异常消息（无消息时退化为异常类名）。本方法不会向外传播这些异常。</p>
      */
     public void tick() {
-        if (ticking) {
+        if (retired || ticking) {
             return;
         }
         ScanProgress current = progress;
@@ -446,6 +447,26 @@ public final class ScanManager {
         collectedFingerprint = null;
         lastBatchNanos = 0L;
         progress = ScanProgress.idle();
+    }
+
+    /**
+     * 标记本调度器已被配置重建取代，并清空扫描状态。
+     *
+     * <p>只允许由服务器线程在扫描不运行时调用。退役后的实例会拒绝后续
+     * {@link #requestScan()} 与 {@link #tick()}，防止旧 {@code CommandService} 引用在组件
+     * 发布后重新启动一个无人驱动的扫描。</p>
+     */
+    public void retire() {
+        retired = true;
+        cancel();
+        reset();
+    }
+
+    /**
+     * @return 本调度器是否已被配置重建退役
+     */
+    public boolean isRetired() {
+        return retired;
     }
 
     /**

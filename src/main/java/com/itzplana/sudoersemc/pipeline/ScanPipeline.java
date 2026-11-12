@@ -451,7 +451,7 @@ public final class ScanPipeline {
         long startedAtNanos = System.nanoTime();
 
         try {
-AppliedSeparation separation = applyOwnershipSeparation(data);
+            AppliedSeparation separation = applyOwnershipSeparation(data);
             data = separation.snapshot();
             SolveResult solveResult;
             if (solveRecipesEnabled) {
@@ -675,7 +675,7 @@ AppliedSeparation separation = applyOwnershipSeparation(data);
             if (fallback.isEmpty()) {
                 continue;
             }
-if (fallback.get().value() < minimumEmc) {
+            if (fallback.get().value() < minimumEmc) {
                 continue;
             }
             candidates.add(fallback.get());
@@ -846,7 +846,7 @@ if (fallback.get().value() < minimumEmc) {
     private void writeDiagnosticReport(PipelineSnapshot snapshot, SolveResult solveResult,
                                        int applied, int quarantined, int overflowResets,
                                        long durationMillis, boolean appliedToStore,
-Map<String, Long> sourceCounts, int refreshedOwned) {
+                                       Map<String, Long> sourceCounts, int refreshedOwned) {
         if (!generateReportsEnabled || reportManager == null) {
             return;
         }
