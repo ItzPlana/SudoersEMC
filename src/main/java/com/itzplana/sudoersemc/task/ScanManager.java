@@ -191,6 +191,20 @@ public final class ScanManager {
         default boolean usesAsyncSolve() {
             return false;
         }
+
+        /**
+         * 当前 tick 是否已经可以应用结果。
+         *
+         * <p>异步实现可以在后台求解完成前返回 {@code false}，使 {@link ScanManager} 跳过
+         * 应用前的指纹重算；求解完成后再返回 {@code true}，此时才校验输入是否在求解期间变化。
+         * 默认返回 {@code true}，表示同步应用每次调用前都应校验。</p>
+         *
+         * @param data 采集阶段产生的快照数据
+         * @return 可以应用时返回 {@code true}
+         */
+        default boolean isReadyToApply(SnapshotData data) {
+            return true;
+        }
     }
 
     /**
@@ -645,7 +659,11 @@ public final class ScanManager {
         if (data == null) {
             throw new IllegalStateException("应用阶段缺少快照数据");
         }
-        verifyFingerprintBeforeApply();
+        // 异步求解在完成前不重算完整输入指纹，避免在等待期间每个 tick 都对大型注册表排序哈希；
+        // 求解完成后再校验，仍能拦截求解期间的 /reload 或注册表变化。
+        if (applier.isReadyToApply(data)) {
+            verifyFingerprintBeforeApply();
+        }
         applier.apply(data);
         if (!applier.isComplete(data)) {
             progress = progress.advance(ScanPhase.APPLYING, 0, 0, "等待后台求解完成");

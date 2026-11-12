@@ -27,7 +27,9 @@ import org.slf4j.LoggerFactory;
  * Converts live Minecraft recipes into immutable {@link RecipeSnapshot}s.
  *
  * <p>Must run on the server thread. Every recipe is handled defensively: one broken or unsupported
- * recipe increments a counter instead of aborting the scan.</p>
+ * recipe increments a counter instead of aborting the scan. Failure to enumerate the recipe id
+ * collection itself is different: it aborts the scan with {@link IllegalStateException} because an
+ * empty id list would otherwise be indistinguishable from a successful empty scan.</p>
  *
  * <p><strong>Contract:</strong> {@link RecipeSnapshot#inputs()} contains only items that are
  * actually consumed. A recipe's station, tool or altar is never listed, so evaluators can sum every
@@ -69,8 +71,13 @@ public final class RecipeScanner {
      * <p>会话开始时只枚举一次配方 id，不会描述任何配方；之后每个 {@link ScanSession#step(int)}
      * 最多描述 {@code maxItems} 条配方。会话必须在服务器线程推进。</p>
      *
+     * <p><strong>失败语义：</strong>配方 id 枚举失败代表整个配方输入不可读取，必须让本次采集
+     * 失败而不是返回空列表；否则 {@code ScanManager} 会以 0 配方完成扫描并写入空配方指纹。
+     * 单条配方在 {@link #scanRecipe} 中失败仍然只增加 {@code failed} 计数，不影响其余配方。</p>
+     *
      * @param manager the active recipe manager
      * @return 新的分片扫描会话
+     * @throws IllegalStateException 无法枚举配方 id 时抛出
      */
     public ScanSession beginScan(RecipeManager manager) {
         Objects.requireNonNull(manager, "manager");
@@ -80,8 +87,8 @@ public final class RecipeScanner {
         try {
             ids = manager.getRecipeIds().toList();
         } catch (RuntimeException e) {
-            LOGGER.warn("Could not enumerate recipe ids", e);
-            ids = List.of();
+            LOGGER.error("Could not enumerate recipe ids", e);
+            throw new IllegalStateException("扫描采集失败：无法枚举配方 id", e);
         }
         return new ScanSession(this, manager, ids);
     }

@@ -4,8 +4,10 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import com.itzplana.sudoersemc.core.ItemKey;
+import java.util.Optional;
 import java.util.stream.Stream;
 import net.minecraft.core.NonNullList;
 import net.minecraft.core.registries.Registries;
@@ -16,6 +18,8 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.crafting.CraftingBookCategory;
 import net.minecraft.world.item.crafting.Ingredient;
+import net.minecraft.world.item.crafting.Recipe;
+import net.minecraft.world.item.crafting.RecipeManager;
 import net.minecraft.world.item.crafting.ShapedRecipe;
 import net.minecraft.world.item.crafting.ShapelessRecipe;
 import org.junit.jupiter.api.BeforeAll;
@@ -80,10 +84,56 @@ class RecipeScannerTest {
         assertNull(scanner.describe(recipe, RECIPE_ID),
                 "a getItems() failure must fail the whole recipe closed");
     }
+    @Test
+    void recipeIdEnumerationFailureAbortsInsteadOfReturningEmptyScan() {
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> scanner.beginScan(new ThrowingIdRecipeManager()));
+
+        assertTrueEnumeratingFailure(failure);
+    }
+
+    @Test
+    void singleRecipeFailureIncrementsFailedWithoutAborting() {
+        RecipeScanner.ScanResult result = scanner.scan(new OneBrokenRecipeManager());
+
+        assertEquals(0, result.recipes().size(),
+                "单条配方失败不得产生可用快照");
+        assertEquals(1, result.failed(),
+                "单条配方失败必须计入 failed，而不是把整次枚举降级为空");
+        assertEquals(1, result.total());
+    }
+
+    private static void assertTrueEnumeratingFailure(IllegalStateException failure) {
+        assertNotNull(failure.getMessage());
+        assertEquals(true, failure.getMessage().contains("无法枚举配方 id"),
+                "异常必须带可诊断的枚举失败原因，实际为 " + failure.getMessage());
+    }
+
+    /** RecipeManager whose id enumeration always fails. */
+    private static final class ThrowingIdRecipeManager extends RecipeManager {
+        @Override
+        public Stream<ResourceLocation> getRecipeIds() {
+            throw new IllegalStateException("broken recipe manager");
+        }
+    }
+
+    /** RecipeManager that exposes one id but fails when the recipe is looked up. */
+    private static final class OneBrokenRecipeManager extends RecipeManager {
+        @Override
+        public Stream<ResourceLocation> getRecipeIds() {
+            return Stream.of(RECIPE_ID);
+        }
+
+        @Override
+        public Optional<? extends Recipe<?>> byKey(ResourceLocation id) {
+            throw new IllegalStateException("broken recipe lookup");
+        }
+    }
 
     private static TagKey<Item> unboundTag() {
         return TagKey.create(Registries.ITEM, new ResourceLocation("sudoersemc_test", "unbound"));
     }
+
 
     private static ShapedRecipe shaped(int width, int height, Ingredient first, Ingredient second,
                                        ItemStack result) {
