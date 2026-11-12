@@ -11,6 +11,7 @@ import com.itzplana.sudoersemc.storage.ScanStateStore;
 import com.itzplana.sudoersemc.task.BatchProcessor;
 import com.itzplana.sudoersemc.task.ScanManager;
 import com.mojang.logging.LogUtils;
+import java.util.function.BooleanSupplier;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.RegisterCommandsEvent;
 import net.minecraftforge.event.TickEvent;
@@ -79,7 +80,7 @@ public final class Sudoersemc {
                 LOGGER.info("SudoersEMC wired its generated-value mapper into ProjectE");
             }
 
-            scanManager = createScanManager();
+            scanManager = createScanManagerIfEnabled(SudoersemcConfig.GENERAL_ENABLED::get);
             SudoemcCommands.setService(new CommandService(
                     scanManager,
                     new com.itzplana.sudoersemc.diagnostic.ReportManager(),
@@ -116,6 +117,80 @@ public final class Sudoersemc {
                 TICK_BUDGET_NANOS);
     }
 
+    /**
+     * 按 {@code [general] enabled} 决定是否创建扫描调度器。
+     *
+     * <p>配置尚未加载或读取失败时沿用与 {@link #createScanManager()} 相同的容错策略：
+     * 记录警告并按启用处理，绝不因为读取开关失败而让模组失去扫描能力。</p>
+     *
+     * @param enabledSupplier 开关读取器；测试可注入固定值
+     * @return 启用时返回新的调度器，关闭时返回 {@code null}
+     */
+    static ScanManager createScanManagerIfEnabled(BooleanSupplier enabledSupplier) {
+        boolean enabled = true;
+        try {
+            enabled = enabledSupplier.getAsBoolean();
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法读取 [general] enabled，按启用处理", e);
+        }
+        if (!enabled) {
+            LOGGER.info("SudoersEMC [general] enabled = false：不创建扫描调度器，自动扫描已关闭");
+            return null;
+        }
+        return createScanManager();
+    }
+
+    /**
+     * 按 {@code [general] alwaysRescan} 决定服务器启动时是否请求一次全量扫描。
+     *
+     * <p>读取失败时保守地按“不重扫”处理，避免配置异常导致意外的全量扫描。</p>
+     *
+     * @param alwaysRescanSupplier 开关读取器；测试可注入固定值
+     * @return 需要请求启动扫描时返回 {@code true}
+     */
+    static boolean shouldRequestScanOnStart(BooleanSupplier alwaysRescanSupplier) {
+        try {
+            return alwaysRescanSupplier.getAsBoolean();
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法读取 [general] alwaysRescan，按不重扫处理", e);
+            return false;
+        }
+    }
+
+    /**
+     * 停服时清理扫描调度器。未完成的扫描会被重置为空闲，避免下一个世界继续 tick
+     * 旧快照或旧回调。
+     *
+     * @param manager 当前调度器，可为 {@code null}
+     */
+    static void resetScanManager(ScanManager manager) {
+        if (manager != null) {
+            manager.reset();
+        }
+    }
+
+    /**
+     * 服务器启动后按 {@code [general] alwaysRescan} 请求扫描。
+     *
+     * <p>只有扫描调度器存在（即 {@code [general] enabled = true}）时才会真正提交请求；
+     * 已有扫描在进行中时保持现状。</p>
+     */
+    private void requestStartupScanIfConfigured() {
+        if (!shouldRequestScanOnStart(SudoersemcConfig.GENERAL_ALWAYS_RESCAN::get)) {
+            return;
+        }
+        ScanManager manager = scanManager;
+        if (manager == null) {
+            LOGGER.info("SudoersEMC [general] alwaysRescan = true，但扫描调度器未启用，跳过启动扫描");
+            return;
+        }
+        if (manager.requestScan()) {
+            LOGGER.info("SudoersEMC [general] alwaysRescan = true：已请求启动扫描");
+        } else {
+            LOGGER.info("SudoersEMC [general] alwaysRescan = true，但已有扫描在进行中，跳过启动扫描");
+        }
+    }
+
     private void onRegisterCommands(RegisterCommandsEvent event) {
         event.getDispatcher().register(SudoemcCommands.register());
         LOGGER.debug("SudoersEMC registered /sudoemc command tree");
@@ -139,9 +214,11 @@ public final class Sudoersemc {
                     OptionalIntegrationManager.isProjectEAvailable() ? "detected" : "absent");
         }
         SmokeTestHook.onServerStarted(event);
+        requestStartupScanIfConfigured();
     }
 
     private void onServerStopping(ServerStoppingEvent event) {
+        resetScanManager(scanManager);
         GeneratedEntryStore store = entryStore;
         if (store != null) {
             store.saveIfDirty();

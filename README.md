@@ -37,14 +37,16 @@ SudoersEMC 是一个**独立实现**的 Minecraft Forge 1.20.1 模组。它扫�
 
 ## 当前状态
 
-项目按阶段推进，已完成前两个阶段：
+项目按阶段线性推进，当前分支（`phase-11-release`）包含 Phase 0–10 的组件与 Phase 11 的入口接线：
 
-| 阶段     | 内容                                                         | 状态      |
-| -------- | ------------------------------------------------------------ | --------- |
-| Phase 0  | Forge 1.20.1 工程骨架、ProjectE 1.0.1 集成调研               | ✅ 完成   |
-| Phase 1  | ProjectE 查询/写入、归属持久化、溢出保护数学、配置、单元测试 | ✅ 完成   |
-| Phase 2  | 物品与配方扫描（含仪式配方）                                 | 🚧 进行中 |
-| Phase 3+ | 递归求解、兜底定价、NBT 变体、批处理、命令、诊断             | ⏳ 计划中 |
+| 阶段       | 内容                                                             | 状态                          |
+| ---------- | ---------------------------------------------------------------- | ----------------------------- |
+| Phase 0    | Forge 1.20.1 工程骨架、ProjectE 1.0.1 集成调研                   | ✅ 完成                       |
+| Phase 1    | ProjectE 查询/写入、归属持久化、溢出保护数学、配置、单元测试     | ✅ 完成                       |
+| Phase 2–10 | 扫描、配方求解、兜底定价、NBT 变体、批处理、安全保护、诊断、命令 | ✅ 组件实现，单元测试通过     |
+| Phase 11   | 模组入口接线与发布验收                                           | 🚧 部分完成（见下方已知限制） |
+
+**已知限制（Phase 11）**：`Sudoersemc.createScanManager()` 的采集/应用回调仍是占位实现（`"待接入真实扫描", 0, 0`），真实扫描管线尚未组装。因此当前构建**不会生成任何 EMC 值**：`/sudoemc rescan-all` 只会跑完一个空状态机，`last_report.txt` 也不会自动生成。DoD 第 4、12 项未达成；命令、调度、持久化、安全与定价组件仅通过单元测试，尚未完成端到端实机验证。
 
 Phase 1 已在专用服务器上验证：写入生效、重启后自动恢复、手动值不被覆盖、缺少 ProjectE 时优雅降级。
 
@@ -193,7 +195,6 @@ generateReports = true
 | ----------------------------------- | ------------ | ------------------------------------------------- |
 | `performance.itemsPerTick`          | `100`        | 服务端线程每 tick 最多处理的物品数                |
 | `recipe.maxRecipePasses`            | `20`         | 单次扫描的配方求解遍数上限                        |
-| `minEmc`                            | `1`          | 生成 EMC 值的下限                                 |
 | `overflow.threshold`                | `999999`     | 严格大于该值的 EMC 会被重置                       |
 | `overflow.resetMin`                 | `100`        | 重置区间下界（含）                                |
 | `overflow.resetMax`                 | `999000`     | 重置区间上界（含）                                |
@@ -204,68 +205,62 @@ generateReports = true
 | `nbt.maxNbtVariantsPerItem`         | `100`        | 每个物品最多扫描的 NBT 变体数                     |
 | `safety.maxAllowedDropRatio`        | `0.5`        | 单次生成值允许的最大相对跌幅                      |
 
-### 校验矩阵
+### 当前实现的校验
 
-加载或重载配置后会执行交叉字段校验。以下取值会被判定为非法，并阻止新配置生效：
+> **状态：** 当前分支只实现了 Forge 单字段范围校验和溢出配置的跨字段警告。`ConfigValidator`、`ConfigWatcher` 与 `ConfigMigrations` 已有组件和单元测试，但**尚未接入生产配置流程**；`/sudoemc reload` 也只返回“配置校验与迁移在下一阶段接线”的提示，不会重新读取磁盘或重建运行时组件。
 
-| 配置项                       | 拒绝条件                                                         |
-| ---------------------------- | ---------------------------------------------------------------- |
-| `performance.itemsPerTick`   | `< 1`                                                            |
-| `recipe.maxRecipePasses`     | `< 1`                                                            |
-| `minEmc`                     | `< 0`                                                            |
-| `overflow.overwriteScope`    | 不是 `owned_only` 或 `entire_custom_emc`（忽略大小写与首尾空白） |
-| `overflow.resetMin`          | 溢出保护开启且 `< 1`                                             |
-| `overflow.resetMin`          | 溢出保护开启且 `> resetMax`                                      |
-| `overflow.threshold`         | 溢出保护开启且 `<= resetMax`                                     |
-| `overflow.bucketCount`       | 溢出保护开启且 `< 1`                                             |
-| `overflow.weightCap`         | 溢出保护开启且 `< 1`                                             |
-| `nbt.maxNbtVariantsPerItem`  | `< 1` 或 `> 1000`                                                |
-| `safety.maxAllowedDropRatio` | 不在 `(0.0, 1.0]` 内，包括 `0.0`、负数与 `NaN`                   |
+单字段范围由 Forge 的 `defineInRange` 在加载时校验，越界值会被纠正到允许区间：
 
-溢出保护关闭时，所有 `overflow.*` 范围校验都会被跳过；`maxNbtVariantsPerItem` 与 `maxAllowedDropRatio` 仍然始终校验。
+| 配置项                                         | 允许范围                       |
+| ---------------------------------------------- | ------------------------------ |
+| `performance.itemsPerTick`                     | `>= 1`                         |
+| `recipe.maxRecipePasses`                       | `>= 1`                         |
+| `overflow.threshold` / `resetMin` / `resetMax` | `>= 1`                         |
+| `overflow.bucketCount` / `weightCap`           | `>= 1`                         |
+| `nbt.maxNbtVariantsPerItem`                    | `>= 1`（没有 1000 上限）       |
+| `safety.maxAllowedDropRatio`                   | `[0.0, 1.0]`（`0.0` 会被接受） |
 
-校验失败时，模组保留上一份有效的组件实例，不会用非法配置重建，并记录一条汇总警告。
+`SudoersemcConfig.validateLoadedConfig()` 在配置加载/重载时只记录**警告**，不会拒绝或回滚配置：
 
-### 警告条件
+- `overflow.threshold <= overflow.resetMax`；
+- `overflow.resetMin > overflow.resetMax`；
+- `overflow.overwriteScope = entire_custom_emc` 且 `allowProjectEFileRewrite = false`。
 
-以下情况不会阻止配置生效，但会记录一条警告：
+非法的 `overflow.overwriteScope` 在解析时回退为 `owned_only` 并记录警告。
 
-| 条件                                                                       | 提示                           |
-| -------------------------------------------------------------------------- | ------------------------------ |
-| `overwriteScope = entire_custom_emc` 且 `allowProjectEFileRewrite = false` | ProjectE 文件改写将被跳过      |
-| `itemsPerTick > 5000`                                                      | 单 tick 处理量过大可能导致卡顿 |
-| `maxRecipePasses > 100`                                                    | 扫描耗时可能显著增加           |
-| `overflow.enabled = false`                                                 | 超大 EMC 值不会被重置          |
+### 尚未实现（后续阶段）
 
-同一条警告在一次运行中只记录一次，避免重载时刷屏。
+以下内容在早期设计中被描述为已生效，但当前分支尚未接线：
 
-### 迁移
+- `ConfigValidator` 的完整跨字段校验与“拒绝新配置”语义；
+- `ConfigWatcher` 的配置变化监听与警告去重；
+- `ConfigMigrations` 的启动迁移（当前 TOML 没有 `schemaVersion` 键）；
+- `/sudoemc reload` 的真实重载与组件重建；
+- `fallback.minEmc` 配置键（当前 `SudoersemcConfig` 中不存在）。
 
-配置 schema 版本为 `2`，旧版本为 `1`：
+`ConfigMigrations` 的 v1→v2 规则（缺少 `overflow.threshold` 时补 `999999`，缺少 `overflow.overwriteScope` 时补 `owned_only`）及其单元测试已经存在，但只有后续阶段接入 Forge TOML 后才会在运行时生效。
 
-- **v1 → v2**：缺少 `overflow.threshold` 时补充 `999999`，缺少 `overwriteScope` 时补充 `owned_only`；已有值保持不变。
-- **v2 → v2**：不做任何修改，也不产生提示。
-- **高于 v2**：保持原样不做修改，并记录提示，防止旧构建覆盖新版本配置。
-- **未知版本（`<= 0`）**：按当前版本处理并记录提示。
-- 迁移始终返回新的映射，不会修改调用方传入的原始数据；持久化由调用方以「临时文件 + 原子替换」方式完成。
-
-> **English:** Schema version 2 validates numeric ranges and cross-field invariants in pure Java. Invalid reloads keep the previously active components, each distinct warning is logged once, and v1 migrations only fill in missing `overflow.threshold` (`999999`) and `overwriteScope` (`"owned_only"`). Configs declaring a newer schema are left untouched.
+> **English:** Only Forge per-field range checks and overflow cross-field warnings are active. `ConfigValidator`, `ConfigWatcher` and `ConfigMigrations` exist with unit tests but are not wired into the production config lifecycle in this branch; `/sudoemc reload` is a stub. TOML migration is therefore not performed at runtime.
 
 ---
 
 ## 数据文件
 
-| 路径                                       | 说明                                                          |
-| ------------------------------------------ | ------------------------------------------------------------- |
-| `config/sudoersemc/generated_entries.json` | 生成值、来源、配方、归属与时间戳                              |
-| `config/sudoersemc/overflow_resets.json`   | 溢出重置审计记录                                              |
-| `config/ProjectE/custom_emc.json`          | ProjectE 手动配置（本模组只读，`entire_custom_emc` 模式除外） |
+| 路径                                       | 说明                                                                                   |
+| ------------------------------------------ | -------------------------------------------------------------------------------------- |
+| `config/sudoersemc/generated_entries.json` | 生成值、来源、配方、归属与时间戳                                                       |
+| `config/sudoersemc/overflow_resets.json`   | 溢出重置审计记录                                                                       |
+| `config/ProjectE/custom_emc.json`          | ProjectE 手动配置（本模组只读，`entire_custom_emc` 模式除外）                          |
+| `config/sudoersemc/scan_state.json`        | 上次扫描指纹/耗时/计数；启动时加载、停服时按需保存（当前扫描管线未接线，通常不会生成） |
+| `config/sudoersemc/last_report.txt`        | 最近一次诊断报告；当前扫描管线未接线，不会自动生成                                     |
 
 所有写入采用「临时文件 + 原子替换」，加载失败只告警不崩溃，遇到更高版本 schema 时拒绝覆盖。
 
 ---
 
 ## 工作原理
+
+> 以下是完整目标链路。当前 Phase 11 只接入了调度骨架、命令与持久化加载；下列第 1–5 步的组件已实现并有单元测试，但**尚未组装进运行时**（采集器仍返回 `"待接入真实扫描", 0, 0`），因此当前构建不会产生任何生成值。
 
 1. **查询** — 通过 `IEMCProxy` 判断物品是否已有 EMC。
 2. **计算** — 从配方、标签、稀有度、层级规则推导候选值；同一物品有多个配方时取最低的有效确定性成本。
@@ -286,7 +281,9 @@ generateReports = true
 ./gradlew test
 ```
 
-测试覆盖：加权采样分布与权重重置、阈值边界、幂等性、持久化往返、损坏文件容错、schema 版本保护。
+测试覆盖：加权采样分布与权重重置、阈值边界、幂等性、持久化往返、损坏文件容错、schema 版本保护、命令层、扫描状态机、General 开关降级与停服清理。
+
+当前测试均为单元/组件测试；扫描管线尚未接线，没有端到端测试。
 
 ---
 
@@ -311,6 +308,7 @@ SudoersEMC is an independent Minecraft Forge 1.20.1 mod that generates EMC value
 - **Overflow protection** resets values above `999999` into a weighted range of `100..999000`, with a hard per-bucket weight cap so the top of the range stays reachable without dominating.
 - **Optional integration**: ProjectE Integration values always win, and Goety ritual recipes (`goety:ritual`, `craft` type only) are evaluated when Goety is installed.
 - Runs on dedicated servers. Loads normally without ProjectE.
+- **Current status (Phase 11)**: the scan pipeline is not wired yet. The jar starts, registers commands and persists state, but generates no EMC values; `/sudoemc rescan-all` only runs an empty state machine.
 
 Build with `./gradlew build`. Output: `build/libs/sudoersemc-<version>.jar`.
 
