@@ -62,6 +62,51 @@ public final class ItemScanner {
      * @return one snapshot per processed non-air, non-ignored item, in registry order
      */
     public List<ItemSnapshot> scan(BooleanSupplier cancellation) {
+        Batch batch = scanBatch(orderedItemIds(), cancellation);
+        if (batch.skippedEmpty() > 0 || batch.skippedIgnored() > 0
+                || batch.skippedUnregistered() > 0) {
+            LOGGER.debug("Item scan skipped: {} ignored, {} empty, {} unregistered ({} collected)",
+                    batch.skippedIgnored(), batch.skippedEmpty(), batch.skippedUnregistered(),
+                    batch.snapshots().size());
+        }
+        return batch.snapshots();
+    }
+
+    /**
+     * 返回按 {@link ResourceLocation} 自然顺序排序的已注册、非空气物品 id。
+     *
+     * <p>分页扫描必须使用稳定顺序，否则跨 tick 的游标会在注册表顺序变化时漂移。这里在
+     * 开始扫描时固化一次顺序，后续每批只按该列表前进。</p>
+     *
+     * @return 不可变、排序后的物品 id 列表
+     */
+    public List<ResourceLocation> orderedItemIds() {
+        List<ResourceLocation> ids = new ArrayList<>();
+        for (Item item : BuiltInRegistries.ITEM) {
+            if (item == Items.AIR) {
+                continue;
+            }
+            ResourceLocation id = BuiltInRegistries.ITEM.getKey(item);
+            if (id != null) {
+                ids.add(id);
+            }
+        }
+        ids.sort(ResourceLocation::compareTo);
+        return List.copyOf(ids);
+    }
+
+    /**
+     * 扫描一页已经排好序的物品 id。
+     *
+     * <p>本方法不修改扫描器状态，调用方负责维护游标。每 {@value #CANCELLATION_CHECK_INTERVAL}
+     * 个条目检查一次取消信号；取消时返回本页已经处理的部分结果。</p>
+     *
+     * @param orderedIds   稳定顺序的物品 id 列表
+     * @param cancellation 取消检查；返回 {@code true} 时停止本页
+     * @return 本页快照与跳过计数
+     */
+    public Batch scanBatch(List<ResourceLocation> orderedIds, BooleanSupplier cancellation) {
+        Objects.requireNonNull(orderedIds, "orderedIds");
         Objects.requireNonNull(cancellation, "cancellation");
         List<ItemSnapshot> snapshots = new ArrayList<>();
         int skippedEmpty = 0;
@@ -69,21 +114,22 @@ public final class ItemScanner {
         int skippedUnregistered = 0;
         int processed = 0;
 
-        for (Item item : BuiltInRegistries.ITEM) {
+        for (ResourceLocation id : orderedIds) {
             if (processed % CANCELLATION_CHECK_INTERVAL == 0 && cancellation.getAsBoolean()) {
                 break;
             }
             processed++;
-            if (item == Items.AIR) {
-                continue;
-            }
-            ResourceLocation id = BuiltInRegistries.ITEM.getKey(item);
             if (id == null) {
                 skippedUnregistered++;
                 continue;
             }
             if (isIgnored(id)) {
                 skippedIgnored++;
+                continue;
+            }
+            Item item = BuiltInRegistries.ITEM.get(id);
+            if (item == null || item == Items.AIR) {
+                skippedUnregistered++;
                 continue;
             }
             ItemStack stack = defaultStack(item);
@@ -121,11 +167,29 @@ public final class ItemScanner {
             snapshots.add(ItemSnapshot.of(key, hasEmc, value, tagPaths, rarity));
         }
 
-        if (skippedEmpty > 0 || skippedIgnored > 0 || skippedUnregistered > 0) {
-            LOGGER.debug("Item scan skipped: {} ignored, {} empty, {} unregistered ({} collected)",
-                    skippedIgnored, skippedEmpty, skippedUnregistered, snapshots.size());
+        return new Batch(List.copyOf(snapshots), processed, skippedEmpty, skippedIgnored,
+                skippedUnregistered);
+    }
+
+    /**
+     * 一页物品扫描结果。
+     *
+     * @param snapshots           本页生成的快照，不可变
+     * @param processed           本页实际检查的 id 数量（包含被跳过项）
+     * @param skippedEmpty        空堆叠数量
+     * @param skippedIgnored      命中忽略规则的数量
+     * @param skippedUnregistered 无法解析到注册物品的数量
+     */
+    public record Batch(List<ItemSnapshot> snapshots, int processed, int skippedEmpty,
+                        int skippedIgnored, int skippedUnregistered) {
+
+        public Batch {
+            snapshots = List.copyOf(snapshots);
+            if (processed < 0 || skippedEmpty < 0 || skippedIgnored < 0
+                    || skippedUnregistered < 0) {
+                throw new IllegalArgumentException("Batch 计数不能为负数");
+            }
         }
-        return List.copyOf(snapshots);
     }
 
     private boolean isIgnored(ResourceLocation id) {

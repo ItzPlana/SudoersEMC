@@ -1505,4 +1505,103 @@ class ScanPipelineTest {
         String suffix = ": " + value;
         return report.lines().anyMatch(line -> line.startsWith(label) && line.endsWith(suffix));
     }
+    // ------------------------------------------------------------------
+    // Phase 27：solveOnly / applySolved 拆分
+    // ------------------------------------------------------------------
+
+    @Test
+    void solveOnlyPlusApplySolvedMatchesSolveAndApply() throws IOException {
+        GeneratedEntryStore storeA = new GeneratedEntryStore(tempDir.resolve("phase27_a.json"));
+        GeneratedEntryStore storeB = new GeneratedEntryStore(tempDir.resolve("phase27_b.json"));
+        GeneratedEmcEntry owned = new GeneratedEmcEntry(
+                RESULT, 50L, PriceSource.RECIPE, null, true, 0L);
+        storeA.stage(owned);
+        storeB.stage(owned);
+        ReportManager reportsA = new ReportManager(tempDir.resolve("phase27_reports_a"));
+        ReportManager reportsB = new ReportManager(tempDir.resolve("phase27_reports_b"));
+
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 5L), item(RESULT, 50L)),
+                List.of(recipe(INGOT, RESULT)),
+                Map.of(INGOT, 5L, RESULT, 50L));
+        ScanPipeline pipelineA = pipeline(
+                storeA, null, reportsA, null, null, null, disabledFallback());
+        ScanPipeline pipelineB = pipeline(
+                storeB, null, reportsB, null, null, null, disabledFallback());
+
+        SolveOutcome outcome = pipelineA.solveOnly(snapshot);
+        assertFalse(outcome.failed());
+        assertEquals(1, outcome.candidateCount());
+        assertEquals(5L, outcome.candidates().get(0).value());
+        assertEquals(PriceSource.RECIPE, outcome.candidates().get(0).source());
+
+        PipelineResult split = pipelineA.applySolved(snapshot, outcome);
+        PipelineResult direct = pipelineB.solveAndApply(snapshot);
+
+        assertEquals(direct.applied(), split.applied());
+        assertEquals(direct.solvedByRecipe(), split.solvedByRecipe());
+        assertEquals(direct.solvedByFallback(), split.solvedByFallback());
+        assertEquals(direct.quarantined(), split.quarantined());
+        assertEquals(direct.overflowResets(), split.overflowResets());
+        assertEquals(direct.unresolved(), split.unresolved());
+        assertEquals(direct.appliedToStore(), split.appliedToStore());
+        assertEquals(direct.sourceBreakdown(), split.sourceBreakdown());
+
+        for (String key : List.of("solverRounds", "solverCacheHits", "solverCacheMisses",
+                "totalRecipes", "usableRecipes", "quarantinedDrops", "retiredEntries",
+                "ownershipExternalModifications", "ownershipReleasedEntries",
+                "solverConverged", "recipesEvaluated")) {
+            assertEquals(direct.extraCounter(key, -1L), split.extraCounter(key, -2L),
+                    "拆分前后计数器必须一致：" + key);
+        }
+
+        String reportA = Files.readString(reportsA.reportFile());
+        String reportB = Files.readString(reportsB.reportFile());
+        long rounds = split.extraCounter("solverRounds", -1L);
+        assertTrue(reportA.lines().anyMatch(line -> line.contains("solverRounds: " + rounds)));
+        assertTrue(reportB.lines().anyMatch(line -> line.contains("solverRounds: " + rounds)));
+        assertTrue(reportA.lines().anyMatch(line -> line.contains("totalRecipes: 1")));
+        assertTrue(reportB.lines().anyMatch(line -> line.contains("totalRecipes: 1")));
+    }
+
+    @Test
+    void solveOnlyIsDeterministicAcrossCalls() {
+        GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("deterministic.json"));
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 5L), item(RESULT, 0L)),
+                List.of(recipe(INGOT, RESULT)),
+                Map.of(INGOT, 5L));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null, disabledFallback());
+
+        SolveOutcome first = pipeline.solveOnly(snapshot);
+        SolveOutcome second = pipeline.solveOnly(snapshot);
+
+        assertTrue(first.sameComputation(second),
+                "两次纯求解必须得到相同候选、轨迹与计数");
+        assertEquals(first.candidates(), second.candidates());
+        assertEquals(first.unresolved(), second.unresolved());
+        assertEquals(first.solverRounds(), second.solverRounds());
+    }
+
+    @Test
+    void solveOnlyDoesNotWriteStore() {
+        GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("read_only.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 50L, PriceSource.RECIPE, null, true, 0L));
+        Map<ItemKey, GeneratedEmcEntry> before = store.snapshotAll();
+        boolean dirtyBefore = store.isDirty();
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 5L), item(RESULT, 50L)),
+                List.of(recipe(INGOT, RESULT)),
+                Map.of(INGOT, 5L, RESULT, 50L));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null, disabledFallback());
+
+        SolveOutcome outcome = pipeline.solveOnly(snapshot);
+
+        assertFalse(outcome.failed());
+        assertEquals(before, store.snapshotAll(), "solveOnly 不得修改存储内容");
+        assertEquals(dirtyBefore, store.isDirty(), "solveOnly 不得把存储标记为脏");
+        assertEquals(1, store.size());
+    }
 }

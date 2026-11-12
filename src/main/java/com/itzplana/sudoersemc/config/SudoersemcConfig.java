@@ -41,6 +41,7 @@ public final class SudoersemcConfig {
 
     public static final ForgeConfigSpec.IntValue PERFORMANCE_ITEMS_PER_TICK;
     public static final ForgeConfigSpec.BooleanValue PERFORMANCE_ADAPTIVE_BATCH_SIZING;
+    public static final ForgeConfigSpec.BooleanValue PERFORMANCE_SOLVE_OFF_THREAD;
 
     public static final ForgeConfigSpec.BooleanValue RECIPE_SOLVE_RECIPES;
     public static final ForgeConfigSpec.IntValue RECIPE_MAX_RECIPE_PASSES;
@@ -117,6 +118,10 @@ public final class SudoersemcConfig {
         PERFORMANCE_ADAPTIVE_BATCH_SIZING = BUILDER.comment(
                         "Adjust batch sizes based on observed processing time.")
                 .define("adaptiveBatchSizing", true);
+        PERFORMANCE_SOLVE_OFF_THREAD = BUILDER.comment(
+                        "Run the pure recipe/fallback solver on the dedicated worker thread.",
+                        "Collection and all store writes always stay on the server thread.")
+                .define("solveOffThread", true);
         BUILDER.pop();
 
         // [recipe]

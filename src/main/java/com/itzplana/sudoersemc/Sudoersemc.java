@@ -16,7 +16,6 @@ import com.itzplana.sudoersemc.integration.ExternalBaselineSource;
 import com.itzplana.sudoersemc.integration.GeneratedEmcMapper;
 import com.itzplana.sudoersemc.integration.OptionalIntegrationManager;
 import com.itzplana.sudoersemc.integration.ProjectEIntegrationBaselineSource;
-import com.itzplana.sudoersemc.pipeline.PipelineSnapshot;
 import com.itzplana.sudoersemc.pipeline.ScanPipeline;
 import com.itzplana.sudoersemc.pricing.FallbackPricing;
 import com.itzplana.sudoersemc.pricing.PricingSettings;
@@ -37,6 +36,7 @@ import com.itzplana.sudoersemc.task.ScanDiagnostics;
 import com.itzplana.sudoersemc.task.ScanFingerprint;
 import com.itzplana.sudoersemc.task.ScanManager;
 import com.itzplana.sudoersemc.task.ScanPhase;
+import com.itzplana.sudoersemc.task.SolveWorker;
 import com.mojang.logging.LogUtils;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -107,6 +107,7 @@ public final class Sudoersemc {
     private static volatile ScanStateStore scanStateStore;
     private static volatile ReportManager reportManager;
     private static volatile ScanManager scanManager;
+    private static volatile SolveWorker solveWorker;
     private static volatile ScanPipeline scanPipeline;
     private static volatile OverflowResetLog overflowResetLog;
     private static volatile FallbackPricing fallbackPricing;
@@ -266,18 +267,24 @@ public final class Sudoersemc {
             return true;
         }
 
-        try {
+            try {
             RuntimeComponents components =
                     createRuntimeComponents(store, quarantineStore, stateStore, reports);
+            SolveWorker previousWorker = solveWorker;
             fallbackPricing = components.fallbackPricing();
             solveSettings = components.solveSettings();
             overflowPipeline = components.overflowPipeline();
             largeDropProtection = components.dropProtection();
             creativeItemProtection = components.creativeProtection();
             scanPipeline = components.pipeline();
+            solveWorker = components.solveWorker();
             scanManager = components.scanManager();
             commandService = components.commandService();
             SudoemcCommands.setService(commandService);
+            // 旧 worker 只在所有新组件都构建并发布成功后关闭，避免半更新状态。
+            if (previousWorker != null && previousWorker != components.solveWorker()) {
+                previousWorker.shutdownNow();
+            }
             pendingReload = false;
             LOGGER.info("SudoersEMC 运行时组件已重建（{}）", label);
             return true;
@@ -346,16 +353,25 @@ public final class Sudoersemc {
                 newCreativeProtection,
                 newFallbackPricing,
                 newSolveSettings);
-        ScanManager manager = createScanManager(pipeline);
-        CommandService service = new CommandService(
-                manager,
-                reports,
-                store,
-                stateStore,
-                () -> requestReload("command"),
-                quarantineStore,
-                OptionalIntegrationManager.provider().orElse(null),
-                OptionalIntegrationManager.manualValues());
+        SolveWorker worker = new SolveWorker(pipeline::solveOnly);
+        ScanManager manager;
+        CommandService service;
+        try {
+            manager = createScanManager(pipeline, worker);
+            service = new CommandService(
+                    manager,
+                    reports,
+                    store,
+                    stateStore,
+                    () -> requestReload("command"),
+                    quarantineStore,
+                    OptionalIntegrationManager.provider().orElse(null),
+                    OptionalIntegrationManager.manualValues());
+        } catch (RuntimeException failure) {
+            // 构建失败时关闭刚创建的线程池，避免配置重建路径泄漏守护线程。
+            worker.shutdownNow();
+            throw failure;
+        }
         return new RuntimeComponents(
                 newFallbackPricing,
                 newSolveSettings,
@@ -364,7 +380,8 @@ public final class Sudoersemc {
                 newCreativeProtection,
                 pipeline,
                 manager,
-                service);
+                service,
+                worker);
     }
 
     /**
@@ -581,26 +598,30 @@ public final class Sudoersemc {
     }
 
     /**
-     * 创建扫描调度器并接入真实管线。
+     * 创建分片扫描调度器并接入真实管线。
      *
-     * <p>接线采用“采集暂存、应用取出”的方式：采集回调在服务器线程完成注册表与配方读取后把
-     * {@link PipelineSnapshot} 暂存到管线中，应用回调再取出求解并写入存储。这样既满足
-     * {@link ScanManager} 跨 tick 的阶段划分，也避免闭包数组带来的隐式状态。</p>
+     * <p>采集回调在服务器线程创建增量会话；求解通过 {@link SolveWorker} 在
+     * {@code sudoersemc-solver} 线程执行纯计算；应用回调仍在服务器线程完成安全层、存储写入、
+     * ProjectE 重映射与落盘。</p>
      *
      * @param pipeline 真实扫描管线
+     * @param worker   纯求解工作线程
      * @return 已接线的扫描调度器
      */
-    private static ScanManager createScanManager(ScanPipeline pipeline) {
+    private static ScanManager createScanManager(ScanPipeline pipeline, SolveWorker worker) {
         int itemsPerTick;
         boolean adaptive;
+        boolean solveOffThread;
         try {
             itemsPerTick = SudoersemcConfig.PERFORMANCE_ITEMS_PER_TICK.get();
             adaptive = SudoersemcConfig.PERFORMANCE_ADAPTIVE_BATCH_SIZING.get();
+            solveOffThread = SudoersemcConfig.PERFORMANCE_SOLVE_OFF_THREAD.get();
         } catch (RuntimeException e) {
             // 配置尚未加载时退回保守默认值，绝不因为读取配置失败而阻止模组启动。
-            LOGGER.warn("SudoersEMC 无法读取性能配置，使用默认值 100 / 自适应开启", e);
+            LOGGER.warn("SudoersEMC 无法读取性能配置，使用默认值 100 / 自适应开启 / 工作线程开启", e);
             itemsPerTick = 100;
             adaptive = true;
+            solveOffThread = true;
         }
         BatchProcessor processor = new BatchProcessor(Math.max(1, itemsPerTick), adaptive);
         ScanDiagnostics diagnostics = new ScanDiagnostics();
@@ -610,8 +631,12 @@ public final class Sudoersemc {
         pipeline.setCancellationCheck(cancellation::isRequested);
         return new ScanManager(
                 processor,
-                () -> collectSnapshot(pipeline),
-                data -> applySnapshot(pipeline),
+                () -> pipeline.beginCollect(ServerLifecycleHooks.getCurrentServer()),
+                (snapshot, outcome) -> {
+                    int applied = pipeline.applySolved(snapshot, outcome).applied();
+                    requestRemapAndSave();
+                    return applied;
+                },
                 TICK_BUDGET_NANOS,
                 diagnostics,
                 (phase, progress, telemetry) -> {
@@ -621,7 +646,9 @@ public final class Sudoersemc {
                         pipeline.writeFailedReport(progress.detail(), telemetry);
                     }
                 },
-                cancellation);
+                cancellation,
+                worker,
+                solveOffThread);
     }
 
     /**
@@ -673,33 +700,11 @@ public final class Sudoersemc {
     }
 
     /**
-     * 采集阶段回调：读取当前服务器并生成不可变快照。
-     *
-     * <p>服务器尚未就绪时返回空快照，避免调度器因为空指针进入失败状态。</p>
-     */
-    private static ScanManager.SnapshotData collectSnapshot(ScanPipeline pipeline) {
-        MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
-        if (server == null) {
-            LOGGER.warn("SudoersEMC 扫描请求到达时服务器尚未就绪，本轮采集空快照");
-            PipelineSnapshot empty = PipelineSnapshot.empty();
-            pipeline.stash(empty);
-            return new ScanManager.SnapshotData("服务器未就绪", 0, 0);
-        }
-
-        PipelineSnapshot snapshot = pipeline.collect(server);
-        pipeline.stash(snapshot);
-        return new ScanManager.SnapshotData(
-                "真实扫描管线", snapshot.itemCount(), snapshot.recipeCount());
-    }
-
-    /**
-     * 应用阶段回调：求解暂存快照、请求 ProjectE 重映射并落盘。
+     * 应用阶段收尾：请求 ProjectE 重映射并落盘存储与扫描状态。
      *
      * <p>所有步骤都在服务器线程执行。重映射失败只记录警告，不会阻止已经生成的条目写入磁盘。</p>
      */
-    private static void applySnapshot(ScanPipeline pipeline) {
-        pipeline.applyStashed();
-
+    private static void requestRemapAndSave() {
         MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
         if (server != null) {
             try {
@@ -771,6 +776,11 @@ public final class Sudoersemc {
     }
 
     private void onServerStarted(ServerStartedEvent event) {
+        // 服务器停止时关闭了求解线程池；同一 JVM 再次开服时重建一份，避免复用已关闭的 worker。
+        SolveWorker worker = solveWorker;
+        if (worker == null || worker.isShutdown()) {
+            rebuildRuntimeFromConfig("server-start-worker");
+        }
         GeneratedEntryStore store = entryStore;
         if (store != null) {
             LOGGER.info("SudoersEMC active: {} generated entries, ProjectE {}",
@@ -852,6 +862,12 @@ public final class Sudoersemc {
         if (resetLog != null) {
             resetLog.save();
         }
+        // 关闭纯求解工作线程；下一次开服会由 onServerStarted 重建运行时组件。
+        SolveWorker worker = solveWorker;
+        solveWorker = null;
+        if (worker != null) {
+            worker.shutdownNow();
+        }
     }
 
     /**
@@ -914,7 +930,8 @@ public final class Sudoersemc {
             CreativeItemProtection creativeProtection,
             ScanPipeline pipeline,
             ScanManager scanManager,
-            CommandService commandService
+            CommandService commandService,
+            SolveWorker solveWorker
     ) {
     }
 }
