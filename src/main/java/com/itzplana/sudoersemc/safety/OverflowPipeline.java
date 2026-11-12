@@ -112,6 +112,20 @@ public final class OverflowPipeline {
     }
 
     /**
+     * 把待写入的审计记录刷新到磁盘。
+     *
+     * <p>由扫描应用路径在每个成功轮次后调用；没有新增记录时不会触碰磁盘。写入失败由
+     * {@link OverflowResetLog} 保留 dirty 标记并在下一次调用时重试，本方法不会向调用方抛出异常。</p>
+     */
+    public void saveAuditIfDirty() {
+        try {
+            log.saveIfDirty();
+        } catch (RuntimeException e) {
+            LOGGER.warn("保存溢出重置审计日志失败，将在下次扫描时重试", e);
+        }
+    }
+
+    /**
      * @return 本流水线实例实际改变数值的次数；审计写入失败但值确实被重置时也计入
      */
     public int resetsApplied() {

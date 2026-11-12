@@ -588,6 +588,26 @@ class RecipeSolverTest {
     }
 
     @Test
+    void provisionalValueFeedsInputsAndIsOverriddenByRecipeValue() {
+        ItemKey raw = item("provisional_raw");
+        ItemKey refined = item("provisional_refined");
+        SolveContext context = SolveContext.empty();
+        context.putProvisional(raw, 10L);
+        context.putProvisional(refined, 99L);
+
+        List<RecipeSnapshot> recipes = List.of(
+                recipe("a_refine_provisional", RecipeKind.FURNACE,
+                        List.of(in(raw)), List.of(out(refined, 1))));
+
+        SolveResult result = SOLVER.solve(recipes, context, REGISTRY, SolveSettings.defaults());
+
+        assertEquals(10L, context.emcOf(raw), "预置值必须参与输入查找");
+        assertFalse(context.hasSeedValue(raw), "预置值不是种子，不应阻止配方发布");
+        assertEquals(Map.of(raw, 10L, refined, 99L), context.provisionalValues());
+        assertEquals(Map.of(refined, 10L), result.values(), "配方值必须覆盖同一物品的预置值");
+    }
+
+    @Test
     void unresolvedItemsDoNotIncludeItemsResolvedLater() {
         ItemKey stone = item("late_stone");
         ItemKey plank = item("late_plank");
