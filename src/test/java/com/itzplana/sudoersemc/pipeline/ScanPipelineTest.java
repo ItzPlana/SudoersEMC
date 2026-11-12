@@ -69,11 +69,21 @@ class ScanPipelineTest {
             new ResourceLocation("minecraft", "stone");
     private static final ResourceLocation SPAWN_EGG_ID =
             new ResourceLocation("minecraft", "bedrock_spawn_egg");
+    private static final ResourceLocation ORE_ID =
+            new ResourceLocation("sudoersemc", "test_ore");
+    private static final ResourceLocation GEAR_ID =
+            new ResourceLocation("sudoersemc", "test_gear");
+    private static final ResourceLocation ORE_TO_INGOT_RECIPE_ID =
+            new ResourceLocation("sudoersemc", "ingot_from_test_ore");
+    private static final ResourceLocation GEAR_RECIPE_ID =
+            new ResourceLocation("sudoersemc", "test_gear_from_ingot");
 
     private static final ItemKey INGOT = ItemKey.of(INGOT_ID);
     private static final ItemKey RESULT = ItemKey.of(RESULT_ID);
     private static final ItemKey DUST = ItemKey.of(DUST_ID);
     private static final ItemKey STONE = ItemKey.of(STONE_ID);
+    private static final ItemKey ORE = ItemKey.of(ORE_ID);
+    private static final ItemKey GEAR = ItemKey.of(GEAR_ID);
 
     private static final ResourceLocation OWNED_OVERFLOW_ID =
             new ResourceLocation("sudoersemc", "owned_overflow");
@@ -530,6 +540,95 @@ class ScanPipelineTest {
     }
 
     @Test
+    void fallbackSeedPropagatesThroughRecipeChain() {
+        GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("generated_chain.json"));
+        ItemSnapshot ore = ItemSnapshot.of(ORE, false, 0L, List.of("forge:ores/test"), Rarity.COMMON);
+        PipelineSnapshot snapshot = snapshot(
+                List.of(ore, item(INGOT, 0L), item(GEAR, 0L)),
+                List.of(oreToIngotRecipe(), gearRecipe()),
+                Map.of());
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null, tagOnlyFallback());
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(2, result.solvedByRecipe(), "锭与齿轮都应由配方定价");
+        assertEquals(1, result.solvedByFallback(), "矿石应由标签兜底定价");
+        assertEquals(3, result.applied());
+        assertTrue(pipeline.lastSolverRoundCount() > 1
+                        && pipeline.lastSolverRoundCount() <= ScanPipeline.MAX_SOLVE_ROUNDS,
+                "兜底种子链路应在轮数上限内收敛，实际轮数为 "
+                        + pipeline.lastSolverRoundCount());
+
+        GeneratedEmcEntry ingot = store.snapshotAll().get(INGOT);
+        GeneratedEmcEntry gear = store.snapshotAll().get(GEAR);
+        assertNotNull(ingot);
+        assertNotNull(gear);
+        assertEquals(PriceSource.RECIPE, ingot.source());
+        assertEquals(PriceSource.RECIPE, gear.source());
+        assertEquals(128L, ingot.value(), "forge:ores/test 应命中默认 ORE 锚点");
+        assertEquals(4L * ingot.value(), gear.value(),
+                "齿轮值必须等于 4 倍锭值，证明兜底值已沿链传播");
+    }
+
+    @Test
+    void emptyWorldStopsAfterSingleRoundWithZeroResult() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_empty_rounds.json"));
+        ScanPipeline pipeline = pipeline(store, null, null, null, null, null, disabledFallback());
+
+        PipelineResult result = pipeline.solveAndApply(PipelineSnapshot.empty());
+
+        assertEquals(1, pipeline.lastSolverRoundCount(), "空世界第一轮无新增值后必须立即退出");
+        assertEquals(0, result.solvedByRecipe());
+        assertEquals(0, result.solvedByFallback());
+        assertEquals(0, result.applied());
+        assertEquals(0, result.quarantined());
+        assertEquals(0, result.overflowResets());
+        assertEquals(0, result.unresolved());
+        assertEquals(0L, result.sourceTotal());
+        assertEquals(0, store.size());
+    }
+
+    @Test
+    void sameItemKeepsRecipeSourceWhenFallbackAlsoMatches() {
+        ScanPipeline.Candidate recipe = new ScanPipeline.Candidate(
+                RESULT, 5L, PriceSource.RECIPE, RECIPE_ID);
+        ScanPipeline.Candidate fallback = new ScanPipeline.Candidate(
+                RESULT, 7L, PriceSource.FALLBACK, null);
+
+        List<ScanPipeline.Candidate> selected = ScanPipeline.selectFinalCandidates(
+                Map.of(RESULT, recipe), Map.of(RESULT, fallback), 1L);
+
+        assertEquals(1, selected.size(), "同一物品只允许保留一条候选");
+        assertEquals(PriceSource.RECIPE, selected.get(0).source());
+        assertEquals(5L, selected.get(0).value());
+        assertEquals(RECIPE_ID, selected.get(0).recipeId());
+    }
+
+    @Test
+    void creativeSpecialValueWinsOverRarityPricing() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_special_value.json"));
+        CreativeItemProtection protection = new CreativeItemProtection(
+                new CreativeItemProtection.Settings(
+                        true, Set.of(), Map.of(RESULT_ID, 64L), Set.of()));
+        ItemSnapshot rare = ItemSnapshot.of(RESULT, false, 0L, List.of(), Rarity.RARE);
+        PipelineSnapshot snapshot = snapshot(List.of(rare), List.of(), Map.of());
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, protection, null,
+                FallbackPricing.withDefaults(PricingSettings.defaults()));
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1, result.solvedByFallback());
+        GeneratedEmcEntry staged = store.snapshotAll().get(RESULT);
+        assertNotNull(staged);
+        assertEquals(64L, staged.value(), "特殊值必须优先于 RARE 稀有度的默认值");
+        assertEquals(PriceSource.TIER, staged.source());
+    }
+
+    @Test
     void defaultScopeDoesNotRewriteCustomEmcFile() throws IOException {
         Path customEmc = writeCustomEmc("default_custom_emc.json");
         GeneratedEntryStore store = customEmcStore();
@@ -947,6 +1046,36 @@ class ScanPipelineTest {
                 RecipeKind.SHAPED,
                 List.of(RecipeInput.of(IngredientOption.of(input))),
                 List.of(RecipeOutput.of(output)));
+    }
+
+    /**
+     * 构造链式夹具中的“矿石 → 锭”配方。
+     */
+    private static RecipeSnapshot oreToIngotRecipe() {
+        return RecipeSnapshot.of(
+                ORE_TO_INGOT_RECIPE_ID,
+                RecipeKind.SHAPED,
+                List.of(RecipeInput.of(IngredientOption.of(ORE))),
+                List.of(RecipeOutput.of(INGOT)));
+    }
+
+    /**
+     * 构造链式夹具中的“4 锭 → 1 齿轮”配方。
+     */
+    private static RecipeSnapshot gearRecipe() {
+        return RecipeSnapshot.of(
+                GEAR_RECIPE_ID,
+                RecipeKind.SHAPED,
+                List.of(new RecipeInput(IngredientOption.of(INGOT), 4)),
+                List.of(RecipeOutput.of(GEAR)));
+    }
+
+    /**
+     * 只启用标签定价的兜底链：稀有度与通用兜底关闭，确保中间产物必须由配方定价。
+     */
+    private static FallbackPricing tagOnlyFallback() {
+        return FallbackPricing.withDefaults(
+                new PricingSettings(true, false, false, false, 0L));
     }
 
     /**

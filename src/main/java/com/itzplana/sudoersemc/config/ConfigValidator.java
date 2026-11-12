@@ -45,6 +45,9 @@ public final class ConfigValidator {
      * @param allowProjectEFileRewrite 是否允许改写 ProjectE 的 custom_emc.json
      * @param maxNbtVariantsPerItem    每个物品最多扫描的 NBT 变体数
      * @param maxAllowedDropRatio      单次生成值允许的最大相对跌幅
+     * @param creativeItemExclusions   禁止自动定价的完整物品 id 原始列表
+     * @param creativeItemSpecialValues 固定 EMC 值原始列表，格式为 {@code namespace:path=正整数}
+     * @param creativeNamespaces       整体视为创造专属的命名空间原始列表
      */
     public record Values(
             int itemsPerTick,
@@ -59,8 +62,21 @@ public final class ConfigValidator {
             String overwriteScope,
             boolean allowProjectEFileRewrite,
             int maxNbtVariantsPerItem,
-            double maxAllowedDropRatio
+            double maxAllowedDropRatio,
+            List<String> creativeItemExclusions,
+            List<String> creativeItemSpecialValues,
+            List<String> creativeNamespaces
     ) {
+
+        public Values {
+            creativeItemExclusions = copyList(creativeItemExclusions);
+            creativeItemSpecialValues = copyList(creativeItemSpecialValues);
+            creativeNamespaces = copyList(creativeNamespaces);
+        }
+
+        private static List<String> copyList(List<String> source) {
+            return source == null ? List.of() : List.copyOf(source);
+        }
     }
 
     /**
@@ -113,6 +129,7 @@ public final class ConfigValidator {
         if (!values.overflowEnabled()) {
             warnings.add("溢出保护已关闭，超大 EMC 值不会被重置");
         }
+        appendCreativeProtectionWarnings(values, warnings);
 
         return errors.isEmpty()
                 ? ConfigValidationResult.ok(warnings)
@@ -138,10 +155,130 @@ public final class ConfigValidator {
         List<String> warnings = new ArrayList<>();
         appendOverflowErrors(values, errors);
         appendScopeWarning(values, warnings);
+        appendCreativeProtectionWarnings(values, warnings);
 
         return errors.isEmpty()
                 ? ConfigValidationResult.ok(warnings)
                 : ConfigValidationResult.failed(errors, warnings);
+    }
+
+    /**
+     * 收集创造物品保护列表的格式警告。
+     *
+     * <p>非法条目不会让整份配置失效：运行时解析会跳过它们，因此这里只给出警告，
+     * 让管理员知道哪些配置项没有生效。校验与运行时解析使用相同的格式规则。</p>
+     */
+    private static void appendCreativeProtectionWarnings(Values values, List<String> warnings) {
+        for (String raw : values.creativeItemExclusions()) {
+            if (!isValidItemId(raw)) {
+                warnings.add("safety.creativeItemExclusions 条目 '" + display(raw)
+                        + "' 不是合法的 namespace:path，将被忽略");
+            }
+        }
+        for (String raw : values.creativeItemSpecialValues()) {
+            if (!isValidSpecialValue(raw)) {
+                warnings.add("safety.creativeItemSpecialValues 条目 '" + display(raw)
+                        + "' 必须为 namespace:path=正整数，将被忽略");
+            }
+        }
+        for (String raw : values.creativeNamespaces()) {
+            if (!isValidNamespace(raw)) {
+                warnings.add("safety.creativeNamespaces 条目 '" + display(raw)
+                        + "' 不是合法的命名空间，将被忽略");
+            }
+        }
+    }
+
+    /**
+     * @return 是否为合法的 {@code namespace:path} 物品 id
+     */
+    private static boolean isValidItemId(String raw) {
+        if (raw == null) {
+            return false;
+        }
+        String value = raw.trim();
+        int separator = value.indexOf(':');
+        if (separator <= 0 || separator != value.lastIndexOf(':')) {
+            return false;
+        }
+        return isValidNamespace(value.substring(0, separator))
+                && isValidPath(value.substring(separator + 1));
+    }
+
+    /**
+     * @return 是否为合法的 {@code namespace:path=正整数} 特殊值
+     */
+    private static boolean isValidSpecialValue(String raw) {
+        if (raw == null) {
+            return false;
+        }
+        String value = raw.trim();
+        int separator = value.indexOf('=');
+        if (separator <= 0 || separator != value.lastIndexOf('=')) {
+            return false;
+        }
+        if (!isValidItemId(value.substring(0, separator))) {
+            return false;
+        }
+        try {
+            return Long.parseLong(value.substring(separator + 1).trim()) > 0L;
+        } catch (NumberFormatException failure) {
+            return false;
+        }
+    }
+
+    /**
+     * @return 是否为合法的命名空间
+     */
+    private static boolean isValidNamespace(String raw) {
+        if (raw == null) {
+            return false;
+        }
+        String value = raw.trim();
+        if (value.isEmpty()) {
+            return false;
+        }
+        for (int index = 0; index < value.length(); index++) {
+            char character = value.charAt(index);
+            boolean valid = character >= 'a' && character <= 'z'
+                    || character >= '0' && character <= '9'
+                    || character == '_' || character == '-' || character == '.';
+            if (!valid) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * @return 是否为合法的资源路径（允许小写字母、数字、下划线、连字符、点与斜杠）
+     */
+    private static boolean isValidPath(String raw) {
+        if (raw == null) {
+            return false;
+        }
+        String value = raw.trim();
+        if (value.isEmpty()) {
+            return false;
+        }
+        for (int index = 0; index < value.length(); index++) {
+            char character = value.charAt(index);
+            boolean valid = character >= 'a' && character <= 'z'
+                    || character >= '0' && character <= '9'
+                    || character == '_' || character == '-' || character == '.'
+                    || character == '/';
+            if (!valid) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * @return 用于警告文本的条目展示形式；空白条目显示为空引号
+     */
+    private static String display(String raw) {
+        return raw == null ? "" : raw.trim();
     }
 
     /**

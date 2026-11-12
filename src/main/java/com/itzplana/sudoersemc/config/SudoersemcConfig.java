@@ -3,6 +3,7 @@ package com.itzplana.sudoersemc.config;
 import com.itzplana.sudoersemc.core.OverflowScope;
 import com.itzplana.sudoersemc.safety.OverflowProtection;
 import com.mojang.logging.LogUtils;
+import java.util.List;
 import java.util.Locale;
 import net.minecraftforge.common.ForgeConfigSpec;
 import net.minecraftforge.eventbus.api.IEventBus;
@@ -46,6 +47,12 @@ public final class SudoersemcConfig {
     public static final ForgeConfigSpec.BooleanValue SAFETY_LARGE_DROP_PROTECTION;
     public static final ForgeConfigSpec.DoubleValue SAFETY_MAX_ALLOWED_DROP_RATIO;
     public static final ForgeConfigSpec.BooleanValue SAFETY_PROTECT_CREATIVE_ONLY_ITEMS;
+    public static final ForgeConfigSpec.ConfigValue<List<? extends String>>
+            SAFETY_CREATIVE_ITEM_EXCLUSIONS;
+    public static final ForgeConfigSpec.ConfigValue<List<? extends String>>
+            SAFETY_CREATIVE_ITEM_SPECIAL_VALUES;
+    public static final ForgeConfigSpec.ConfigValue<List<? extends String>>
+            SAFETY_CREATIVE_NAMESPACES;
 
     public static final ForgeConfigSpec.BooleanValue OVERFLOW_ENABLED;
     public static final ForgeConfigSpec.LongValue OVERFLOW_THRESHOLD;
@@ -125,6 +132,18 @@ public final class SudoersemcConfig {
         SAFETY_PROTECT_CREATIVE_ONLY_ITEMS = BUILDER.comment(
                         "Do not generate survival-obtainable values for creative-only items.")
                 .define("protectCreativeOnlyItems", true);
+        SAFETY_CREATIVE_ITEM_EXCLUSIONS = BUILDER.comment(
+                        "Exact item ids that must never be auto-priced (format: namespace:path).")
+                .defineListAllowEmpty("creativeItemExclusions", List.of(),
+                        entry -> entry instanceof String);
+        SAFETY_CREATIVE_ITEM_SPECIAL_VALUES = BUILDER.comment(
+                        "Fixed EMC values that override normal solving (format: namespace:path=positive long).")
+                .defineListAllowEmpty("creativeItemSpecialValues", List.of(),
+                        entry -> entry instanceof String);
+        SAFETY_CREATIVE_NAMESPACES = BUILDER.comment(
+                        "Namespaces whose items are treated as creative-only and never auto-priced.")
+                .defineListAllowEmpty("creativeNamespaces", List.of(),
+                        entry -> entry instanceof String);
         BUILDER.pop();
 
         // [overflow]
@@ -254,7 +273,10 @@ public final class SudoersemcConfig {
                 OVERFLOW_OVERWRITE_SCOPE.get(),
                 OVERFLOW_ALLOW_PROJECTE_FILE_REWRITE.get(),
                 NBT_MAX_NBT_VARIANTS_PER_ITEM.get(),
-                SAFETY_MAX_ALLOWED_DROP_RATIO.get());
+                SAFETY_MAX_ALLOWED_DROP_RATIO.get(),
+                List.copyOf(SAFETY_CREATIVE_ITEM_EXCLUSIONS.get()),
+                List.copyOf(SAFETY_CREATIVE_ITEM_SPECIAL_VALUES.get()),
+                List.copyOf(SAFETY_CREATIVE_NAMESPACES.get()));
     }
 
     /**

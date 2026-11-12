@@ -28,6 +28,7 @@ import com.itzplana.sudoersemc.task.AutoScanPolicy;
 import com.itzplana.sudoersemc.task.BatchProcessor;
 import com.itzplana.sudoersemc.task.ScanManager;
 import com.mojang.logging.LogUtils;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import net.minecraft.server.MinecraftServer;
@@ -329,17 +330,28 @@ public final class Sudoersemc {
 
     /**
      * 创建创造物品保护；配置读取失败时默认启用保护。
+     *
+     * <p>三个列表键由 {@link CreativeItemProtection#parseSettings} 容错解析：无法识别的条目
+     * 会被跳过，并在最后汇总为一条警告，避免单条拼写错误阻止模组启动或静默失效。</p>
      */
     private static CreativeItemProtection createCreativeProtection() {
-        boolean protectCreativeOnly;
         try {
-            protectCreativeOnly = SudoersemcConfig.SAFETY_PROTECT_CREATIVE_ONLY_ITEMS.get();
+            boolean protectCreativeOnly = SudoersemcConfig.SAFETY_PROTECT_CREATIVE_ONLY_ITEMS.get();
+            CreativeItemProtection.ParsedSettings parsed = CreativeItemProtection.parseSettings(
+                    protectCreativeOnly,
+                    List.copyOf(SudoersemcConfig.SAFETY_CREATIVE_ITEM_EXCLUSIONS.get()),
+                    List.copyOf(SudoersemcConfig.SAFETY_CREATIVE_ITEM_SPECIAL_VALUES.get()),
+                    List.copyOf(SudoersemcConfig.SAFETY_CREATIVE_NAMESPACES.get()));
+            if (!parsed.skippedEntries().isEmpty()) {
+                LOGGER.warn("SudoersEMC 创造物品保护配置有 {} 条无效条目已被忽略：{}",
+                        parsed.skippedEntries().size(), parsed.skippedEntries());
+            }
+            return new CreativeItemProtection(parsed.settings());
         } catch (RuntimeException e) {
             LOGGER.warn("SudoersEMC 无法读取创造物品保护配置，默认启用保护", e);
-            protectCreativeOnly = true;
+            return new CreativeItemProtection(new CreativeItemProtection.Settings(
+                    true, Set.of(), Map.of(), Set.of()));
         }
-        return new CreativeItemProtection(new CreativeItemProtection.Settings(
-                protectCreativeOnly, Set.of(), Map.of(), Set.of()));
     }
 
     /**

@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.itzplana.sudoersemc.core.ItemKey;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import net.minecraft.resources.ResourceLocation;
@@ -120,5 +121,63 @@ class CreativeItemProtectionTest {
         assertFalse(decision.priceable());
         assertEquals(0L, decision.specialValue());
         assertEquals("explicit-exclusion", decision.reason());
+    }
+
+    @Test
+    void parsedExclusionsAndNamespacesBlockPricing() {
+        CreativeItemProtection.ParsedSettings parsed = CreativeItemProtection.parseSettings(
+                true,
+                List.of("minecraft:bedrock", "create:creative_crate"),
+                List.of(),
+                List.of("goety"));
+        CreativeItemProtection protection = new CreativeItemProtection(parsed.settings());
+
+        assertTrue(parsed.skippedEntries().isEmpty());
+        assertFalse(protection.isPriceable(BEDROCK, true, true));
+        assertFalse(protection.isPriceable(CREATIVE_CRATE, true, true));
+        assertFalse(protection.isPriceable(DARK_ALTAR, true, true));
+    }
+
+    @Test
+    void parsedSpecialValueWinsOverNormalPricing() {
+        CreativeItemProtection.ParsedSettings parsed = CreativeItemProtection.parseSettings(
+                true,
+                List.of(),
+                List.of("minecraft:diamond=12345"),
+                List.of());
+        CreativeItemProtection protection = new CreativeItemProtection(parsed.settings());
+
+        CreativeItemProtection.Decision decision = protection.decide(DIAMOND, false, false);
+
+        assertTrue(decision.priceable());
+        assertEquals(12_345L, decision.specialValue(),
+                "特殊固定值必须在稀有度/无解兜底之前生效");
+        assertEquals("special-value", decision.reason());
+    }
+
+    @Test
+    void emptyParsedConfigurationKeepsNormalItemsPriceable() {
+        CreativeItemProtection.ParsedSettings parsed = CreativeItemProtection.parseSettings(
+                true, List.of(), List.of(), List.of());
+        CreativeItemProtection protection = new CreativeItemProtection(parsed.settings());
+
+        assertTrue(parsed.skippedEntries().isEmpty());
+        assertTrue(protection.isPriceable(STICK, false, false));
+        assertEquals("unsolvable-fallback", protection.decide(STICK, false, false).reason());
+    }
+
+    @Test
+    void invalidParsedEntriesAreSkipped() {
+        CreativeItemProtection.ParsedSettings parsed = CreativeItemProtection.parseSettings(
+                true,
+                List.of("minecraft:bedrock", "not a valid id"),
+                List.of("minecraft:diamond=64", "minecraft:emerald=0",
+                        "minecraft:gold_ingot=abc", "broken-entry"),
+                List.of("create", "UPPERCASE"));
+
+        assertEquals(5, parsed.skippedEntries().size(), "非法条目必须全部被忽略");
+        assertEquals(Set.of(BEDROCK_ID), parsed.settings().explicitExclusions());
+        assertEquals(Map.of(DIAMOND_ID, 64L), parsed.settings().specialValues());
+        assertEquals(Set.of("create"), parsed.settings().creativeOnlyNamespaces());
     }
 }
