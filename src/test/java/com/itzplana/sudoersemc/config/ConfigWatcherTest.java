@@ -94,4 +94,19 @@ class ConfigWatcherTest {
         assertThrows(NullPointerException.class, () -> watcher.register(null));
         assertEquals(0, watcher.listenerCount());
     }
+
+    @Test
+    void repeatedIdenticalInvalidResultsAreLoggedOnce() {
+        ConfigWatcher watcher = new ConfigWatcher();
+        ConfigValidationResult invalid = ConfigValidationResult.failed(
+                List.of("boom"), List.of("warn"));
+
+        watcher.fireReload(invalid);
+        watcher.fireReload(invalid);
+
+        assertEquals(1, watcher.loggedWarningCount());
+
+        watcher.fireReload(ConfigValidationResult.failed(List.of("other"), List.of()));
+        assertEquals(2, watcher.loggedWarningCount());
+    }
 }

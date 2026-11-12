@@ -80,6 +80,8 @@ public final class ScanPipeline {
     private final OverflowPipeline overflowPipeline;
     private final FallbackPricing fallbackPricing;
     private final SolveSettings solveSettings;
+    private volatile boolean solveRecipesEnabled = true;
+    private volatile boolean generateReportsEnabled = true;
 
     private final AtomicReference<PipelineSnapshot> stashedSnapshot = new AtomicReference<>();
 
@@ -162,6 +164,30 @@ public final class ScanPipeline {
      */
     public void setProjectEFileRewriteEnabled(boolean enabled) {
         this.allowProjectEFileRewrite = enabled;
+    }
+
+    /**
+     * 设置是否启用配方求解。
+     *
+     * <p>关闭后管线不再运行 {@link RecipeSolver}，只使用快照中的既有值与兜底定价链。
+     * 该开关在每次扫描开始时读取，重建管线后立即生效。</p>
+     *
+     * @param enabled {@code true} 表示启用配方求解；默认启用
+     */
+    public void setSolveRecipesEnabled(boolean enabled) {
+        this.solveRecipesEnabled = enabled;
+    }
+
+    /**
+     * 设置是否写出诊断报告。
+     *
+     * <p>关闭后 {@code last_report.txt} 不再更新，但本轮扫描的计数、状态存储与持久化
+     * 行为保持不变。该开关在每次扫描开始时读取，重建管线后立即生效。</p>
+     *
+     * @param enabled {@code true} 表示写出诊断报告；默认启用
+     */
+    public void setGenerateReportsEnabled(boolean enabled) {
+        this.generateReportsEnabled = enabled;
     }
 
     /**
@@ -384,9 +410,15 @@ public final class ScanPipeline {
 
         try {
             data = applyOwnershipSeparation(data);
-            SolveContext context = new SolveContext(data.existingValues());
-            SolveResult solveResult = new RecipeSolver().solve(
-                    data.recipes(), context, EvaluatorRegistry.defaults(), solveSettings);
+            SolveResult solveResult;
+            if (solveRecipesEnabled) {
+                SolveContext context = new SolveContext(data.existingValues());
+                solveResult = new RecipeSolver().solve(
+                        data.recipes(), context, EvaluatorRegistry.defaults(), solveSettings);
+            } else {
+                LOGGER.debug("配方求解已按配置禁用，本轮仅使用既有值与兜底定价");
+                solveResult = skippedSolveResult();
+            }
 
             List<Candidate> candidates = new ArrayList<>();
             int solvedByRecipe = addRecipeCandidates(solveResult, candidates);
@@ -520,6 +552,16 @@ public final class ScanPipeline {
     }
 
     /**
+     * 构造“跳过配方求解”的空结果。
+     *
+     * <p>该结果不包含任何生成值、轨迹或未解析物品，表示本轮没有评估配方；用于
+     * {@code recipe.solveRecipes=false} 时保持下游候选收集与诊断计数结构不变。</p>
+     */
+    private static SolveResult skippedSolveResult() {
+        return new SolveResult(Map.of(), Map.of(), List.of(), Set.of(), 0, false, 0L, 0);
+    }
+
+    /**
      * 为求解器没有覆盖的物品追加兜底候选。
      *
      * <p>只处理既不在既有 EMC 中、也不在求解结果中的物品。创造物品保护决定物品是否允许自动
@@ -530,6 +572,7 @@ public final class ScanPipeline {
     private int addFallbackCandidates(PipelineSnapshot snapshot, SolveResult solveResult,
                                       List<Candidate> candidates) {
         int added = 0;
+        long minimumEmc = solveSettings.minimumEmc();
         for (ItemSnapshot itemSnapshot : snapshot.items()) {
             ItemKey item = itemSnapshot.key();
             if (snapshot.existingValues().containsKey(item) || solveResult.values().containsKey(item)) {
@@ -548,8 +591,10 @@ public final class ScanPipeline {
             }
 
             if (decision.specialValue() > 0L) {
-                candidates.add(new Candidate(item, decision.specialValue(), PriceSource.TIER, null));
-                added++;
+                if (decision.specialValue() >= minimumEmc) {
+                    candidates.add(new Candidate(item, decision.specialValue(), PriceSource.TIER, null));
+                    added++;
+                }
                 continue;
             }
 
@@ -570,7 +615,7 @@ public final class ScanPipeline {
             }
 
             FallbackPricing.PricedValue pricedValue = priced.get();
-            if (pricedValue.value() <= 0L) {
+            if (pricedValue.value() <= 0L || pricedValue.value() < minimumEmc) {
                 continue;
             }
             candidates.add(new Candidate(item, pricedValue.value(), pricedValue.source(), null));
@@ -675,7 +720,7 @@ public final class ScanPipeline {
                                        int applied, int quarantined, int overflowResets,
                                        long durationMillis, boolean appliedToStore,
                                        Map<String, Long> sourceCounts) {
-        if (reportManager == null) {
+        if (!generateReportsEnabled || reportManager == null) {
             return;
         }
         try {

@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.function.Supplier;
 
 /**
  * 纯 Java 的配置校验逻辑。
@@ -92,23 +93,7 @@ public final class ConfigValidator {
             errors.add("overwriteScope 只能是 owned_only 或 entire_custom_emc，当前为 "
                     + values.overwriteScope());
         }
-        if (values.overflowEnabled()) {
-            if (values.resetMin() < 1L) {
-                errors.add("overflow.resetMin 必须 >= 1，当前为 " + values.resetMin());
-            }
-            if (values.resetMin() > values.resetMax()) {
-                errors.add("overflow.resetMin 不能大于 resetMax");
-            }
-            if (values.overflowThreshold() <= values.resetMax()) {
-                errors.add("overflow.threshold 必须大于 resetMax");
-            }
-            if (values.bucketCount() < 1) {
-                errors.add("overflow.bucketCount 必须 >= 1，当前为 " + values.bucketCount());
-            }
-            if (values.weightCap() < 1) {
-                errors.add("overflow.weightCap 必须 >= 1，当前为 " + values.weightCap());
-            }
-        }
+        appendOverflowErrors(values, errors);
         if (values.maxNbtVariantsPerItem() < 1 || values.maxNbtVariantsPerItem() > 1000) {
             errors.add("maxNbtVariantsPerItem 必须在 [1, 1000] 内，当前为 "
                     + values.maxNbtVariantsPerItem());
@@ -118,10 +103,7 @@ public final class ConfigValidator {
                     + values.maxAllowedDropRatio());
         }
 
-        if (isEntireCustomEmc(values.overwriteScope()) && !values.allowProjectEFileRewrite()) {
-            warnings.add("overwriteScope=entire_custom_emc 但 allowProjectEFileRewrite=false，"
-                    + "ProjectE 文件改写将被跳过");
-        }
+        appendScopeWarning(values, warnings);
         if (values.itemsPerTick() > 5_000) {
             warnings.add("itemsPerTick 大于 5000，单 tick 处理量过大可能导致卡顿");
         }
@@ -135,6 +117,109 @@ public final class ConfigValidator {
         return errors.isEmpty()
                 ? ConfigValidationResult.ok(warnings)
                 : ConfigValidationResult.failed(errors, warnings);
+    }
+
+    /**
+     * 只执行运行时重建真正依赖的跨字段校验。
+     *
+     * <p>单项数值范围由 {@code ForgeConfigSpec} 在加载配置时强制，本方法不重复检查；
+     * 它复用 {@link #validate(Values)} 中同一组溢出区间规则与改写范围冲突警告，
+     * 因此不会出现两套规则文本。适用于 {@code ModConfigEvent} 与命令触发的运行时
+     * 重载：只要这些跨字段不变量成立，现有组件就可以安全替换。</p>
+     *
+     * @param values 待校验配置，不能为 {@code null}
+     * @return 校验结果；存在跨字段错误时 {@link ConfigValidationResult#valid()} 为 {@code false}
+     * @throws NullPointerException 当 {@code values} 为 {@code null} 时
+     */
+    public static ConfigValidationResult validateCrossField(Values values) {
+        Objects.requireNonNull(values, "values");
+
+        List<String> errors = new ArrayList<>();
+        List<String> warnings = new ArrayList<>();
+        appendOverflowErrors(values, errors);
+        appendScopeWarning(values, warnings);
+
+        return errors.isEmpty()
+                ? ConfigValidationResult.ok(warnings)
+                : ConfigValidationResult.failed(errors, warnings);
+    }
+
+    /**
+     * 收集溢出区间相关的跨字段错误；溢出保护关闭时跳过全部范围检查。
+     */
+    private static void appendOverflowErrors(Values values, List<String> errors) {
+        if (!values.overflowEnabled()) {
+            return;
+        }
+        if (values.resetMin() < 1L) {
+            errors.add("overflow.resetMin 必须 >= 1，当前为 " + values.resetMin());
+        }
+        if (values.resetMin() > values.resetMax()) {
+            errors.add("overflow.resetMin 不能大于 resetMax");
+        }
+        if (values.overflowThreshold() <= values.resetMax()) {
+            errors.add("overflow.threshold 必须大于 resetMax");
+        }
+        if (values.bucketCount() < 1) {
+            errors.add("overflow.bucketCount 必须 >= 1，当前为 " + values.bucketCount());
+        }
+        if (values.weightCap() < 1) {
+            errors.add("overflow.weightCap 必须 >= 1，当前为 " + values.weightCap());
+        }
+    }
+
+    /**
+     * 收集改写范围冲突警告；这是警告而非错误，配置仍然可用。
+     */
+    private static void appendScopeWarning(Values values, List<String> warnings) {
+        if (isEntireCustomEmc(values.overwriteScope()) && !values.allowProjectEFileRewrite()) {
+            warnings.add("overwriteScope=entire_custom_emc 但 allowProjectEFileRewrite=false，"
+                    + "ProjectE 文件改写将被跳过");
+        }
+    }
+
+    /**
+     * 使用给定快照来源执行运行时跨字段校验。
+     *
+     * <p>该重载把“读取当前配置”与“校验规则”解耦：生产环境通过无参版本读取 Forge
+     * 配置，单元测试可以直接注入普通值快照。来源抛出运行时异常或返回 {@code null}
+     * 时转换为带单条错误的结果，调用方因此可以统一按“校验失败”处理。</p>
+     *
+     * @param valuesSupplier 配置快照提供者，不能为 {@code null}
+     * @return 校验结果；读取失败时 {@link ConfigValidationResult#valid()} 为 {@code false}
+     * @throws NullPointerException 当 {@code valuesSupplier} 为 {@code null} 时
+     */
+    public static ConfigValidationResult validateCurrent(Supplier<Values> valuesSupplier) {
+        Objects.requireNonNull(valuesSupplier, "valuesSupplier");
+
+        Values values;
+        try {
+            values = valuesSupplier.get();
+        } catch (RuntimeException failure) {
+            String detail = failure.getMessage();
+            String reason = detail == null || detail.isBlank()
+                    ? failure.getClass().getSimpleName()
+                    : detail;
+            return ConfigValidationResult.failed(
+                    List.of("无法读取当前配置：" + reason), List.of());
+        }
+
+        if (values == null) {
+            return ConfigValidationResult.failed(List.of("当前配置快照为空"), List.of());
+        }
+        return validateCrossField(values);
+    }
+
+    /**
+     * 校验当前 Forge 配置。
+     *
+     * <p>配置尚未加载或读取失败时返回失败结果，不向调用方抛出异常。跨字段规则由
+     * {@link #validateCrossField(Values)} 统一实现，本方法只负责读取快照。</p>
+     *
+     * @return 校验结果；配置不可读时 {@link ConfigValidationResult#valid()} 为 {@code false}
+     */
+    public static ConfigValidationResult validateCurrent() {
+        return validateCurrent(SudoersemcConfig::validationValues);
     }
 
     /**

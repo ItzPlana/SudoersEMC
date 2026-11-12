@@ -41,6 +41,7 @@ public final class SudoersemcConfig {
     public static final ForgeConfigSpec.BooleanValue FALLBACK_USE_TAG_PRICING;
     public static final ForgeConfigSpec.BooleanValue FALLBACK_USE_RARITY_PRICING;
     public static final ForgeConfigSpec.BooleanValue FALLBACK_USE_PROJECTE_INTEGRATION_BASELINES;
+    public static final ForgeConfigSpec.LongValue FALLBACK_MIN_EMC;
 
     public static final ForgeConfigSpec.BooleanValue SAFETY_LARGE_DROP_PROTECTION;
     public static final ForgeConfigSpec.DoubleValue SAFETY_MAX_ALLOWED_DROP_RATIO;
@@ -107,6 +108,10 @@ public final class SudoersemcConfig {
         FALLBACK_USE_PROJECTE_INTEGRATION_BASELINES = BUILDER.comment(
                         "Use ProjectE integration baselines when available.")
                 .define("useProjectEIntegrationBaselines", true);
+        FALLBACK_MIN_EMC = BUILDER.comment(
+                        "Minimum EMC value for fallback pricing; lower candidates are discarded.",
+                        "Also passed to the recipe solver as its minimum output value.")
+                .defineInRange("minEmc", 1L, 0L, Long.MAX_VALUE);
         BUILDER.pop();
 
         // [safety]
@@ -220,14 +225,36 @@ public final class SudoersemcConfig {
                 parseOverflowScope(OVERFLOW_OVERWRITE_SCOPE.get()),
                 OVERFLOW_ALLOW_PROJECTE_FILE_REWRITE.get(),
                 OVERFLOW_RANDOM_SEED.get());
-
-        if (settings.scope() == OverflowScope.ENTIRE_CUSTOM_EMC
-                && !settings.allowProjectEFileRewrite()) {
-            LOGGER.warn(
-                    "[overflow] overwriteScope = entire_custom_emc requires "
-                            + "allowProjectEFileRewrite = true; ProjectE's custom_emc.json will not be rewritten.");
-        }
         return settings;
+    }
+
+    /**
+     * Builds a validation snapshot from the current config values.
+     *
+     * <p>The returned record contains plain Java values only, so the cross-field rules in
+     * {@link ConfigValidator} can run without exposing Forge types to the validator.</p>
+     *
+     * @throws IllegalStateException when the config has not been loaded yet
+     */
+    public static ConfigValidator.Values validationValues() {
+        if (!SPEC.isLoaded()) {
+            throw new IllegalStateException("SudoersemcConfig is not loaded yet");
+        }
+
+        return new ConfigValidator.Values(
+                PERFORMANCE_ITEMS_PER_TICK.get(),
+                RECIPE_MAX_RECIPE_PASSES.get(),
+                FALLBACK_MIN_EMC.get(),
+                OVERFLOW_ENABLED.get(),
+                OVERFLOW_THRESHOLD.get(),
+                OVERFLOW_RESET_MIN.get(),
+                OVERFLOW_RESET_MAX.get(),
+                OVERFLOW_BUCKET_COUNT.get(),
+                OVERFLOW_WEIGHT_CAP.get(),
+                OVERFLOW_OVERWRITE_SCOPE.get(),
+                OVERFLOW_ALLOW_PROJECTE_FILE_REWRITE.get(),
+                NBT_MAX_NBT_VARIANTS_PER_ITEM.get(),
+                SAFETY_MAX_ALLOWED_DROP_RATIO.get());
     }
 
     /**

@@ -260,6 +260,59 @@ class ConfigValidatorTest {
         assertEquals(OverflowScope.OWNED_ONLY, ConfigValidator.parseScope(null));
     }
 
+    @Test
+    void currentConfigAdapterAcceptsValidValues() {
+        ConfigValidationResult result = ConfigValidator.validateCurrent(() -> base().build());
+
+        assertTrue(result.valid());
+        assertEquals(List.of(), result.errors());
+    }
+
+    @Test
+    void currentConfigAdapterRejectsThresholdNotAboveResetMax() {
+        ConfigValidationResult result = ConfigValidator.validateCurrent(
+                () -> base().overflowThreshold(999_000L).build());
+
+        assertFalse(result.valid());
+        assertEquals(List.of("overflow.threshold 必须大于 resetMax"), result.errors());
+    }
+
+    @Test
+    void currentConfigAdapterRejectsResetMinAboveResetMax() {
+        ConfigValidationResult result = ConfigValidator.validateCurrent(
+                () -> base().resetMin(1_000L).resetMax(999L).build());
+
+        assertFalse(result.valid());
+        assertEquals(List.of("overflow.resetMin 不能大于 resetMax"), result.errors());
+    }
+
+    @Test
+    void currentConfigAdapterRejectsZeroBucketCount() {
+        ConfigValidationResult result = ConfigValidator.validateCurrent(
+                () -> base().bucketCount(0).build());
+
+        assertFalse(result.valid());
+        assertEquals(List.of("overflow.bucketCount 必须 >= 1，当前为 0"), result.errors());
+    }
+
+    @Test
+    void currentConfigAdapterConvertsReadFailureToInvalidResult() {
+        ConfigValidationResult result = ConfigValidator.validateCurrent(() -> {
+            throw new IllegalStateException("not loaded");
+        });
+
+        assertFalse(result.valid());
+        assertEquals(List.of("无法读取当前配置：not loaded"), result.errors());
+    }
+
+    @Test
+    void currentConfigAdapterRejectsNullSnapshot() {
+        ConfigValidationResult result = ConfigValidator.validateCurrent(() -> null);
+
+        assertFalse(result.valid());
+        assertEquals(List.of("当前配置快照为空"), result.errors());
+    }
+
     private static final class ValuesBuilder {
 
         private int itemsPerTick = 100;

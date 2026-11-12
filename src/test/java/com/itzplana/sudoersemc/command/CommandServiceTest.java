@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.itzplana.sudoersemc.config.ReloadDecision;
 import com.itzplana.sudoersemc.core.GeneratedEmcEntry;
 import com.itzplana.sudoersemc.core.ItemKey;
 import com.itzplana.sudoersemc.core.PriceSource;
@@ -117,15 +118,58 @@ class CommandServiceTest {
     }
 
     @Test
-    void reloadConfigAlwaysSucceedsAndNeverThrows() {
+    void reloadConfigWithoutActionFails() {
         CommandService service = new CommandService(null, null, null, null);
 
         CommandResult result = assertDoesNotThrow(service::reloadConfig);
 
+        assertFalse(result.success());
+        assertEquals(List.of("配置服务不可用"), result.lines());
+    }
+
+    @Test
+    void reloadConfigAppliedReturnsSuccess() {
+        CommandService service = new CommandService(
+                null, null, null, null, () -> ReloadDecision.APPLY_NOW);
+
+        CommandResult result = service.reloadConfig();
+
         assertTrue(result.success());
-        assertEquals(List.of(
-                "配置重载请求已提交",
-                "提示: 配置校验与迁移在下一阶段接线"), result.lines());
+        assertEquals(List.of("配置已重新加载并生效"), result.lines());
+    }
+
+    @Test
+    void reloadConfigDeferredDuringScanReturnsSuccess() {
+        CommandService service = new CommandService(
+                null, null, null, null, () -> ReloadDecision.DEFER);
+
+        CommandResult result = service.reloadConfig();
+
+        assertTrue(result.success());
+        assertEquals(List.of("扫描进行中，配置将在扫描结束后生效"), result.lines());
+    }
+
+    @Test
+    void reloadConfigRejectedKeepsPreviousConfig() {
+        CommandService service = new CommandService(
+                null, null, null, null, () -> ReloadDecision.REJECT);
+
+        CommandResult result = service.reloadConfig();
+
+        assertFalse(result.success());
+        assertEquals(List.of("配置校验失败，已保留上一份有效配置"), result.lines());
+    }
+
+    @Test
+    void reloadConfigCatchesActionFailure() {
+        CommandService service = new CommandService(null, null, null, null, () -> {
+            throw new IllegalStateException("boom");
+        });
+
+        CommandResult result = assertDoesNotThrow(service::reloadConfig);
+
+        assertFalse(result.success());
+        assertEquals(List.of("命令执行失败: IllegalStateException"), result.lines());
     }
 
     @Test

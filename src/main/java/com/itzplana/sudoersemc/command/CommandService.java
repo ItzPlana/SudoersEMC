@@ -1,5 +1,6 @@
 package com.itzplana.sudoersemc.command;
 
+import com.itzplana.sudoersemc.config.ReloadDecision;
 import com.itzplana.sudoersemc.core.GeneratedEmcEntry;
 import com.itzplana.sudoersemc.core.ItemKey;
 import com.itzplana.sudoersemc.diagnostic.PriceExplanation;
@@ -37,8 +38,14 @@ public final class CommandService {
     private final @Nullable ReportManager reportManager;
     private final @Nullable GeneratedEntryStore entryStore;
     private final @Nullable ScanStateStore scanStateStore;
+    private final @Nullable ReloadAction reloadAction;
 
     /**
+     * 创建不执行真实配置重载的命令服务。
+     *
+     * <p>该构造函数保留给只查询状态或诊断信息的调用方；{@link #reloadConfig()} 在缺少
+     * 重载动作时返回“配置服务不可用”。</p>
+     *
      * @param scanManager    扫描状态机，可为 {@code null}
      * @param reportManager  诊断报告管理器，可为 {@code null}
      * @param entryStore     已生成条目的存储，可为 {@code null}
@@ -48,10 +55,26 @@ public final class CommandService {
                           @Nullable ReportManager reportManager,
                           @Nullable GeneratedEntryStore entryStore,
                           @Nullable ScanStateStore scanStateStore) {
+        this(scanManager, reportManager, entryStore, scanStateStore, null);
+    }
+
+    /**
+     * @param scanManager    扫描状态机，可为 {@code null}
+     * @param reportManager  诊断报告管理器，可为 {@code null}
+     * @param entryStore     已生成条目的存储，可为 {@code null}
+     * @param scanStateStore 上一次扫描状态的存储，可为 {@code null}
+     * @param reloadAction   真实配置重载动作，可为 {@code null}（视为不可用）
+     */
+    public CommandService(@Nullable ScanManager scanManager,
+                          @Nullable ReportManager reportManager,
+                          @Nullable GeneratedEntryStore entryStore,
+                          @Nullable ScanStateStore scanStateStore,
+                          @Nullable ReloadAction reloadAction) {
         this.scanManager = scanManager;
         this.reportManager = reportManager;
         this.entryStore = entryStore;
         this.scanStateStore = scanStateStore;
+        this.reloadAction = reloadAction;
     }
 
     /**
@@ -108,18 +131,28 @@ public final class CommandService {
     }
 
     /**
-     * 提交配置重载请求。
+     * 提交配置重载请求并返回真实结果。
      *
-     * <p>当前阶段只负责返回提示，配置校验与迁移的实际接线留待下一阶段完成，因此第二条
-     * 输出明确告知管理员该限制。</p>
+     * <p>重建由注入的 {@link ReloadAction} 执行：立即生效、扫描结束后生效以及校验失败
+     * 分别对应成功、延后与失败三种回执。缺少重载动作或重建抛出运行时异常时返回中文
+     * 失败提示，绝不向命令调度器传播异常。</p>
      *
-     * @return 固定成功提示；永不抛出异常
+     * @return 真实的重载结果；永不抛出异常
      */
     public CommandResult reloadConfig() {
         try {
-            return CommandResult.ok(
-                    "配置重载请求已提交",
-                    "提示: 配置校验与迁移在下一阶段接线");
+            if (reloadAction == null) {
+                return CommandResult.failure("配置服务不可用");
+            }
+            ReloadDecision decision = reloadAction.reload();
+            if (decision == null) {
+                decision = ReloadDecision.REJECT;
+            }
+            return switch (decision) {
+                case APPLY_NOW -> CommandResult.ok("配置已重新加载并生效");
+                case DEFER -> CommandResult.ok("扫描进行中，配置将在扫描结束后生效");
+                case REJECT -> CommandResult.failure("配置校验失败，已保留上一份有效配置");
+            };
         } catch (RuntimeException e) {
             return unexpectedFailure(e);
         }
