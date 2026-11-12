@@ -2,6 +2,7 @@ package com.itzplana.sudoersemc.config;
 
 import com.itzplana.sudoersemc.core.OverflowScope;
 import com.itzplana.sudoersemc.safety.OverflowProtection;
+import com.itzplana.sudoersemc.safety.CreativeItemProtection;
 import com.itzplana.sudoersemc.solver.RecipeSelectionStrategy;
 import com.mojang.logging.LogUtils;
 import java.util.ArrayList;
@@ -45,6 +46,9 @@ public final class SudoersemcConfig {
     public static final ForgeConfigSpec.IntValue RECIPE_MAX_RECIPE_PASSES;
     public static final ForgeConfigSpec.BooleanValue RECIPE_ALLOW_RECIPE_VALUE_INCREASE;
     public static final ForgeConfigSpec.ConfigValue<String> RECIPE_SELECTION_STRATEGY;
+    public static final ForgeConfigSpec.BooleanValue RECIPE_SCAN_CONTAINER_REMAINDERS;
+    public static final ForgeConfigSpec.BooleanValue RECIPE_CREDIT_CONTAINER_REMAINDERS;
+    public static final ForgeConfigSpec.BooleanValue RECIPE_PRICE_SECONDARY_OUTPUTS;
 
     public static final ForgeConfigSpec.BooleanValue FALLBACK_USE_FALLBACK_FOR_UNSOLVABLE;
     public static final ForgeConfigSpec.BooleanValue FALLBACK_USE_TAG_PRICING;
@@ -54,6 +58,10 @@ public final class SudoersemcConfig {
 
     public static final ForgeConfigSpec.BooleanValue SAFETY_LARGE_DROP_PROTECTION;
     public static final ForgeConfigSpec.DoubleValue SAFETY_MAX_ALLOWED_DROP_RATIO;
+    public static final ForgeConfigSpec.ConfigValue<List<? extends String>>
+            SAFETY_DROP_PROTECTION_EXEMPT_NAMESPACES;
+    public static final ForgeConfigSpec.ConfigValue<List<? extends String>>
+            SAFETY_DROP_PROTECTION_EXEMPT_ITEMS;
     public static final ForgeConfigSpec.BooleanValue SAFETY_PROTECT_CREATIVE_ONLY_ITEMS;
     public static final ForgeConfigSpec.ConfigValue<List<? extends String>>
             SAFETY_CREATIVE_ITEM_EXCLUSIONS;
@@ -61,6 +69,12 @@ public final class SudoersemcConfig {
             SAFETY_CREATIVE_ITEM_SPECIAL_VALUES;
     public static final ForgeConfigSpec.ConfigValue<List<? extends String>>
             SAFETY_CREATIVE_NAMESPACES;
+    public static final ForgeConfigSpec.BooleanValue SAFETY_AUTO_DETECT_CREATIVE_ONLY_ITEMS;
+    public static final ForgeConfigSpec.ConfigValue<List<? extends String>>
+            SAFETY_CREATIVE_ONLY_ITEM_PATTERNS;
+    public static final ForgeConfigSpec.ConfigValue<List<? extends String>>
+            SAFETY_AUTO_DETECT_CREATIVE_ONLY_NAMESPACES;
+    public static final ForgeConfigSpec.BooleanValue SAFETY_PRESERVE_EXTERNALLY_MODIFIED_VALUES;
 
     public static final ForgeConfigSpec.BooleanValue OVERFLOW_ENABLED;
     public static final ForgeConfigSpec.LongValue OVERFLOW_THRESHOLD;
@@ -115,6 +129,16 @@ public final class SudoersemcConfig {
                         "stable_id: lowest cost, ties explicitly broken by recipe id",
                         "Unknown values fall back to lowest_cost with one warning.")
                 .define("selectionStrategy", "lowest_cost");
+        RECIPE_SCAN_CONTAINER_REMAINDERS = BUILDER.comment(
+                        "Read recipe remaining items (buckets, empty bottles, ...) during recipe scanning.")
+                .define("scanContainerRemainders", true);
+        RECIPE_CREDIT_CONTAINER_REMAINDERS = BUILDER.comment(
+                        "Subtract the value of returned containers from recipe cost.")
+                .define("creditContainerRemainders", true);
+        RECIPE_PRICE_SECONDARY_OUTPUTS = BUILDER.comment(
+                        "Publish the same per-unit value to every output of a multi-output recipe.",
+                        "When false (default), the whole net cost is assigned to the primary output only.")
+                .define("priceSecondaryOutputs", false);
         BUILDER.pop();
 
         // [fallback]
@@ -144,6 +168,16 @@ public final class SudoersemcConfig {
         SAFETY_MAX_ALLOWED_DROP_RATIO = BUILDER.comment(
                         "Largest allowed relative drop in a generated value, in [0, 1].")
                 .defineInRange("maxAllowedDropRatio", 0.5D, 0.0D, 1.0D);
+        SAFETY_DROP_PROTECTION_EXEMPT_NAMESPACES = BUILDER.comment(
+                        "Namespaces exempt from large-drop quarantine (format: namespace; path is ignored).",
+                        "Invalid entries are skipped and summarized in one warning.")
+                .defineListAllowEmpty("dropProtectionExemptNamespaces", List.of(),
+                        entry -> entry instanceof String);
+        SAFETY_DROP_PROTECTION_EXEMPT_ITEMS = BUILDER.comment(
+                        "Exact item ids exempt from large-drop quarantine (format: namespace:path).",
+                        "Invalid entries are skipped and summarized in one warning.")
+                .defineListAllowEmpty("dropProtectionExemptItems", List.of(),
+                        entry -> entry instanceof String);
         SAFETY_PROTECT_CREATIVE_ONLY_ITEMS = BUILDER.comment(
                         "Do not generate survival-obtainable values for creative-only items.")
                 .define("protectCreativeOnlyItems", true);
@@ -159,6 +193,25 @@ public final class SudoersemcConfig {
                         "Namespaces whose items are treated as creative-only and never auto-priced.")
                 .defineListAllowEmpty("creativeNamespaces", List.of(),
                         entry -> entry instanceof String);
+        SAFETY_AUTO_DETECT_CREATIVE_ONLY_ITEMS = BUILDER.comment(
+                        "Conservatively detect known creative-only items in addition to explicit rules.",
+                        "Only the configured regex patterns and namespaces below are auto-detected.")
+                .define("autoDetectCreativeOnlyItems", true);
+        SAFETY_CREATIVE_ONLY_ITEM_PATTERNS = BUILDER.comment(
+                        "Regex patterns matched against the full namespace:path item id.",
+                        "Defaults cover vanilla command/structure-only items; invalid patterns are skipped.")
+                .defineListAllowEmpty("creativeOnlyItemPatterns",
+                        CreativeItemProtection.DEFAULT_AUTO_DETECT_PATTERNS,
+                        entry -> entry instanceof String);
+        SAFETY_AUTO_DETECT_CREATIVE_ONLY_NAMESPACES = BUILDER.comment(
+                        "Namespaces whose items are automatically treated as creative-only.",
+                        "Defaults to empty so normal modded items are never affected implicitly.")
+                .defineListAllowEmpty("autoDetectCreativeOnlyNamespaces", List.of(),
+                        entry -> entry instanceof String);
+        SAFETY_PRESERVE_EXTERNALLY_MODIFIED_VALUES = BUILDER.comment(
+                        "Preserve values changed externally or pinned by ProjectE's manual file.",
+                        "Default true releases ownership instead of overwriting those values.")
+                .define("preserveExternallyModifiedValues", true);
         BUILDER.pop();
 
         // [overflow]
@@ -292,7 +345,11 @@ public final class SudoersemcConfig {
                 List.copyOf(SAFETY_CREATIVE_ITEM_EXCLUSIONS.get()),
                 List.copyOf(SAFETY_CREATIVE_ITEM_SPECIAL_VALUES.get()),
                 List.copyOf(SAFETY_CREATIVE_NAMESPACES.get()),
-                RECIPE_SELECTION_STRATEGY.get());
+                RECIPE_SELECTION_STRATEGY.get(),
+                List.copyOf(SAFETY_DROP_PROTECTION_EXEMPT_NAMESPACES.get()),
+                List.copyOf(SAFETY_DROP_PROTECTION_EXEMPT_ITEMS.get()),
+                List.copyOf(SAFETY_CREATIVE_ONLY_ITEM_PATTERNS.get()),
+                List.copyOf(SAFETY_AUTO_DETECT_CREATIVE_ONLY_NAMESPACES.get()));
     }
 
     /**
@@ -353,6 +410,9 @@ public final class SudoersemcConfig {
             addEntry(entries, "recipe.maxRecipePasses", RECIPE_MAX_RECIPE_PASSES.get());
             addEntry(entries, "recipe.allowRecipeValueIncrease", RECIPE_ALLOW_RECIPE_VALUE_INCREASE.get());
             addEntry(entries, "recipe.selectionStrategy", RECIPE_SELECTION_STRATEGY.get());
+            addEntry(entries, "recipe.scanContainerRemainders", RECIPE_SCAN_CONTAINER_REMAINDERS.get());
+            addEntry(entries, "recipe.creditContainerRemainders", RECIPE_CREDIT_CONTAINER_REMAINDERS.get());
+            addEntry(entries, "recipe.priceSecondaryOutputs", RECIPE_PRICE_SECONDARY_OUTPUTS.get());
             addEntry(entries, "fallback.useFallbackForUnsolvable",
                     FALLBACK_USE_FALLBACK_FOR_UNSOLVABLE.get());
             addEntry(entries, "fallback.useTagPricing", FALLBACK_USE_TAG_PRICING.get());
@@ -370,6 +430,18 @@ public final class SudoersemcConfig {
                     SAFETY_CREATIVE_ITEM_SPECIAL_VALUES.get());
             addListEntries(entries, "safety.creativeNamespaces",
                     SAFETY_CREATIVE_NAMESPACES.get());
+            addListEntries(entries, "safety.dropProtectionExemptNamespaces",
+                    SAFETY_DROP_PROTECTION_EXEMPT_NAMESPACES.get());
+            addListEntries(entries, "safety.dropProtectionExemptItems",
+                    SAFETY_DROP_PROTECTION_EXEMPT_ITEMS.get());
+            addEntry(entries, "safety.autoDetectCreativeOnlyItems",
+                    SAFETY_AUTO_DETECT_CREATIVE_ONLY_ITEMS.get());
+            addListEntries(entries, "safety.creativeOnlyItemPatterns",
+                    SAFETY_CREATIVE_ONLY_ITEM_PATTERNS.get());
+            addListEntries(entries, "safety.autoDetectCreativeOnlyNamespaces",
+                    SAFETY_AUTO_DETECT_CREATIVE_ONLY_NAMESPACES.get());
+            addEntry(entries, "safety.preserveExternallyModifiedValues",
+                    SAFETY_PRESERVE_EXTERNALLY_MODIFIED_VALUES.get());
             addEntry(entries, "overflow.enabled", OVERFLOW_ENABLED.get());
             addEntry(entries, "overflow.threshold", OVERFLOW_THRESHOLD.get());
             addEntry(entries, "overflow.resetMin", OVERFLOW_RESET_MIN.get());

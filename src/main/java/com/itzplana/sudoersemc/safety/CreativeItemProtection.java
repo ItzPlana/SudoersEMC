@@ -9,6 +9,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 import net.minecraft.resources.ResourceLocation;
 
 /**
@@ -16,25 +17,48 @@ import net.minecraft.resources.ResourceLocation;
  *
  * <h2>未知不等于创造专属</h2>
  * <p>无法求解的物品（既没有配方，也没有可用的标签定价）仍然允许以 {@code 0} 兜底定价。
- * 只有两种明确信号会阻止定价：物品出现在 {@link Settings#explicitExclusions()} 中，或物品
- * 的命名空间出现在 {@link Settings#creativeOnlyNamespaces()} 中。绝不能因为“算不出价值”就
- * 假定物品是创造专属的。</p>
+ * 只有三种明确信号会阻止定价：物品出现在 {@link Settings#explicitExclusions()} 中，物品
+ * 的命名空间出现在 {@link Settings#creativeOnlyNamespaces()} 中，或物品命中
+ * {@link Settings#creativeOnlyItemPatterns()} / {@link Settings#autoDetectCreativeOnlyNamespaces()}
+ * 的保守自动识别规则。绝不能因为“算不出价值”就假定物品是创造专属的。</p>
  *
- * <p>判定顺序固定：保护禁用、显式排除、创造专属命名空间、特殊固定值、无解兜底、普通物品。
- * 显式排除优先于特殊固定值，因此管理员可以用排除规则覆盖误配置的固定值。</p>
+ * <p>判定顺序固定：保护禁用、显式排除、创造专属命名空间、自动识别、特殊固定值、无解兜底、
+ * 普通物品。显式排除与自动识别都优先于特殊固定值，因此管理员无法用固定值让被排除或已被识别
+ * 为创造专属的物品重新进入自动定价。</p>
  */
 public final class CreativeItemProtection {
 
     /** 合法命名空间：小写字母、数字、下划线、连字符与点。 */
     private static final Pattern NAMESPACE_PATTERN = Pattern.compile("[a-z0-9_.-]+");
 
+    /**
+     * 默认的“已知创造专属”物品 id 正则。
+     *
+     * <p>默认集合只覆盖原版中只能通过创造模式或命令获得的命令/结构类物品；普通方块、
+     * 刷怪笼、基岩等可能被整合包以生存方式提供的物品刻意不包含在内。管理员可以通过
+     * {@code safety.creativeOnlyItemPatterns} 追加模式，或关闭自动识别。</p>
+     */
+    public static final List<String> DEFAULT_AUTO_DETECT_PATTERNS = List.of(
+            "^minecraft:(barrier|chain_command_block|command_block|command_block_minecart|"
+                    + "debug_stick|jigsaw|knowledge_book|light|repeating_command_block|"
+                    + "structure_block|structure_void)$");
+
     private final Settings settings;
+    private final List<Pattern> autoDetectPatterns;
 
     /**
      * @param settings 保护配置；不能为 {@code null}
      */
     public CreativeItemProtection(Settings settings) {
         this.settings = Objects.requireNonNull(settings, "settings");
+        this.autoDetectPatterns = compilePatterns(settings.creativeOnlyItemPatterns());
+    }
+
+    /**
+     * @return 默认的已知创造专属物品正则列表
+     */
+    public static List<String> defaultAutoDetectPatterns() {
+        return DEFAULT_AUTO_DETECT_PATTERNS;
     }
 
     /**
@@ -73,6 +97,39 @@ public final class CreativeItemProtection {
                                                List<? extends String> rawExclusions,
                                                List<? extends String> rawSpecialValues,
                                                List<? extends String> rawCreativeNamespaces) {
+        return parseSettings(enabled, rawExclusions, rawSpecialValues, rawCreativeNamespaces,
+                false, List.of(), List.of());
+    }
+
+    /**
+     * 把配置字符串解析为 {@link Settings}，并收集被忽略的非法条目。
+     *
+     * <p>解析规则：</p>
+     * <ul>
+     *   <li>排除项与命名空间条目必须是合法的 {@code namespace:path} / 命名空间；</li>
+     *   <li>特殊值必须是 {@code namespace:path=正整数}，非正数按非法条目处理；</li>
+     *   <li>自动识别模式必须是可编译的正则表达式；</li>
+     *   <li>非法条目不会中断解析，只会进入 {@link ParsedSettings#skippedEntries()}。</li>
+     * </ul>
+     *
+     * <p>该方法不读取任何 Forge 配置对象，调用方负责读取原始字符串列表并汇总警告。</p>
+     *
+     * @param enabled                  是否启用保护
+     * @param rawExclusions            原始排除项列表，允许为 {@code null}
+     * @param rawSpecialValues         原始特殊值列表，允许为 {@code null}
+     * @param rawCreativeNamespaces    原始命名空间列表，允许为 {@code null}
+     * @param autoDetectCreativeOnly   是否启用已知创造专属自动识别
+     * @param rawCreativeOnlyPatterns  原始自动识别正则列表，允许为 {@code null}
+     * @param rawAutoDetectNamespaces  原始自动识别命名空间列表，允许为 {@code null}
+     * @return 解析结果；永不为 {@code null}
+     */
+    public static ParsedSettings parseSettings(boolean enabled,
+                                               List<? extends String> rawExclusions,
+                                               List<? extends String> rawSpecialValues,
+                                               List<? extends String> rawCreativeNamespaces,
+                                               boolean autoDetectCreativeOnly,
+                                               List<? extends String> rawCreativeOnlyPatterns,
+                                               List<? extends String> rawAutoDetectNamespaces) {
         Set<ResourceLocation> exclusions = new LinkedHashSet<>();
         List<String> skippedEntries = new ArrayList<>();
 
@@ -111,7 +168,32 @@ public final class CreativeItemProtection {
             }
         }
 
-        Settings settings = new Settings(enabled, exclusions, specialValues, creativeNamespaces);
+        Set<String> creativeOnlyPatterns = new LinkedHashSet<>();
+        if (rawCreativeOnlyPatterns != null) {
+            for (String raw : rawCreativeOnlyPatterns) {
+                String pattern = raw == null ? "" : raw.trim();
+                if (isValidPattern(pattern)) {
+                    creativeOnlyPatterns.add(pattern);
+                } else {
+                    skippedEntries.add(raw == null ? "" : raw);
+                }
+            }
+        }
+
+        Set<String> autoDetectNamespaces = new LinkedHashSet<>();
+        if (rawAutoDetectNamespaces != null) {
+            for (String raw : rawAutoDetectNamespaces) {
+                String namespace = raw == null ? "" : raw.trim();
+                if (isValidNamespace(namespace)) {
+                    autoDetectNamespaces.add(namespace);
+                } else {
+                    skippedEntries.add(raw == null ? "" : raw);
+                }
+            }
+        }
+
+        Settings settings = new Settings(enabled, exclusions, specialValues, creativeNamespaces,
+                autoDetectCreativeOnly, creativeOnlyPatterns, autoDetectNamespaces);
         return new ParsedSettings(settings, skippedEntries);
     }
 
@@ -168,6 +250,21 @@ public final class CreativeItemProtection {
     }
 
     /**
+     * @return 是否为可编译的正则表达式
+     */
+    private static boolean isValidPattern(String pattern) {
+        if (pattern == null || pattern.isBlank()) {
+            return false;
+        }
+        try {
+            Pattern.compile(pattern);
+            return true;
+        } catch (PatternSyntaxException failure) {
+            return false;
+        }
+    }
+
+    /**
      * 特殊值解析中间结果。
      */
     private record ParsedSpecialValue(ResourceLocation itemId, long value) {
@@ -176,16 +273,22 @@ public final class CreativeItemProtection {
     /**
      * 创造物品保护配置。
      *
-     * @param enabled                是否启用保护
-     * @param explicitExclusions     明确禁止定价的完整物品 id
-     * @param specialValues          绕过配方/标签求解的固定 EMC 值，键为完整物品 id
-     * @param creativeOnlyNamespaces 整体视为创造专属、禁止自动定价的命名空间
+     * @param enabled                          是否启用保护
+     * @param explicitExclusions               明确禁止定价的完整物品 id
+     * @param specialValues                    绕过配方/标签求解的固定 EMC 值，键为完整物品 id
+     * @param creativeOnlyNamespaces           整体视为创造专属、禁止自动定价的命名空间
+     * @param autoDetectCreativeOnly           是否启用已知创造专属自动识别
+     * @param creativeOnlyItemPatterns         自动识别的完整物品 id 正则集合
+     * @param autoDetectCreativeOnlyNamespaces 自动识别的命名空间集合
      */
     public record Settings(
             boolean enabled,
             Set<ResourceLocation> explicitExclusions,
             Map<ResourceLocation, Long> specialValues,
-            Set<String> creativeOnlyNamespaces
+            Set<String> creativeOnlyNamespaces,
+            boolean autoDetectCreativeOnly,
+            Set<String> creativeOnlyItemPatterns,
+            Set<String> autoDetectCreativeOnlyNamespaces
     ) {
 
         public Settings {
@@ -194,7 +297,64 @@ public final class CreativeItemProtection {
             creativeOnlyNamespaces = creativeOnlyNamespaces == null
                     ? Set.of()
                     : Set.copyOf(creativeOnlyNamespaces);
+            creativeOnlyItemPatterns = creativeOnlyItemPatterns == null
+                    ? Set.of()
+                    : Set.copyOf(creativeOnlyItemPatterns);
+            autoDetectCreativeOnlyNamespaces = autoDetectCreativeOnlyNamespaces == null
+                    ? Set.of()
+                    : Set.copyOf(autoDetectCreativeOnlyNamespaces);
         }
+
+        /**
+         * 兼容 Phase 23 及更早调用点的构造器：关闭自动识别，保持旧行为。
+         */
+        public Settings(boolean enabled,
+                        Set<ResourceLocation> explicitExclusions,
+                        Map<ResourceLocation, Long> specialValues,
+                        Set<String> creativeOnlyNamespaces) {
+            this(enabled, explicitExclusions, specialValues, creativeOnlyNamespaces,
+                    false, Set.of(), Set.of());
+        }
+    }
+
+    /**
+     * @return 自动识别模式是否命中该物品 id
+     */
+    private boolean isAutoDetectedCreativeOnly(ResourceLocation itemId) {
+        if (!settings.autoDetectCreativeOnly()) {
+            return false;
+        }
+        if (settings.autoDetectCreativeOnlyNamespaces().contains(itemId.getNamespace())) {
+            return true;
+        }
+        String fullId = itemId.toString();
+        for (Pattern pattern : autoDetectPatterns) {
+            if (pattern.matcher(fullId).matches()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 编译配置中的正则；非法模式在运行时静默跳过。
+     *
+     * <p>配置解析路径会先把非法模式汇总到 {@link ParsedSettings#skippedEntries()}，因此这里
+     * 只作为直接构造 {@link Settings} 时的防御性兜底。</p>
+     */
+    private static List<Pattern> compilePatterns(Set<String> rawPatterns) {
+        if (rawPatterns == null || rawPatterns.isEmpty()) {
+            return List.of();
+        }
+        List<Pattern> compiled = new ArrayList<>(rawPatterns.size());
+        for (String raw : rawPatterns) {
+            try {
+                compiled.add(Pattern.compile(raw));
+            } catch (PatternSyntaxException ignored) {
+                // 直接构造 Settings 时忽略非法模式；配置路径会给出汇总警告。
+            }
+        }
+        return List.copyOf(compiled);
     }
 
     /**
@@ -233,6 +393,9 @@ public final class CreativeItemProtection {
         }
         if (settings.creativeOnlyNamespaces().contains(itemId.getNamespace())) {
             return new Decision(false, 0L, "creative-only-namespace");
+        }
+        if (isAutoDetectedCreativeOnly(itemId)) {
+            return new Decision(false, 0L, "auto-detected-creative-only");
         }
         Long specialValue = settings.specialValues().get(itemId);
         if (specialValue != null) {

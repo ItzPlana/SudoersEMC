@@ -566,6 +566,93 @@ class ScanPipelineTest {
     }
 
     @Test
+    void externallyModifiedOwnedEntryIsReleasedAndPreserved() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_external_drift.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 5L, PriceSource.RECIPE, null, true, 0L));
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(RESULT, 7L)), List.of(), Map.of(RESULT, 7L));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null, genericFallback(3L));
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1L, result.extraCounter("ownershipExternalModifications", -1L));
+        assertEquals(1L, result.extraCounter("ownershipReleasedEntries", -1L));
+        assertEquals(0, result.applied(), "外部值必须阻止兜底重新定价");
+        GeneratedEmcEntry entry = store.snapshotAll().get(RESULT);
+        assertNotNull(entry);
+        assertFalse(entry.owned());
+        assertEquals(5L, entry.value(), "释放所有权不得修改持久化数值");
+    }
+
+    @Test
+    void manualValueIsProtectedEvenWithoutObservedBackendValue() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_manual_protected.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 5L, PriceSource.RECIPE, null, true, 0L));
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(RESULT, 0L)), List.of(), Map.of());
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null, genericFallback(3L));
+        pipeline.setManualValueDetector(key -> key.equals(RESULT));
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1L, result.extraCounter("ownershipExternalModifications", -1L));
+        assertEquals(0, result.applied(), "ProjectE 手工值必须阻止自动定价");
+        GeneratedEmcEntry entry = store.snapshotAll().get(RESULT);
+        assertNotNull(entry);
+        assertFalse(entry.owned());
+        assertEquals(5L, entry.value(), "没有后端观测值时保留最后已知值");
+    }
+
+    @Test
+    void disablingExternalModificationPreservationRestoresRefreshSemantics() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_refresh_owned.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 5L, PriceSource.RECIPE, null, true, 0L));
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(RESULT, 7L)), List.of(), Map.of(RESULT, 7L));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null, genericFallback(3L));
+        pipeline.setPreserveExternallyModifiedValues(false);
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(0L, result.extraCounter("ownershipExternalModifications", -1L));
+        assertEquals(1, result.applied());
+        GeneratedEmcEntry entry = store.snapshotAll().get(RESULT);
+        assertNotNull(entry);
+        assertTrue(entry.owned(), "关闭保护后应恢复 Phase 14 的自有刷新语义");
+        assertEquals(3L, entry.value());
+    }
+
+    @Test
+    void recipeClassificationCountersAreReported() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_recipe_kinds.json"));
+        RecipeSnapshot shaped = recipe(INGOT, RESULT);
+        RecipeSnapshot shapeless = new RecipeSnapshot(
+                new ResourceLocation("sudoersemc", "shapeless_with_byproduct"),
+                RecipeKind.SHAPELESS,
+                List.of(RecipeInput.of(IngredientOption.of(INGOT))),
+                List.of(RecipeOutput.of(RESULT), new RecipeOutput(DUST, 2)),
+                List.of(RecipeOutput.of(INGOT)), false, Map.of());
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 0L)), List.of(shaped, shapeless), Map.of());
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null, disabledFallback());
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1L, result.extraCounter("shapedRecipes", -1L));
+        assertEquals(1L, result.extraCounter("shapelessRecipes", -1L));
+        assertEquals(1L, result.extraCounter("multiOutputRecipes", -1L));
+        assertEquals(1L, result.extraCounter("containerRemainderRecipes", -1L));
+    }
+
+    @Test
     void taggedSnapshotProducesTagCandidate() {
         GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("generated_tag.json"));
         ItemSnapshot tagged = ItemSnapshot.of(RESULT, false, 0L,

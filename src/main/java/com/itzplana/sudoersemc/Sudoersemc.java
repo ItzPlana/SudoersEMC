@@ -337,11 +337,16 @@ public final class Sudoersemc {
     private static LargeDropProtection createDropProtection() {
         LargeDropProtection.Settings settings;
         try {
-            settings = new LargeDropProtection.Settings(
+            LargeDropProtection.ParsedSettings parsed = LargeDropProtection.parseSettings(
                     SudoersemcConfig.SAFETY_LARGE_DROP_PROTECTION.get(),
                     SudoersemcConfig.SAFETY_MAX_ALLOWED_DROP_RATIO.get(),
-                    Set.of(),
-                    Set.of());
+                    List.copyOf(SudoersemcConfig.SAFETY_DROP_PROTECTION_EXEMPT_NAMESPACES.get()),
+                    List.copyOf(SudoersemcConfig.SAFETY_DROP_PROTECTION_EXEMPT_ITEMS.get()));
+            if (!parsed.skippedEntries().isEmpty()) {
+                LOGGER.warn("SudoersEMC 降价豁免配置有 {} 条无效条目已被忽略：{}",
+                        parsed.skippedEntries().size(), parsed.skippedEntries());
+            }
+            settings = parsed.settings();
         } catch (RuntimeException e) {
             LOGGER.warn("SudoersEMC 无法读取大幅降价保护配置，使用默认值", e);
             settings = LargeDropProtection.Settings.defaults();
@@ -362,7 +367,10 @@ public final class Sudoersemc {
                     protectCreativeOnly,
                     List.copyOf(SudoersemcConfig.SAFETY_CREATIVE_ITEM_EXCLUSIONS.get()),
                     List.copyOf(SudoersemcConfig.SAFETY_CREATIVE_ITEM_SPECIAL_VALUES.get()),
-                    List.copyOf(SudoersemcConfig.SAFETY_CREATIVE_NAMESPACES.get()));
+                    List.copyOf(SudoersemcConfig.SAFETY_CREATIVE_NAMESPACES.get()),
+                    SudoersemcConfig.SAFETY_AUTO_DETECT_CREATIVE_ONLY_ITEMS.get(),
+                    List.copyOf(SudoersemcConfig.SAFETY_CREATIVE_ONLY_ITEM_PATTERNS.get()),
+                    List.copyOf(SudoersemcConfig.SAFETY_AUTO_DETECT_CREATIVE_ONLY_NAMESPACES.get()));
             if (!parsed.skippedEntries().isEmpty()) {
                 LOGGER.warn("SudoersEMC 创造物品保护配置有 {} 条无效条目已被忽略：{}",
                         parsed.skippedEntries().size(), parsed.skippedEntries());
@@ -371,7 +379,8 @@ public final class Sudoersemc {
         } catch (RuntimeException e) {
             LOGGER.warn("SudoersEMC 无法读取创造物品保护配置，默认启用保护", e);
             return new CreativeItemProtection(new CreativeItemProtection.Settings(
-                    true, Set.of(), Map.of(), Set.of()));
+                    true, Set.of(), Map.of(), Set.of(),
+                    true, Set.copyOf(CreativeItemProtection.defaultAutoDetectPatterns()), Set.of()));
         }
     }
 
@@ -461,6 +470,20 @@ public final class Sudoersemc {
                 "nbt.scanNbtVariants", SudoersemcConfig.NBT_SCAN_NBT_VARIANTS, true));
         pipeline.setMaxNbtVariantsPerItem(readInt(
                 "nbt.maxNbtVariantsPerItem", SudoersemcConfig.NBT_MAX_NBT_VARIANTS_PER_ITEM, 100));
+        pipeline.setScanContainerRemaindersEnabled(readBoolean(
+                "recipe.scanContainerRemainders",
+                SudoersemcConfig.RECIPE_SCAN_CONTAINER_REMAINDERS, true));
+        pipeline.setCreditContainerRemaindersEnabled(readBoolean(
+                "recipe.creditContainerRemainders",
+                SudoersemcConfig.RECIPE_CREDIT_CONTAINER_REMAINDERS, true));
+        pipeline.setPriceSecondaryOutputsEnabled(readBoolean(
+                "recipe.priceSecondaryOutputs",
+                SudoersemcConfig.RECIPE_PRICE_SECONDARY_OUTPUTS, false));
+        pipeline.setPreserveExternallyModifiedValues(readBoolean(
+                "safety.preserveExternallyModifiedValues",
+                SudoersemcConfig.SAFETY_PRESERVE_EXTERNALLY_MODIFIED_VALUES, true));
+        pipeline.setManualValueDetectorSupplier(
+                () -> OptionalIntegrationManager.manualValues().snapshotPredicate());
         return pipeline;
     }
 

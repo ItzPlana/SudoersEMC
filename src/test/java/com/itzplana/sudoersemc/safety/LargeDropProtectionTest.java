@@ -205,4 +205,25 @@ class LargeDropProtectionTest {
         assertTrue(defaults.exemptNamespaces().isEmpty());
         assertTrue(defaults.exemptItems().isEmpty());
     }
+
+    @Test
+    void parseSettingsKeepsValidExemptionsAndSkipsInvalidEntries() {
+        LargeDropProtection.ParsedSettings parsed = LargeDropProtection.parseSettings(
+                true, 0.5,
+                List.of("create", "UPPERCASE", "with space"),
+                List.of("minecraft:diamond", "stone", "minecraft:iron_ingot=1", "minecraft:emerald"));
+        LargeDropProtection protection = new LargeDropProtection(parsed.settings());
+
+        assertEquals(Set.of(new ResourceLocation("create", "all_items")),
+                parsed.settings().exemptNamespaces());
+        assertEquals(Set.of(DIAMOND, EMERALD), parsed.settings().exemptItems());
+        assertEquals(List.of("UPPERCASE", "with space", "stone", "minecraft:iron_ingot=1"),
+                parsed.skippedEntries());
+
+        assertTrue(protection.evaluate(DIAMOND, 1_000L, 1L).allowed(),
+                "精确物品豁免必须来自配置解析");
+        assertTrue(protection.evaluate(COGWHEEL, 1_000L, 1L).allowed(),
+                "命名空间豁免必须来自配置解析");
+        assertEquals(0, protection.quarantineCount());
+    }
 }

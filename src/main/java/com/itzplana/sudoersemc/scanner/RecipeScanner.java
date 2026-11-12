@@ -19,7 +19,10 @@ import net.minecraft.world.item.crafting.RecipeManager;
 import net.minecraft.world.item.crafting.SmeltingRecipe;
 import net.minecraft.world.item.crafting.SmokingRecipe;
 import net.minecraft.world.item.crafting.StonecutterRecipe;
+import net.minecraft.world.inventory.TransientCraftingContainer;
 import net.minecraft.world.item.crafting.CraftingRecipe;
+import net.minecraft.world.item.crafting.ShapedRecipe;
+import net.minecraft.world.item.crafting.ShapelessRecipe;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -42,9 +45,10 @@ public final class RecipeScanner {
     static final int MAX_FAILED_DETAILS = 50;
 
     private final GoetyRitualReader goetyReader;
+    private final boolean scanContainerRemainders;
 
     public RecipeScanner() {
-        this(GoetyRitualReader.unavailable());
+        this(GoetyRitualReader.unavailable(), true);
     }
 
     /**
@@ -52,7 +56,16 @@ public final class RecipeScanner {
      *                    when Goety is not installed
      */
     public RecipeScanner(GoetyRitualReader goetyReader) {
+        this(goetyReader, true);
+    }
+
+    /**
+     * @param goetyReader            optional Goety reflection bridge
+     * @param scanContainerRemainders whether crafting remainders (buckets, bottles, ...) should be read
+     */
+    public RecipeScanner(GoetyRitualReader goetyReader, boolean scanContainerRemainders) {
         this.goetyReader = Objects.requireNonNull(goetyReader, "goetyReader");
+        this.scanContainerRemainders = scanContainerRemainders;
     }
 
     /** 每扫描多少条配方检查一次取消信号。 */
@@ -173,7 +186,7 @@ public final class RecipeScanner {
      * @return the snapshot, or {@code null} when this build cannot describe the recipe type
      */
     @Nullable
-    private RecipeSnapshot describe(Recipe<?> recipe, ResourceLocation id) {
+    RecipeSnapshot describe(Recipe<?> recipe, ResourceLocation id) {
         if (recipe instanceof AbstractCookingRecipe cooking) {
             return describeCooking(cooking, id);
         }
@@ -212,42 +225,117 @@ public final class RecipeScanner {
         if (inputs.isEmpty()) {
             return null;
         }
-        RecipeOutput output = convertStack(result);
-        if (output == null) {
+        List<RecipeOutput> outputs = convertStacks(List.of(result));
+        if (outputs.isEmpty()) {
             return null;
         }
-        return RecipeSnapshot.of(id, kind, inputs, List.of(output));
+        return RecipeSnapshot.of(id, kind, inputs, outputs);
     }
 
     private RecipeSnapshot describeCrafting(CraftingRecipe recipe, ResourceLocation id) {
-        RecipeKind kind = recipe.isSpecial() ? RecipeKind.UNSUPPORTED : RecipeKind.SHAPED;
-        if (kind == RecipeKind.UNSUPPORTED) {
+        if (recipe.isSpecial()) {
             // Special crafting recipes (dye blending, map cloning, ...) do not follow the generic
             // cost rule and are intentionally excluded from automatic pricing.
             return null;
         }
-        if (!recipe.canCraftInDimensions(3, 3)) {
-            return null;
-        }
-        List<RecipeInput> inputs = convertIngredients(recipe.getIngredients());
+        NonNullList<Ingredient> ingredients = recipe.getIngredients();
+        List<RecipeInput> inputs = convertIngredients(ingredients);
         if (inputs.isEmpty()) {
             return null;
         }
+
+        RecipeKind kind;
+        int width;
+        int height;
+        if (recipe instanceof ShapedRecipe shaped) {
+            kind = RecipeKind.SHAPED;
+            width = Math.max(1, shaped.getWidth());
+            height = Math.max(1, shaped.getHeight());
+        } else if (recipe instanceof ShapelessRecipe shapeless) {
+            kind = RecipeKind.SHAPELESS;
+            width = Math.max(1, shapeless.getIngredients().size());
+            height = 1;
+        } else {
+            // Unknown generic crafting recipe: preserve the previous shaped classification while
+            // still accepting grids larger than 3x3.
+            kind = RecipeKind.SHAPED;
+            width = Math.max(1, ingredients.size());
+            height = 1;
+        }
+        if (!fitsCraftingGrid(recipe, width, height)) {
+            return null;
+        }
+
         ItemStack result;
         try {
             result = recipe.getResultItem(null);
         } catch (RuntimeException e) {
             return null;
         }
-        RecipeOutput output = convertStack(result);
-        if (output == null) {
+        // Reuse the shared stack conversion path so output counts and NBT handling stay identical
+        // to every other recipe family. A single result stack may still have count > 1; that count
+        // is divided in the evaluator, never duplicated here.
+        List<RecipeOutput> outputs = convertStacks(List.of(result));
+        if (outputs.isEmpty()) {
             return null;
         }
-        // 容器余量（桶、空瓶等）需要真实的 CraftingContainer 才能计算。扫描阶段没有可用容器，
-        // 因此这里显式降级为「无余量」：配方仍然参与定价，只是不抵扣返还物。
-        // 绝不因为拿不到余量就把整条配方标记为失败——那会丢失大量可定价配方。
-        return new RecipeSnapshot(id, kind, inputs, List.of(output), List.of(),
-                false, java.util.Map.of());
+
+        List<RecipeOutput> remainders = scanContainerRemainders
+                ? containerRemainderOutputs(recipe, ingredients, width, height)
+                : List.of();
+        return new RecipeSnapshot(id, kind, inputs, outputs, remainders, false,
+                java.util.Map.of(
+                        "gridWidth", Integer.toString(width),
+                        "gridHeight", Integer.toString(height)));
+    }
+
+    /**
+     * 判断配方能否放入其实际声明的合成网格。
+     *
+     * <p>旧实现无条件要求 3x3，会丢弃模组提供的 4x1、4x4 等工作台配方。这里先保留 3x3
+     * 兼容路径，再按配方自己声明的 width×height 检查，绝不把“大于 3x3”直接当成非法。</p>
+     */
+    private static boolean fitsCraftingGrid(CraftingRecipe recipe, int width, int height) {
+        try {
+            if (recipe.canCraftInDimensions(3, 3)) {
+                return true;
+            }
+            return width > 0 && height > 0 && recipe.canCraftInDimensions(width, height);
+        } catch (RuntimeException failure) {
+            LOGGER.debug("配方网格判断失败，按不可合成处理", failure);
+            return false;
+        }
+    }
+
+    /**
+     * 使用配方输入的代表性物品构造临时合成网格，并读取 remaining items。
+     *
+     * <p>标签输入可能有多个候选；扫描阶段没有玩家选择，因此固定使用第一个候选。计算结果只用于
+     * 成本抵扣，不会发布为产物。无法计算余量时返回空列表，配方仍然参与定价。</p>
+     */
+    private static List<RecipeOutput> containerRemainderOutputs(CraftingRecipe recipe,
+                                                               NonNullList<Ingredient> ingredients,
+                                                               int width, int height) {
+        try {
+            int size = Math.max(1, ingredients.size());
+            NonNullList<ItemStack> items = NonNullList.withSize(size, ItemStack.EMPTY);
+            for (int index = 0; index < size; index++) {
+                Ingredient ingredient = index < ingredients.size() ? ingredients.get(index) : null;
+                if (ingredient == null || ingredient.isEmpty()) {
+                    continue;
+                }
+                ItemStack[] stacks = ingredient.getItems();
+                if (stacks.length > 0 && !stacks[0].isEmpty()) {
+                    items.set(index, stacks[0].copyWithCount(1));
+                }
+            }
+            TransientCraftingContainer container = new TransientCraftingContainer(
+                    null, Math.max(1, width), Math.max(1, height), items);
+            return convertStacks(recipe.getRemainingItems(container));
+        } catch (RuntimeException failure) {
+            LOGGER.debug("无法计算配方 {} 的容器返还物，按无余量处理", recipe.getId(), failure);
+            return List.of();
+        }
     }
 
     /**
@@ -333,8 +421,8 @@ public final class RecipeScanner {
         }
     }
 
-    private static List<RecipeOutput> convertStacks(@Nullable NonNullList<ItemStack> stacks) {
-        if (stacks == null || stacks.isEmpty()) {
+    private static List<RecipeOutput> convertStacks(@Nullable Iterable<ItemStack> stacks) {
+        if (stacks == null) {
             return List.of();
         }
         List<RecipeOutput> converted = new ArrayList<>();
@@ -380,6 +468,16 @@ public final class RecipeScanner {
 
     /** Convenience accessor used by the pipeline. */
     public static Optional<RecipeScanner> withGoety() {
-        return GoetyRitualReader.available() ? Optional.of(new RecipeScanner(GoetyRitualReader.create())) : Optional.empty();
+        return withGoety(true);
+    }
+
+    /**
+     * @param scanContainerRemainders 是否读取 crafting remaining items
+     * @return 已接入 Goety 的扫描器；Goety 不可用时为空
+     */
+    public static Optional<RecipeScanner> withGoety(boolean scanContainerRemainders) {
+        return GoetyRitualReader.available()
+                ? Optional.of(new RecipeScanner(GoetyRitualReader.create(), scanContainerRemainders))
+                : Optional.empty();
     }
 }

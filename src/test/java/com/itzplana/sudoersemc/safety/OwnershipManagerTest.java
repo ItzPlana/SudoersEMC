@@ -11,6 +11,7 @@ import com.itzplana.sudoersemc.core.PriceSource;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import net.minecraft.resources.ResourceLocation;
 import org.junit.jupiter.api.Test;
 
@@ -251,6 +252,39 @@ class OwnershipManagerTest {
         assertEquals(0, manager.migrateOwnership());
         assertTrue(manager.snapshotStates().isEmpty());
         assertTrue(sink.get(IRON).owned(), "存储失败时不得改动已有条目");
+    }
+
+    @Test
+    void detectExternalModificationsHonorsConsideredSet() {
+        InMemorySink sink = new InMemorySink();
+        FakeReader reader = new FakeReader();
+        sink.put(entry(IRON, 100L, true));
+        sink.put(entry(DIAMOND, 300L, true));
+        reader.set(IRON, 90L);
+        reader.set(DIAMOND, 350L);
+
+        List<ItemKey> drifted = new OwnershipManager(sink, reader)
+                .detectExternalModifications(Set.of(DIAMOND));
+
+        assertEquals(List.of(DIAMOND), drifted,
+                "未纳入本轮比较集合的物品不得被误判为外部修改");
+    }
+
+    @Test
+    void migrateOwnershipHonorsConsideredSet() {
+        InMemorySink sink = new InMemorySink();
+        FakeReader reader = new FakeReader();
+        sink.put(entry(IRON, 100L, true));
+        sink.put(entry(DIAMOND, 300L, true));
+        reader.set(IRON, 90L);
+        reader.set(DIAMOND, 350L);
+
+        int released = new OwnershipManager(sink, reader)
+                .migrateOwnership(Set.of(DIAMOND));
+
+        assertEquals(1, released);
+        assertTrue(sink.get(IRON).owned(), "集合外的条目必须保持所有权");
+        assertFalse(sink.get(DIAMOND).owned());
     }
 
     private static GeneratedEmcEntry entry(ItemKey item, long value, boolean owned) {

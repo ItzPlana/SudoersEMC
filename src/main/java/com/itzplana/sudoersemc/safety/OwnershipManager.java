@@ -8,7 +8,9 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.TreeMap;
+import org.jetbrains.annotations.Nullable;
 
 /**
  * 判定物品归属，并在发现外部改动时把所有权迁移出去。
@@ -97,6 +99,19 @@ public final class OwnershipManager {
      * 读取器不可用或存储异常时返回空列表，绝不抛出异常。</p>
      */
     public List<ItemKey> detectExternalModifications() {
+        return detectExternalModifications(null);
+    }
+
+    /**
+     * 找出指定集合中“记录为 owned 且当前值与记录值不同”的物品。
+     *
+     * <p>调用方通常只把本轮后端实际报告过数值的物品传入，避免把“本轮未扫描到”误判为
+     * 外部删除。{@code consideredItems == null} 表示不限制，保持旧行为。</p>
+     *
+     * @param consideredItems 需要比较的物品集合；{@code null} 表示全部已记录物品
+     * @return 发生外部修改的物品，按自然顺序升序排列
+     */
+    public List<ItemKey> detectExternalModifications(@Nullable Set<ItemKey> consideredItems) {
         if (!isReaderAvailable()) {
             return List.of();
         }
@@ -112,6 +127,9 @@ public final class OwnershipManager {
             }
             ItemKey item = entry.item() == null ? mapEntry.getKey() : entry.item();
             if (item == null) {
+                continue;
+            }
+            if (consideredItems != null && !consideredItems.contains(item)) {
                 continue;
             }
             Long current = readCurrentValue(item);
@@ -160,11 +178,21 @@ public final class OwnershipManager {
      * @return 成功释放所有权的条目数量
      */
     public int migrateOwnership() {
+        return migrateOwnership(null);
+    }
+
+    /**
+     * 把指定集合中被外部改动过的条目迁移出所有权。
+     *
+     * @param consideredItems 需要检查的物品集合；{@code null} 表示全部已记录物品
+     * @return 成功释放所有权的条目数量
+     */
+    public int migrateOwnership(@Nullable Set<ItemKey> consideredItems) {
         if (!isReaderAvailable()) {
             return 0;
         }
         int released = 0;
-        for (ItemKey item : detectExternalModifications()) {
+        for (ItemKey item : detectExternalModifications(consideredItems)) {
             if (releaseOwnership(item)) {
                 released++;
             }

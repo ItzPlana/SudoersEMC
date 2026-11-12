@@ -180,4 +180,79 @@ class CreativeItemProtectionTest {
         assertEquals(Map.of(DIAMOND_ID, 64L), parsed.settings().specialValues());
         assertEquals(Set.of("create"), parsed.settings().creativeOnlyNamespaces());
     }
+
+    private static final ResourceLocation COMMAND_BLOCK_ID =
+            new ResourceLocation("minecraft", "command_block");
+
+    @Test
+    void defaultAutoDetectionBlocksKnownCreativeOnlyItem() {
+        CreativeItemProtection.ParsedSettings parsed = CreativeItemProtection.parseSettings(
+                true, List.of(), List.of(), List.of(), true,
+                CreativeItemProtection.defaultAutoDetectPatterns(), List.of());
+        CreativeItemProtection protection = new CreativeItemProtection(parsed.settings());
+
+        CreativeItemProtection.Decision decision =
+                protection.decide(ItemKey.of(COMMAND_BLOCK_ID), false, false);
+
+        assertTrue(parsed.skippedEntries().isEmpty());
+        assertFalse(decision.priceable());
+        assertEquals("auto-detected-creative-only", decision.reason());
+        assertTrue(protection.isPriceable(STICK, false, false),
+                "默认自动识别不能误伤普通物品");
+    }
+
+    @Test
+    void autoDetectionCanBeDisabledToRestoreOldBehavior() {
+        CreativeItemProtection.ParsedSettings parsed = CreativeItemProtection.parseSettings(
+                true, List.of(), List.of(), List.of(), false,
+                CreativeItemProtection.defaultAutoDetectPatterns(), List.of());
+        CreativeItemProtection protection = new CreativeItemProtection(parsed.settings());
+
+        CreativeItemProtection.Decision decision =
+                protection.decide(ItemKey.of(COMMAND_BLOCK_ID), false, false);
+
+        assertTrue(decision.priceable());
+        assertEquals("unsolvable-fallback", decision.reason());
+    }
+
+    @Test
+    void autoDetectionWinsOverConfiguredSpecialValue() {
+        CreativeItemProtection.ParsedSettings parsed = CreativeItemProtection.parseSettings(
+                true, List.of(), List.of("minecraft:command_block=64"), List.of(), true,
+                List.of("^minecraft:command_block$"), List.of());
+        CreativeItemProtection protection = new CreativeItemProtection(parsed.settings());
+
+        CreativeItemProtection.Decision decision =
+                protection.decide(ItemKey.of(COMMAND_BLOCK_ID), false, false);
+
+        assertFalse(decision.priceable(),
+                "创造专属自动识别必须优先于固定值，不能让被识别物品重新定价");
+        assertEquals(0L, decision.specialValue());
+        assertEquals("auto-detected-creative-only", decision.reason());
+    }
+
+    @Test
+    void autoDetectionNamespaceBlocksPricing() {
+        CreativeItemProtection.ParsedSettings parsed = CreativeItemProtection.parseSettings(
+                true, List.of(), List.of(), List.of(), true, List.of(), List.of("create"));
+        CreativeItemProtection protection = new CreativeItemProtection(parsed.settings());
+
+        CreativeItemProtection.Decision decision =
+                protection.decide(CREATIVE_CRATE, false, false);
+
+        assertFalse(decision.priceable());
+        assertEquals("auto-detected-creative-only", decision.reason());
+    }
+
+    @Test
+    void invalidAutoDetectionEntriesAreSkippedWithWarningsSource() {
+        CreativeItemProtection.ParsedSettings parsed = CreativeItemProtection.parseSettings(
+                true, List.of(), List.of(), List.of(), true,
+                List.of("[", "^minecraft:command_block$"), List.of("Create"));
+
+        assertEquals(List.of("[", "Create"), parsed.skippedEntries());
+        assertEquals(Set.of("^minecraft:command_block$"),
+                parsed.settings().creativeOnlyItemPatterns());
+        assertTrue(parsed.settings().autoDetectCreativeOnlyNamespaces().isEmpty());
+    }
 }

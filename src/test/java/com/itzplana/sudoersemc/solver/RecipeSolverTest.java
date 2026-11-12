@@ -155,6 +155,23 @@ class RecipeSolverTest {
     }
 
     @Test
+    void duplicateOutputStacksPublishEachItemOnlyOnce() {
+        ItemKey input = item("dupe_in");
+        ItemKey product = item("dupe_out");
+        List<RecipeSnapshot> recipes = List.of(
+                recipe("dupe_recipe", RecipeKind.SHAPED, List.of(in(input)),
+                        List.of(out(product, 1), out(product, 3))));
+        RecipeSolver solver = new RecipeSolver(
+                new EvaluationPolicy(EvaluationPolicy.DEFAULT_MINIMUM_EMC, true, true));
+
+        SolveResult result = solver.solve(recipes, new SolveContext(Map.of(input, 100L)), REGISTRY,
+                SolveSettings.defaults());
+
+        assertEquals(1, result.values().size(), "同一产物只应发布一条值");
+        assertEquals(25L, result.values().get(product), "100 分摊到 1 + 3 个单位");
+    }
+
+    @Test
     void missingInputStaysUnresolved() {
         ItemKey known = item("known");
         ItemKey unknown = item("never_priced");

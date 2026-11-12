@@ -376,6 +376,37 @@ class ConfigValidatorTest {
                 .anyMatch(warning -> warning.contains("recipe.selectionStrategy")));
     }
 
+    @Test
+    void validDropExemptionsAndAutoDetectionEntriesProduceNoWarnings() {
+        ConfigValidationResult result = ConfigValidator.validate(base()
+                .dropProtectionExemptNamespaces("create", "goety")
+                .dropProtectionExemptItems("minecraft:diamond", "create:cogwheel")
+                .creativeOnlyItemPatterns("^minecraft:command_block$")
+                .autoDetectCreativeOnlyNamespaces("example")
+                .build());
+
+        assertTrue(result.valid());
+        assertEquals(List.of(), result.warnings());
+    }
+
+    @Test
+    void malformedDropExemptionsAndAutoDetectionEntriesProduceWarnings() {
+        ConfigValidationResult result = ConfigValidator.validate(base()
+                .dropProtectionExemptNamespaces("UPPERCASE")
+                .dropProtectionExemptItems("stone")
+                .creativeOnlyItemPatterns("[")
+                .autoDetectCreativeOnlyNamespaces("Bad NS")
+                .build());
+
+        assertTrue(result.valid());
+        assertEquals(List.of(
+                "safety.dropProtectionExemptNamespaces 条目 'UPPERCASE' 不是合法的命名空间，将被忽略",
+                "safety.dropProtectionExemptItems 条目 'stone' 不是合法的 namespace:path，将被忽略",
+                "safety.creativeOnlyItemPatterns 条目 '[' 不是合法的正则表达式，将被忽略",
+                "safety.autoDetectCreativeOnlyNamespaces 条目 'Bad NS' 不是合法的命名空间，将被忽略"),
+                result.warnings());
+    }
+
     private static final class ValuesBuilder {
 
         private int itemsPerTick = 100;
@@ -395,6 +426,10 @@ class ConfigValidatorTest {
         private List<String> creativeItemSpecialValues = List.of();
         private List<String> creativeNamespaces = List.of();
         private String recipeSelectionStrategy = "lowest_cost";
+        private List<String> dropProtectionExemptNamespaces = List.of();
+        private List<String> dropProtectionExemptItems = List.of();
+        private List<String> creativeOnlyItemPatterns = List.of();
+        private List<String> autoDetectCreativeOnlyNamespaces = List.of();
 
         ValuesBuilder itemsPerTick(int value) {
             this.itemsPerTick = value;
@@ -481,6 +516,26 @@ class ConfigValidatorTest {
             return this;
         }
 
+        ValuesBuilder dropProtectionExemptNamespaces(String... values) {
+            this.dropProtectionExemptNamespaces = List.of(values);
+            return this;
+        }
+
+        ValuesBuilder dropProtectionExemptItems(String... values) {
+            this.dropProtectionExemptItems = List.of(values);
+            return this;
+        }
+
+        ValuesBuilder creativeOnlyItemPatterns(String... values) {
+            this.creativeOnlyItemPatterns = List.of(values);
+            return this;
+        }
+
+        ValuesBuilder autoDetectCreativeOnlyNamespaces(String... values) {
+            this.autoDetectCreativeOnlyNamespaces = List.of(values);
+            return this;
+        }
+
         ConfigValidator.Values build() {
             return new ConfigValidator.Values(
                     itemsPerTick,
@@ -499,7 +554,11 @@ class ConfigValidatorTest {
                     creativeItemExclusions,
                     creativeItemSpecialValues,
                     creativeNamespaces,
-                    recipeSelectionStrategy);
+                    recipeSelectionStrategy,
+                    dropProtectionExemptNamespaces,
+                    dropProtectionExemptItems,
+                    creativeOnlyItemPatterns,
+                    autoDetectCreativeOnlyNamespaces);
         }
     }
 }

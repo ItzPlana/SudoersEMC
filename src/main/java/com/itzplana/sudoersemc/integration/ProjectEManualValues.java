@@ -20,6 +20,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Predicate;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.TagParser;
 import net.minecraft.resources.ResourceLocation;
@@ -175,6 +176,20 @@ public final class ProjectEManualValues {
     public boolean isManuallySet(ItemKey key) {
         refreshIfChanged();
         return isManuallySetInSnapshot(key);
+    }
+
+    /**
+     * 刷新一次文件状态并返回可复用的批量判定器。
+     *
+     * <p>扫描阶段会遍历大量物品；如果每个物品都调用 {@link #isManuallySet(ItemKey)}，就会
+     * 每件物品执行一次文件 stat。该方法是批量调用入口：只在创建判定器时刷新一次，后续判定
+     * 只读取当前不可变快照。手工文件在两次扫描之间变化时，下一次扫描会重新创建判定器。</p>
+     *
+     * @return 基于当前快照的手工值判定器，永不为 {@code null}
+     */
+    public Predicate<ItemKey> snapshotPredicate() {
+        refreshIfChanged();
+        return this::isManuallySetInSnapshot;
     }
 
     /**
