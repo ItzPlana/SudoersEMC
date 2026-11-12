@@ -71,6 +71,24 @@ class RecipeSolverTest {
     }
 
     @Test
+    void deniedItemIsNotPublishedAndCannotFeedDownstreamRecipes() {
+        ItemKey ore = item("denied_ore");
+        ItemKey ingot = item("denied_ingot");
+        ItemKey gear = item("denied_gear");
+        List<RecipeSnapshot> recipes = List.of(
+                recipe("a_ingot", RecipeKind.FURNACE, List.of(in(ore)), List.of(out(ingot, 1))),
+                recipe("b_gear", RecipeKind.SHAPED, List.of(in(ingot, 4)), List.of(out(gear, 1))));
+
+        SolveContext context = new SolveContext(Map.of(ore, 100L), Set.of(ingot));
+        SolveResult result = SOLVER.solve(recipes, context, REGISTRY, SolveSettings.defaults());
+
+        assertFalse(result.values().containsKey(ingot), "被排除物品不得发布生成值");
+        assertFalse(result.values().containsKey(gear), "被排除物品不得作为下游配方输入");
+        assertTrue(result.unresolvedItems().contains(gear));
+        assertEquals(0L, context.emcOf(ingot), "被排除物品的查找值必须为 0");
+    }
+
+    @Test
     void multiStageChainNeedsOnePassPerStage() {
         ItemKey stone = item("stone");
         ItemKey plank = item("plank");
@@ -585,6 +603,26 @@ class RecipeSolverTest {
         assertEquals(60L, result.values().get(component), "3 * 20");
         assertEquals(120L, result.values().get(finalProduct), "2 * 60");
         assertEquals(3, result.solvedCount());
+    }
+
+    @Test
+    void provisionalValueFeedsInputsAndIsOverriddenByRecipeValue() {
+        ItemKey raw = item("provisional_raw");
+        ItemKey refined = item("provisional_refined");
+        SolveContext context = SolveContext.empty();
+        context.putProvisional(raw, 10L);
+        context.putProvisional(refined, 99L);
+
+        List<RecipeSnapshot> recipes = List.of(
+                recipe("a_refine_provisional", RecipeKind.FURNACE,
+                        List.of(in(raw)), List.of(out(refined, 1))));
+
+        SolveResult result = SOLVER.solve(recipes, context, REGISTRY, SolveSettings.defaults());
+
+        assertEquals(10L, context.emcOf(raw), "预置值必须参与输入查找");
+        assertFalse(context.hasSeedValue(raw), "预置值不是种子，不应阻止配方发布");
+        assertEquals(Map.of(raw, 10L, refined, 99L), context.provisionalValues());
+        assertEquals(Map.of(refined, 10L), result.values(), "配方值必须覆盖同一物品的预置值");
     }
 
     @Test

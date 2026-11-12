@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.List;
 import net.minecraft.SharedConstants;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.world.item.ItemStack;
@@ -21,6 +22,8 @@ import org.junit.jupiter.api.Test;
 class VariantScannerTest {
 
     private static final ResourceLocation STONE_ID = new ResourceLocation("minecraft", "stone");
+    private static final ResourceLocation DIAMOND_SWORD_ID =
+            new ResourceLocation("minecraft", "diamond_sword");
     private static final ItemStack BASE_STACK;
     private static final ItemStack DAMAGEABLE_STACK;
 
@@ -98,6 +101,27 @@ class VariantScannerTest {
                 List.of(damageTag(1), damageTag(2)), 10);
 
         assertTrue(keys.isEmpty());
+    }
+
+    @Test
+    void damageValuesCollapseForDamageableVariants() {
+        List<ItemKey> keys = scanner.scan(DAMAGEABLE_STACK,
+                List.of(enchantedSwordTag(3), enchantedSwordTag(900)), 10);
+
+        assertEquals(List.of(ItemKey.of(DIAMOND_SWORD_ID,
+                "{Damage:0,Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}")), keys);
+    }
+
+    private static CompoundTag enchantedSwordTag(int damage) {
+        CompoundTag enchantment = new CompoundTag();
+        enchantment.putString("id", "minecraft:sharpness");
+        enchantment.putShort("lvl", (short) 5);
+        ListTag enchantments = new ListTag();
+        enchantments.add(enchantment);
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", damage);
+        tag.put("Enchantments", enchantments);
+        return tag;
     }
 
     @Test

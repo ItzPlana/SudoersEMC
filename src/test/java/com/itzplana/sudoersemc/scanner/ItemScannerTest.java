@@ -11,6 +11,7 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.item.Rarity;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -94,6 +95,30 @@ class ItemScannerTest {
         assertFalse(snapshots.isEmpty(), "one broken query must not abort the item scan");
         assertFalse(dirt.hasExistingEmc());
         assertEquals(0L, dirt.existingValue());
+    }
+
+    @Test
+    void tagAndRarityMetadataAreCaptured() {
+        ItemScanner scanner = new ItemScanner(noEmc(), Set.of(), Set.of(),
+                stack -> new ItemScanner.ItemMetadata(
+                        List.of("forge:storage_blocks/iron", "forge:ingots/iron"), Rarity.RARE));
+
+        ItemSnapshot dirt = find(scanner.scan(), DIRT);
+
+        assertEquals(List.of("forge:storage_blocks/iron", "forge:ingots/iron"), dirt.tagPaths());
+        assertEquals(Rarity.RARE, dirt.rarity());
+    }
+
+    @Test
+    void metadataFailureFallsBackToEmptyTagsAndCommonRarity() {
+        ItemScanner scanner = new ItemScanner(noEmc(), Set.of(), Set.of(), stack -> {
+            throw new IllegalStateException("tag lookup failed");
+        });
+
+        ItemSnapshot dirt = find(scanner.scan(), DIRT);
+
+        assertTrue(dirt.tagPaths().isEmpty(), "采集失败时必须退化为空标签，不能中断整次扫描");
+        assertEquals(Rarity.COMMON, dirt.rarity(), "采集失败时稀有度必须退化为 COMMON");
     }
 
     private static ItemSnapshot find(List<ItemSnapshot> snapshots, ResourceLocation id) {
