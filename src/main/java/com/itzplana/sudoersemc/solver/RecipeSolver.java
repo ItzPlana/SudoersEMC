@@ -46,8 +46,8 @@ import net.minecraft.resources.ResourceLocation;
  * <h2>零值与循环</h2>
  * <p>成本 {@code <= 0} 的配方不会产生可支付的值：该物品不会写入，若没有其它正值配方，则进入
  * {@link SolveResult#unresolvedItems()} 并让对应配方进入未解析列表。轮次结束后使用迭代式
- * Kosaraju 算法（无递归）在“未定价物品”依赖图上检测强连通分量，循环中的物品和配方都会被记录，
- * 不会无限重试。</p>
+ * Kosaraju 算法（无递归）在“未定价物品”依赖图上检测强连通分量，成环物品会写入
+ * {@link SolveResult#cyclicItems()}，不会无限重试。</p>
  *
  * <p>求解器对单条配方抛出的 {@link RuntimeException} 做隔离：计数后继续处理其余配方，绝不因一条
  * 坏配方中断整轮求解。</p>
@@ -107,7 +107,7 @@ public final class RecipeSolver {
 
         if (orderedRecipes.isEmpty()) {
             return new SolveResult(context.generatedValues(), context.traces(), List.of(), Set.of(),
-                    0, true, elapsedMillis(startedAtNanos), 0);
+                    0, true, elapsedMillis(startedAtNanos), 0, Set.of());
         }
 
         int recipesEvaluated = 0;
@@ -224,10 +224,10 @@ public final class RecipeSolver {
             }
         }
 
-        // 迭代式循环检测：只分析最终仍未定价的物品，把真正成环的物品补充进诊断集合。
+        // 迭代式循环检测：只分析最终仍未定价的物品，单独记录真正成环的物品。
         NavigableMap<ItemKey, NavigableSet<ItemKey>> dependencyGraph =
                 buildDependencyGraph(orderedRecipes, policy, context, lastUnresolvedInputs);
-        unresolvedItems.addAll(findCyclicItems(unresolvedItems, dependencyGraph));
+        Set<ItemKey> cyclicItems = findCyclicItems(unresolvedItems, dependencyGraph);
 
         return new SolveResult(
                 context.generatedValues(),
@@ -237,7 +237,8 @@ public final class RecipeSolver {
                 passesUsed,
                 converged,
                 elapsedMillis(startedAtNanos),
-                recipesEvaluated);
+                recipesEvaluated,
+                cyclicItems);
     }
 
     /**
