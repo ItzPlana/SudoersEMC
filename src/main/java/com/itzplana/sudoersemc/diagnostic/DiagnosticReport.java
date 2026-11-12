@@ -16,7 +16,8 @@ import java.util.Map;
  * “数据缺失”。</p>
  *
  * <p>{@link #formatText()} 输出固定顺序的中文多行报告，标签按显示宽度对齐（中日韩字符按两列
- * 计算），数值部分使用 {@link Locale#ROOT} 格式化，保证不同区域设置下小数点一致。</p>
+ * 计算），数值部分使用 {@link Locale#ROOT} 格式化，保证不同区域设置下小数点一致。
+ * {@code extraCounters} 按名称字典序追加在固定指标之后，保证不同调用顺序下报告文本一致。</p>
  *
  * @param totalRegisteredItems    本次扫描遍历到的注册物品总数
  * @param itemsWithExistingEmc    其中已经有 EMC 值的物品数量
@@ -213,6 +214,9 @@ public record DiagnosticReport(
         appendLine(text, "未解析物品", Long.toString(unresolvedItems));
         appendLine(text, "隔离的降价", Long.toString(quarantinedDrops));
         appendLine(text, "失败配方", Long.toString(failedRecipes));
+        extraCounters.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey())
+                .forEach(entry -> appendLine(text, entry.getKey(), Long.toString(entry.getValue())));
         appendLine(text, "扫描耗时", totalDurationMillis + " ms");
         appendLine(text, "峰值堆内存", formatMiB(peakHeapBytes));
 

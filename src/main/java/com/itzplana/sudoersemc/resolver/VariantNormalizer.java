@@ -10,6 +10,8 @@ import net.minecraft.nbt.NumericTag;
 import net.minecraft.nbt.StringTag;
 import net.minecraft.nbt.Tag;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.world.item.Item;
 import org.jetbrains.annotations.Nullable;
 
 /**
@@ -58,10 +60,14 @@ public final class VariantNormalizer {
      * @return 规范化的 SNBT；清洗后没有经济相关数据时返回 {@code null}
      */
     public static @Nullable String normalize(@Nullable CompoundTag tag) {
+        return normalize(tag, false);
+    }
+
+    private static @Nullable String normalize(@Nullable CompoundTag tag, boolean stripTopLevelDamage) {
         if (tag == null || tag.isEmpty()) {
             return null;
         }
-        CompoundTag sanitized = sanitizeCompound(tag);
+        CompoundTag sanitized = sanitizeCompound(tag, stripTopLevelDamage);
         if (sanitized.isEmpty() || isDefaultDamageOnly(sanitized)) {
             return null;
         }
@@ -78,7 +84,9 @@ public final class VariantNormalizer {
      * @return 带有变体哈希的物品键；没有可保留数据时返回普通物品键
      */
     public static ItemKey keyFor(ResourceLocation itemId, @Nullable CompoundTag tag) {
-        return ItemKey.of(itemId, normalize(tag));
+        Item item = BuiltInRegistries.ITEM.getOptional(itemId).orElse(null);
+        boolean stripTopLevelDamage = item != null && item.canBeDepleted();
+        return ItemKey.of(itemId, normalize(tag, stripTopLevelDamage));
     }
 
     /**
@@ -98,9 +106,12 @@ public final class VariantNormalizer {
         return damage instanceof NumericTag numeric && numeric.getAsInt() == 0;
     }
 
-    private static CompoundTag sanitizeCompound(CompoundTag source) {
+    private static CompoundTag sanitizeCompound(CompoundTag source, boolean stripTopLevelDamage) {
         CompoundTag result = new CompoundTag();
         for (String key : source.getAllKeys()) {
+            if (STRIPPED_KEYS.contains(key) || (stripTopLevelDamage && DAMAGE.equals(key))) {
+                continue;
+            }
             if (STRIPPED_KEYS.contains(key)) {
                 continue;
             }
@@ -129,7 +140,7 @@ public final class VariantNormalizer {
             for (int i = 0; i < list.size(); i++) {
                 Tag element = list.get(i);
                 if (element instanceof CompoundTag entry) {
-                    CompoundTag sanitized = sanitizeCompound(entry);
+                    CompoundTag sanitized = sanitizeCompound(entry, false);
                     sanitized.remove(UUID);
                     result.add(sanitized);
                 } else {
@@ -139,7 +150,7 @@ public final class VariantNormalizer {
             return result;
         }
         if (tag instanceof CompoundTag compound) {
-            CompoundTag sanitized = sanitizeCompound(compound);
+            CompoundTag sanitized = sanitizeCompound(compound, false);
             sanitized.remove(UUID);
             return sanitized;
         }
@@ -148,7 +159,7 @@ public final class VariantNormalizer {
 
     private static Tag sanitizeTag(Tag tag) {
         if (tag instanceof CompoundTag compound) {
-            return sanitizeCompound(compound);
+            return sanitizeCompound(compound, false);
         }
         if (tag instanceof ListTag list) {
             ListTag result = new ListTag();

@@ -392,12 +392,12 @@ public final class ConfigValidator {
     }
 
     /**
-     * 收集溢出区间相关的跨字段错误；溢出保护关闭时跳过全部范围检查。
+     * 收集溢出区间相关的跨字段错误。
+     *
+     * <p>{@code OverflowProtection.Settings} 即使 {@code enabled=false} 也会构造采样器并强制
+     * 这些不变量，因此校验器不能因开关关闭而放行非法区间。</p>
      */
     private static void appendOverflowErrors(Values values, List<String> errors) {
-        if (!values.overflowEnabled()) {
-            return;
-        }
         if (values.resetMin() < 1L) {
             errors.add("overflow.resetMin 必须 >= 1，当前为 " + values.resetMin());
         }

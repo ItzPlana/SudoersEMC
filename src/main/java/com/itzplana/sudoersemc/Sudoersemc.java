@@ -44,6 +44,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraftforge.common.ForgeConfigSpec;
 import net.minecraftforge.common.MinecraftForge;
@@ -346,7 +347,8 @@ public final class Sudoersemc {
                 newCreativeProtection,
                 newFallbackPricing,
                 newSolveSettings);
-        ScanManager manager = createScanManager(pipeline);
+        boolean scanEnabled = readBoolean("general.enabled", SudoersemcConfig.GENERAL_ENABLED, true);
+        ScanManager manager = scanEnabled ? createScanManager(pipeline) : null;
         CommandService service = new CommandService(
                 manager,
                 reports,
@@ -604,10 +606,12 @@ public final class Sudoersemc {
         }
         BatchProcessor processor = new BatchProcessor(Math.max(1, itemsPerTick), adaptive);
         ScanDiagnostics diagnostics = new ScanDiagnostics();
-        pipeline.setDiagnostics(diagnostics);
-        // 调度器与管线共享同一个取消令牌：cancel() 后采集/求解/应用循环都能在检查点提前退出。
         ScanCancellation cancellation = new ScanCancellation();
-        pipeline.setCancellationCheck(cancellation::isRequested);
+        if (pipeline != null) {
+            pipeline.setDiagnostics(diagnostics);
+            // 调度器与管线共享同一个取消令牌：cancel() 后采集/求解/应用循环都能在检查点提前退出。
+            pipeline.setCancellationCheck(cancellation::isRequested);
+        }
         return new ScanManager(
                 processor,
                 () -> collectSnapshot(pipeline),
@@ -669,6 +673,41 @@ public final class Sudoersemc {
         } catch (RuntimeException failure) {
             LOGGER.warn("SudoersEMC 读取外部基线指纹失败，按空基线处理", failure);
             return List.of("external-baseline=fingerprint-error");
+        }
+    }
+
+    /**
+     * 兼容测试与命令入口的开关判断：关闭时返回 {@code null}。
+     */
+    static ScanManager createScanManagerIfEnabled(BooleanSupplier enabledSupplier) {
+        boolean enabled = true;
+        try {
+            enabled = enabledSupplier.getAsBoolean();
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法读取 [general] enabled，按启用处理", e);
+        }
+        return enabled ? createScanManager(null) : null;
+    }
+
+    /**
+     * 兼容测试的启动扫描开关判断。
+     */
+    static boolean shouldRequestScanOnStart(BooleanSupplier alwaysRescanSupplier) {
+        try {
+            return alwaysRescanSupplier.getAsBoolean();
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法读取 [general] alwaysRescan，按不重扫处理", e);
+            return false;
+        }
+    }
+
+    /**
+     * 停服时取消并重置调度器。
+     */
+    static void resetScanManager(ScanManager manager) {
+        if (manager != null) {
+            manager.cancel();
+            manager.reset();
         }
     }
 
@@ -771,6 +810,7 @@ public final class Sudoersemc {
     }
 
     private void onServerStarted(ServerStartedEvent event) {
+        SudoemcCommands.setService(commandService);
         GeneratedEntryStore store = entryStore;
         if (store != null) {
             LOGGER.info("SudoersEMC active: {} generated entries, ProjectE {}",
@@ -836,6 +876,7 @@ public final class Sudoersemc {
     }
 
     private void onServerStopping(ServerStoppingEvent event) {
+        resetScanManager(scanManager);
         GeneratedEntryStore store = entryStore;
         if (store != null) {
             store.saveIfDirty();
@@ -852,6 +893,9 @@ public final class Sudoersemc {
         if (resetLog != null) {
             resetLog.save();
         }
+        pendingReload = false;
+        // 不保留指向旧世界的命令服务；下一次 ServerStartedEvent 会重新注入。
+        SudoemcCommands.setService(null);
     }
 
     /**
