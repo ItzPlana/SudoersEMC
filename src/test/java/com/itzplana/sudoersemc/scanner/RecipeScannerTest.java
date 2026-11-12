@@ -88,4 +88,18 @@ class RecipeScannerTest {
         assertEquals("{Damage:3}", output.outputNbt(), "非空 SNBT 必须原样保留");
         assertFalse(output.outputNbt().isBlank());
     }
+
+    @Test
+    void defaultDamageZeroTagSerialisesToNullSnbt() {
+        ItemStack stack = new ItemStack(Items.DIAMOND_SWORD);
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 0);
+        stack.setTag(tag);
+
+        RecipeOutput output = RecipeScanner.convertStack(stack);
+
+        assertNotNull(output);
+        assertNull(output.outputNbt(), "默认 {Damage:0} 必须归一为 null，避免生成伪变体");
+        assertFalse(output.hasOutputNbt());
+    }
 }

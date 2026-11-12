@@ -105,6 +105,16 @@ class VariantScannerTest {
                 () -> scanner.scan(BASE_STACK, List.of(damageTag(1)), -1));
     }
 
+    @Test
+    void defaultDamageZeroTagIsDropped() {
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 0);
+
+        List<ItemKey> keys = scanner.scan(BASE_STACK, List.of(tag), 10);
+
+        assertTrue(keys.isEmpty(), "默认伤害标签不是经济变体");
+    }
+
     private static CompoundTag damageTag(int damage) {
         CompoundTag tag = new CompoundTag();
         tag.putInt("Damage", damage);

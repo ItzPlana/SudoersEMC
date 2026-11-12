@@ -242,4 +242,37 @@ class VariantNormalizerTest {
         assertEquals(ItemKey.of(SUDOERSEMC_TOKEN, "{Damage:3}"),
                 VariantNormalizer.keyFor(SUDOERSEMC_TOKEN, damage));
     }
+
+    @Test
+    void defaultDamageZeroOnlyNormalisesToNull() {
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 0);
+
+        assertNull(VariantNormalizer.normalize(tag),
+                "默认 {Damage:0} 只表示未受损，必须视为无变体");
+        assertEquals(ItemKey.of(SUDOERSEMC_TOKEN),
+                VariantNormalizer.keyFor(SUDOERSEMC_TOKEN, tag));
+    }
+
+    @Test
+    void defaultDamageZeroIsStillRecognisedAfterDisplayStripping() {
+        CompoundTag display = new CompoundTag();
+        display.putString("Name", "{\"text\":\"名称\"}");
+
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 0);
+        tag.put("display", display);
+
+        assertNull(VariantNormalizer.normalize(tag));
+    }
+
+    @Test
+    void defaultDamageIsKeptWhenOtherEconomicKeysArePresent() {
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 0);
+        tag.putLong("stored_emc", 64L);
+
+        assertEquals("{Damage:0,stored_emc:64L}", VariantNormalizer.normalize(tag),
+                "存在其它经济字段时 Damage 必须作为组合变体的一部分保留");
+    }
 }

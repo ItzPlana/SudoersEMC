@@ -6,6 +6,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
+import net.minecraft.nbt.NumericTag;
 import net.minecraft.nbt.StringTag;
 import net.minecraft.nbt.Tag;
 import net.minecraft.resources.ResourceLocation;
@@ -38,6 +39,7 @@ public final class VariantNormalizer {
 
     private static final String ATTRIBUTE_MODIFIERS = "AttributeModifiers";
     private static final String UUID = "UUID";
+    private static final String DAMAGE = "Damage";
 
     private VariantNormalizer() {
     }
@@ -48,6 +50,10 @@ public final class VariantNormalizer {
      * <p>该方法不会修改传入的标签；返回的字符串可安全地长期保存。嵌套的复合标签与列表
      * 也会递归清洗，因此容器内容中物品的自定义名称不会影响容器变体的身份。</p>
      *
+     * <p>可损坏物品默认携带的 {@code {Damage:0}} 只表示「未受损」，不构成经济差异；
+     * 因此当清洗后的标签只剩 {@code Damage} 且值为 0 时同样返回 {@code null}。若还包含
+     * 其它经济字段，或伤害值非 0，则保留 {@code Damage}。</p>
+     *
      * @param tag 原始物品标签，允许为 {@code null}
      * @return 规范化的 SNBT；清洗后没有经济相关数据时返回 {@code null}
      */
@@ -56,7 +62,7 @@ public final class VariantNormalizer {
             return null;
         }
         CompoundTag sanitized = sanitizeCompound(tag);
-        if (sanitized.isEmpty()) {
+        if (sanitized.isEmpty() || isDefaultDamageOnly(sanitized)) {
             return null;
         }
         StringBuilder out = new StringBuilder();
@@ -73,6 +79,23 @@ public final class VariantNormalizer {
      */
     public static ItemKey keyFor(ResourceLocation itemId, @Nullable CompoundTag tag) {
         return ItemKey.of(itemId, normalize(tag));
+    }
+
+    /**
+     * 判断清洗后的标签是否只包含「未受损」这一默认伤害标记。
+     *
+     * <p>只有唯一键 {@code Damage} 且数值为 0 时才算默认值。若还有其它键，说明
+     * 该标签携带额外经济数据，{@code Damage} 必须作为组合变体的一部分保留。</p>
+     *
+     * @param tag 已清洗的标签，不能为空
+     * @return 仅包含默认 {@code Damage:0} 时返回 {@code true}
+     */
+    private static boolean isDefaultDamageOnly(CompoundTag tag) {
+        if (tag.size() != 1) {
+            return false;
+        }
+        Tag damage = tag.get(DAMAGE);
+        return damage instanceof NumericTag numeric && numeric.getAsInt() == 0;
     }
 
     private static CompoundTag sanitizeCompound(CompoundTag source) {

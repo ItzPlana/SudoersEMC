@@ -261,7 +261,12 @@ public final class RecipeScanner {
             // 某些实现可能把空 CompoundTag 序列化成 "{}" 或带空白的等价形式；
             // 去除全部空白后仍为 "{}" 时按无 NBT 处理，避免下游生成伪变体。
             String compact = snbt.replaceAll("\\s+", "");
-            return compact.isEmpty() || "{}".equals(compact) ? null : snbt;
+            if (compact.isEmpty() || "{}".equals(compact)) {
+                return null;
+            }
+            // 可损坏物品默认携带 {Damage:0}，它只表示「未受损」，不是经济变体。
+            // 与 VariantNormalizer 保持一致，避免下游把默认伤害当成真实差异。
+            return "{Damage:0}".equals(compact) ? null : snbt;
         } catch (RuntimeException failure) {
             LOGGER.debug("序列化配方输出 NBT 失败，按无 NBT 处理", failure);
             return null;
