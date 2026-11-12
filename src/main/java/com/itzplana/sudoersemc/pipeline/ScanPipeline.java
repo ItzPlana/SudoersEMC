@@ -382,7 +382,10 @@ String detail = "扫描采集失败：服务器尚未就绪";
             RecipeScanner recipeScanner = RecipeScanner.withGoety().orElseGet(RecipeScanner::new);
             RecipeScanner.ScanResult scanResult = recipeScanner.scan(server.getRecipeManager());
 
-            return collectSnapshotData(items, scanResult, query);
+            PipelineSnapshot snapshot = collectSnapshotData(items, scanResult, query);
+            // 成功采集必须清除上一次失败原因，否则下一次 applyStashed 会误丢新快照。
+            lastCollectFailure = null;
+            return snapshot;
         } catch (Throwable failure) {
             String detail = "扫描采集失败：" + failureDetail(failure);
             LOGGER.error("SudoersEMC 扫描采集失败", failure);
@@ -430,7 +433,9 @@ String detail = "扫描采集失败：服务器尚未就绪";
                 existingValues,
                 scanResult.unsupported(),
                 scanResult.invalid(),
-                scanResult.failed());
+                scanResult.failed(),
+                scanResult.enumerationFailed(),
+                scanResult.failedRecipeDetails());
     }
 
     /**
@@ -614,6 +619,10 @@ String detail = "扫描采集失败：服务器尚未就绪";
     public void stash(@Nullable PipelineSnapshot snapshot) {
         fullReportWritten = false;
         pendingReport = null;
+        if (snapshot != null) {
+            // 新快照代表一次成功采集，清除上一次失败原因，避免恢复扫描被误判为失败。
+            lastCollectFailure = null;
+        }
         stashedSnapshot.set(snapshot);
     }
 

@@ -37,7 +37,7 @@ SudoersEMC 是一个**独立实现**的 Minecraft Forge 1.20.1 模组。它扫�
 
 ## 当前状态
 
-项目按阶段推进。当前代码基线为 Phase 22 分支 `phase-22-diagnostics`，**622 个单元测试通过**（0 failures / 0 errors / 0 skipped）；Phase 18–22 已完成，Goety 与 NBT 变体的真实环境验证仍待进行。
+项目按阶段推进。当前代码基线为 Phase 22 分支 `phase-22-diagnostics`，**716 个单元测试通过**（0 failures / 0 errors / 0 skipped）；Phase 18–22 已完成，Goety 与 NBT 变体的真实环境验证仍待进行。
 
 | 阶段       | 内容                                                                                                                                  | 状态                                            |
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------- |
@@ -360,7 +360,7 @@ ProjectE 原生值与 `custom_emc.json` 中的手动值不会进入这条候选�
 ./gradlew test
 ```
 
-测试覆盖：加权采样分布与权重重置、阈值边界、幂等性、持久化往返、损坏文件容错、schema 版本保护（含 v1→v2 兼容）、归属刷新、陈旧条目清理、`custom_emc.json` 受控改写（备份、原子替换、未知字段保留）、配置热重载决策、NBT 变体规范化（含空 NBT 与默认 `{Damage:0}`）、隔离记录存储与审批、备选成本持久化与 `explain` 输出、Goety 读取失败语义、Phase 22 的诊断报告计数器与失败明细、tick 耗时最大/平均/P95（最近秩法）、峰值堆采样、`extraCounters` 持久化、取消/失败部分报告，以及扫描接线。当前基线共 **524 个单元测试通过**（0 failures / 0 errors / 0 skipped）。
+测试覆盖：加权采样分布与权重重置、阈值边界、幂等性、持久化往返、损坏文件容错、schema 版本保护（含 v1→v2 兼容）、归属刷新、陈旧条目清理、`custom_emc.json` 受控改写（备份、原子替换、未知字段保留）、配置热重载决策、NBT 变体规范化（含空 NBT 与默认 `{Damage:0}`）、隔离记录存储与审批、备选成本持久化与 `explain` 输出、Goety 读取失败语义、Phase 22 的诊断报告计数器与失败明细、tick 耗时最大/平均/P95（最近秩法）、峰值堆采样、`extraCounters` 持久化、取消/失败部分报告，以及扫描接线。当前基线共 **716 个单元测试通过**（0 failures / 0 errors / 0 skipped）。
 
 ---
 
@@ -376,7 +376,7 @@ ProjectE 原生值与 `custom_emc.json` 中的手动值不会进入这条候选�
 
 ## English Summary
 
-SudoersEMC is an independent Minecraft Forge 1.20.1 mod that generates EMC values for items that ProjectE does not price. Current baseline: Phase 22 commit `35ebdc6`, **524 unit tests passing** (0 failures / 0 errors / 0 skipped); Phases 18–22 are complete, while live Goety and NBT-variant verification are still pending.
+SudoersEMC is an independent Minecraft Forge 1.20.1 mod that generates EMC values for items that ProjectE does not price. Current baseline: Phase 22 branch `phase-22-diagnostics`, **716 unit tests passing** (0 failures / 0 errors / 0 skipped); Phases 18–22 are complete, while live Goety and NBT-variant verification are still pending.
 
 - **Queries** go through ProjectE's public `IEMCProxy`.
 - **Writes** use ProjectE's official `@EMCMapper` extension point (`priority = -1000`, `setValueBefore`), never ProjectE internals.
