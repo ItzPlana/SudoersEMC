@@ -2,8 +2,10 @@ package com.itzplana.sudoersemc.integration;
 
 import com.itzplana.sudoersemc.core.GeneratedValueSource;
 import com.itzplana.sudoersemc.core.ItemKey;
+import com.itzplana.sudoersemc.core.VariantRegistration;
 import com.electronwill.nightconfig.core.file.CommentedFileConfig;
 import com.mojang.logging.LogUtils;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import moze_intel.projecte.api.mapper.EMCMapper;
@@ -14,6 +16,7 @@ import moze_intel.projecte.api.nss.NormalizedSimpleStack;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.TagParser;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.ReloadableServerResources;
 import net.minecraft.server.packs.resources.ResourceManager;
 import net.minecraftforge.fml.ModList;
@@ -104,6 +107,7 @@ public final class GeneratedEmcMapper implements IEMCMapper<NormalizedSimpleStac
             if (values == null || values.isEmpty()) {
                 return;
             }
+            Map<ItemKey, List<String>> variantNbts = currentSource.snapshotOwnedVariantNbts();
 
             int applied = 0;
             int manualSkips = 0;
@@ -121,23 +125,34 @@ public final class GeneratedEmcMapper implements IEMCMapper<NormalizedSimpleStac
                     continue;
                 }
 
-                NormalizedSimpleStack nss;
-                try {
-                    nss = toSimpleStack(key);
-                } catch (Throwable t) {
-                    invalidSkips++;
-                    if (VARIANT_WARNING_LOGGED.compareAndSet(false, true)) {
-                        LOGGER.warn("Skipping generated EMC value for {}: the variant data is not valid SNBT", key, t);
+                if (!key.hasVariant()) {
+                    if (registerValue(mapper, key.itemId(), null, value)) {
+                        applied++;
+                    } else {
+                        invalidSkips++;
                     }
                     continue;
                 }
-                if (nss == null) {
+
+                List<String> registrations = VariantRegistration.registrationNbts(
+                        key, variantNbts == null ? List.of() : variantNbts.get(key));
+                if (registrations.isEmpty()) {
                     invalidSkips++;
                     continue;
                 }
-
-                mapper.setValueBefore(nss, value);
-                applied++;
+                for (String snbt : registrations) {
+                    // 手动配置的原始 NBT 变体也必须保持保护；规范 key 的检查在上方已完成。
+                    if (currentManual != null
+                            && currentManual.isManuallySetInSnapshot(ItemKey.of(key.itemId(), snbt))) {
+                        manualSkips++;
+                        continue;
+                    }
+                    if (registerValue(mapper, key.itemId(), snbt, value)) {
+                        applied++;
+                    } else {
+                        invalidSkips++;
+                    }
+                }
             }
 
             if (applied > 0 || manualSkips > 0 || invalidSkips > 0) {
@@ -150,11 +165,39 @@ public final class GeneratedEmcMapper implements IEMCMapper<NormalizedSimpleStac
         }
     }
 
-    private static @Nullable NormalizedSimpleStack toSimpleStack(ItemKey key) throws Exception {
-        CompoundTag nbt = null;
-        if (key.hasVariant()) {
-            nbt = TagParser.parseTag(key.variantHash());
+    /**
+     * 把一个 NBT key 注册到 ProjectE。
+     *
+     * <p>变体条目会同时注册规范 SNBT 与观测到的原始 SNBT：规范 key 用于经济身份与去重，
+     * 原始 key 才能匹配带上展示字段的真实堆叠。单个坏 SNBT 只跳过该 key，不中断整轮映射。</p>
+     *
+     * @return {@code true} 表示注册成功
+     */
+    private static boolean registerValue(IMappingCollector<NormalizedSimpleStack, Long> mapper,
+                                         ResourceLocation itemId,
+                                         @Nullable String snbt, long value) {
+        try {
+            NormalizedSimpleStack nss = toSimpleStack(itemId, snbt);
+            if (nss == null) {
+                return false;
+            }
+            mapper.setValueBefore(nss, value);
+            return true;
+        } catch (Throwable t) {
+            if (VARIANT_WARNING_LOGGED.compareAndSet(false, true)) {
+                LOGGER.warn("Skipping generated EMC value for {} with NBT {}: the variant data is not valid SNBT",
+                        itemId, snbt, t);
+            }
+            return false;
         }
-        return NSSItem.createItem(key.itemId(), nbt);
+    }
+
+    private static @Nullable NormalizedSimpleStack toSimpleStack(
+            ResourceLocation itemId, @Nullable String snbt) throws Exception {
+        CompoundTag nbt = null;
+        if (snbt != null) {
+            nbt = TagParser.parseTag(snbt);
+        }
+        return NSSItem.createItem(itemId, nbt);
     }
 }

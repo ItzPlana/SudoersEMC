@@ -9,7 +9,6 @@ import com.itzplana.sudoersemc.core.ItemKey;
 import com.itzplana.sudoersemc.safety.OverflowProtection;
 import com.itzplana.sudoersemc.storage.JsonFileIO;
 import com.mojang.logging.LogUtils;
-import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -27,9 +26,12 @@ import org.slf4j.Logger;
  * <p>只有当管理员显式选择 {@code entire_custom_emc} 作用域并允许改写 ProjectE 文件时，上层才会
  * 调用本类。改写遵循以下约束：</p>
  * <ul>
+ *   <li><strong>红线：</strong>只重置 {@code owned} 判定为 SudoersEMC 自有的条目；管理员手动
+ *       配置的条目即使超过阈值也永远保持原值，只计数并汇总告警；</li>
  *   <li>只处理与 {@link ProjectEManualValues} 相同结构中的条目：顶层 {@code entries} 数组，或
  *       直接以数组为根；条目格式为 {@code {"item": "...", "emc": 123}}；</li>
- *   <li>只有严格大于阈值的整数 EMC 才会进入 {@link OverflowProtection#applyIdempotent(long)}；</li>
+ *   <li>只有严格大于阈值的数字 EMC（JSON 数字或数字字符串，解析口径与
+ *       {@link ProjectEManualValues} 一致）才会进入 {@link OverflowProtection#applyIdempotent(long)}；</li>
  *   <li>使用 Gson 树模型原地替换数值，未知字段与键顺序保持不变；</li>
  *   <li>写入前先做时间戳备份，再原子替换；没有任何改动时不触碰磁盘；</li>
  *   <li>文件缺失、内容损坏或结构不符合预期时保持原文件不变，绝不创建或覆盖。</li>
@@ -74,33 +76,32 @@ public final class ProjectECustomEmcFile {
     }
 
     /**
-     * 改写所有严格超过阈值的条目。
+     * 改写所有严格超过阈值且归 SudoersEMC 所有的条目。
      *
-     * @param protection    溢出策略，不能为 {@code null}
-     * @param owned         归属判定，不能为 {@code null}
-     * @param allowNonOwner 是否允许改写不属于 SudoersEMC 的条目
+     * <p>非自有（管理员手动）条目始终保留原值，只计入 {@link RewriteResult#notOwned()}。</p>
+     *
+     * @param protection 溢出策略，不能为 {@code null}
+     * @param owned      归属判定，不能为 {@code null}
      * @return 改写统计；文件缺失、损坏或无需改动时 {@code wroteFile} 为 {@code false}
      */
     public RewriteResult rewriteAboveThreshold(OverflowProtection protection,
-                                               Predicate<ItemKey> owned,
-                                               boolean allowNonOwner) {
-        return rewriteAboveThreshold(protection, owned, allowNonOwner, null);
+                                               Predicate<ItemKey> owned) {
+        return rewriteAboveThreshold(protection, owned, null);
     }
 
     /**
-     * 改写所有严格超过阈值的条目，并在成功写盘后逐条通知监听器。
+     * 改写所有严格超过阈值且归 SudoersEMC 所有的条目，并在成功写盘后逐条通知监听器。
      *
-     * <p>通知发生在文件替换成功之后，因此不会为失败或被取消的写入产生审计记录。</p>
+     * <p>通知发生在文件替换成功之后，因此不会为失败或被取消的写入产生审计记录。
+     * 非自有条目永远不会被写入，只计入 {@link RewriteResult#notOwned()}。</p>
      *
-     * @param protection    溢出策略，不能为 {@code null}
-     * @param owned         归属判定，不能为 {@code null}
-     * @param allowNonOwner 是否允许改写不属于 SudoersEMC 的条目
-     * @param listener      每条实际重置的回调，允许为 {@code null}
+     * @param protection 溢出策略，不能为 {@code null}
+     * @param owned      归属判定，不能为 {@code null}
+     * @param listener   每条实际重置的回调，允许为 {@code null}
      * @return 改写统计；文件缺失、损坏或无需改动时 {@code wroteFile} 为 {@code false}
      */
     public RewriteResult rewriteAboveThreshold(OverflowProtection protection,
                                                Predicate<ItemKey> owned,
-                                               boolean allowNonOwner,
                                                @Nullable ResetListener listener) {
         Objects.requireNonNull(protection, "protection");
         Objects.requireNonNull(owned, "owned");
@@ -157,7 +158,6 @@ public final class ProjectECustomEmcFile {
 
         int skipped = 0;
         int notOwned = 0;
-        int nonOwnedSkipped = 0;
         List<PendingReset> pendingResets = new ArrayList<>();
 
         for (JsonElement element : entries) {
@@ -180,7 +180,7 @@ public final class ProjectECustomEmcFile {
             }
             Long currentValue = integerValue(entry.get(EMC_KEY));
             if (currentValue == null) {
-                // 非整数或非数字：ProjectE 可能有自己的解释，保持原样。
+                // 非数字、负数或无法解析：ProjectE 可能有自己的解释，保持原样。
                 skipped++;
                 continue;
             }
@@ -211,11 +211,9 @@ public final class ProjectECustomEmcFile {
                 isOwned = false;
             }
             if (!isOwned) {
+                // 红线：管理员手动值永不改写，只计数并在下面汇总告警。
                 notOwned++;
-                if (!allowNonOwner) {
-                    nonOwnedSkipped++;
-                    continue;
-                }
+                continue;
             }
 
             // 原地替换数值，保留条目中的其它字段与键顺序。
@@ -223,11 +221,11 @@ public final class ProjectECustomEmcFile {
             pendingResets.add(new PendingReset(key, currentValue, resetValue));
         }
 
-        if (nonOwnedSkipped > 0) {
-            // 汇总一条告警，避免逐条刷屏。
+        if (notOwned > 0) {
+            // 汇总一条告警，避免逐条刷屏；非自有条目始终不会被写入。
             LOGGER.warn("ProjectE 手动 EMC 文件 {} 中有 {} 个超限条目不属于 SudoersEMC，"
-                            + "已保持原值（需要显式允许改写非自有条目）",
-                    file, nonOwnedSkipped);
+                            + "已保持原值（管理员手动配置永不改写）",
+                    file, notOwned);
         }
 
         if (pendingResets.isEmpty()) {
@@ -287,22 +285,35 @@ public final class ProjectECustomEmcFile {
     }
 
     /**
-     * 仅接受 JSON 数字且数学上为整数的值；字符串、布尔、小数和越界数值都返回 {@code null}。
+     * 解析 EMC 数值，口径与 {@link ProjectEManualValues} 保持一致：JSON 数字或十进制数字字符串。
+     *
+     * <p>JSON 数字按 ProjectE 的 {@code long} 语义解析（小数截断，超大值抛异常时视为无效）；
+     * 字符串会先去除首尾空白再按十进制整数解析。布尔、空白字符串、负数和越界数值都返回
+     * {@code null}。接受这两种形式是为了避免 ProjectE 能识别的手动值（例如
+     * {@code "emc": "6000"}）被静默跳过，导致超限条目永远无法进入归属判定与汇总告警。</p>
      */
     private static @Nullable Long integerValue(@Nullable JsonElement element) {
         if (element == null || !element.isJsonPrimitive()) {
             return null;
         }
         JsonPrimitive primitive = element.getAsJsonPrimitive();
-        if (!primitive.isNumber()) {
-            return null;
+        if (primitive.isNumber()) {
+            try {
+                long value = primitive.getAsLong();
+                return value >= 0L ? value : null;
+            } catch (RuntimeException failure) {
+                return null;
+            }
         }
-        try {
-            BigDecimal decimal = primitive.getAsBigDecimal();
-            return decimal.longValueExact();
-        } catch (ArithmeticException | NumberFormatException failure) {
-            return null;
+        if (primitive.isString()) {
+            try {
+                long value = Long.parseLong(primitive.getAsString().trim());
+                return value >= 0L ? value : null;
+            } catch (NumberFormatException failure) {
+                return null;
+            }
         }
+        return null;
     }
 
     /**
@@ -315,8 +326,8 @@ public final class ProjectECustomEmcFile {
      * 改写结果的汇总。
      *
      * @param rewritten 实际写回的新值数量
-     * @param skipped   格式不合法、非整数或未产生数值变化的条目数量
-     * @param notOwned  超过阈值但不属于 SudoersEMC 的条目数量（无论是否放行都会计数）
+     * @param skipped   格式不合法、非数字、负数或未产生数值变化的条目数量
+     * @param notOwned  超过阈值但不属于 SudoersEMC 的条目数量；这些条目始终保留原值
      * @param wroteFile 是否真正替换了磁盘文件
      * @param backup    本次改写前创建的备份路径；未写盘时为 {@code null}
      */

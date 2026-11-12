@@ -16,7 +16,7 @@
 ### 已知限制
 
 - 扫描管线尚未接线：采集器仍返回 `"待接入真实扫描", 0, 0`，当前构建不会生成任何 EMC 值。
-- `ENTIRE_CUSTOM_EMC` 的 ProjectE 文件改写未实现。
+- `ENTIRE_CUSTOM_EMC` 的 ProjectE 文件改写只覆盖 SudoersEMC 自有条目；管理员手动条目永不改写。
 - `ConfigValidator` / `ConfigWatcher` / `ConfigMigrations` 尚未接入生产配置流程。
 - Goety 真实环境与大型模组包性能未验证。
 
