@@ -1293,6 +1293,27 @@ class ScanPipelineTest {
     }
 
     @Test
+    void staleOwnedEntryIsKeptWhenRecipeScanHasFailures() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_stale_scan_failed.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 128L, PriceSource.RECIPE, null, true, 0L));
+
+        PipelineSnapshot snapshot = new PipelineSnapshot(
+                List.of(item(INGOT, 5L), item(GEAR, 0L), item(RESULT, 0L)),
+                List.of(recipe(INGOT, GEAR)),
+                Map.of(INGOT, 5L),
+                0, 0, 1);
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null, disabledFallback());
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1, result.applied(), "本轮仍需为其它物品生成候选");
+        assertNotNull(store.snapshotAll().get(RESULT),
+                "配方描述失败导致本轮求解不完整时不得清理自有条目");
+    }
+
+    @Test
     void staleOwnedEntryIsKeptWhenSolveRecipesDisabled() {
         GeneratedEntryStore store = new GeneratedEntryStore(
                 tempDir.resolve("generated_stale_solve_disabled.json"));

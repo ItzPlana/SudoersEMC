@@ -876,8 +876,8 @@ public final class ScanPipeline {
      * 即视为完全没有参与定价。非自有条目（手动配置或外部后端写入）永远不会删除。</p>
      *
      * <p>以下情况直接跳过，避免把“本轮没有计算”误判成“条目陈旧”：干跑模式
-     * （{@code store == null}）、配方求解被禁用、本轮没有任何候选，或快照没有任何物品
-     * （例如服务器尚未就绪）。</p>
+     * （{@code store == null}）、配方求解被禁用、配方描述失败导致本轮求解不完整、本轮没有任何
+     * 候选，或快照没有任何物品（例如服务器尚未就绪）。</p>
      *
      * @param snapshot       本轮采集结果
      * @param pricedKeys     本轮选出的候选物品集合
@@ -889,6 +889,12 @@ public final class ScanPipeline {
         if (store == null) {
             return 0;
         }
+        if (snapshot.failedRecipes() > 0) {
+            LOGGER.debug("本轮有 {} 条配方描述失败，求解结果可能不完整，跳过陈旧自有条目清理",
+                    snapshot.failedRecipes());
+            return 0;
+        }
+
         if (!solveRecipesEnabled) {
             LOGGER.debug("配方求解已禁用，跳过陈旧自有条目清理");
             return 0;
