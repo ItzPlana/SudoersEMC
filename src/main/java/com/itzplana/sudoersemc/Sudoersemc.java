@@ -121,7 +121,7 @@ public final class Sudoersemc {
         BatchProcessor processor = new BatchProcessor(Math.max(1, itemsPerTick), adaptive);
         return new ScanManager(
                 processor,
-                () -> new ScanManager.SnapshotData("待接入真实扫描", 0, 0),
+                ScanManager.oneShot(new ScanManager.SnapshotData("待接入真实扫描", 0, 0)),
                 data -> LOGGER.debug("SudoersEMC 扫描应用阶段：{}", data.label()),
                 TICK_BUDGET_NANOS);
     }
