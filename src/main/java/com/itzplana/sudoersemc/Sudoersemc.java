@@ -510,13 +510,30 @@ public final class Sudoersemc {
         if (pipeline != null) {
             pipeline.setDiagnostics(diagnostics);
         }
+        ScanManager.ResultApplier applier = new ScanManager.ResultApplier() {
+            @Override
+            public void apply(ScanManager.SnapshotData data) {
+                applySnapshot(pipeline);
+            }
+
+            @Override
+            public void onCompleted() {
+                // 最后一个 tick 的耗时/内存样本已经记录，此时写报告才能包含 APPLYING/SAVING。
+                if (pipeline != null) {
+                    pipeline.writePendingReport();
+                }
+            }
+        };
         return new ScanManager(
                 processor,
                 () -> collectSnapshot(pipeline),
-                data -> applySnapshot(pipeline),
+                applier,
                 TICK_BUDGET_NANOS,
                 diagnostics,
                 (phase, progress, telemetry) -> {
+                    if (pipeline == null) {
+                        return;
+                    }
                     if (phase == ScanPhase.CANCELLED) {
                         pipeline.writeCancelledReport(telemetry);
                     } else if (phase == ScanPhase.FAILED) {
@@ -563,15 +580,16 @@ public final class Sudoersemc {
     /**
      * 采集阶段回调：读取当前服务器并生成不可变快照。
      *
-     * <p>服务器尚未就绪时返回空快照，避免调度器因为空指针进入失败状态。</p>
+     * <p>服务器尚未就绪或采集整体失败时抛出 {@link IllegalStateException}，由调度器转入
+     * {@link ScanPhase#FAILED} 并写出 {@code scanFailed=1} 的部分诊断报告，避免把采集失败
+     * 静默伪装成一次正常空扫描。</p>
      */
     private static ScanManager.SnapshotData collectSnapshot(ScanPipeline pipeline) {
         MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
         if (server == null) {
-            LOGGER.warn("SudoersEMC 扫描请求到达时服务器尚未就绪，本轮采集空快照");
-            PipelineSnapshot empty = PipelineSnapshot.empty();
-            pipeline.stash(empty);
-            return new ScanManager.SnapshotData("服务器未就绪", 0, 0);
+            LOGGER.warn("SudoersEMC 扫描请求到达时服务器尚未就绪，本轮采集失败");
+            // 抛出而不是返回空快照：让 ScanManager 进入 FAILED 并写出 scanFailed=1 的部分报告。
+            throw new IllegalStateException("服务器尚未就绪，无法采集扫描快照");
         }
 
         PipelineSnapshot snapshot = pipeline.collect(server);

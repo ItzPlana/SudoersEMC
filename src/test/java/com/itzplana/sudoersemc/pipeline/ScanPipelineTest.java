@@ -32,8 +32,11 @@ import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
 import com.itzplana.sudoersemc.storage.OverflowResetLog;
 import com.itzplana.sudoersemc.storage.QuarantinedDropsStore;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
+import com.itzplana.sudoersemc.task.BatchProcessor;
 import com.itzplana.sudoersemc.task.ScanDiagnostics;
 import com.itzplana.sudoersemc.task.ScanFingerprint;
+import com.itzplana.sudoersemc.task.ScanManager;
+import com.itzplana.sudoersemc.task.ScanPhase;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -134,6 +137,7 @@ class ScanPipelineTest {
         ScanPipeline pipeline = pipeline(store, null, reportManager, null, null, null, disabledFallback());
 
         PipelineResult result = pipeline.solveAndApply(snapshot);
+        pipeline.writePendingReport();
 
         assertEquals(0, result.solvedByRecipe());
         assertEquals(0, result.solvedByFallback());
@@ -364,9 +368,10 @@ class ScanPipelineTest {
                 store, null, reportManager, null, null, null, genericFallback(7L));
 
         pipeline.solveAndApply(snapshot);
+        pipeline.writePendingReport();
 
         Path reportFile = reportManager.reportFile();
-        assertTrue(Files.isRegularFile(reportFile), "求解完成后必须写出诊断报告");
+        assertTrue(Files.isRegularFile(reportFile), "完成回调必须写出诊断报告");
         String report = Files.readString(reportFile);
         assertTrue(report.contains("SudoersEMC 诊断报告"));
         assertTrue(hasCounterLine(report, "兜底定价", 1L));
@@ -821,6 +826,7 @@ class ScanPipelineTest {
 
         PipelineResult result = pipeline.solveAndApply(
                 snapshot(List.of(item(RESULT, 0L)), List.of(), Map.of()));
+        pipeline.writePendingReport();
 
         assertEquals(1, result.applied());
         assertFalse(Files.exists(reportManager.reportFile()), "禁用后不得写出 last_report.txt");
@@ -1072,6 +1078,7 @@ class ScanPipelineTest {
         pipeline.setDiagnostics(diagnostics);
 
         PipelineResult result = pipeline.solveAndApply(snapshot);
+        pipeline.writePendingReport();
 
         assertEquals(1, result.quarantined());
         assertEquals(6L, result.extraCounter("totalRecipes", -1L),
@@ -1086,6 +1093,8 @@ class ScanPipelineTest {
         assertTrue(hasCounterLine(report, "不支持配方", 2L));
         assertTrue(hasCounterLine(report, "无效配方", 1L));
         assertTrue(hasCounterLine(report, "失败配方", 3L));
+        assertTrue(hasCounterLine(report, "扫描失败配方", 3L),
+                "配方扫描区块必须使用不重复的标签");
         assertTrue(report.contains("bad_recipe: boom"), "失败配方明细必须写入报告");
         assertTrue(report.lines().anyMatch(line -> line.contains("quarantinedDrops: 1")),
                 "PipelineResult.extraCounters 中的计数器必须全部输出");
@@ -1121,6 +1130,106 @@ class ScanPipelineTest {
         assertTrue(failed.contains("部分报告（扫描失败）"));
         assertTrue(failed.lines().anyMatch(line -> line.contains("scanFailed: 1")));
         assertTrue(failed.lines().anyMatch(line -> line.contains("scanAborts: 1")));
+    }
+
+    @Test
+    void completionReportIncludesApplyingAndSavingTicks() throws IOException {
+        ReportManager reportManager = new ReportManager(tempDir.resolve("completion_report"));
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_completion_report.json"));
+        ScanPipeline pipeline = pipeline(
+                store, null, reportManager, null, null, null, genericFallback(7L));
+        ScanDiagnostics diagnostics = new ScanDiagnostics();
+        pipeline.setDiagnostics(diagnostics);
+        PipelineSnapshot snapshot = snapshot(List.of(item(RESULT, 0L)), List.of(), Map.of());
+
+        ScanManager manager = new ScanManager(
+                new BatchProcessor(10, false),
+                () -> {
+                    pipeline.stash(snapshot);
+                    return new ScanManager.SnapshotData("测试快照", snapshot.itemCount(), 0);
+                },
+                new ScanManager.ResultApplier() {
+                    @Override
+                    public void apply(ScanManager.SnapshotData data) {
+                        pipeline.applyStashed();
+                    }
+
+                    @Override
+                    public void onCompleted() {
+                        pipeline.writePendingReport();
+                    }
+                },
+                1_000_000L,
+                diagnostics,
+                null);
+
+        assertTrue(manager.requestScan());
+        int ticks = 0;
+        while (manager.isRunning() && ticks < 20) {
+            manager.tick();
+            ticks++;
+        }
+
+        assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
+        String report = Files.readString(reportManager.reportFile());
+        assertTrue(hasCounterLine(report, "tick 采样数", ticks),
+                "完整报告必须包含 APPLYING/SAVING tick，期望 " + ticks + " 个样本，实际报告:\n" + report);
+    }
+
+    @Test
+    void collectFailureProducesFailedReportInsteadOfSilentEmptyScan() throws IOException {
+        ReportManager reportManager = new ReportManager(tempDir.resolve("collect_failure_report"));
+        ScanPipeline pipeline = pipeline(
+                null, null, reportManager, null, null, null, disabledFallback());
+
+        PipelineSnapshot empty = pipeline.collect(null);
+        assertTrue(empty.isEmpty());
+        assertNotNull(pipeline.lastCollectFailure(), "采集失败必须保留原因");
+        pipeline.stash(empty);
+
+        PipelineResult result = pipeline.applyStashed();
+
+        assertEquals(0, result.applied());
+        String report = Files.readString(reportManager.reportFile());
+        assertTrue(report.contains("部分报告（扫描失败）"),
+                "采集失败不得伪装成正常空扫描");
+        assertTrue(report.lines().anyMatch(line -> line.contains("scanFailed: 1")));
+    }
+
+    @Test
+    void applyStashedWithoutSnapshotWritesFailedReport() throws IOException {
+        ReportManager reportManager = new ReportManager(tempDir.resolve("missing_snapshot_report"));
+        ScanPipeline pipeline = pipeline(
+                null, null, reportManager, null, null, null, disabledFallback());
+
+        PipelineResult result = pipeline.applyStashed();
+
+        assertEquals(0, result.applied());
+        String report = Files.readString(reportManager.reportFile());
+        assertTrue(report.contains("部分报告（扫描失败）"));
+        assertTrue(report.lines().anyMatch(line -> line.contains("scanFailed: 1")));
+    }
+
+    @Test
+    void recipeEnumerationFailureShowsUnknownTotal() throws IOException {
+        ReportManager reportManager = new ReportManager(tempDir.resolve("enumeration_failure_report"));
+        ScanPipeline pipeline = pipeline(
+                null, null, reportManager, null, null, null, disabledFallback());
+        PipelineSnapshot snapshot = new PipelineSnapshot(
+                List.of(item(RESULT, 0L)), List.of(), Map.of(), 0, 0, 0, true,
+                List.of("recipe-manager: boom"));
+
+        pipeline.solveAndApply(snapshot);
+        pipeline.writePendingReport();
+
+        String report = Files.readString(reportManager.reportFile());
+        assertTrue(report.contains("不可用（配方枚举失败）"),
+                "枚举失败时报告必须明确标注统计不可用");
+        assertFalse(report.lines().anyMatch(line -> line.startsWith("配方扫描总数")),
+                "枚举失败时不得输出伪造的配方总数");
+        assertTrue(report.lines().anyMatch(line -> line.contains("recipeEnumerationFailed: 1")));
+        assertTrue(report.contains("recipe-manager: boom"));
     }
 
     /**

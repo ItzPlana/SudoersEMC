@@ -413,6 +413,65 @@ class ScanManagerTest {
     }
 
     @Test
+    void completionCallbackRunsAfterFinalTickIsRecorded() {
+        ScanDiagnostics diagnostics = new ScanDiagnostics();
+        AtomicInteger completedTickCount = new AtomicInteger(-1);
+        ScanManager manager = new ScanManager(new BatchProcessor(10, false),
+                () -> data(1, 0),
+                new ScanManager.ResultApplier() {
+                    @Override
+                    public void apply(ScanManager.SnapshotData data) {
+                        // 应用本身不影响本测试关注的 tick 记录顺序。
+                    }
+
+                    @Override
+                    public void onCompleted() {
+                        completedTickCount.set(diagnostics.tickCount());
+                    }
+                },
+                TICK_BUDGET_NANOS, diagnostics, null);
+
+        manager.requestScan();
+        int ticks = 0;
+        while (manager.isRunning() && ticks < TICK_GUARD) {
+            manager.tick();
+            ticks++;
+        }
+
+        assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
+        assertEquals(ticks, completedTickCount.get(),
+                "完成回调必须在本轮最后一个 tick 记录耗时之后执行");
+        assertEquals(ticks, diagnostics.tickCount(),
+                "每个 tick（含 APPLYING/SAVING）都必须留下耗时样本");
+    }
+
+    @Test
+    void completionCallbackExceptionDoesNotEscape() {
+        ScanManager manager = new ScanManager(new BatchProcessor(10, false),
+                () -> data(0, 0),
+                new ScanManager.ResultApplier() {
+                    @Override
+                    public void apply(ScanManager.SnapshotData data) {
+                    }
+
+                    @Override
+                    public void onCompleted() {
+                        throw new IllegalStateException("完成回调爆炸");
+                    }
+                },
+                TICK_BUDGET_NANOS, new ScanDiagnostics(), null);
+
+        manager.requestScan();
+        int ticks = 0;
+        while (manager.isRunning() && ticks < TICK_GUARD) {
+            assertDoesNotThrow(manager::tick);
+            ticks++;
+        }
+
+        assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
+    }
+
+    @Test
     void cancelInvokesAbortListener() {
         AtomicReference<ScanPhase> observedPhase = new AtomicReference<>();
         AtomicReference<ScanDiagnostics> observedTelemetry = new AtomicReference<>();

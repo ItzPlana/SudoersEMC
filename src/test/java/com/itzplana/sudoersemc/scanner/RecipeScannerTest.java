@@ -4,8 +4,10 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.itzplana.sudoersemc.core.ItemKey;
+import java.util.Optional;
 import java.util.stream.Stream;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.NonNullList;
@@ -20,6 +22,8 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.crafting.CraftingBookCategory;
 import net.minecraft.world.item.crafting.Ingredient;
+import net.minecraft.world.item.crafting.Recipe;
+import net.minecraft.world.item.crafting.RecipeManager;
 import net.minecraft.world.item.crafting.ShapedRecipe;
 import net.minecraft.world.item.crafting.ShapelessRecipe;
 import org.junit.jupiter.api.BeforeAll;
@@ -165,8 +169,60 @@ class RecipeScannerTest {
         assertFalse(output.hasOutputNbt());
     }
 
+    @Test
+    void recipeEnumerationFailureIsReportedAsUnknownTotal() {
+        RecipeScanner.ScanResult result = scanner.scan(new ExplodingRecipeManager());
+
+        assertTrue(result.enumerationFailed(), "枚举失败必须使用独立标志");
+        assertEquals(0, result.failed(), "不得把枚举失败伪造成一条失败配方");
+        assertEquals(0, result.total(), "枚举失败时配方总数未知");
+        assertEquals(1, result.failedRecipeDetails().size());
+        assertTrue(result.failedRecipeDetails().get(0).contains("recipe-manager"));
+    }
+
+    @Test
+    void failedRecipeDetailsAreCappedButFailureCountKeepsGrowing() {
+        int brokenRecipes = RecipeScanner.MAX_FAILED_DETAILS + 10;
+        RecipeScanner.ScanResult result = scanner.scan(new FailingRecipeManager(brokenRecipes));
+
+        assertFalse(result.enumerationFailed());
+        assertEquals(brokenRecipes, result.failed(), "失败总数必须继续累加");
+        assertEquals(RecipeScanner.MAX_FAILED_DETAILS, result.failedRecipeDetails().size(),
+                "失败明细必须限制在内存上限内");
+    }
+
     private static TagKey<Item> unboundTag() {
         return TagKey.create(Registries.ITEM, new ResourceLocation("sudoersemc_test", "unbound"));
+    }
+
+    /** 模拟配方管理器整体枚举失败。 */
+    private static final class ExplodingRecipeManager extends RecipeManager {
+
+        @Override
+        public Stream<ResourceLocation> getRecipeIds() {
+            throw new IllegalStateException("枚举爆炸");
+        }
+    }
+
+    /** 模拟大量配方在读取时抛异常，用于验证失败明细上限。 */
+    private static final class FailingRecipeManager extends RecipeManager {
+
+        private final int recipeCount;
+
+        private FailingRecipeManager(int recipeCount) {
+            this.recipeCount = recipeCount;
+        }
+
+        @Override
+        public Stream<ResourceLocation> getRecipeIds() {
+            return java.util.stream.IntStream.range(0, recipeCount)
+                    .mapToObj(index -> new ResourceLocation("sudoersemc_test", "broken_" + index));
+        }
+
+        @Override
+        public Optional<? extends Recipe<?>> byKey(ResourceLocation id) {
+            throw new IllegalStateException("配方损坏");
+        }
     }
 
     private static ShapedRecipe shaped(int width, int height, Ingredient first, Ingredient second,

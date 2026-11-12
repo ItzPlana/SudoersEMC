@@ -122,6 +122,10 @@ public final class ScanPipeline {
     private volatile long lastDurationMillis;
     private volatile ScanDiagnostics diagnostics = new ScanDiagnostics();
     private volatile boolean fullReportWritten;
+    /** 最近一次采集失败的中文原因；采集成功后清空，供应用阶段写出失败报告。 */
+    private volatile String lastCollectFailure;
+    /** 等待扫描完成回调写出的完整报告参数；为空表示没有待写报告。 */
+    private volatile PendingReport pendingReport;
 
     /**
      * 创建管线。
@@ -303,6 +307,7 @@ public final class ScanPipeline {
     public PipelineSnapshot collect(@Nullable MinecraftServer server) {
         if (server == null) {
             LOGGER.warn("SudoersEMC 扫描采集被调用时服务器尚未就绪，返回空快照");
+            lastCollectFailure = "服务器尚未就绪，无法采集扫描快照";
             return PipelineSnapshot.empty();
         }
 
@@ -362,6 +367,7 @@ public final class ScanPipeline {
                 }
             }
 
+            lastCollectFailure = null;
             return new PipelineSnapshot(
                     allItems,
                     scanResult.recipes(),
@@ -369,9 +375,11 @@ public final class ScanPipeline {
                     scanResult.unsupported(),
                     scanResult.invalid(),
                     scanResult.failed(),
+                    scanResult.enumerationFailed(),
                     scanResult.failedRecipeDetails());
         } catch (Throwable failure) {
             LOGGER.error("SudoersEMC 扫描采集失败，本轮按空快照处理", failure);
+            lastCollectFailure = "扫描采集失败：" + failureDetail(failure);
             return PipelineSnapshot.empty();
         }
     }
@@ -486,21 +494,42 @@ public final class ScanPipeline {
      */
     public void stash(@Nullable PipelineSnapshot snapshot) {
         fullReportWritten = false;
+        pendingReport = null;
         stashedSnapshot.set(snapshot);
+    }
+
+    /**
+     * @return 最近一次采集失败的中文原因；最近一次采集成功时为 {@code null}
+     */
+    @Nullable
+    public String lastCollectFailure() {
+        return lastCollectFailure;
     }
 
     /**
      * 取出并应用最近一次暂存的快照。
      *
-     * <p>快照在取出后立即清空，因此重复调用不会把同一批结果写入两次。没有暂存快照时返回全零
-     * 结果并记录警告，不会抛出异常。</p>
+     * <p>快照在取出后立即清空，因此重复调用不会把同一批结果写入两次。没有暂存快照或采集阶段
+     * 已经失败时返回全零结果并写出失败诊断报告，不会抛出异常。</p>
      *
-     * @return 本次应用的结果；没有暂存数据时为 {@link PipelineResult#zeroed(long)}
+     * @return 本次应用的结果；没有暂存数据或采集失败时为 {@link PipelineResult#zeroed(long)}
      */
     public PipelineResult applyStashed() {
         PipelineSnapshot snapshot = stashedSnapshot.getAndSet(null);
         if (snapshot == null) {
+            String detail = lastCollectFailure == null
+                    ? "应用阶段没有可用的暂存快照"
+                    : lastCollectFailure;
+            lastCollectFailure = detail;
             LOGGER.warn("SudoersEMC 应用阶段没有可用的暂存快照，跳过本轮写入");
+            writeFailedReport(detail, diagnostics);
+            return PipelineResult.zeroed(0L);
+        }
+        String collectFailure = lastCollectFailure;
+        if (collectFailure != null) {
+            // collect(...) 吞掉异常后返回空快照；这里不能再把它当成正常空扫描。
+            lastCollectFailure = null;
+            writeFailedReport(collectFailure, diagnostics);
             return PipelineResult.zeroed(0L);
         }
         return solveAndApply(snapshot);
@@ -566,6 +595,7 @@ public final class ScanPipeline {
                 snapshot.unsupportedRecipes(),
                 snapshot.invalidRecipes(),
                 snapshot.failedRecipes(),
+                snapshot.recipeEnumerationFailed(),
                 snapshot.failedRecipeDetails());
     }
 
@@ -611,6 +641,8 @@ public final class ScanPipeline {
     public PipelineResult solveAndApply(@Nullable PipelineSnapshot snapshot) {
         PipelineSnapshot data = snapshot == null ? PipelineSnapshot.empty() : snapshot;
         fullReportWritten = false;
+        // 显式调用求解说明调用方已经拿到了可用快照，旧的采集失败标志不再适用。
+        lastCollectFailure = null;
         long startedAtNanos = System.nanoTime();
 
         try {
@@ -730,7 +762,8 @@ public final class ScanPipeline {
                     appliedToStore,
                     sourceCounts,
                     extraCounters);
-            writeDiagnosticReport(data, result);
+            // 完整报告延迟到 ScanManager 完成回调写出，确保 APPLYING/SAVING tick 已经计数。
+            pendingReport = new PendingReport(data, result);
             return result;
         } catch (Throwable failure) {
             long durationMillis = elapsedMillis(startedAtNanos);
@@ -1179,18 +1212,39 @@ public final class ScanPipeline {
     }
 
     /**
-     * 写出完整诊断报告。报告写入失败只影响诊断文件，不影响本轮数值结果。
+     * 写出等待中的完整诊断报告。
+     *
+     * <p>必须在扫描的最后一个 tick 采样完成后调用（生产接线由
+     * {@code ScanManager.ResultApplier#onCompleted()} 触发），这样 APPLYING/SAVING tick 的
+     * 耗时与峰值内存也会进入报告。报告使用调用时刻的最新诊断采样重建动态计数器，因此
+     * tick 数、耗时与峰值堆可能比 {@code applyStashed()} 返回的 {@link PipelineResult#extraCounters()}
+     * 更新；磁盘写入失败时 {@code fullReportWritten} 保持 {@code false}，后续取消/失败路径
+     * 仍可写出部分报告。</p>
      */
-    private void writeDiagnosticReport(PipelineSnapshot snapshot, PipelineResult result) {
+    public void writePendingReport() {
+        PendingReport pending = pendingReport;
+        pendingReport = null;
+        if (pending == null) {
+            return;
+        }
         if (!generateReportsEnabled || reportManager == null) {
             return;
         }
         try {
-            reportManager.writeReport(buildReport(snapshot, result, result.extraCounters()));
-            fullReportWritten = true;
+            Map<String, Long> counters = new LinkedHashMap<>(pending.result().extraCounters());
+            refreshDiagnosticCounters(counters, pending.result().durationMillis(), diagnostics);
+            if (reportManager.writeReport(buildReport(pending.snapshot(), pending.result(), counters))) {
+                fullReportWritten = true;
+            }
         } catch (RuntimeException failure) {
             LOGGER.warn("写入诊断报告失败，本轮结果仍然有效", failure);
         }
+    }
+
+    /**
+     * 等待完成回调写出的完整报告参数。
+     */
+    private record PendingReport(PipelineSnapshot snapshot, PipelineResult result) {
     }
 
     /**
@@ -1228,6 +1282,8 @@ public final class ScanPipeline {
         if (!generateReportsEnabled || reportManager == null) {
             return;
         }
+        // 扫描已经完成但完成回调尚未触发时，优先写出包含全部 tick 的完整报告。
+        writePendingReport();
         if (fullReportWritten) {
             LOGGER.debug("完整诊断报告已写出，跳过部分报告（{}）", reason);
             return;
@@ -1265,25 +1321,21 @@ public final class ScanPipeline {
                                                          boolean appliedToStore,
                                                          int retiredEntries, int solverRounds,
                                                          @Nullable ScanDiagnostics telemetry) {
-        ScanDiagnostics selected = telemetry == null ? new ScanDiagnostics() : telemetry;
-        selected.recordMemory();
-
-        long tickCount = selected.tickCount();
-        long scanTotalMillis = tickCount > 0L
-                ? selected.elapsedSinceResetMillis()
-                : durationMillis;
-        long usableRecipes = snapshot.recipeCount();
-        long unsupported = snapshot.unsupportedRecipes();
-        long invalid = snapshot.invalidRecipes();
-        long failed = snapshot.failedRecipes();
-        long totalRecipes = usableRecipes + unsupported + invalid + failed;
-
         Map<String, Long> counters = new LinkedHashMap<>();
-        counters.put("totalRecipes", totalRecipes);
-        counters.put("usableRecipes", usableRecipes);
-        counters.put("unsupportedRecipes", unsupported);
-        counters.put("invalidRecipes", invalid);
-        counters.put("failedRecipes", failed);
+        if (snapshot.recipeEnumerationFailed()) {
+            // 枚举整体失败时总数与分类计数都未知，不能伪造一条失败配方。
+            counters.put("recipeEnumerationFailed", 1L);
+        } else {
+            long usableRecipes = snapshot.recipeCount();
+            long unsupported = snapshot.unsupportedRecipes();
+            long invalid = snapshot.invalidRecipes();
+            long failed = snapshot.failedRecipes();
+            counters.put("totalRecipes", usableRecipes + unsupported + invalid + failed);
+            counters.put("usableRecipes", usableRecipes);
+            counters.put("unsupportedRecipes", unsupported);
+            counters.put("invalidRecipes", invalid);
+            counters.put("failedRecipes", failed);
+        }
         counters.put("failedRecipeDetailsRecorded", (long) snapshot.failedRecipeDetails().size());
         counters.put("solverPasses", (long) solveResult.passesUsed());
         counters.put("solverRounds", (long) solverRounds);
@@ -1293,6 +1345,26 @@ public final class ScanPipeline {
         counters.put("overflowResets", (long) overflowResets);
         counters.put("retiredEntries", (long) retiredEntries);
         counters.put("dryRun", appliedToStore ? 0L : 1L);
+        refreshDiagnosticCounters(counters, durationMillis, telemetry);
+        counters.put("partialReport", 0L);
+        return counters;
+    }
+
+    /**
+     * 用当前诊断采样刷新动态计数器。
+     *
+     * <p>延迟写报告与部分报告都复用本方法，保证 tick 数、最大/平均/P95 耗时、总耗时与
+     * 峰值堆内存始终来自写出时刻的最新采样，而不是求解结束时的旧快照。</p>
+     */
+    private static void refreshDiagnosticCounters(Map<String, Long> counters,
+                                                  long fallbackDurationMillis,
+                                                  @Nullable ScanDiagnostics telemetry) {
+        ScanDiagnostics selected = telemetry == null ? new ScanDiagnostics() : telemetry;
+        selected.recordMemory();
+        long tickCount = selected.tickCount();
+        long scanTotalMillis = tickCount > 0L
+                ? selected.elapsedSinceResetMillis()
+                : fallbackDurationMillis;
         counters.put("scanTotalMillis", Math.max(0L, scanTotalMillis));
         counters.put("scanTicks", tickCount);
         counters.put("tickMaxMicros", nanosToMicros(selected.maxTickNanos()));
@@ -1300,8 +1372,6 @@ public final class ScanPipeline {
         counters.put("tickP95Micros", nanosToMicros(selected.p95TickNanos()));
         counters.put("peakHeapBytes", selected.peakHeapBytes());
         counters.put("heapAtReportBytes", selected.heapBytes());
-        counters.put("partialReport", 0L);
-        return counters;
     }
 
     private static long nanosToMicros(long nanos) {

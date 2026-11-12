@@ -74,7 +74,8 @@ public final class RecipeScanner {
             ids = manager.getRecipeIds().toList();
         } catch (RuntimeException e) {
             LOGGER.warn("Could not enumerate recipe ids", e);
-            return new ScanResult(List.of(), 0, 0, 1,
+            // 枚举失败时不能把“一条失败配方”当成真实统计：配方总数此时未知。
+            return new ScanResult(List.of(), 0, 0, 0, true,
                     List.of("recipe-manager: " + failureText(e)));
         }
 
@@ -359,16 +360,15 @@ public final class RecipeScanner {
     }
 
     /**
-     * Outcome of one recipe scan.
-     *
      * @param recipes             every usable snapshot
      * @param unsupported         recipes whose type this build cannot evaluate
      * @param invalid             recipes missing an id, inputs or outputs
      * @param failed              recipes that threw while being described
+     * @param enumerationFailed   是否在枚举配方 id 时整体失败；为 {@code true} 时总数未知
      * @param failedRecipeDetails 失败配方的可读明细；最多保留 {@link RecipeScanner#MAX_FAILED_DETAILS} 条
      */
     public record ScanResult(List<RecipeSnapshot> recipes, int unsupported, int invalid, int failed,
-                             List<String> failedRecipeDetails) {
+                             boolean enumerationFailed, List<String> failedRecipeDetails) {
 
         public ScanResult {
             recipes = List.copyOf(recipes);
@@ -378,12 +378,24 @@ public final class RecipeScanner {
         }
 
         /**
-         * 兼容旧调用点的构造器：不携带失败明细。
+         * 兼容 Phase 22 早期调用点的构造器：不携带枚举失败标志。
          */
-        public ScanResult(List<RecipeSnapshot> recipes, int unsupported, int invalid, int failed) {
-            this(recipes, unsupported, invalid, failed, List.of());
+        public ScanResult(List<RecipeSnapshot> recipes, int unsupported, int invalid, int failed,
+                          List<String> failedRecipeDetails) {
+            this(recipes, unsupported, invalid, failed, false, failedRecipeDetails);
         }
 
+        /**
+         * 兼容旧调用点的构造器：不携带枚举失败标志与失败明细。
+         */
+        public ScanResult(List<RecipeSnapshot> recipes, int unsupported, int invalid, int failed) {
+            this(recipes, unsupported, invalid, failed, false, List.of());
+        }
+
+        /**
+         * @return 已分类的配方总数；配方枚举失败时返回 0，调用方必须优先检查
+         *         {@link #enumerationFailed()} 而不能把 0 当作“世界中没有配方”
+         */
         public int total() {
             return recipes.size() + unsupported + invalid + failed;
         }

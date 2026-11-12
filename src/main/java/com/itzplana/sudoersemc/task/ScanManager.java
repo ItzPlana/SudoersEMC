@@ -52,6 +52,16 @@ public final class ScanManager {
          * @param data 采集阶段产生的快照数据
          */
         void apply(SnapshotData data);
+
+        /**
+         * 扫描正常完成后的收尾回调。
+         *
+         * <p>调用时本轮最后一个 tick 的耗时与内存样本已经记录完毕，因此实现方可以安全地
+         * 在这里写出需要包含全部 tick 指标的完整诊断报告。默认实现为空，兼容只关心应用的
+         * lambda 调用点。实现方不应抛出异常；即使抛出，本类也只记录日志并继续。</p>
+         */
+        default void onCompleted() {
+        }
     }
 
     /**
@@ -280,8 +290,9 @@ public final class ScanManager {
         }
         ticking = true;
 
-        long startedNanos = System.nanoTime();
+        // 先采样堆内存再开始计时，避免采样开销污染本 tick 耗时与自适应批量反馈。
         diagnostics.recordMemory();
+        long startedNanos = System.nanoTime();
         int batch = 0;
         boolean batchRecorded = false;
         ScanPhase abortedPhase = null;
@@ -325,6 +336,18 @@ public final class ScanManager {
 
         if (abortedPhase != null) {
             notifyAborted(abortedPhase);
+        } else if (current.phase() != ScanPhase.COMPLETED
+                && progress.phase() == ScanPhase.COMPLETED) {
+            // 完成回调放在最后一个 tick 的 recordTick 之后，保证报告能包含 APPLYING/SAVING tick。
+            notifyCompleted();
+        }
+    }
+
+    private void notifyCompleted() {
+        try {
+            applier.onCompleted();
+        } catch (RuntimeException failure) {
+            LOGGER.warn("SudoersEMC 扫描完成回调失败，已忽略", failure);
         }
     }
 

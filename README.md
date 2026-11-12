@@ -37,23 +37,23 @@ SudoersEMC 是一个**独立实现**的 Minecraft Forge 1.20.1 模组。它扫�
 
 ## 当前状态
 
-项目按阶段推进。当前代码基线为 Phase 22 提交 `35ebdc6`（分支 `phase-22-diagnostics`），**524 个单元测试通过**（0 failures / 0 errors / 0 skipped）；Phase 18–22 已完成，Goety 与 NBT 变体的真实环境验证仍待进行。
+项目按阶段推进。当前代码基线为 Phase 22 分支 `phase-22-diagnostics`，**622 个单元测试通过**（0 failures / 0 errors / 0 skipped）；Phase 18–22 已完成，Goety 与 NBT 变体的真实环境验证仍待进行。
 
-| 阶段       | 内容                                                                                                                                  | 状态                                        |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
-| Phase 0-1  | Forge 1.20.1 工程骨架、ProjectE 1.0.1 集成调研、查询/写入、归属持久化、溢出保护数学、配置、单元测试                                   | ✅ 完成                                     |
-| Phase 2-13 | 物品与配方扫描（含 Goety 仪式）、扫描管线接线、递归求解、兜底定价、安全层、命令、诊断                                                 | ✅ 完成                                     |
-| Phase 14   | 归属生命周期（owned 值刷新）与溢出审计落盘                                                                                            | ✅ 完成                                     |
-| Phase 15   | `ENTIRE_CUSTOM_EMC` 受控改写（双开关、时间戳备份、原子替换、未知字段保留）                                                            | ✅ 完成（已实机验证）                       |
-| Phase 16   | 配置生命周期（热重载、交叉字段校验接线、`fallback.minEmc` 配置键）                                                                    | ✅ 完成                                     |
-| Phase 17   | NBT 变体端到端接线（配方输出 NBT → `VariantScanner` → 带 `variantHash` 的 `ItemSnapshot`）                                            | ✅ 完成（真实环境未验证）                   |
-| Phase 18   | solve → fallback 多轮收敛；创造物品保护配置化（`safety.creativeItemExclusions` / `creativeItemSpecialValues` / `creativeNamespaces`） | ✅ 完成                                     |
-| Phase 19   | 空 NBT 归一、排除规则覆盖配方路径、陈旧 owned 条目清理                                                                                | ✅ 完成                                     |
-| Phase 20   | 默认 `{Damage:0}` 变体归一、Goety 读取器 fail-closed 加固                                                                             | ✅ 完成（Goety 实机未验证）                 |
-| Phase 21   | 隔离降价落盘与 `/sudoemc approve`、`GeneratedEmcEntry.alternativeCosts`（schema v1→v2）、`/sudoemc explain` 备选成本                  | ✅ 完成（开发服实机验证）                   |
-| Phase 22   | 诊断可观测性：配方扫描统计与失败明细、tick 耗时采样（最大/平均/P95）、峰值堆采样、`extraCounters`、取消/失败部分报告                  | ✅ 完成（开发服实机验证；代表性模组包未测） |
+| 阶段       | 内容                                                                                                                                  | 状态                                            |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------- |
+| Phase 0-1  | Forge 1.20.1 工程骨架、ProjectE 1.0.1 集成调研、查询/写入、归属持久化、溢出保护数学、配置、单元测试                                   | ✅ 完成                                         |
+| Phase 2-13 | 物品与配方扫描（含 Goety 仪式）、扫描管线接线、递归求解、兜底定价、安全层、命令、诊断                                                 | ✅ 完成                                         |
+| Phase 14   | 归属生命周期（owned 值刷新）与溢出审计落盘                                                                                            | ✅ 完成                                         |
+| Phase 15   | `ENTIRE_CUSTOM_EMC` 受控改写（双开关、时间戳备份、原子替换、未知字段保留）                                                            | ✅ 完成（已实机验证）                           |
+| Phase 16   | 配置生命周期（热重载、交叉字段校验接线、`fallback.minEmc` 配置键）                                                                    | ✅ 完成                                         |
+| Phase 17   | NBT 变体端到端接线（配方输出 NBT → `VariantScanner` → 带 `variantHash` 的 `ItemSnapshot`）                                            | ✅ 完成（真实环境未验证）                       |
+| Phase 18   | solve → fallback 多轮收敛；创造物品保护配置化（`safety.creativeItemExclusions` / `creativeItemSpecialValues` / `creativeNamespaces`） | ✅ 完成                                         |
+| Phase 19   | 空 NBT 归一、排除规则覆盖配方路径、陈旧 owned 条目清理                                                                                | ✅ 完成                                         |
+| Phase 20   | 默认 `{Damage:0}` 变体归一、Goety 读取器 fail-closed 加固                                                                             | ✅ 完成（Goety 实机未验证）                     |
+| Phase 21   | 隔离降价落盘与 `/sudoemc approve`、`GeneratedEmcEntry.alternativeCosts`（schema v1→v2）、`/sudoemc explain` 备选成本                  | ✅ 完成（单元测试；实机验收记录未保留）         |
+| Phase 22   | 诊断可观测性：配方扫描统计与失败明细、tick 耗时采样（最大/平均/P95）、峰值堆采样、`extraCounters`、取消/失败部分报告                  | ✅ 完成（单元测试；开发服初步观测，模组包未测） |
 
-Phase 1 曾在专用服务器上验证写入生效、重启后自动恢复、手动值不被覆盖与缺少 ProjectE 时的降级行为；该记录属于历史验证，不代表当前全链路已在所有模组组合下复测。Phase 15 的双开关改写已在独立环境实机验证：默认配置与单独开启任一开关都不会改动 `custom_emc.json`；双开关同时开启时，严格超过阈值的条目被重置，并生成时间戳备份与 `overflow_resets.json` 审计记录。Phase 17 的 NBT 变体路径只有单元测试；由于原版配方不产生 NBT 输出，真实环境尚未验证。Phase 18–22 的新增能力均有单元测试；其中隔离落盘与审批流程已在开发服实机验证（Phase 21），Goety 反射路径仍未在真实环境验证。Phase 22 的计数器、耗时采样、峰值堆采样与取消/失败部分报告均有单元测试；开发服记录到配方扫描总数 1322（可用 1281 / 不支持 41 / 无效 0 / 失败 0）、13 个 tick 样本与 868.3 MiB 峰值堆，但采集、求解与应用仍是单 tick 重活，代表性模组包性能未测量。
+Phase 1 曾在专用服务器上验证写入生效、重启后自动恢复、手动值不被覆盖与缺少 ProjectE 时的降级行为；该记录属于历史验证，不代表当前全链路已在所有模组组合下复测。Phase 15 的双开关改写已在独立环境实机验证：默认配置与单独开启任一开关都不会改动 `custom_emc.json`；双开关同时开启时，严格超过阈值的条目被重置，并生成时间戳备份与 `overflow_resets.json` 审计记录。Phase 17 的 NBT 变体路径只有单元测试；由于原版配方不产生 NBT 输出，真实环境尚未验证。Phase 18–22 的新增能力均有单元测试；其中隔离落盘与审批流程的实机验收记录未随仓库保存，Goety 反射路径仍未在真实环境验证。Phase 22 的计数器、耗时采样、峰值堆采样与取消/失败部分报告均有单元测试；开发服曾做过一次初步观测，但原始日志未随仓库保存。修复后的 tick 采样包含 APPLYING/SAVING tick，旧的样本数量不再作为性能基线；采集、求解与应用仍是单 tick 重活，代表性模组包性能未测量。
 
 ### Phase 18–22 已完成能力
 
@@ -64,7 +64,7 @@ Phase 1 曾在专用服务器上验证写入生效、重启后自动恢复、手
 - **陈旧 owned 条目清理** —— Phase 19 完成。`ScanPipeline.retireStaleOwnedEntries(...)` 会删除本轮既不在候选中、也不在受保护既有值中的自有条目；干跑模式或空快照时跳过。
 - **隔离降价落盘与审批** —— Phase 21 完成。非干跑模式下每次隔离写入 `quarantined_drops.json`（同一物品保留一条，最多 5000 条）；`/sudoemc approve <item>` 只把记录标记为已批准并落盘，不修改 EMC，也不触发重扫。
 - **备选成本与 schema v2** —— Phase 21 完成。`GeneratedEmcEntry.alternativeCosts` 记录同一轮求解中其它有效配方的成本；`generated_entries.json` 从 schema v1 升到 v2（新增 `alternatives` 数组），仍可读取 v1 文件但只写出 v2；`/sudoemc explain` 最多显示 5 条备选成本。
-- **诊断报告计数器与失败明细** —— Phase 22 完成。`last_report.txt` 新增配方扫描区块，输出总数/可用/不支持/无效/失败计数，并展示最多 10 条失败配方明细（超出部分只显示剩余总数）；`PipelineResult.extraCounters` 同时承载求解轮数、隔离/清理数量、干跑标记等计数器。
+- **诊断报告计数器与失败明细** —— Phase 22 完成。`last_report.txt` 新增配方扫描区块，输出总数/可用/不支持/无效/失败计数，并展示最多 10 条失败配方明细（超出部分只显示剩余总数）；配方 id 枚举整体失败时显示“统计不可用”，不会伪造总数。`PipelineResult.extraCounters` 同时承载求解轮数、隔离/清理数量、干跑标记等计数器。
 - **扫描耗时与峰值堆采样** —— Phase 22 完成。`ScanManager` 在每个 tick 边界采样耗时与堆内存；报告输出扫描总耗时、tick 采样数、tick 最大/平均/P95 耗时（最近秩法）以及峰值堆内存和报告时瞬时堆内存。
 - **取消/失败部分报告** —— Phase 22 完成。`ScanManager.AbortListener` 在取消或失败时通知管线，由 `ScanPipeline.writeCancelledReport` / `writeFailedReport` 写出部分报告，标记 `partialReport=1`、`scanCancelled`/`scanFailed` 与 `scanAborts`。
 
@@ -79,7 +79,7 @@ Phase 1 曾在专用服务器上验证写入生效、重启后自动恢复、手
 - **配置迁移接入 Forge TOML** —— 尚未实现。`ConfigMigrations` 只有单元测试，配置文件没有 `schemaVersion` 字段，启动与重载都不会执行迁移。
 - **审批后的自动应用** —— 未实现。`/sudoemc approve <item>` 只把隔离记录标记为已批准并落盘，不会修改 `generated_entries.json` 或 ProjectE 的 EMC，也不会自动触发重扫；下一次扫描仍按正常定价与降价保护重新判定。
 - **Goety 真实环境验证** —— 尚未进行。Phase 20 已把必需字段读取失败改为 fail-closed（跳过整条配方），但反射路径仍只有在真实 Goety 环境中才能完整验证；当前没有实机记录。
-- **代表性模组包性能测量** —— 尚未进行。Phase 22 只在开发服记录了扫描耗时、tick 采样与峰值堆，没有在代表性模组包上测量，也没有基线对比。
+- **代表性模组包性能测量** —— 尚未进行。Phase 22 只在开发服做过一次初步观测（原始日志未随仓库保存），没有在代表性模组包上测量，也没有基线对比。
 - **`fallback.useProjectEIntegrationBaselines`** —— 当前未生效。该键没有外部基线读取路径；兜底链运行时传入的外部基线固定为 `0`。
 - **`diagnostic.debugLogging`** —— 当前未生效。配置键存在，但生产代码没有读取它。
 - **NBT 变体的真实环境验证** —— Phase 17 已接线并有单元测试，Phase 19/20 只补充空 NBT 与默认 `{Damage:0}` 归一；原版配方不产生 NBT 输出，真实环境尚未验证，`/sudoemc explain` 也不覆盖带变体条目。
