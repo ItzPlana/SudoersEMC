@@ -259,7 +259,7 @@ public final class Sudoersemc {
         BatchProcessor processor = new BatchProcessor(Math.max(1, itemsPerTick), adaptive);
         return new ScanManager(
                 processor,
-                () -> collectSnapshot(pipeline),
+                () -> ScanManager.oneShot(collectSnapshot(pipeline)).begin(),
                 data -> applySnapshot(pipeline),
                 TICK_BUDGET_NANOS);
     }

@@ -30,7 +30,7 @@ class SudoersemcLifecycleTest {
     private static ScanManager activeManager() {
         ScanManager manager = new ScanManager(
                 new BatchProcessor(1, false),
-                () -> new ScanManager.SnapshotData("测试快照", 10, 2),
+                ScanManager.oneShot(new ScanManager.SnapshotData("测试快照", 10, 2)),
                 data -> { },
                 1_000_000L);
         assertTrue(manager.requestScan());
