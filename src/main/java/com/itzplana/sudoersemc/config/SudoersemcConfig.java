@@ -300,6 +300,15 @@ public final class SudoersemcConfig {
         return OverflowScope.OWNED_ONLY;
     }
 
+    /**
+     * 兼容旧命令路径：配置未加载时明确失败；已加载时校验当前快照。
+     */
+    public static ConfigValidationResult reloadFromDisk() {
+        if (!SPEC.isLoaded()) {
+            return ConfigValidationResult.failed(List.of("配置尚未加载"), List.of());
+        }
+        return ConfigValidator.validateCurrent();
+    }
     private static void onConfigLoading(ModConfigEvent.Loading event) {
         if (event.getConfig().getSpec() == SPEC) {
             validateLoadedConfig();
