@@ -2,7 +2,10 @@ package com.itzplana.sudoersemc.config;
 
 import com.itzplana.sudoersemc.core.OverflowScope;
 import com.itzplana.sudoersemc.safety.OverflowProtection;
+import com.itzplana.sudoersemc.solver.SolveSettings;
 import com.mojang.logging.LogUtils;
+import java.nio.file.Path;
+import java.util.List;
 import java.util.Locale;
 import net.minecraftforge.common.ForgeConfigSpec;
 import net.minecraftforge.eventbus.api.IEventBus;
@@ -10,6 +13,7 @@ import net.minecraftforge.fml.ModLoadingContext;
 import net.minecraftforge.fml.config.ModConfig;
 import net.minecraftforge.fml.event.config.ModConfigEvent;
 import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
+import net.minecraftforge.fml.loading.FMLPaths;
 import org.slf4j.Logger;
 
 /**
@@ -61,6 +65,8 @@ public final class SudoersemcConfig {
 
     public static final ForgeConfigSpec.BooleanValue DIAGNOSTIC_DEBUG_LOGGING;
     public static final ForgeConfigSpec.BooleanValue DIAGNOSTIC_GENERATE_REPORTS;
+
+    public static final ForgeConfigSpec.IntValue SCHEMA_VERSION;
 
     static {
         // [general]
@@ -115,8 +121,9 @@ public final class SudoersemcConfig {
                         "Protect against unexpectedly large decreases in generated values.")
                 .define("largeDropProtection", true);
         SAFETY_MAX_ALLOWED_DROP_RATIO = BUILDER.comment(
-                        "Largest allowed relative drop in a generated value, in [0, 1].")
-                .defineInRange("maxAllowedDropRatio", 0.5D, 0.0D, 1.0D);
+                        "Largest allowed relative drop in a generated value, in (0, 1].",
+                        "0.0 is rejected because it would quarantine every nonzero drop.")
+                .defineInRange("maxAllowedDropRatio", 0.5D, Double.MIN_VALUE, 1.0D);
         SAFETY_PROTECT_CREATIVE_ONLY_ITEMS = BUILDER.comment(
                         "Do not generate survival-obtainable values for creative-only items.")
                 .define("protectCreativeOnlyItems", true);
@@ -161,9 +168,11 @@ public final class SudoersemcConfig {
         NBT_SCAN_NBT_VARIANTS = BUILDER.comment(
                         "Scan economically relevant NBT variants of items.")
                 .define("scanNbtVariants", true);
+        // Upper bound mirrors VariantScanner.HARD_VARIANT_CEILING; a larger spec value would be
+        // silently clamped by the consumer, so reject it at the config boundary instead.
         NBT_MAX_NBT_VARIANTS_PER_ITEM = BUILDER.comment(
-                        "Maximum number of NBT variants scanned per item; must be >= 1.")
-                .defineInRange("maxNbtVariantsPerItem", 100, 1, Integer.MAX_VALUE);
+                        "Maximum number of NBT variants scanned per item, in [1, 1000].")
+                .defineInRange("maxNbtVariantsPerItem", 100, 1, 1000);
         BUILDER.pop();
 
         // [diagnostic]
@@ -173,9 +182,36 @@ public final class SudoersemcConfig {
         DIAGNOSTIC_GENERATE_REPORTS = BUILDER.comment("Write diagnostic reports after scans.")
                 .define("generateReports", true);
         BUILDER.pop();
+
+        // Root-level schema version. A missing key is treated as legacy v1 by
+        // ConfigFileMigration; newly generated files start at the current version.
+        SCHEMA_VERSION = BUILDER.comment(
+                        "配置 schema 版本，请勿手动修改。当前构建支持 "
+                                + ConfigMigrations.SCHEMA_VERSION + "。")
+                .defineInRange("schemaVersion",
+                        ConfigMigrations.SCHEMA_VERSION,
+                        0,
+                        Integer.MAX_VALUE);
     }
 
     public static final ForgeConfigSpec SPEC = BUILDER.build();
+
+    private static final ConfigWatcher CONFIG_WATCHER = new ConfigWatcher();
+
+    /** Built-in conservative settings used until the first valid config snapshot is applied. */
+    private static final OverflowProtection.Settings SAFE_DEFAULT_OVERFLOW_SETTINGS =
+            new OverflowProtection.Settings();
+
+    private static volatile OverflowProtection.Settings activeOverflowSettings =
+            SAFE_DEFAULT_OVERFLOW_SETTINGS;
+
+    private static volatile ConfigValidator.Values activeValues;
+
+    private static volatile ConfigValidationResult lastValidationResult = ConfigValidationResult.ok();
+
+    static {
+        CONFIG_WATCHER.register(result -> refreshActiveSnapshots());
+    }
 
     private static boolean registered;
 
@@ -192,6 +228,8 @@ public final class SudoersemcConfig {
             return;
         }
         registered = true;
+        // Forge parses the TOML after registerConfig(); migrate legacy schema before that.
+        ConfigFileMigration.migrate(commonConfigPath());
         ModLoadingContext.get().registerConfig(ModConfig.Type.COMMON, SPEC);
 
         IEventBus modEventBus = FMLJavaModLoadingContext.get().getModEventBus();
@@ -200,34 +238,65 @@ public final class SudoersemcConfig {
     }
 
     /**
-     * Builds an {@link OverflowProtection.Settings} snapshot from the current config values.
+     * Returns the last validated overflow settings snapshot.
      *
-     * @throws IllegalArgumentException when the current values violate the overflow invariants
-     * @throws IllegalStateException    when the config has not been loaded yet
+     * <p>The snapshot is rebuilt only when a config load/reload passes
+     * {@link ConfigValidator#validate(ConfigValidator.Values)}. Invalid reloads keep the previous
+     * snapshot, and an invalid first load keeps the built-in conservative defaults. Runtime
+     * components should use this method instead of reading raw Forge values, otherwise they could
+     * observe a configuration that failed validation.</p>
+     *
+     * @throws IllegalStateException when the config has not been loaded yet
      */
     public static OverflowProtection.Settings overflowSettings() {
         if (!SPEC.isLoaded()) {
             throw new IllegalStateException("SudoersemcConfig is not loaded yet");
         }
+        return activeOverflowSettings;
+    }
 
-        OverflowProtection.Settings settings = new OverflowProtection.Settings(
+    /**
+     * Builds a plain-Java validation snapshot from the current Forge values.
+     *
+     * <p>{@code minEmc} is not a configuration key in this phase: the solver lower bound is the
+     * hard-coded {@link SolveSettings#DEFAULT_MINIMUM_EMC}. Exposing it as a config option is a
+     * later-phase concern; the validator field stays so the rule can be reused once it is wired.</p>
+     *
+     * @throws IllegalStateException when the config has not been loaded yet
+     */
+    public static ConfigValidator.Values validationValues() {
+        if (!SPEC.isLoaded()) {
+            throw new IllegalStateException("SudoersemcConfig is not loaded yet");
+        }
+        return new ConfigValidator.Values(
+                PERFORMANCE_ITEMS_PER_TICK.get(),
+                RECIPE_MAX_RECIPE_PASSES.get(),
+                SolveSettings.DEFAULT_MINIMUM_EMC,
                 OVERFLOW_ENABLED.get(),
                 OVERFLOW_THRESHOLD.get(),
                 OVERFLOW_RESET_MIN.get(),
                 OVERFLOW_RESET_MAX.get(),
                 OVERFLOW_BUCKET_COUNT.get(),
                 OVERFLOW_WEIGHT_CAP.get(),
-                parseOverflowScope(OVERFLOW_OVERWRITE_SCOPE.get()),
+                OVERFLOW_OVERWRITE_SCOPE.get(),
                 OVERFLOW_ALLOW_PROJECTE_FILE_REWRITE.get(),
-                OVERFLOW_RANDOM_SEED.get());
+                NBT_MAX_NBT_VARIANTS_PER_ITEM.get(),
+                SAFETY_MAX_ALLOWED_DROP_RATIO.get());
+    }
 
-        if (settings.scope() == OverflowScope.ENTIRE_CUSTOM_EMC
-                && !settings.allowProjectEFileRewrite()) {
-            LOGGER.warn(
-                    "[overflow] overwriteScope = entire_custom_emc requires "
-                            + "allowProjectEFileRewrite = true; ProjectE's custom_emc.json will not be rewritten.");
-        }
-        return settings;
+    /**
+     * @return the most recent validation result; starts as a valid, warning-free result
+     */
+    public static ConfigValidationResult lastValidationResult() {
+        return lastValidationResult;
+    }
+
+    /**
+     * @return the last snapshot that passed validation and became active; {@code null} before the
+     *         first valid load
+     */
+    public static ConfigValidator.Values activeValues() {
+        return activeValues;
     }
 
     /**
@@ -253,61 +322,79 @@ public final class SudoersemcConfig {
 
     private static void onConfigLoading(ModConfigEvent.Loading event) {
         if (event.getConfig().getSpec() == SPEC) {
-            validateLoadedConfig();
+            handleConfigEvent("loading");
         }
     }
 
     private static void onConfigReloading(ModConfigEvent.Reloading event) {
         if (event.getConfig().getSpec() == SPEC) {
-            validateLoadedConfig();
+            handleConfigEvent("reloading");
         }
     }
 
     /**
-     * Validates cross-field overflow invariants after the config is loaded or reloaded.
+     * Validates the freshly loaded values and hands the result to {@link ConfigWatcher}.
      *
-     * <p>Individual numeric ranges are enforced by {@link ForgeConfigSpec}. This method adds the
-     * checks Forge cannot express per-entry (for example {@code threshold > resetMax}) and warns
-     * about combinations that would silently disable part of the requested behavior.</p>
+     * <p>Forge may fire these events on a config-loading thread. This method only reads the spec
+     * and swaps immutable volatile snapshots; it never touches the server, a level, or scan state.
+     * Listeners run only for a valid result, so a rejected reload keeps the previous snapshot.
+     * If even the first load is invalid, the built-in safe defaults stay active.</p>
      */
-    private static void validateLoadedConfig() {
+    private static void handleConfigEvent(String phase) {
         if (!SPEC.isLoaded()) {
             return;
         }
 
-        long threshold = OVERFLOW_THRESHOLD.get();
-        long resetMin = OVERFLOW_RESET_MIN.get();
-        long resetMax = OVERFLOW_RESET_MAX.get();
-        int bucketCount = OVERFLOW_BUCKET_COUNT.get();
-        int weightCap = OVERFLOW_WEIGHT_CAP.get();
-        OverflowScope scope = parseOverflowScope(OVERFLOW_OVERWRITE_SCOPE.get());
+        ConfigValidationResult result;
+        try {
+            result = ConfigValidator.validate(validationValues());
+        } catch (RuntimeException failure) {
+            String detail = failure.getMessage();
+            String reason = detail == null || detail.isBlank()
+                    ? failure.getClass().getSimpleName()
+                    : detail;
+            result = ConfigValidationResult.failed(
+                    List.of("无法读取当前配置：" + reason), List.of());
+            LOGGER.warn("[config] 无法读取配置（{}），保留上一份有效配置", phase, failure);
+        }
 
-        if (threshold <= resetMax) {
-            LOGGER.warn(
-                    "[overflow] Invalid configuration: threshold ({}) must be greater than resetMax ({}). "
-                            + "OverflowProtection.Settings will reject these values.",
-                    threshold,
-                    resetMax);
+        lastValidationResult = result;
+        CONFIG_WATCHER.fireReload(result);
+    }
+
+    /**
+     * {@link ConfigWatcher} activation callback. Only validated configurations reach this point.
+     *
+     * <p>If snapshot construction still fails, the previous snapshot stays active. This is the
+     * fail-closed path promised by the README: a rejected reload never rebuilds components from
+     * partially valid values.</p>
+     */
+    private static void refreshActiveSnapshots() {
+        try {
+            ConfigValidator.Values values = validationValues();
+            OverflowProtection.Settings settings = buildOverflowSettings(values);
+            activeValues = values;
+            activeOverflowSettings = settings;
+            LOGGER.debug("[config] 已应用新的配置快照");
+        } catch (RuntimeException failure) {
+            LOGGER.warn("[config] 构建配置快照失败，保留上一份有效配置", failure);
         }
-        if (resetMin < 1L) {
-            LOGGER.warn("[overflow] Invalid configuration: resetMin ({}) must be >= 1.", resetMin);
-        }
-        if (resetMin > resetMax) {
-            LOGGER.warn(
-                    "[overflow] Invalid configuration: resetMin ({}) must be <= resetMax ({}).",
-                    resetMin,
-                    resetMax);
-        }
-        if (bucketCount < 1) {
-            LOGGER.warn("[overflow] Invalid configuration: bucketCount ({}) must be >= 1.", bucketCount);
-        }
-        if (weightCap < 1) {
-            LOGGER.warn("[overflow] Invalid configuration: weightCap ({}) must be >= 1.", weightCap);
-        }
-        if (scope == OverflowScope.ENTIRE_CUSTOM_EMC && !OVERFLOW_ALLOW_PROJECTE_FILE_REWRITE.get()) {
-            LOGGER.warn(
-                    "[overflow] Conflicting configuration: overwriteScope = entire_custom_emc but "
-                            + "allowProjectEFileRewrite = false. ProjectE's custom_emc.json will not be rewritten.");
-        }
+    }
+
+    private static OverflowProtection.Settings buildOverflowSettings(ConfigValidator.Values values) {
+        return new OverflowProtection.Settings(
+                values.overflowEnabled(),
+                values.overflowThreshold(),
+                values.resetMin(),
+                values.resetMax(),
+                values.bucketCount(),
+                values.weightCap(),
+                ConfigValidator.parseScope(values.overwriteScope()),
+                values.allowProjectEFileRewrite(),
+                OVERFLOW_RANDOM_SEED.get());
+    }
+
+    private static Path commonConfigPath() {
+        return FMLPaths.CONFIGDIR.get().resolve("sudoersemc-common.toml");
     }
 }

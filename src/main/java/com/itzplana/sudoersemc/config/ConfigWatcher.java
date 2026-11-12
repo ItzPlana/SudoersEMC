@@ -58,7 +58,8 @@ public final class ConfigWatcher {
      * 记录一次配置校验结果并在通过时通知监听器。
      *
      * <p>无论结果是否合法都会更新 {@link #lastResult()}。结果非法时不调用任何
-     * 监听器，保留现有组件实例，并只记录一条汇总警告。</p>
+     * 监听器，保留现有组件实例，并只记录一条汇总警告；结果合法时会先通过
+     * {@link #logConflictWarnings(ConfigValidationResult)} 去重记录警告，再通知监听器。</p>
      *
      * @param result 校验结果，不能为 {@code null}
      * @throws NullPointerException 当 {@code result} 为 {@code null} 时
@@ -72,6 +73,11 @@ public final class ConfigWatcher {
                     result.format());
             return;
         }
+
+        // fireReload is the single reload entry point used by the Forge config events. Logging
+        // warnings here guarantees the "each warning is logged once" contract even when callers
+        // do not invoke logConflictWarnings() themselves.
+        logConflictWarnings(result);
 
         for (RebuildListener listener : listeners) {
             try {
