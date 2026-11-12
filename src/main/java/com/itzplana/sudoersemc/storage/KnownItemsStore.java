@@ -24,10 +24,16 @@ import org.slf4j.LoggerFactory;
  * 与快照方法可由任意线程调用。{@link #load()} 与 {@link #save()} 通过私有锁串行化，快照返回
  * 不可变副本，可以在遍历时继续记录新物品。</p>
  *
+ * <h2>容量</h2>
+ * <p>目录按设计不设硬上限：它必须记住所有见过的 {@link ItemKey}（包括 NBT/经济变体），才能
+ * 支撑增量扫描。文件大小与关服写盘时间随唯一物品数增长，单次保存还需要一次全量排序；大型整合包
+ * 通常为数千到数万条，属于可接受范围。若文件因异常数据膨胀，管理员可在关服后删除
+ * {@code known_items.json}，让目录在下次扫描时重建。</p>
+ *
  * <h2>失败行为</h2>
  * <p>所有公开方法都不抛出异常。文件缺失按空目录处理；JSON 损坏时清空内存目录并保留原始文件，
  * 下次保存前自动备份；更高的 {@code schemaVersion} 既不加载也不覆盖。单条格式错误的记录会被
- * 跳过，不影响其余记录。</p>
+ * 跳过，不影响其余记录。写入或备份失败时保留脏标记，下一次 {@link #saveIfDirty()} 会重试。</p>
  */
 public final class KnownItemsStore {
 
@@ -122,7 +128,7 @@ public final class KnownItemsStore {
                     LOGGER.warn("无法解析 {}，按空物品目录处理", file);
                     return;
                 }
-                if (dto.schemaVersion != SCHEMA_VERSION) {
+                if (dto.schemaVersion > SCHEMA_VERSION) {
                     unsupportedSchemaVersion = true;
                     loadedSchemaVersion = dto.schemaVersion;
                     backupPending = false;
@@ -164,7 +170,8 @@ public final class KnownItemsStore {
     /**
      * 按 {@link ItemKey#compareTo(ItemKey)} 升序写出全部记录。
      *
-     * <p>不支持的更高版本会阻止写入。首次重写已存在的文件前会生成带时间戳的 {@code .bak}。</p>
+     * <p>不支持的更高版本会阻止写入。首次重写已存在的文件前会生成带时间戳的 {@code .bak}。
+     * 写入或备份失败时保留脏标记，调用方可在下一次 {@link #saveIfDirty()} 时重试。</p>
      */
     public void save() {
         synchronized (loadSaveLock) {
@@ -187,10 +194,15 @@ public final class KnownItemsStore {
                     dto.items.add(ItemDto.from(item));
                 }
 
-                if (backupPending) {
-                    JsonFileIO.backupIfExists(file);
+                if (backupPending && !JsonFileIO.backupIfExists(file)) {
+                    dirty.set(true);
+                    LOGGER.warn("保存物品目录到 {} 失败：无法创建备份，保留待保存状态等待重试", file);
+                    return;
                 }
-                JsonFileIO.writeAtomically(file, dto);
+                if (!JsonFileIO.writeAtomically(file, dto)) {
+                    dirty.set(true);
+                    return;
+                }
                 backupPending = false;
             } catch (RuntimeException e) {
                 dirty.set(true);

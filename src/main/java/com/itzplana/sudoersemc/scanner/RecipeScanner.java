@@ -16,6 +16,7 @@ import net.minecraft.world.item.crafting.Ingredient;
 import net.minecraft.world.item.crafting.Recipe;
 import net.minecraft.world.item.crafting.RecipeManager;
 import net.minecraft.world.item.crafting.SmeltingRecipe;
+import net.minecraft.world.item.crafting.ShapelessRecipe;
 import net.minecraft.world.item.crafting.SmokingRecipe;
 import net.minecraft.world.item.crafting.StonecutterRecipe;
 import net.minecraft.world.item.crafting.CraftingRecipe;
@@ -113,7 +114,7 @@ public final class RecipeScanner {
      * @return the snapshot, or {@code null} when this build cannot describe the recipe type
      */
     @Nullable
-    private RecipeSnapshot describe(Recipe<?> recipe, ResourceLocation id) {
+    RecipeSnapshot describe(Recipe<?> recipe, ResourceLocation id) {
         if (recipe instanceof AbstractCookingRecipe cooking) {
             return describeCooking(cooking, id);
         }
@@ -148,20 +149,19 @@ public final class RecipeScanner {
 
     private RecipeSnapshot describeSingleOutput(ResourceLocation id, RecipeKind kind,
                                                 NonNullList<Ingredient> ingredients, ItemStack result) {
-        List<RecipeInput> inputs = convertIngredients(ingredients);
-        if (inputs.isEmpty()) {
+        ConvertedIngredients converted = convertIngredients(ingredients, false);
+        if (converted == null || converted.inputs().isEmpty()) {
             return null;
         }
         RecipeOutput output = convertStack(result);
         if (output == null) {
             return null;
         }
-        return RecipeSnapshot.of(id, kind, inputs, List.of(output));
+        return RecipeSnapshot.of(id, kind, converted.inputs(), List.of(output));
     }
 
     private RecipeSnapshot describeCrafting(CraftingRecipe recipe, ResourceLocation id) {
-        RecipeKind kind = recipe.isSpecial() ? RecipeKind.UNSUPPORTED : RecipeKind.SHAPED;
-        if (kind == RecipeKind.UNSUPPORTED) {
+        if (recipe.isSpecial()) {
             // Special crafting recipes (dye blending, map cloning, ...) do not follow the generic
             // cost rule and are intentionally excluded from automatic pricing.
             return null;
@@ -169,8 +169,12 @@ public final class RecipeScanner {
         if (!recipe.canCraftInDimensions(3, 3)) {
             return null;
         }
-        List<RecipeInput> inputs = convertIngredients(recipe.getIngredients());
-        if (inputs.isEmpty()) {
+        RecipeKind kind = recipe instanceof ShapelessRecipe ? RecipeKind.SHAPELESS : RecipeKind.SHAPED;
+        // Vanilla Recipe#getRemainingItems dereferences its container argument, and ShapedRecipe /
+        // ShapelessRecipe do not override it. Deriving remainders from the ingredient choices keeps
+        // the scan container-free; any unreadable slot makes the whole recipe unsupported.
+        ConvertedIngredients converted = convertIngredients(recipe.getIngredients(), true);
+        if (converted == null || converted.inputs().isEmpty()) {
             return null;
         }
         ItemStack result;
@@ -183,19 +187,27 @@ public final class RecipeScanner {
         if (output == null) {
             return null;
         }
-        // 容器余量（桶、空瓶等）需要真实的 CraftingContainer 才能计算。扫描阶段没有可用容器，
-        // 因此这里显式降级为「无余量」：配方仍然参与定价，只是不抵扣返还物。
-        // 绝不因为拿不到余量就把整条配方标记为失败——那会丢失大量可定价配方。
-        return new RecipeSnapshot(id, kind, inputs, List.of(output), List.of(),
-                false, java.util.Map.of());
+        return new RecipeSnapshot(id, kind, converted.inputs(), List.of(output),
+                converted.remainders(), false, java.util.Map.of());
     }
 
     /**
      * Converts Minecraft ingredients. Tag ingredients become multi-choice options so the evaluator
      * can pick the cheapest member.
+     *
+     * <p>Fail-closed: if a non-empty slot cannot be read (an exception, an unbound tag, or no usable
+     * candidates) the whole recipe is reported as unsupported instead of being priced with missing
+     * inputs. Container remainders are only credited when every candidate for a slot returns the
+     * same remainder item, because the scan cannot know which candidate the player will use.</p>
+     *
+     * @param collectRemainders whether to derive container remainders for this recipe family
+     * @return the conversion, or {@code null} when the recipe cannot be described safely
      */
-    private static List<RecipeInput> convertIngredients(NonNullList<Ingredient> ingredients) {
-        List<RecipeInput> converted = new ArrayList<>();
+    @Nullable
+    private static ConvertedIngredients convertIngredients(NonNullList<Ingredient> ingredients,
+                                                            boolean collectRemainders) {
+        List<RecipeInput> inputs = new ArrayList<>();
+        List<RecipeOutput> remainders = new ArrayList<>();
         for (Ingredient ingredient : ingredients) {
             if (ingredient == null || ingredient.isEmpty()) {
                 continue;
@@ -204,24 +216,61 @@ public final class RecipeScanner {
             try {
                 stacks = ingredient.getItems();
             } catch (RuntimeException e) {
-                continue;
+                return null;
             }
             List<ItemKey> candidates = new ArrayList<>(stacks.length);
+            ItemKey commonRemainder = null;
+            boolean remainderAmbiguous = false;
             for (ItemStack stack : stacks) {
-                if (stack.isEmpty()) {
+                if (stack.isEmpty() || IngredientStacks.isEmptyTagPlaceholder(stack)) {
                     continue;
                 }
-                ResourceLocation id = BuiltInRegistries.ITEM.getKey(stack.getItem());
-                if (id != null) {
-                    candidates.add(ItemKey.of(id));
+                ResourceLocation itemId = BuiltInRegistries.ITEM.getKey(stack.getItem());
+                if (itemId != null) {
+                    candidates.add(ItemKey.of(itemId));
+                }
+                if (collectRemainders) {
+                    if (stack.hasCraftingRemainingItem()) {
+                        ItemStack remainder = stack.getCraftingRemainingItem();
+                        ResourceLocation remainderId = remainder.isEmpty()
+                                ? null
+                                : BuiltInRegistries.ITEM.getKey(remainder.getItem());
+                        if (remainderId == null) {
+                            remainderAmbiguous = true;
+                        } else {
+                            ItemKey remainderKey = ItemKey.of(remainderId);
+                            if (commonRemainder == null) {
+                                commonRemainder = remainderKey;
+                            } else if (!commonRemainder.equals(remainderKey)) {
+                                remainderAmbiguous = true;
+                            }
+                        }
+                    } else {
+                        // Another candidate would not return a container, so crediting one would
+                        // understate the recipe cost.
+                        remainderAmbiguous = true;
+                    }
                 }
             }
             if (candidates.isEmpty()) {
-                continue;
+                return null;
             }
-            converted.add(RecipeInput.of(new IngredientOption(candidates)));
+            inputs.add(RecipeInput.of(new IngredientOption(candidates)));
+            if (collectRemainders && !remainderAmbiguous && commonRemainder != null) {
+                remainders.add(RecipeOutput.of(commonRemainder));
+            }
         }
-        return converted;
+        return new ConvertedIngredients(inputs, remainders);
+    }
+
+    /**
+     * Result of a fail-closed ingredient conversion. Callers must reject an empty {@code inputs}
+     * list as unsupported.
+     *
+     * @param inputs     consumed slots
+     * @param remainders container returns that are unambiguous across every candidate
+     */
+    private record ConvertedIngredients(List<RecipeInput> inputs, List<RecipeOutput> remainders) {
     }
 
     /**
@@ -260,20 +309,6 @@ public final class RecipeScanner {
             LOGGER.debug("序列化配方输出 NBT 失败，按无 NBT 处理", failure);
             return null;
         }
-    }
-
-    private static List<RecipeOutput> convertStacks(@Nullable NonNullList<ItemStack> stacks) {
-        if (stacks == null || stacks.isEmpty()) {
-            return List.of();
-        }
-        List<RecipeOutput> converted = new ArrayList<>();
-        for (ItemStack stack : stacks) {
-            RecipeOutput output = convertStack(stack);
-            if (output != null) {
-                converted.add(output);
-            }
-        }
-        return converted;
     }
 
     /**

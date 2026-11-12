@@ -10,7 +10,9 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.List;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -169,5 +171,151 @@ class ScanStateStoreTest {
 
         assertFalse(store.isDirty());
         assertTrue(Files.isRegularFile(file));
+    }
+
+    @Test
+    void emptyFileIsBackedUpAndRewritten() throws IOException {
+        Path file = tempDir.resolve(ScanStateStore.FILE_NAME);
+        Files.writeString(file, "", StandardCharsets.UTF_8);
+
+        ScanStateStore store = new ScanStateStore(file);
+        assertDoesNotThrow(store::load);
+        assertTrue(store.fingerprint().isEmpty());
+        assertFalse(store.isDirty());
+
+        store.update(fingerprint(), 42L, 7, 0);
+        store.save();
+
+        assertFalse(store.isDirty());
+        String json = Files.readString(file, StandardCharsets.UTF_8);
+        assertTrue(json.contains("\"schemaVersion\": 1"));
+        assertTrue(json.contains("\"lastScanDurationMillis\": 42"));
+        assertEquals(1L, backupCount(), "首次重写空文件前也应生成 .bak");
+    }
+
+    @Test
+    void lowerSchemaVersionIsLoadedAndRewritten() throws IOException {
+        Path file = tempDir.resolve(ScanStateStore.FILE_NAME);
+        ScanFingerprint expected = fingerprint();
+        String content = """
+                {
+                  "schemaVersion": 0,
+                  "fingerprint": {
+                    "item": "%s",
+                    "recipe": "%s",
+                    "tag": "%s",
+                    "config": "%s",
+                    "baseline": "%s"
+                  },
+                  "lastScanEpochMillis": 11,
+                  "lastScanDurationMillis": 22,
+                  "lastSolvedCount": 3,
+                  "lastUnresolvedCount": 4
+                }
+                """.formatted(
+                expected.itemFingerprint(),
+                expected.recipeFingerprint(),
+                expected.tagFingerprint(),
+                expected.configFingerprint(),
+                expected.baselineFingerprint());
+        Files.writeString(file, content, StandardCharsets.UTF_8);
+
+        ScanStateStore store = new ScanStateStore(file);
+        store.load();
+
+        // 低版本按当前字段加载，而不是被当作“更高的未知版本”拒绝。
+        assertTrue(store.matches(expected));
+        assertEquals(22L, store.lastScanDurationMillis());
+        assertEquals(3, store.lastSolvedCount());
+
+        store.save();
+
+        String json = Files.readString(file, StandardCharsets.UTF_8);
+        assertTrue(json.contains("\"schemaVersion\": 1"), "保存时应升级到当前 schemaVersion");
+        assertFalse(store.isDirty());
+        assertEquals(1L, backupCount());
+    }
+
+    @Test
+    void missingSchemaVersionIsTreatedAsLegacy() throws IOException {
+        Path file = tempDir.resolve(ScanStateStore.FILE_NAME);
+        Files.writeString(file, """
+                {
+                  "lastScanDurationMillis": 55,
+                  "lastSolvedCount": 6
+                }
+                """, StandardCharsets.UTF_8);
+
+        ScanStateStore store = new ScanStateStore(file);
+        store.load();
+
+        assertEquals(55L, store.lastScanDurationMillis());
+        assertEquals(6, store.lastSolvedCount());
+
+        store.save();
+
+        String json = Files.readString(file, StandardCharsets.UTF_8);
+        assertTrue(json.contains("\"schemaVersion\": 1"));
+        assertEquals(1L, backupCount());
+    }
+
+    @Test
+    void failedWriteKeepsDirtyAndRetriesWithBackup() throws IOException {
+        Path file = tempDir.resolve(ScanStateStore.FILE_NAME);
+        ScanStateStore store = new ScanStateStore(file);
+        store.update(fingerprint(), 1L, 1, 0);
+        store.save();
+        assertFalse(store.isDirty());
+
+        store.load(); // 文件已存在：下一次重写前必须生成 .bak
+        store.update(fingerprint(), 222L, 2, 1);
+
+        blockTempFile(file);
+        store.save();
+        assertTrue(store.isDirty(), "写入失败后必须保留脏标记，saveIfDirty() 才能重试");
+
+        unblockTempFile(file);
+        // 只有失败后的下一次成功写入仍然生成 .bak，才能在新备份中看到这个标记。
+        Files.writeString(file, "\n/* external-change-marker */", StandardCharsets.UTF_8,
+                StandardOpenOption.APPEND);
+
+        store.saveIfDirty();
+
+        assertFalse(store.isDirty());
+        assertTrue(Files.readString(file, StandardCharsets.UTF_8)
+                .contains("\"lastScanDurationMillis\": 222"));
+        assertTrue(anyBackupContains("external-change-marker"),
+                "首次写入失败后，下一次成功写入仍必须重新生成 .bak");
+    }
+
+    private long backupCount() throws IOException {
+        try (Stream<Path> files = Files.list(tempDir)) {
+            return files.filter(path -> path.getFileName().toString().endsWith(".bak")).count();
+        }
+    }
+
+    private boolean anyBackupContains(String marker) throws IOException {
+        List<Path> backups;
+        try (Stream<Path> files = Files.list(tempDir)) {
+            backups = files.filter(path -> path.getFileName().toString().endsWith(".bak")).toList();
+        }
+        for (Path backup : backups) {
+            if (Files.readString(backup, StandardCharsets.UTF_8).contains(marker)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void blockTempFile(Path file) throws IOException {
+        Path temp = file.resolveSibling(file.getFileName() + ".tmp");
+        Files.createDirectories(temp);
+        Files.writeString(temp.resolve("blocker"), "x", StandardCharsets.UTF_8);
+    }
+
+    private static void unblockTempFile(Path file) throws IOException {
+        Path temp = file.resolveSibling(file.getFileName() + ".tmp");
+        Files.deleteIfExists(temp.resolve("blocker"));
+        Files.deleteIfExists(temp);
     }
 }
