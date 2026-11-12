@@ -3,6 +3,7 @@ package com.itzplana.sudoersemc.resolver;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.itzplana.sudoersemc.core.ItemKey;
 import java.util.UUID;
@@ -447,6 +448,37 @@ private static final ResourceLocation SUDOERSEMC_TOKEN =
         assertNull(VariantNormalizer.normalize(longDamage));
         assertNull(VariantNormalizer.normalize(floatDamage));
         assertNull(VariantNormalizer.normalize(doubleDamage));
+    }
+
+    @Test
+    void defaultDamageHelperUsesNumericExactZeroAcrossTagTypes() {
+        CompoundTag zeroByte = new CompoundTag();
+        zeroByte.putByte("Damage", (byte) 0);
+        CompoundTag zeroLong = new CompoundTag();
+        zeroLong.putLong("Damage", 0L);
+        CompoundTag zeroFloat = new CompoundTag();
+        zeroFloat.putFloat("Damage", 0.0F);
+        CompoundTag zeroDouble = new CompoundTag();
+        zeroDouble.putDouble("Damage", 0.0D);
+        CompoundTag nonZeroLong = new CompoundTag();
+        nonZeroLong.putLong("Damage", 4294967296L);
+        CompoundTag nonZeroDouble = new CompoundTag();
+        nonZeroDouble.putDouble("Damage", 0.5D);
+        CompoundTag otherKey = new CompoundTag();
+        otherKey.putInt("Damage", 0);
+        otherKey.putInt("Marker", 1);
+
+        assertTrue(VariantNormalizer.isDefaultDamageOnly(zeroByte));
+        assertTrue(VariantNormalizer.isDefaultDamageOnly(zeroLong));
+        assertTrue(VariantNormalizer.isDefaultDamageOnly(zeroFloat));
+        assertTrue(VariantNormalizer.isDefaultDamageOnly(zeroDouble));
+        assertFalse(VariantNormalizer.isDefaultDamageOnly(nonZeroLong),
+                "2^32 不能被整数截断为 0");
+        assertFalse(VariantNormalizer.isDefaultDamageOnly(nonZeroDouble),
+                "0.5 不能被整数截断为 0");
+        assertFalse(VariantNormalizer.isDefaultDamageOnly(otherKey),
+                "存在其它经济字段时不得视为默认伤害");
+        assertFalse(VariantNormalizer.isDefaultDamageOnly(null));
     }
 
     @Test

@@ -362,10 +362,12 @@ public final class RecipeScanner {
     }
 
     /**
-     * 读取参与变体身份计算的标签，并把“仅 {@code Damage:0}”归一为无 NBT。
+     * 读取参与变体身份计算的标签，并把“仅数值为 0 的 {@code Damage}”归一为无 NBT。
      *
      * <p>可损坏物品默认携带 {@code Damage:0}，它只表示“未受损”，不是经济变体；
-     * 若保留该标签，非可损坏物品还会产生无意义的 {@code {Damage:0}} 伪变体。</p>
+     * 若保留该标签，非可损坏物品还会产生无意义的 {@code {Damage:0}} 伪变体。数值判定统一
+     * 委托给 {@link VariantNormalizer#isDefaultDamageOnly(CompoundTag)}，避免本层用
+     * {@code getInt()} 把 {@code 4294967296L}、{@code 0.5d} 等非零值截断为 0。</p>
      */
     @Nullable
     private static CompoundTag effectiveVariantTag(ItemStack stack) {
@@ -373,7 +375,7 @@ public final class RecipeScanner {
         if (tag == null || tag.isEmpty()) {
             return null;
         }
-        if (tag.size() == 1 && tag.contains("Damage") && tag.getInt("Damage") == 0) {
+        if (VariantNormalizer.isDefaultDamageOnly(tag)) {
             return null;
         }
         return tag;
@@ -382,8 +384,8 @@ public final class RecipeScanner {
     /**
      * 把输出堆叠的 NBT 序列化为 SNBT。
      *
-     * <p>没有标签、空标签或仅 {@code Damage:0} 时返回 {@code null}；序列化失败时记录调试日志
-     * 并返回 {@code null}，绝不因为单个损坏的标签中断整轮配方扫描。</p>
+     * <p>没有标签、空标签或仅默认伤害（数值为 0 的 {@code Damage}）时返回 {@code null}；
+     * 序列化失败时记录调试日志并返回 {@code null}，绝不因为单个损坏的标签中断整轮配方扫描。</p>
      */
     @Nullable
     private static String serializeTag(@Nullable CompoundTag tag) {
@@ -401,9 +403,9 @@ public final class RecipeScanner {
             if (compact.isEmpty() || "{}".equals(compact)) {
                 return null;
             }
-            // 可损坏物品默认携带 {Damage:0}，它只表示「未受损」，不是经济变体。
-            // 与 VariantNormalizer 保持一致，避免下游把默认伤害当成真实差异。
-            return "{Damage:0}".equals(compact) ? null : snbt;
+            // 默认伤害的数值判定统一由 VariantNormalizer 提供，覆盖 0b/0L/0.0f 等标签类型；
+            // 避免本层再用精确字符串判定造成两套语义。
+            return VariantNormalizer.isDefaultDamageOnly(tag) ? null : snbt;
         } catch (RuntimeException failure) {
             LOGGER.debug("序列化配方输出 NBT 失败，按无 NBT 处理", failure);
             return null;

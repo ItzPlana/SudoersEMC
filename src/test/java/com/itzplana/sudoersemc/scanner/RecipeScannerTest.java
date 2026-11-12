@@ -214,6 +214,48 @@ class RecipeScannerTest {
     }
 
     @Test
+    void longDamageAboveIntRangeKeepsRecipeVariant() {
+        CompoundTag tag = new CompoundTag();
+        tag.putLong("Damage", 4294967296L);
+        ItemStack stack = new ItemStack(Items.STONE);
+        stack.setTag(tag);
+
+        RecipeOutput output = RecipeScanner.convertStack(stack);
+
+        assertNotNull(output);
+        assertEquals(ItemKey.of(STONE_ID, "{Damage:4294967296L}"), output.item(),
+                "LongTag 2^32 不能被 getInt() 截断后丢失变体");
+        assertEquals(tag.toString(), output.outputNbt(),
+                "非零 long 伤害必须保留原始 SNBT");
+    }
+
+    @Test
+    void fractionalDamageKeepsRecipeVariant() {
+        CompoundTag tag = new CompoundTag();
+        tag.putDouble("Damage", 0.5D);
+        ItemStack stack = new ItemStack(Items.STONE);
+        stack.setTag(tag);
+
+        RecipeOutput output = RecipeScanner.convertStack(stack);
+
+        assertNotNull(output);
+        assertEquals(ItemKey.of(STONE_ID, "{Damage:0.5d}"), output.item(),
+                "0.5 不能被 getInt() 截断为 0 后误判为默认伤害");
+        assertEquals(tag.toString(), output.outputNbt(),
+                "非零小数伤害必须保留原始 SNBT");
+    }
+
+    @Test
+    void zeroDamageOfEveryNumericTypeIsDroppedFromRecipeOutput() {
+        assertZeroDamageDropped((byte) 0);
+        assertZeroDamageDropped((short) 0);
+        assertZeroDamageDropped(0);
+        assertZeroDamageDropped(0L);
+        assertZeroDamageDropped(0.0F);
+        assertZeroDamageDropped(0.0D);
+    }
+
+    @Test
     void linkageErrorDuringRecipeLookupCountsAsFailed() {
         RecipeManager manager = new RecipeManager() {
 
@@ -322,6 +364,36 @@ class RecipeScannerTest {
                 "求解与变体扫描必须使用同一规范化身份");
         assertEquals(tag.toString(), output.outputNbt(),
                 "注册 ProjectE 仍需要包含 display 的原始 SNBT");
+    }
+
+    /**
+     * 数值为 0 的 {@code Damage} 不论标签类型都必须归一为无变体、无 NBT。
+     */
+    private static void assertZeroDamageDropped(Number value) {
+        CompoundTag tag = new CompoundTag();
+        if (value instanceof Byte byteValue) {
+            tag.putByte("Damage", byteValue);
+        } else if (value instanceof Short shortValue) {
+            tag.putShort("Damage", shortValue);
+        } else if (value instanceof Integer intValue) {
+            tag.putInt("Damage", intValue);
+        } else if (value instanceof Long longValue) {
+            tag.putLong("Damage", longValue);
+        } else if (value instanceof Float floatValue) {
+            tag.putFloat("Damage", floatValue);
+        } else {
+            tag.putDouble("Damage", value.doubleValue());
+        }
+        ItemStack stack = new ItemStack(Items.STONE);
+        stack.setTag(tag);
+
+        RecipeOutput output = RecipeScanner.convertStack(stack);
+
+        assertNotNull(output);
+        assertEquals(ItemKey.of(STONE_ID), output.item(),
+                "数值为 0 的 Damage 不得产生变体身份：" + tag);
+        assertNull(output.outputNbt(),
+                "数值为 0 的 Damage 不得保留为配方输出 NBT：" + tag);
     }
 
 

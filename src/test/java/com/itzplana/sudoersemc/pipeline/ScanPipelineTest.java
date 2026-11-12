@@ -1717,6 +1717,33 @@ class ScanPipelineTest {
     }
 
     @Test
+    void successfulSnapshotClearsPreviousCollectFailure() throws IOException {
+        ReportManager reportManager = new ReportManager(tempDir.resolve("collect_recovery_report"));
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_collect_recovery.json"));
+        ScanPipeline pipeline = pipeline(
+                store, null, reportManager, null, null, null, genericFallback(7L));
+
+        assertThrows(IllegalStateException.class, () -> pipeline.collect(null));
+        assertNotNull(pipeline.lastCollectFailure(), "失败采集必须保留原因");
+
+        PipelineSnapshot snapshot = snapshot(List.of(item(RESULT, 0L)), List.of(), Map.of());
+        pipeline.stash(snapshot);
+
+        PipelineResult result = pipeline.applyStashed();
+        assertEquals(1, result.applied(),
+                "新一次成功采集不能被上一次采集失败标志丢弃");
+        assertNull(pipeline.lastCollectFailure(), "成功交接快照后必须清除旧失败原因");
+
+        pipeline.writePendingReport();
+        String report = Files.readString(reportManager.reportFile());
+        assertFalse(report.contains("部分报告（扫描失败）"),
+                "恢复扫描必须写出完整报告，不得复用旧失败标记");
+        assertTrue(report.contains("===== SudoersEMC 诊断报告 ====="),
+                "恢复扫描必须写出完整报告");
+    }
+
+    @Test
     void recipeEnumerationFailureShowsUnknownTotal() throws IOException {
         ReportManager reportManager = new ReportManager(tempDir.resolve("enumeration_failure_report"));
         ScanPipeline pipeline = pipeline(
@@ -1758,6 +1785,31 @@ class ScanPipelineTest {
         assertEquals(3, limited.items().size(), "基础物品 + 两个变体");
         assertEquals(2, limited.items().stream().filter(item -> item.key().hasVariant()).count(),
                 "nbt.maxNbtVariantsPerItem 必须经由管线字段生效");
+    }
+
+    @Test
+    void collectSnapshotDataPropagatesRecipeScanFailures() {
+        ScanPipeline pipeline = pipeline(null, null, null, null, null, null, disabledFallback());
+        ItemSnapshot stoneBase = ItemSnapshot.of(STONE, false, 0L);
+
+        RecipeScanner.ScanResult enumerationFailure = new RecipeScanner.ScanResult(
+                List.of(), 0, 0, 0, true, List.of("recipe-manager: boom"));
+        PipelineSnapshot failed = pipeline.collectSnapshotData(
+                List.of(stoneBase), enumerationFailure, null);
+
+        assertTrue(failed.recipeEnumerationFailed(),
+                "配方枚举失败标志必须从 ScanResult 传入快照");
+        assertEquals(List.of("recipe-manager: boom"), failed.failedRecipeDetails(),
+                "枚举失败明细必须从 ScanResult 传入快照");
+
+        RecipeScanner.ScanResult partialFailure = new RecipeScanner.ScanResult(
+                List.of(), 1, 2, 3, List.of("bad_recipe: boom"));
+        PipelineSnapshot partial = pipeline.collectSnapshotData(
+                List.of(stoneBase), partialFailure, null);
+
+        assertEquals(3, partial.failedRecipes());
+        assertEquals(List.of("bad_recipe: boom"), partial.failedRecipeDetails(),
+                "逐条配方失败明细必须从 ScanResult 传入快照");
     }
 
     @Test
