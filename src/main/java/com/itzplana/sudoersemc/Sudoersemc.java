@@ -418,6 +418,10 @@ public final class Sudoersemc {
                 "recipe.solveRecipes", SudoersemcConfig.RECIPE_SOLVE_RECIPES, true));
         pipeline.setGenerateReportsEnabled(readBoolean(
                 "diagnostic.generateReports", SudoersemcConfig.DIAGNOSTIC_GENERATE_REPORTS, true));
+        pipeline.setNbtVariantsEnabled(readBoolean(
+                "nbt.scanNbtVariants", SudoersemcConfig.NBT_SCAN_NBT_VARIANTS, true));
+        pipeline.setMaxNbtVariantsPerItem(readInt(
+                "nbt.maxNbtVariantsPerItem", SudoersemcConfig.NBT_MAX_NBT_VARIANTS_PER_ITEM, 100));
         return pipeline;
     }
 
@@ -425,6 +429,18 @@ public final class Sudoersemc {
      * 读取一个布尔配置开关；读取失败时记录警告并返回给定默认值。
      */
     private static boolean readBoolean(String key, ForgeConfigSpec.BooleanValue value, boolean fallback) {
+        try {
+            return value.get();
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法读取 {} 配置，使用默认值 {}", key, fallback, e);
+            return fallback;
+        }
+    }
+
+    /**
+     * 读取一个整数配置值；读取失败时记录警告并返回给定默认值。
+     */
+    private static int readInt(String key, ForgeConfigSpec.IntValue value, int fallback) {
         try {
             return value.get();
         } catch (RuntimeException e) {

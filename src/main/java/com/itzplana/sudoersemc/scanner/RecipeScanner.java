@@ -7,6 +7,7 @@ import java.util.Objects;
 import java.util.Optional;
 import net.minecraft.core.NonNullList;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.nbt.CompoundTag;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.crafting.AbstractCookingRecipe;
@@ -223,8 +224,13 @@ public final class RecipeScanner {
         return converted;
     }
 
+    /**
+     * 把输出堆叠转换为不可变产物，并保留其 SNBT。
+     *
+     * <p>该方法为包级可见，便于单元测试直接验证 SNBT 保留与空标签语义。</p>
+     */
     @Nullable
-    private static RecipeOutput convertStack(@Nullable ItemStack stack) {
+    static RecipeOutput convertStack(@Nullable ItemStack stack) {
         if (stack == null || stack.isEmpty()) {
             return null;
         }
@@ -232,7 +238,28 @@ public final class RecipeScanner {
         if (id == null) {
             return null;
         }
-        return new RecipeOutput(ItemKey.of(id), Math.max(1, stack.getCount()));
+        return new RecipeOutput(ItemKey.of(id), Math.max(1, stack.getCount()), serializeTag(stack));
+    }
+
+    /**
+     * 把输出堆叠的 NBT 序列化为 SNBT。
+     *
+     * <p>没有标签时返回 {@code null}；序列化失败时记录调试日志并返回 {@code null}，
+     * 绝不因为单个损坏的标签中断整轮配方扫描。</p>
+     */
+    @Nullable
+    private static String serializeTag(ItemStack stack) {
+        try {
+            CompoundTag tag = stack.getTag();
+            if (tag == null || tag.isEmpty()) {
+                return null;
+            }
+            String snbt = tag.toString();
+            return snbt.isBlank() ? null : snbt;
+        } catch (RuntimeException failure) {
+            LOGGER.debug("序列化配方输出 NBT 失败，按无 NBT 处理", failure);
+            return null;
+        }
     }
 
     private static List<RecipeOutput> convertStacks(@Nullable NonNullList<ItemStack> stacks) {
