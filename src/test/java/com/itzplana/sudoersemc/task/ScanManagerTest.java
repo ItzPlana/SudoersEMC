@@ -587,6 +587,38 @@ class ScanManagerTest {
         };
     }
 
+    @Test
+    void resetDuringSolvingCancelsFutureAndReturnsIdle() throws Exception {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch interrupted = new CountDownLatch(1);
+        SolveWorker worker = new SolveWorker(snapshot -> {
+            started.countDown();
+            try {
+                Thread.sleep(30_000L);
+            } catch (InterruptedException interruption) {
+                interrupted.countDown();
+                Thread.currentThread().interrupt();
+            }
+            return emptyOutcome();
+        });
+        ScanManager manager = pipelineManager(worker, true,
+                pipelineSession(1, 0, new AtomicInteger()), new AtomicInteger());
+
+        manager.requestScan();
+        manager.tick();
+        assertEquals(ScanPhase.SOLVING, manager.progress().phase());
+        assertTrue(started.await(2L, TimeUnit.SECONDS));
+
+        manager.cancel();
+        manager.reset();
+
+        assertEquals(ScanPhase.IDLE, manager.progress().phase());
+        assertFalse(manager.isRunning(), "reset 后旧扫描不得再阻塞重建检查");
+        assertFalse(manager.isCancelRequested(), "reset 必须清除取消标志");
+        assertTrue(interrupted.await(2L, TimeUnit.SECONDS), "reset 必须取消并中断工作线程");
+        worker.shutdownNow();
+    }
+
     private static SolveOutcome emptyOutcome() {
         return new SolveOutcome(PipelineSnapshot.empty(), List.of(),
                 new SolveResult(Map.of(), Map.of(), List.of(), Set.of(), 0, false, 0L, 0),

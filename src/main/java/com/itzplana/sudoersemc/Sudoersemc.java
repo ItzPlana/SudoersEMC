@@ -257,7 +257,8 @@ public final class Sudoersemc {
             LOGGER.warn("SudoersEMC 配置重建校验异常（{}），保留上一份有效配置", label, failure);
             return false;
         }
-        boolean scanRunning = scanManager != null && scanManager.isRunning();
+        boolean scanRunning = scanManager != null && scanManager.isRunning()
+                && solveWorker != null && !solveWorker.isShutdown();
         ReloadDecision decision = ReloadDecision.decide(scanRunning, validation.valid());
         lastReloadDecision = decision;
 
@@ -816,6 +817,8 @@ public final class Sudoersemc {
         // 服务器停止时关闭了求解线程池；同一 JVM 再次开服时重建一份，避免复用已关闭的 worker。
         SolveWorker worker = solveWorker;
         if (worker == null || worker.isShutdown()) {
+            // 旧 manager 可能仍停留在 SOLVING/COLLECTING；必须先清理，否则重建会被 DEFER 永久阻塞。
+            resetScanManagerForShutdown(scanManager);
             rebuildRuntimeFromConfig("server-start-worker");
         }
         GeneratedEntryStore store = entryStore;
@@ -900,10 +903,35 @@ public final class Sudoersemc {
             resetLog.save();
         }
         // 关闭纯求解工作线程；下一次开服会由 onServerStarted 重建运行时组件。
+        // 先中止并重置调度器：否则旧 manager 会停留在 SOLVING，导致重开服时 rebuild 被永久 DEFER。
+        resetScanManagerForShutdown(scanManager);
         SolveWorker worker = solveWorker;
         solveWorker = null;
         if (worker != null) {
             worker.shutdownNow();
+        }
+    }
+
+    /**
+     * 停止并重置扫描调度器，供停服与“worker 已关闭后重开服”两条路径复用。
+     *
+     * <p>{@link ScanManager#reset()} 会取消未完成的求解 future、丢弃采集会话并把进度恢复为
+     * {@link ScanPhase#IDLE}。这样孪生防御确保旧 manager 不会以活动状态阻塞下一次
+     * {@code rebuildRuntimeFromConfig}。</p>
+     *
+     * @param manager 扫描调度器，允许为 {@code null}
+     */
+    static void resetScanManagerForShutdown(@Nullable ScanManager manager) {
+        if (manager == null) {
+            return;
+        }
+        boolean wasRunning = manager.isRunning();
+        manager.cancel();
+        manager.reset();
+        if (wasRunning) {
+            LOGGER.info("SudoersEMC 停服/重建前已中止并重置活动扫描，避免复用关闭的求解线程");
+        } else {
+            LOGGER.debug("SudoersEMC 停服/重建前已重置扫描调度器状态");
         }
     }
 
