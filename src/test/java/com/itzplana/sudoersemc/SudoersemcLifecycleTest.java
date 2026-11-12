@@ -81,4 +81,20 @@ class SudoersemcLifecycleTest {
     void shutdownResetToleratesMissingManager() {
         assertDoesNotThrow(() -> Sudoersemc.resetScanManager(null));
     }
+
+    @Test
+    void zeroDropRatioIsMappedToFailClosedValue() {
+        assertEquals(Double.MIN_VALUE, Sudoersemc.sanitizeMaxAllowedDropRatio(0.0D),
+                "0.0 不得静默退回默认 0.5");
+        assertEquals(Double.MIN_VALUE, Sudoersemc.sanitizeMaxAllowedDropRatio(-1.0D));
+        assertEquals(Double.MIN_VALUE, Sudoersemc.sanitizeMaxAllowedDropRatio(1.5D));
+        assertEquals(Double.MIN_VALUE, Sudoersemc.sanitizeMaxAllowedDropRatio(Double.NaN));
+    }
+
+    @Test
+    void validDropRatioIsPreserved() {
+        assertEquals(0.5D, Sudoersemc.sanitizeMaxAllowedDropRatio(0.5D));
+        assertEquals(Double.MIN_VALUE,
+                Sudoersemc.sanitizeMaxAllowedDropRatio(Double.MIN_VALUE));
+    }
 }

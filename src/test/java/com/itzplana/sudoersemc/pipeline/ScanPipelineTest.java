@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.itzplana.sudoersemc.core.GeneratedEmcEntry;
@@ -26,7 +27,10 @@ import com.itzplana.sudoersemc.scanner.RecipeSnapshot;
 import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
 import com.itzplana.sudoersemc.storage.OverflowResetLog;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
+import com.itzplana.sudoersemc.task.BatchProcessor;
 import com.itzplana.sudoersemc.task.ScanFingerprint;
+import com.itzplana.sudoersemc.task.ScanManager;
+import com.itzplana.sudoersemc.task.ScanPhase;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -78,6 +82,43 @@ class ScanPipelineTest {
         assertTrue(result.appliedToStore());
         assertEquals(0, store.size());
         assertFalse(store.isDirty());
+    }
+
+    @Test
+    void collectWithoutServerFailsInsteadOfReturningEmptySnapshot() {
+        ScanPipeline pipeline = pipeline(null, null, null, null, null, null, disabledFallback());
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> pipeline.collect(null));
+
+        assertTrue(failure.getMessage().contains("扫描采集失败"),
+                "采集失败必须带可诊断信息，不能静默返回空快照");
+    }
+
+    @Test
+    void failedCollectionDoesNotRecordCompletedScanState() {
+        ScanStateStore stateStore = new ScanStateStore(tempDir.resolve("scan_state_failure.json"));
+        ScanPipeline pipeline = pipeline(null, stateStore, null, null, null, null, disabledFallback());
+        ScanManager manager = new ScanManager(
+                new BatchProcessor(10, false),
+                () -> {
+                    PipelineSnapshot snapshot = pipeline.collect(null);
+                    pipeline.stash(snapshot);
+                    return new ScanManager.SnapshotData(
+                            "测试采集", snapshot.itemCount(), snapshot.recipeCount());
+                },
+                data -> pipeline.applyStashed(),
+                1_000_000L);
+
+        assertTrue(manager.requestScan());
+        manager.tick();
+
+        assertEquals(ScanPhase.FAILED, manager.progress().phase(),
+                "采集失败必须让扫描进入 FAILED");
+        assertEquals(0L, stateStore.lastScanEpochMillis(),
+                "失败采集不得写入扫描完成时间");
+        assertFalse(stateStore.isDirty(),
+                "失败采集不得把空指纹标记为待保存状态");
     }
 
     @Test
