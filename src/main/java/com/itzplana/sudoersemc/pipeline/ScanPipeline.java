@@ -4,11 +4,13 @@ import com.itzplana.sudoersemc.core.GeneratedEmcEntry;
 import com.itzplana.sudoersemc.core.ItemKey;
 import com.itzplana.sudoersemc.core.OverflowScope;
 import com.itzplana.sudoersemc.core.PriceSource;
+import com.itzplana.sudoersemc.core.VariantRegistration;
 import com.itzplana.sudoersemc.diagnostic.DiagnosticReport;
 import com.itzplana.sudoersemc.diagnostic.ReportManager;
 import com.itzplana.sudoersemc.integration.EmcProvider;
 import com.itzplana.sudoersemc.integration.ProjectECustomEmcFile;
 import com.itzplana.sudoersemc.pricing.FallbackPricing;
+import com.itzplana.sudoersemc.resolver.VariantNormalizer;
 import com.itzplana.sudoersemc.resolver.VariantScanner;
 import com.itzplana.sudoersemc.safety.CreativeItemProtection;
 import com.itzplana.sudoersemc.safety.LargeDropProtection;
@@ -36,9 +38,11 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -73,9 +77,10 @@ import org.slf4j.LoggerFactory;
  * 创造物品保护使用安全默认值，兜底定价与溢出保护在缺失时直接跳过。这样单元测试可以在没有完整
  * 运行时环境的情况下验证管线主干。</p>
  *
- * <p><strong>异常契约：</strong>{@link #collect(MinecraftServer)} 与
- * {@link #solveAndApply(PipelineSnapshot)} 都不会向调用方抛出异常。任何失败都会记录日志并返回
- * 空快照或全零结果，保证服务器主循环与 {@code ScanManager} 状态机不会被单次扫描拖垮。</p>
+ * <p><strong>异常契约：</strong>{@link #collect(MinecraftServer)} 在服务器未就绪或采集失败时
+ * 抛出 {@link IllegalStateException}，由 {@code ScanManager} 转为 {@code FAILED}，绝不把失败
+ * 伪装成“成功的空扫描”；{@link #solveAndApply(PipelineSnapshot)} 仍不向调用方抛出异常，
+ * 任何未预期失败记录日志后返回全零结果，保证服务器主循环不被单次扫描拖垮。</p>
  */
 public final class ScanPipeline {
 
@@ -170,7 +175,9 @@ public final class ScanPipeline {
      * 设置溢出保护作用域。
      *
      * <p>生产环境默认 {@link OverflowScope#OWNED_ONLY}，只允许改写 SudoersEMC 自己拥有的条目。
-     * 传入 {@code null} 时恢复该默认值，绝不隐式扩大作用域。</p>
+     * {@link OverflowScope#ENTIRE_CUSTOM_EMC} 仅扩大扫描范围到 ProjectE 的
+     * {@code custom_emc.json}，不会授权改写非自有条目；传入 {@code null} 时恢复默认值，
+     * 绝不隐式扩大作用域。</p>
      *
      * @param scope 作用域，允许为 {@code null}
      */
@@ -179,12 +186,13 @@ public final class ScanPipeline {
     }
 
     /**
-     * 设置是否允许改写 ProjectE 的 {@code custom_emc.json}。
+     * 设置是否允许改写 ProjectE 的 {@code custom_emc.json} 中归 SudoersEMC 所有的条目。
      *
      * <p>默认 {@code false}。只有同时启用 {@link OverflowScope#ENTIRE_CUSTOM_EMC} 作用域时才会
-     * 产生实际文件写入；这是避免误改管理员手动配置的第二道保险。</p>
+     * 产生实际文件写入；这是避免误改管理员手动配置的第二道保险。无论该开关如何设置，
+     * 非自有（管理员手动）条目都不会被改写。</p>
      *
-     * @param enabled 是否允许改写 ProjectE 文件
+     * @param enabled 是否允许改写 ProjectE 文件中的自有条目
      */
     public void setProjectEFileRewriteEnabled(boolean enabled) {
         this.allowProjectEFileRewrite = enabled;
@@ -257,13 +265,18 @@ public final class ScanPipeline {
      * 转换为不可变的 {@link ItemSnapshot} / {@link RecipeSnapshot}。返回后所有数据都可以安全地
      * 脱离服务器线程处理。</p>
      *
+     * <p>服务器未就绪、注册表/配方扫描失败或出现未预期异常时抛出
+     * {@link IllegalStateException}。调用方（{@code ScanManager}）会把它转换为扫描失败，
+     * 从而避免用空快照覆盖上一次有效的扫描状态。</p>
+     *
      * @param server 当前服务器实例，允许为 {@code null}
-     * @return 采集结果；任何失败或服务器未就绪时返回空快照
+     * @return 本次采集的不可变快照
+     * @throws IllegalStateException 服务器未就绪或采集过程失败时抛出
      */
     public PipelineSnapshot collect(@Nullable MinecraftServer server) {
         if (server == null) {
-            LOGGER.warn("SudoersEMC 扫描采集被调用时服务器尚未就绪，返回空快照");
-            return PipelineSnapshot.empty();
+            LOGGER.warn("SudoersEMC 扫描采集被调用时服务器尚未就绪，本次扫描失败");
+            throw new IllegalStateException("扫描采集失败：服务器尚未就绪");
         }
 
         try {
@@ -298,6 +311,23 @@ public final class ScanPipeline {
                         return 0L;
                     }
                 }
+
+                @Override
+                public long getExactValue(ItemStack stack) {
+                    EmcProvider provider = emcProvider;
+                    if (provider == null) {
+                        return 0L;
+                    }
+                    try {
+                        if (!provider.isAvailable()) {
+                            return 0L;
+                        }
+                        return Math.max(0L, provider.getExactValue(stack));
+                    } catch (RuntimeException | LinkageError failure) {
+                        LOGGER.debug("EMC 后端读取精确 NBT 数值失败，按 0 处理", failure);
+                        return 0L;
+                    }
+                }
             };
 
             List<ItemSnapshot> items = new ItemScanner(query, Set.of(), Set.of()).scan();
@@ -305,47 +335,67 @@ public final class ScanPipeline {
             RecipeScanner recipeScanner = RecipeScanner.withGoety().orElseGet(RecipeScanner::new);
             RecipeScanner.ScanResult scanResult = recipeScanner.scan(server.getRecipeManager());
 
-            List<ItemSnapshot> variantItems = collectVariantSnapshots(
-                    items, scanResult.recipes(), nbtVariantsEnabled, maxNbtVariantsPerItem);
-            List<ItemSnapshot> allItems = items;
-            if (!variantItems.isEmpty()) {
-                List<ItemSnapshot> combined = new ArrayList<>(items.size() + variantItems.size());
-                combined.addAll(items);
-                combined.addAll(variantItems);
-                allItems = List.copyOf(combined);
-            }
-
-            Map<ItemKey, Long> existingValues = new TreeMap<>();
-            for (ItemSnapshot item : allItems) {
-                if (item.hasExistingEmc()) {
-                    existingValues.put(item.key(), item.existingValue());
-                }
-            }
-
-            return new PipelineSnapshot(
-                    allItems,
-                    scanResult.recipes(),
-                    existingValues,
-                    scanResult.unsupported(),
-                    scanResult.invalid(),
-                    scanResult.failed());
+            return collectSnapshotData(items, scanResult, query);
         } catch (Throwable failure) {
-            LOGGER.error("SudoersEMC 扫描采集失败，本轮按空快照处理", failure);
-            return PipelineSnapshot.empty();
+            LOGGER.error("SudoersEMC 扫描采集失败", failure);
+            throw new IllegalStateException("SudoersEMC 扫描采集失败", failure);
         }
+    }
+
+    /**
+     * 把已完成的物品与配方扫描结果组装成不可变快照。
+     *
+     * <p>该方法从管线字段读取 NBT 变体开关与单物品上限，是 {@link #collect(MinecraftServer)}
+     * 的可测试接缝：生产路径与测试都走同一段变体生成与既有值查询逻辑。</p>
+     *
+     * @param items      基础物品扫描结果，不能为 null
+     * @param scanResult 配方扫描结果，不能为 null
+     * @param emcQuery   后端查询；允许为 {@code null}（测试或后端缺失时按无既有值处理）
+     * @return 组装后的快照
+     */
+    PipelineSnapshot collectSnapshotData(List<ItemSnapshot> items,
+                                         RecipeScanner.ScanResult scanResult,
+                                         @Nullable ItemScanner.EmcQuery emcQuery) {
+        Objects.requireNonNull(items, "items");
+        Objects.requireNonNull(scanResult, "scanResult");
+        List<ItemSnapshot> variantItems = collectVariantSnapshots(
+                items, scanResult.recipes(), nbtVariantsEnabled, maxNbtVariantsPerItem, emcQuery);
+        List<ItemSnapshot> allItems = items;
+        if (!variantItems.isEmpty()) {
+            List<ItemSnapshot> combined = new ArrayList<>(items.size() + variantItems.size());
+            combined.addAll(items);
+            combined.addAll(variantItems);
+            allItems = List.copyOf(combined);
+        }
+
+        Map<ItemKey, Long> existingValues = new TreeMap<>();
+        for (ItemSnapshot item : allItems) {
+            if (item.hasExistingEmc()) {
+                existingValues.put(item.key(), item.existingValue());
+            }
+        }
+
+        return new PipelineSnapshot(
+                allItems,
+                scanResult.recipes(),
+                existingValues,
+                scanResult.unsupported(),
+                scanResult.invalid(),
+                scanResult.failed());
     }
 
     /**
      * 根据配方输出中观测到的 SNBT 生成 NBT 变体快照。
      *
-     * <p>处理顺序固定：先按物品 id 汇总所有 {@link RecipeOutput#outputNbt()}，再把 SNBT
-     * 解析回 {@link CompoundTag}，交给 {@link VariantScanner} 规范化、去重并限制数量。只有
-     * 已在基础物品快照中出现过的物品才会生成变体，因此忽略规则与注册表缺失物品不会被
-     * 变体扫描重新引入。</p>
+     * <p>先按物品 id 汇总并去重原始 SNBT，再逐个解析、规范化；每个物品只保留字典序最小的
+     * {@code maxNbtVariantsPerItem} 个变体。解析是流式的：同一时刻只持有一个临时
+     * {@link CompoundTag}，不会把与配方数成正比的解析结果全部留在内存中。全部物品共享
+     * {@link VariantScanner#HARD_TOTAL_VARIANT_CEILING} 的总预算。只有已在基础物品快照中
+     * 出现过的物品才会生成变体，因此忽略规则与注册表缺失物品不会被变体扫描重新引入。</p>
      *
-     * <p>变体快照的 {@code hasExistingEmc} 固定为 {@code false}、{@code existingValue} 固定为
-     * {@code 0}，标签路径与稀有度继承基础物品。结果按 {@link ItemKey} 排序（物品 id，然后
-     * variantHash），保证相同输入得到稳定的输出顺序；无法解析或无法规范化的标签会被跳过。</p>
+     * <p>变体快照的 {@code hasExistingEmc}/{@code existingValue} 来自对带原始 NBT 堆叠的
+     * 精确查询：只要任一观测原始 SNBT 已有 NBT 专属 EMC，就取最大值作为既有值，避免覆盖
+     * 其它模组或 ProjectE NBT 处理器注册的值。标签路径与稀有度继承基础物品。</p>
      *
      * @param baseItems            基础物品快照，保持扫描器返回的顺序
      * @param recipes              本轮可用配方
@@ -357,13 +407,26 @@ public final class ScanPipeline {
                                                       List<RecipeSnapshot> recipes,
                                                       boolean enabled,
                                                       int maxNbtVariantsPerItem) {
+        return collectVariantSnapshots(baseItems, recipes, enabled, maxNbtVariantsPerItem, null);
+    }
+
+    /**
+     * 带 EMC 精确查询的变体采集重载。
+     *
+     * @param emcQuery 精确 NBT 查询；{@code null} 时按无既有值处理
+     */
+    static List<ItemSnapshot> collectVariantSnapshots(List<ItemSnapshot> baseItems,
+                                                      List<RecipeSnapshot> recipes,
+                                                      boolean enabled,
+                                                      int maxNbtVariantsPerItem,
+                                                      @Nullable ItemScanner.EmcQuery emcQuery) {
         if (!enabled || baseItems == null || baseItems.isEmpty()
                 || recipes == null || recipes.isEmpty()) {
             return List.of();
         }
         int limit = Math.max(1, Math.min(maxNbtVariantsPerItem, VariantScanner.HARD_VARIANT_CEILING));
 
-        Map<ResourceLocation, List<String>> observedByItem = new TreeMap<>();
+        Map<ResourceLocation, TreeSet<String>> observedByItem = new TreeMap<>();
         for (RecipeSnapshot recipe : recipes) {
             for (RecipeOutput output : recipe.outputs()) {
                 String outputNbt = output.outputNbt();
@@ -371,7 +434,7 @@ public final class ScanPipeline {
                     continue;
                 }
                 observedByItem
-                        .computeIfAbsent(output.item().itemId(), id -> new ArrayList<>())
+                        .computeIfAbsent(output.item().itemId(), id -> new TreeSet<>())
                         .add(outputNbt);
             }
         }
@@ -386,10 +449,12 @@ public final class ScanPipeline {
             }
         }
 
-        VariantScanner variantScanner = new VariantScanner();
         Set<ItemKey> seen = new HashSet<>();
         List<ItemSnapshot> variants = new ArrayList<>();
-        for (Map.Entry<ResourceLocation, List<String>> entry : observedByItem.entrySet()) {
+        int totalBudget = VariantScanner.HARD_TOTAL_VARIANT_CEILING;
+        boolean budgetExhausted = false;
+
+        for (Map.Entry<ResourceLocation, TreeSet<String>> entry : observedByItem.entrySet()) {
             ItemSnapshot base = baseByItem.get(entry.getKey());
             if (base == null) {
                 // 基础物品未被扫描（被忽略或未注册）时不生成变体，避免绕过排除规则。
@@ -400,39 +465,93 @@ public final class ScanPipeline {
                 continue;
             }
 
-            List<CompoundTag> observedTags = new ArrayList<>(entry.getValue().size());
+            // 原始 SNBT 已按字典序去重；逐个解析并即时裁剪到 limit，保持结果与配方顺序无关。
+            TreeSet<ItemKey> uniqueKeys = new TreeSet<>();
+            Map<ItemKey, TreeSet<String>> rawFormsByKey = new LinkedHashMap<>();
             for (String snbt : entry.getValue()) {
+                CompoundTag tag;
                 try {
-                    observedTags.add(TagParser.parseTag(snbt));
+                    tag = TagParser.parseTag(snbt);
                 } catch (Exception failure) {
                     LOGGER.debug("无法解析配方输出 SNBT，跳过该观测变体：{}", snbt, failure);
+                    continue;
+                }
+                ItemKey key = VariantNormalizer.keyFor(entry.getKey(), tag);
+                if (!key.hasVariant()) {
+                    continue;
+                }
+                uniqueKeys.add(key);
+                TreeSet<String> forms = rawFormsByKey.computeIfAbsent(key, ignored -> new TreeSet<>());
+                if (forms.size() < VariantRegistration.MAX_OBSERVED_NBT_PER_VARIANT) {
+                    forms.add(snbt);
+                }
+                if (uniqueKeys.size() > limit) {
+                    ItemKey removed = uniqueKeys.pollLast();
+                    rawFormsByKey.remove(removed);
                 }
             }
-            if (observedTags.isEmpty()) {
+            if (uniqueKeys.isEmpty()) {
                 continue;
             }
 
-            List<ItemKey> variantKeys;
-            try {
-                variantKeys = variantScanner.scan(new ItemStack(item), observedTags, limit);
-            } catch (RuntimeException failure) {
-                LOGGER.debug("生成物品 {} 的 NBT 变体失败，跳过", entry.getKey(), failure);
-                continue;
-            }
-            for (ItemKey variantKey : variantKeys) {
-                if (!variantKey.hasVariant() || !seen.add(variantKey)) {
+            for (ItemKey variantKey : uniqueKeys) {
+                if (!seen.add(variantKey)) {
                     continue;
                 }
+                if (variants.size() >= totalBudget) {
+                    budgetExhausted = true;
+                    break;
+                }
+                long existingValue = queryVariantExistingValue(
+                        item, variantKey, rawFormsByKey.getOrDefault(variantKey, new TreeSet<>()), emcQuery);
                 variants.add(ItemSnapshot.of(
-                        variantKey, false, 0L, base.tagPaths(), base.rarity()));
+                        variantKey, existingValue > 0L, existingValue, base.tagPaths(), base.rarity()));
+            }
+            if (variants.size() >= totalBudget) {
+                budgetExhausted = true;
+                break;
             }
         }
 
+        if (budgetExhausted) {
+            LOGGER.debug("NBT 变体生成达到全局上限 {}，后续物品不再采集", totalBudget);
+        }
         if (variants.isEmpty()) {
             return List.of();
         }
         variants.sort(Comparator.comparing(ItemSnapshot::key));
         return List.copyOf(variants);
+    }
+
+    /**
+     * 查询一个变体身份下所有观测原始 NBT 的精确既有值。
+     *
+     * <p>同一经济变体可能对应多个原始 SNBT；采用最大值可避免把任何一个已存在的 NBT 专属
+     * 值当成“无值”后覆盖。任一查询失败只按该形态无值处理。</p>
+     *
+     * @return 精确 NBT 既有值；没有专属映射时返回 {@code 0}
+     */
+    private static long queryVariantExistingValue(Item item, ItemKey variantKey,
+                                                  Iterable<String> rawSnbts,
+                                                  @Nullable ItemScanner.EmcQuery emcQuery) {
+        if (emcQuery == null) {
+            return 0L;
+        }
+        long maxValue = 0L;
+        for (String snbt : rawSnbts) {
+            try {
+                CompoundTag tag = TagParser.parseTag(snbt);
+                ItemStack probe = new ItemStack(item);
+                probe.setTag(tag);
+                long value = Math.max(0L, emcQuery.getExactValue(probe));
+                if (value > maxValue) {
+                    maxValue = value;
+                }
+            } catch (Exception failure) {
+                LOGGER.debug("查询变体 {} 的精确 NBT 既有值失败，跳过该形态：{}", variantKey, snbt, failure);
+            }
+        }
+        return maxValue;
     }
 
     /**
@@ -473,16 +592,18 @@ public final class ScanPipeline {
      *
      * @param items 本次扫描到的物品快照，不能为 {@code null}
      * @param owned 归属判定；返回 {@code true} 表示该物品由 SudoersEMC 所有
-     * @return 分离后的物品、既有值与刷新数量
+     * @return 分离后的物品、仍受保护的既有值、刷新数量与全部自有物品键
      */
     static OwnershipSeparation separateOwnedEntries(List<ItemSnapshot> items,
                                                     Predicate<ItemKey> owned) {
         List<ItemSnapshot> separated = new ArrayList<>(items.size());
         Map<ItemKey, Long> existingValues = new TreeMap<>();
+        Set<ItemKey> ownedItems = new TreeSet<>();
         int refreshedOwned = 0;
         for (ItemSnapshot item : items) {
             ItemKey key = item.key();
             if (owned.test(key)) {
+                ownedItems.add(key);
                 if (item.hasExistingEmc() || item.existingValue() > 0L) {
                     refreshedOwned++;
                 }
@@ -494,7 +615,7 @@ public final class ScanPipeline {
                 existingValues.put(key, item.existingValue());
             }
         }
-        return new OwnershipSeparation(separated, existingValues, refreshedOwned);
+        return new OwnershipSeparation(separated, existingValues, refreshedOwned, ownedItems);
     }
 
     /**
@@ -505,25 +626,43 @@ public final class ScanPipeline {
      * 自有条目；干跑模式没有存储，保持原始语义不变。</p>
      *
      * @param snapshot 采集结果，不能为 {@code null}
-     * @return 分离后的快照；无需刷新时返回原实例
+     * @return 分离后的快照与自有物品键；无需刷新时快照返回原实例
      */
-    private PipelineSnapshot applyOwnershipSeparation(PipelineSnapshot snapshot) {
+    private AppliedSeparation applyOwnershipSeparation(PipelineSnapshot snapshot) {
         if (store == null) {
-            return snapshot;
+            return new AppliedSeparation(snapshot, Set.of(), 0);
         }
         OwnershipSeparation separation = separateOwnedEntries(snapshot.items(), store::isOwned);
         if (separation.refreshedOwned() == 0) {
-            return snapshot;
+            return new AppliedSeparation(snapshot, separation.ownedItems(), 0);
         }
         LOGGER.debug("SudoersEMC 归属分离刷新了 {} 个自有条目，本轮将重新求解其数值",
                 separation.refreshedOwned());
-        return new PipelineSnapshot(
-                separation.items(),
-                snapshot.recipes(),
-                separation.existingValues(),
-                snapshot.unsupportedRecipes(),
-                snapshot.invalidRecipes(),
-                snapshot.failedRecipes());
+        return new AppliedSeparation(
+                new PipelineSnapshot(
+                        separation.items(),
+                        snapshot.recipes(),
+                        separation.existingValues(),
+                        snapshot.unsupportedRecipes(),
+                        snapshot.invalidRecipes(),
+                        snapshot.failedRecipes()),
+                separation.ownedItems(),
+                separation.refreshedOwned());
+    }
+
+    /**
+     * 归属分离的应用结果。
+     *
+     * @param snapshot       分离后的快照
+     * @param ownedItems     本轮扫描中归 SudoersEMC 所有的物品键
+     * @param refreshedOwned 被清除既有值的自有条目数量
+     */
+    private record AppliedSeparation(PipelineSnapshot snapshot, Set<ItemKey> ownedItems,
+                                     int refreshedOwned) {
+
+        AppliedSeparation {
+            ownedItems = Collections.unmodifiableSet(new TreeSet<>(ownedItems));
+        }
     }
 
     /**
@@ -532,13 +671,15 @@ public final class ScanPipeline {
      * @param items          分离后的物品快照，保持输入顺序
      * @param existingValues 仍然受保护的非自有既有值，按键升序排列
      * @param refreshedOwned 被清除既有值的自有条目数量
+     * @param ownedItems     本轮扫描中归 SudoersEMC 所有的物品键，按键升序排列
      */
     record OwnershipSeparation(List<ItemSnapshot> items, Map<ItemKey, Long> existingValues,
-                               int refreshedOwned) {
+                               int refreshedOwned, Set<ItemKey> ownedItems) {
 
         OwnershipSeparation {
             items = List.copyOf(items);
             existingValues = Collections.unmodifiableMap(new TreeMap<>(existingValues));
+            ownedItems = Collections.unmodifiableSet(new TreeSet<>(ownedItems));
         }
     }
 
@@ -561,6 +702,11 @@ public final class ScanPipeline {
      * {@link ItemScanner} 无法区分 ProjectE 原生值与 SudoersEMC 自己写回的值；只有在这里
      * 依据持久化存储的归属信息做一次分离，自有值才能随配方变化刷新，外部值仍然受到保护。</p>
      *
+     * <p><strong>多级自有链条：</strong>分离会移除自有原料的旧值，而兜底定价原本发生在求解之后，
+     * 导致依赖这些原料的配方产物拿不到新值。现在会在求解前把自有叶子条目的兜底价作为预置值
+     * 注入 {@link SolveContext}：配方仍然可以覆盖它，下游配方则能在同一轮看到它。求解结束后
+     * 才为仍未定价的条目生成兜底候选，计数语义保持不变。</p>
+     *
      * <p>存储为 {@code null} 时进入干跑模式：计数与报告照常生成，但不会产生任何持久化写入。</p>
      *
      * @param snapshot 采集结果，允许为 {@code null}
@@ -571,7 +717,8 @@ public final class ScanPipeline {
         long startedAtNanos = System.nanoTime();
 
         try {
-            data = applyOwnershipSeparation(data);
+            AppliedSeparation separation = applyOwnershipSeparation(data);
+            data = separation.snapshot();
             long minimumEmc = solveSettings.minimumEmc();
 
             Map<ItemKey, Candidate> recipeCandidates = new TreeMap<>();
@@ -587,6 +734,9 @@ public final class ScanPipeline {
                         new Candidate(item, value, PriceSource.SPECIAL_VALUE, null));
             }
             Set<ItemKey> recipeOutputs = recipeOutputItems(data);
+            Set<ItemKey> variantItems = variantItemKeys(data.items());
+            Map<ItemKey, List<String>> variantRegistrationNbts =
+                    collectVariantRegistrationNbts(data.recipes(), variantItems);
 
             SolveResult lastSolveResult = skippedSolveResult();
             int roundsUsed = 0;
@@ -596,7 +746,7 @@ public final class ScanPipeline {
                 lastSolveResult = roundResult;
 
                 boolean solvedProgress = mergeSolvedValues(roundResult, recipeCandidates, seeds,
-                        protection.deniedItems(), protection.specialValues());
+                        protection.deniedItems(), protection.specialValues(), variantItems);
                 int fallbackAdded = addFallbackCandidates(
                         data, seeds, fallbackCandidates, recipeOutputs);
                 if (!solvedProgress && fallbackAdded == 0) {
@@ -653,7 +803,8 @@ public final class ScanPipeline {
                             candidate.source(),
                             candidate.recipeId(),
                             true,
-                            System.currentTimeMillis()));
+                            System.currentTimeMillis()),
+                            variantRegistrationNbts.getOrDefault(candidate.item(), List.of()));
                     if (!staged) {
                         LOGGER.debug("物品 {} 的生成值未被存储接受，可能已有非 SudoersEMC 拥有的条目",
                                 candidate.item());
@@ -670,6 +821,10 @@ public final class ScanPipeline {
             int overflowResets = overflowPipeline == null
                     ? 0
                     : Math.max(0, overflowPipeline.resetsApplied() - overflowBefore);
+            if (store != null) {
+                // 每轮扫描结束即刷新审计日志，崩溃时最多丢失当前这一轮。
+                persistOverflowAudit();
+            }
             int unresolved = countUnresolved(lastSolveResult, seeds);
             long durationMillis = elapsedMillis(startedAtNanos);
 
@@ -680,7 +835,8 @@ public final class ScanPipeline {
             boolean appliedToStore = store != null;
             updateScanState(data, durationMillis, applied, unresolved, roundsUsed);
             writeDiagnosticReport(data, lastSolveResult, unresolved, applied, quarantined,
-                    overflowResets, durationMillis, roundsUsed, appliedToStore, sourceCounts);
+                    overflowResets, durationMillis, roundsUsed, appliedToStore, sourceCounts,
+                    separation.refreshedOwned());
 
             return new PipelineResult(
                     solvedByRecipe,
@@ -774,19 +930,27 @@ public final class ScanPipeline {
      * 被创造保护拒绝的物品会被丢弃；配置了固定值的物品始终使用固定值，并记录为
      * {@link PriceSource#SPECIAL_VALUE}。</p>
      *
+     * <p>变体输出只允许发布到本轮真实采集到的变体快照：{@code nbt.scanNbtVariants=false}
+     * 或被排除的基础物品不会经由配方求解重新进入持久化。</p>
+     *
+     * @param acceptedVariants 本轮通过采集门禁的变体身份
      * @return 本轮是否新增或更新了任何种子
      */
     private boolean mergeSolvedValues(SolveResult solveResult,
                                       Map<ItemKey, Candidate> recipeCandidates,
                                       Map<ItemKey, Long> seeds,
                                       Set<ItemKey> deniedItems,
-                                      Map<ItemKey, Long> specialValues) {
+                                      Map<ItemKey, Long> specialValues,
+                                      Set<ItemKey> acceptedVariants) {
         boolean changed = false;
         boolean allowIncrease = solveSettings.allowValueIncrease();
         for (Map.Entry<ItemKey, Long> entry : solveResult.values().entrySet()) {
             ItemKey item = entry.getKey();
             long solvedValue = entry.getValue();
             if (solvedValue <= 0L || deniedItems.contains(item)) {
+                continue;
+            }
+            if (item.hasVariant() && !acceptedVariants.contains(item)) {
                 continue;
             }
 
@@ -862,6 +1026,56 @@ public final class ScanPipeline {
             }
         }
         return unresolved;
+    }
+
+    /**
+     * @return 本轮物品快照中所有带变体哈希的身份
+     */
+    private static Set<ItemKey> variantItemKeys(List<ItemSnapshot> items) {
+        Set<ItemKey> keys = new HashSet<>();
+        for (ItemSnapshot item : items) {
+            if (item.key().hasVariant()) {
+                keys.add(item.key());
+            }
+        }
+        return keys;
+    }
+
+    /**
+     * 从配方输出收集“变体身份 -> 观测到的原始 SNBT”。
+     *
+     * <p>求解阶段只携带规范化身份，ProjectE 注册需要原始 NBT。这里只汇总本轮真实采集到的
+     * 变体，按经济身份截断原始形态，随后随生成条目一并持久化。</p>
+     *
+     * @param recipes         本轮可用配方
+     * @param acceptedVariants 本轮通过采集门禁的变体身份
+     */
+    private static Map<ItemKey, List<String>> collectVariantRegistrationNbts(
+            List<RecipeSnapshot> recipes, Set<ItemKey> acceptedVariants) {
+        if (acceptedVariants.isEmpty()) {
+            return Map.of();
+        }
+        Map<ItemKey, TreeSet<String>> observed = new TreeMap<>();
+        for (RecipeSnapshot recipe : recipes) {
+            for (RecipeOutput output : recipe.outputs()) {
+                ItemKey key = output.item();
+                String snbt = output.outputNbt();
+                if (!key.hasVariant() || !acceptedVariants.contains(key)
+                        || snbt == null || snbt.isBlank()) {
+                    continue;
+                }
+                TreeSet<String> forms = observed.computeIfAbsent(key, ignored -> new TreeSet<>());
+                if (forms.size() < VariantRegistration.MAX_OBSERVED_NBT_PER_VARIANT) {
+                    forms.add(snbt);
+                }
+            }
+        }
+        if (observed.isEmpty()) {
+            return Map.of();
+        }
+        Map<ItemKey, List<String>> registrations = new TreeMap<>();
+        observed.forEach((key, forms) -> registrations.put(key, List.copyOf(forms)));
+        return Map.copyOf(registrations);
     }
 
     /**
@@ -1070,10 +1284,12 @@ public final class ScanPipeline {
     }
 
     /**
-     * 在作用域与显式开关都允许时改写 ProjectE 的 {@code custom_emc.json}。
+     * 在作用域与显式开关都允许时处理 ProjectE 的 {@code custom_emc.json}。
      *
-     * <p>干跑模式（{@code store == null}）一律跳过，避免测试或预览路径意外写入真实配置目录。
-     * 文件改写失败只记录警告，绝不中断本轮扫描。</p>
+     * <p>红线：只重置 {@code store::isOwned} 的自有条目；管理员手动配置的条目即使超过阈值也
+     * 永不改写。{@link OverflowScope#ENTIRE_CUSTOM_EMC} 仅表示扫描整个文件，不构成改写非自有
+     * 条目的授权。干跑模式（{@code store == null}）一律跳过，避免测试或预览路径意外写入真实
+     * 配置目录。文件改写成功时立即落盘审计；失败只记录警告，绝不中断本轮扫描。</p>
      */
     private void rewriteProjectECustomEmcIfEnabled() {
         if (overflowScope != OverflowScope.ENTIRE_CUSTOM_EMC || !allowProjectEFileRewrite) {
@@ -1090,13 +1306,14 @@ public final class ScanPipeline {
             ProjectECustomEmcFile target = projectECustomEmcFile == null
                     ? new ProjectECustomEmcFile()
                     : new ProjectECustomEmcFile(projectECustomEmcFile);
+            // 生产接线固定只允许自有条目：ENTIRE_CUSTOM_EMC 不是改写管理员手动值的授权。
             ProjectECustomEmcFile.RewriteResult result = target.rewriteAboveThreshold(
                     overflowPipeline.protection(),
                     store::isOwned,
-                    // ENTIRE_CUSTOM_EMC 本身就是改写整个文件的显式 opt-in。
-                    true,
                     overflowPipeline::recordCustomEmcReset);
             if (result.wroteFile()) {
+                // 破坏性写盘已成功，立即落盘审计，避免进程崩溃时只剩 .bak 备份。
+                overflowPipeline.flushAudit();
                 LOGGER.info("ProjectE custom_emc.json 受控改写完成：rewritten={} skipped={} notOwned={} backup={}",
                         result.rewritten(), result.skipped(), result.notOwned(), result.backup());
             } else {
@@ -1105,6 +1322,24 @@ public final class ScanPipeline {
             }
         } catch (Throwable failure) {
             LOGGER.warn("改写 ProjectE custom_emc.json 失败，本轮扫描结果仍然有效", failure);
+        }
+    }
+
+    /**
+     * 把本轮新增的溢出审计记录原子落盘。
+     *
+     * <p>审计日志不再只在优雅关服时保存：每轮扫描应用完成后都会刷新，崩溃或强杀最多丢失
+     * 当前这一轮的记录。写入失败由 {@link OverflowPipeline} 记录警告并保留 dirty 标记，
+     * 下一轮扫描会重试；任何失败都不影响已经应用的扫描结果。</p>
+     */
+    private void persistOverflowAudit() {
+        if (overflowPipeline == null) {
+            return;
+        }
+        try {
+            overflowPipeline.saveAuditIfDirty();
+        } catch (RuntimeException failure) {
+            LOGGER.warn("保存溢出审计日志失败，本轮结果仍然有效，下一轮将重试", failure);
         }
     }
 
@@ -1130,14 +1365,15 @@ public final class ScanPipeline {
     private void writeDiagnosticReport(PipelineSnapshot snapshot, SolveResult solveResult,
                                        int unresolvedCount, int applied, int quarantined,
                                        int overflowResets, long durationMillis, int solverRounds,
-                                       boolean appliedToStore, Map<String, Long> sourceCounts) {
+                                       boolean appliedToStore, Map<String, Long> sourceCounts,
+                                       int refreshedOwned) {
         if (!generateReportsEnabled || reportManager == null) {
             return;
         }
         try {
             reportManager.writeReport(buildReport(snapshot, solveResult, unresolvedCount,
                     quarantined, overflowResets, durationMillis, solverRounds, appliedToStore,
-                    sourceCounts));
+                    sourceCounts, refreshedOwned));
         } catch (RuntimeException failure) {
             LOGGER.warn("写入诊断报告失败，本轮结果仍然有效", failure);
         }
@@ -1154,7 +1390,7 @@ public final class ScanPipeline {
                                                 int unresolvedCount, int quarantined,
                                                 int overflowResets, long durationMillis,
                                                 int solverRounds, boolean appliedToStore,
-                                                Map<String, Long> sourceCounts) {
+                                                Map<String, Long> sourceCounts, int refreshedOwned) {
         Map<String, Long> extraCounters = new LinkedHashMap<>();
         extraCounters.put("unsupportedRecipes", (long) snapshot.unsupportedRecipes());
         extraCounters.put("invalidRecipes", (long) snapshot.invalidRecipes());
@@ -1166,6 +1402,7 @@ public final class ScanPipeline {
         extraCounters.put("specialValues",
                 sourceCounts.getOrDefault(PriceSource.SPECIAL_VALUE.name(), 0L));
         extraCounters.put("overflowResets", (long) overflowResets);
+        extraCounters.put("ownedRefreshed", (long) refreshedOwned);
         extraCounters.put("dryRun", appliedToStore ? 0L : 1L);
 
         return new DiagnosticReport(

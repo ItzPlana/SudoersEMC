@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
 import net.minecraft.resources.ResourceLocation;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -23,15 +24,16 @@ import org.slf4j.LoggerFactory;
  * can never grow the file without bound.</p>
  *
  * <h2>Threading model</h2>
- * <p>{@link #record(OverflowReset)}, {@link #entries()} and {@link #save()} synchronize on a
- * private lock. {@code save()} snapshots the records under the lock and performs I/O outside it,
- * so recording a reset never waits on disk. A reset recorded during a save is written by the next
- * save, which is acceptable for an audit trail that is flushed on server stop.</p>
+ * <p>{@link #record(OverflowReset)}, {@link #entries()} and the snapshot phase of
+ * {@link #save()} synchronize on a private lock. {@code save()} performs I/O outside it, so
+ * recording a reset never waits on disk. A reset recorded during a save marks the log dirty and is
+ * written by the next save; callers flush after each scan and on server stop.</p>
  *
  * <h2>Failure behaviour</h2>
  * <p>The constructor and all public methods swallow I/O and parsing problems. A corrupt file
- * yields an empty log after a single warning; a file from a newer schema version is preserved and
- * never overwritten.</p>
+ * yields an empty log after a warning, and the original bytes are backed up before the next
+ * rewrite. A failed write keeps the log dirty so a later {@link #saveIfDirty()} retries; a file
+ * from a newer schema version is preserved and never overwritten.</p>
  */
 public final class OverflowResetLog {
 
@@ -50,9 +52,12 @@ public final class OverflowResetLog {
     private final int maxEntries;
     private final Object lock = new Object();
     private final ArrayDeque<OverflowReset> resets = new ArrayDeque<>();
+    private final AtomicBoolean dirty = new AtomicBoolean(false);
 
     private volatile boolean unsupportedSchemaVersion;
     private volatile int loadedSchemaVersion = SCHEMA_VERSION;
+    /** True until the first save of a file that already existed on disk. */
+    private volatile boolean backupPending;
 
     /**
      * Production constructor; loads {@code config/sudoersemc/overflow_resets.json} immediately.
@@ -84,17 +89,26 @@ public final class OverflowResetLog {
     }
 
     private void load() {
+        dirty.set(false);
+        backupPending = false;
         try {
             boolean existed = Files.isRegularFile(file);
             ResetsFileDto dto = JsonFileIO.read(file, ResetsFileDto.class);
-            if (!existed || dto == null) {
-                // Missing file is normal. A corrupt file was already logged by JsonFileIO; start
-                // empty and let the next save replace it.
+            if (!existed) {
+                // Missing file is normal.
+                return;
+            }
+            // From here on the file exists: any rewrite must be preceded by a backup.
+            backupPending = true;
+            if (dto == null) {
+                // A corrupt file was already logged by JsonFileIO; keep its bytes for the backup
+                // and start empty so the next save can replace it safely.
                 return;
             }
             if (dto.schemaVersion != SCHEMA_VERSION) {
                 unsupportedSchemaVersion = true;
                 loadedSchemaVersion = dto.schemaVersion;
+                backupPending = false;
                 LOGGER.warn(
                         "{} uses unsupported schemaVersion {} (this build supports {}); "
                                 + "keeping the file untouched and refusing to save over it",
@@ -130,8 +144,9 @@ public final class OverflowResetLog {
     /**
      * Appends a reset record to the in-memory history.
      *
-     * <p>Does not touch the disk; call {@link #save()} when the surrounding operation completes.
-     * A {@code null} reset and any unexpected runtime failure are ignored.</p>
+     * <p>Does not touch the disk; call {@link #saveIfDirty()} after the surrounding operation
+     * completes. Recording marks the log dirty so a failed write is retried later. A {@code null}
+     * reset and any unexpected runtime failure are ignored.</p>
      *
      * @param reset reset to append
      */
@@ -143,6 +158,7 @@ public final class OverflowResetLog {
             synchronized (lock) {
                 resets.addLast(reset);
                 trimToLimit();
+                dirty.set(true);
             }
         } catch (RuntimeException e) {
             LOGGER.warn("Failed to record overflow reset for {}", reset.item(), e);
@@ -173,30 +189,65 @@ public final class OverflowResetLog {
     }
 
     /**
+     * Writes the retained records only when something changed since the last successful save.
+     */
+    public void saveIfDirty() {
+        if (dirty.get() && !unsupportedSchemaVersion) {
+            save();
+        }
+    }
+
+    /**
+     * @return {@code true} when records were added or the last save failed and needs a retry
+     */
+    public boolean isDirty() {
+        return dirty.get();
+    }
+
+    /**
      * Writes the retained records with an atomic replace.
      *
-     * <p>No-op when the loaded file had an unsupported schema version.</p>
+     * <p>No-op when the loaded file had an unsupported schema version. The dirty flag is cleared
+     * before the snapshot is taken: a record that races with this save marks it again and is
+     * written by the next save. A failed backup or write restores the flag so the next
+     * {@link #saveIfDirty()} retries instead of silently dropping audit records.</p>
      */
     public void save() {
-        if (unsupportedSchemaVersion) {
-            LOGGER.warn(
-                    "Not saving {} because it was written with unsupported schemaVersion {}",
-                    file, loadedSchemaVersion);
-            return;
-        }
         List<OverflowReset> snapshot;
         synchronized (lock) {
+            if (unsupportedSchemaVersion) {
+                LOGGER.warn(
+                        "Not saving {} because it was written with unsupported schemaVersion {}",
+                        file, loadedSchemaVersion);
+                return;
+            }
+            // Clear first: a record that races with this save sets the flag again and is picked
+            // up by the next save instead of being silently dropped.
+            dirty.set(false);
             snapshot = new ArrayList<>(resets);
         }
         try {
+            if (backupPending && !JsonFileIO.backupIfExists(file)) {
+                dirty.set(true);
+                LOGGER.warn(
+                        "Failed to save overflow reset log to {}: could not create a backup; "
+                                + "keeping it dirty for a later retry",
+                        file);
+                return;
+            }
             ResetsFileDto dto = new ResetsFileDto();
             dto.schemaVersion = SCHEMA_VERSION;
             dto.resets = new ArrayList<>(snapshot.size());
             for (OverflowReset reset : snapshot) {
                 dto.resets.add(ResetDto.from(reset));
             }
-            JsonFileIO.writeAtomically(file, dto);
+            if (!JsonFileIO.writeAtomically(file, dto)) {
+                dirty.set(true);
+                return;
+            }
+            backupPending = false;
         } catch (RuntimeException e) {
+            dirty.set(true);
             LOGGER.warn("Failed to save overflow reset log to {}", file, e);
         }
     }
