@@ -324,6 +324,19 @@ class CommandServiceTest {
     }
 
     @Test
+    void approveIsRejectedWhileScanRunning() {
+        ScanManager manager = idleManager();
+        assertTrue(manager.requestScan(), "测试前置条件：扫描应进入运行状态");
+        CommandService service = new CommandService(manager, null, null, null);
+
+        CommandResult result = service.approve("minecraft:stone");
+
+        assertFalse(result.success(), "扫描期间审批必须在写入任何条目之前被拒绝");
+        assertTrue(result.joinLines().contains("扫描进行中"),
+                "拒绝原因必须明确说明扫描仍在进行：" + result.joinLines());
+    }
+
+    @Test
     void approveMarksRecordAndPersistsIt() {
         QuarantinedDropsStore quarantineStore = quarantineStoreWith(STONE);
         GeneratedEntryStore entryStore = new GeneratedEntryStore(

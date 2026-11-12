@@ -28,6 +28,7 @@ import com.itzplana.sudoersemc.scanner.RecipeInput;
 import com.itzplana.sudoersemc.scanner.RecipeKind;
 import com.itzplana.sudoersemc.scanner.RecipeOutput;
 import com.itzplana.sudoersemc.scanner.RecipeSnapshot;
+import com.itzplana.sudoersemc.solver.SolveResult;
 import com.itzplana.sudoersemc.solver.SolveSettings;
 import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
 import com.itzplana.sudoersemc.storage.OverflowResetLog;
@@ -42,6 +43,10 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 import net.minecraft.SharedConstants;
 import net.minecraft.resources.ResourceLocation;
@@ -1603,5 +1608,104 @@ class ScanPipelineTest {
         assertEquals(before, store.snapshotAll(), "solveOnly 不得修改存储内容");
         assertEquals(dirtyBefore, store.isDirty(), "solveOnly 不得把存储标记为脏");
         assertEquals(1, store.size());
+    }
+
+    @Test
+    void prepareSolveInputsFreezesManualDetectorForWorkerThread() throws Exception {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("manual_detector_frozen.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 50L, PriceSource.RECIPE, null, true, 0L));
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(RESULT, 50L)), List.of(), Map.of(RESULT, 50L));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null, disabledFallback());
+
+        Set<String> detectorThreads = ConcurrentHashMap.newKeySet();
+        pipeline.setManualValueDetectorSupplier(() -> key -> {
+            detectorThreads.add(Thread.currentThread().getName());
+            return true;
+        });
+        pipeline.prepareSolveInputs(snapshot.items());
+        String serverThread = Thread.currentThread().getName();
+
+        ExecutorService executor = Executors.newSingleThreadExecutor(
+                runnable -> new Thread(runnable, "phase27-solver-test"));
+        try {
+            SolveOutcome outcome = executor.submit(() -> pipeline.solveOnly(snapshot))
+                    .get(10L, TimeUnit.SECONDS);
+            assertFalse(outcome.failed(), outcome.failureDetail());
+        } finally {
+            executor.shutdownNow();
+        }
+
+        assertTrue(detectorThreads.contains(serverThread),
+                "预热阶段必须在服务器线程调用原始手工值判定器");
+        assertFalse(detectorThreads.contains("phase27-solver-test"),
+                "工作线程只能查询固化集合，不得再调用会访问 Forge 注册表的手工值判定器");
+    }
+
+    @Test
+    void cancelledOutcomeDoesNotReleaseOwnership() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("cancelled_ownership.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 50L, PriceSource.RECIPE, null, true, 0L));
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(RESULT, 50L)), List.of(), Map.of(RESULT, 50L));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null, disabledFallback());
+        SolveOutcome cancelled = new SolveOutcome(snapshot, List.of(),
+                new SolveResult(Map.of(), Map.of(), List.of(), Set.of(), 0, false, 0L, 0),
+                0, 1, 0, 0, 1, Set.of(RESULT), 0, true, false, "",
+                System.nanoTime(), 0L);
+
+        PipelineResult result = pipeline.applySolved(snapshot, cancelled);
+
+        assertEquals(0, result.applied());
+        GeneratedEmcEntry entry = store.snapshotAll().get(RESULT);
+        assertNotNull(entry);
+        assertTrue(entry.owned(), "取消结果不得在应用阶段释放所有权（写 store）");
+    }
+
+    @Test
+    void failedOutcomeDoesNotReleaseOwnership() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("failed_ownership.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 50L, PriceSource.RECIPE, null, true, 0L));
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(RESULT, 50L)), List.of(), Map.of(RESULT, 50L));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null, disabledFallback());
+        SolveOutcome failed = new SolveOutcome(snapshot, List.of(),
+                new SolveResult(Map.of(), Map.of(), List.of(), Set.of(), 0, false, 0L, 0),
+                0, 1, 0, 0, 1, Set.of(RESULT), 0, false, true, "boom",
+                System.nanoTime(), 0L);
+
+        PipelineResult result = pipeline.applySolved(snapshot, failed);
+
+        assertEquals(0, result.applied());
+        GeneratedEmcEntry entry = store.snapshotAll().get(RESULT);
+        assertNotNull(entry);
+        assertTrue(entry.owned(), "失败结果不得在应用阶段释放所有权（写 store）");
+    }
+
+    @Test
+    void solveOnlyStopsWhenThreadInterrupted() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("interrupted_solver.json"));
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 5L), item(RESULT, 0L)),
+                List.of(recipe(INGOT, RESULT)),
+                Map.of(INGOT, 5L));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null, disabledFallback());
+
+        Thread.currentThread().interrupt();
+        try {
+            SolveOutcome outcome = pipeline.solveOnly(snapshot);
+            assertTrue(outcome.cancelled(),
+                    "Future.cancel(true) 设置的中断标志必须让纯求解返回取消结果");
+        } finally {
+            Thread.interrupted();
+        }
     }
 }

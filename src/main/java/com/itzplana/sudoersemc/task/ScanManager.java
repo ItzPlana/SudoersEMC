@@ -7,6 +7,7 @@ import java.util.Objects;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
+import java.util.function.Consumer;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -146,9 +147,17 @@ public final class ScanManager {
     @Nullable
     private final SolveWorker solveWorker;
     private final boolean solveOffThread;
+    /** 取消/失败时把部分快照交给管线暂存，供部分诊断报告使用；可为 {@code null}。 */
+    @Nullable
+    private final Consumer<PipelineSnapshot> partialSnapshotStasher;
+    /** 新扫描开始时清空管线上一轮的报告状态；可为 {@code null}。 */
+    @Nullable
+    private final Runnable scanStartHook;
 
     private volatile ScanProgress progress = ScanProgress.idle();
     private final ScanCancellation cancellation;
+    /** 本 tick 执行了内联求解，不能把该耗时当作批量样本。 */
+    private boolean skipBatchSample;
 
     @Nullable
     private SnapshotData snapshot;
@@ -196,7 +205,7 @@ public final class ScanManager {
                        @Nullable AbortListener abortListener,
                        @Nullable ScanCancellation cancellation) {
         this(batchProcessor, collector, applier, null, null, tickBudgetNanos, diagnostics,
-                abortListener, cancellation, null, false);
+                abortListener, cancellation, null, false, null, null);
     }
 
     /**
@@ -225,8 +234,30 @@ public final class ScanManager {
                        @Nullable ScanCancellation cancellation,
                        @Nullable SolveWorker solveWorker,
                        boolean solveOffThread) {
+        this(batchProcessor, collector, applier, tickBudgetNanos, diagnostics, abortListener,
+                cancellation, solveWorker, solveOffThread, null, null);
+    }
+
+    /**
+     * 完整分片构造器：额外接入部分快照暂存与扫描开始回调。
+     *
+     * @param partialSnapshotStasher 取消/失败时暂存部分快照的回调，可为 {@code null}
+     * @param scanStartHook          新扫描开始时清空管线报告状态的回调，可为 {@code null}
+     */
+    public ScanManager(BatchProcessor batchProcessor,
+                       PipelineCollector collector,
+                       PipelineApplier applier,
+                       long tickBudgetNanos,
+                       @Nullable ScanDiagnostics diagnostics,
+                       @Nullable AbortListener abortListener,
+                       @Nullable ScanCancellation cancellation,
+                       @Nullable SolveWorker solveWorker,
+                       boolean solveOffThread,
+                       @Nullable Consumer<PipelineSnapshot> partialSnapshotStasher,
+                       @Nullable Runnable scanStartHook) {
         this(batchProcessor, null, null, collector, applier, tickBudgetNanos, diagnostics,
-                abortListener, cancellation, solveWorker, solveOffThread);
+                abortListener, cancellation, solveWorker, solveOffThread,
+                partialSnapshotStasher, scanStartHook);
     }
 
     /**
@@ -252,7 +283,9 @@ public final class ScanManager {
                         @Nullable AbortListener abortListener,
                         @Nullable ScanCancellation cancellation,
                         @Nullable SolveWorker solveWorker,
-                        boolean solveOffThread) {
+                        boolean solveOffThread,
+                        @Nullable Consumer<PipelineSnapshot> partialSnapshotStasher,
+                        @Nullable Runnable scanStartHook) {
         this.batchProcessor = Objects.requireNonNull(batchProcessor, "batchProcessor");
         boolean pipelineMode = pipelineCollector != null || pipelineApplier != null;
         if (pipelineMode) {
@@ -278,6 +311,8 @@ public final class ScanManager {
         this.cancellation = cancellation == null ? new ScanCancellation() : cancellation;
         this.solveWorker = solveWorker;
         this.solveOffThread = solveOffThread;
+        this.partialSnapshotStasher = partialSnapshotStasher;
+        this.scanStartHook = scanStartHook;
     }
 
     /**
@@ -312,6 +347,7 @@ public final class ScanManager {
         lastBatchNanos = 0L;
         diagnostics.reset();
         diagnostics.recordMemory();
+        notifyScanStart();
         long now = System.currentTimeMillis();
         progress = new ScanProgress(ScanPhase.COLLECTING_SNAPSHOT, 0, 0, now, now,
                 pipelineMode() ? "等待开始分片采集" : "等待采集快照");
@@ -363,9 +399,11 @@ public final class ScanManager {
         diagnostics.recordMemory();
         int batch = 0;
         boolean batchRecorded = false;
+        skipBatchSample = false;
         ScanPhase abortedPhase = null;
         try {
             if (cancellation.isRequested()) {
+                capturePartialCollectionForAbort();
                 cancelOutstandingFuture();
                 cancellation.clear();
                 progress = current.advance(ScanPhase.CANCELLED, current.processed(),
@@ -373,8 +411,13 @@ public final class ScanManager {
                 abortedPhase = ScanPhase.CANCELLED;
             } else {
                 batch = batchProcessor.nextBatchSize(lastBatchNanos, tickBudgetNanos);
-                batchRecorded = !(pipelineMode() && current.phase() == ScanPhase.SOLVING);
-                switch (current.phase()) {
+                // 只有真正消耗批量预算的采集/求解阶段才更新自适应批量；APPLYING/SAVING
+                // 的落盘与回调耗时不能持久缩小下一轮采集批量。分片求解阶段只轮询 future，
+                // 也不应产生批量样本。
+                ScanPhase phase = current.phase();
+                batchRecorded = phase == ScanPhase.COLLECTING_SNAPSHOT
+                        || (phase == ScanPhase.SOLVING && !pipelineMode());
+                switch (phase) {
                     case COLLECTING_SNAPSHOT -> {
                         if (pipelineMode()) {
                             collectPipelineStep(batch);
@@ -403,6 +446,7 @@ public final class ScanManager {
                 }
             }
         } catch (CancellationException cancelled) {
+            cancellation.clear();
             progress = progress.advance(ScanPhase.CANCELLED, progress.processed(),
                     progress.total(), "扫描已取消");
             abortedPhase = ScanPhase.CANCELLED;
@@ -414,7 +458,7 @@ public final class ScanManager {
         } finally {
             long elapsedNanos = System.nanoTime() - startedNanos;
             lastBatchNanos = elapsedNanos;
-            if (batchRecorded) {
+            if (batchRecorded && !skipBatchSample) {
                 batchProcessor.recordBatch(batch, elapsedNanos);
             }
             diagnostics.recordTick(elapsedNanos);
@@ -435,6 +479,51 @@ public final class ScanManager {
             listener.onScanAborted(phase, progress, diagnostics);
         } catch (RuntimeException failure) {
             LOGGER.warn("SudoersEMC 扫描终止回调失败（{}），已忽略", phase, failure);
+        }
+    }
+
+    private void notifyScanStart() {
+        Runnable hook = scanStartHook;
+        if (hook == null) {
+            return;
+        }
+        try {
+            hook.run();
+        } catch (RuntimeException failure) {
+            LOGGER.warn("SudoersEMC 扫描开始回调失败，已忽略", failure);
+        }
+    }
+
+    /**
+     * 取消发生在采集阶段时，先完成会话以取得已采集的部分快照，再交给管线暂存。
+     *
+     * <p>共享取消令牌此时仍处于请求状态，{@link ScanPipeline.CollectSession#finish()} 会在
+     * 下一个批次边界看到取消并立即返回部分快照，因此不会把剩余注册表全部扫完。</p>
+     */
+    private void capturePartialCollectionForAbort() {
+        ScanPipeline.CollectSession session = collectSession;
+        if (session == null) {
+            return;
+        }
+        collectSession = null;
+        try {
+            PipelineSnapshot partial = session.finish();
+            pipelineSnapshot = partial;
+            stashPartialSnapshot(partial);
+        } catch (RuntimeException failure) {
+            LOGGER.warn("SudoersEMC 取消时收集部分快照失败，报告将回退到最近一次快照", failure);
+        }
+    }
+
+    private void stashPartialSnapshot(@Nullable PipelineSnapshot snapshot) {
+        Consumer<PipelineSnapshot> stasher = partialSnapshotStasher;
+        if (stasher == null || snapshot == null) {
+            return;
+        }
+        try {
+            stasher.accept(snapshot);
+        } catch (RuntimeException failure) {
+            LOGGER.warn("SudoersEMC 暂存部分快照失败，诊断报告可能缺少本次统计", failure);
         }
     }
 
@@ -541,9 +630,11 @@ public final class ScanManager {
 
         collectSession.step(batch);
         if (cancellation.isRequested()) {
+            int processed = collectSession.processedItems();
+            int total = collectSession.itemCount();
+            capturePartialCollectionForAbort();
             progress = progress.advance(ScanPhase.COLLECTING_SNAPSHOT,
-                    collectSession.processedItems(), collectSession.itemCount(),
-                    "采集已请求取消");
+                    processed, total, "采集已请求取消");
             return;
         }
         publishCollectProgress(batch);
@@ -585,6 +676,8 @@ public final class ScanManager {
         }
         pipelineSnapshot = collected;
         collectSession = null;
+        // 即使随后在求解/应用中失败，部分诊断报告也能拿到本轮采集的完整统计。
+        stashPartialSnapshot(collected);
 
         if (solveWorker == null) {
             throw new IllegalStateException("分片求解需要 SolveWorker");
@@ -593,11 +686,21 @@ public final class ScanManager {
             solveFuture = solveWorker.submit(collected);
             progress = progress.advance(ScanPhase.SOLVING, 0, 0, "求解中（工作线程）");
         } else {
+            // 内联求解与采集发生在同一 tick，其耗时不能作为下一轮采集批量的自适应样本。
+            skipBatchSample = true;
             solveOutcome = solveWorker.solveNow(collected);
+            if (solveOutcome == null) {
+                throw new IllegalStateException("同步求解返回 null");
+            }
+            if (solveOutcome.failed()) {
+                throw new IllegalStateException("同步求解失败: " + solveOutcome.failureDetail());
+            }
+            if (solveOutcome.cancelled() || cancellation.isRequested()) {
+                throw new CancellationException("求解已取消");
+            }
             progress = progress.advance(ScanPhase.APPLYING, 0,
-                    solveOutcome == null ? 0 : solveOutcome.candidateCount(),
-                    "求解完成（同步），准备应用 "
-                            + (solveOutcome == null ? 0 : solveOutcome.candidateCount()) + " 条");
+                    solveOutcome.candidateCount(),
+                    "求解完成（同步），准备应用 " + solveOutcome.candidateCount() + " 条");
         }
     }
 
@@ -623,6 +726,12 @@ public final class ScanManager {
         }
         if (solveOutcome == null) {
             throw new IllegalStateException("工作线程求解返回 null");
+        }
+        if (solveOutcome.failed()) {
+            throw new IllegalStateException("工作线程求解失败: " + solveOutcome.failureDetail());
+        }
+        if (solveOutcome.cancelled() || cancellation.isRequested()) {
+            throw new CancellationException("求解已取消");
         }
         progress = progress.advance(ScanPhase.APPLYING, 0, solveOutcome.candidateCount(),
                 "求解完成，准备应用 " + solveOutcome.candidateCount() + " 条");

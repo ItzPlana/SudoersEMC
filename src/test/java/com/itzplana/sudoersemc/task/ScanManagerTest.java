@@ -3,6 +3,7 @@ package com.itzplana.sudoersemc.task;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -515,6 +516,279 @@ class ScanManagerTest {
         assertTrue(manager.progress().detail().contains("批 1"),
                 "进度必须显示当前批量：" + manager.progress().detail());
         worker.shutdownNow();
+    }
+
+    @Test
+    void pipelineWorkerFailedOutcomeEndsInFailedState() {
+        SolveWorker worker = new SolveWorker(snapshot -> outcome(false, true, "生产求解失败"));
+        AtomicInteger applied = new AtomicInteger();
+        ScanManager manager = pipelineManager(worker, true,
+                pipelineSession(1, 0, new AtomicInteger()), applied);
+
+        manager.requestScan();
+        int ticks = 0;
+        while (manager.isRunning() && ticks < TICK_GUARD) {
+            manager.tick();
+            ticks++;
+        }
+
+        assertEquals(ScanPhase.FAILED, manager.progress().phase(),
+                "SolveOutcome.failed() 必须以 FAILED 结束，不能继续 APPLYING");
+        assertTrue(manager.progress().detail().contains("生产求解失败"));
+        assertEquals(0, applied.get(), "失败结果不得进入应用阶段");
+        worker.shutdownNow();
+    }
+
+    @Test
+    void pipelineWorkerCancelledOutcomeEndsInCancelledState() {
+        SolveWorker worker = new SolveWorker(snapshot -> outcome(true, false, ""));
+        AtomicInteger applied = new AtomicInteger();
+        ScanManager manager = pipelineManager(worker, true,
+                pipelineSession(1, 0, new AtomicInteger()), applied);
+
+        manager.requestScan();
+        int ticks = 0;
+        while (manager.isRunning() && ticks < TICK_GUARD) {
+            manager.tick();
+            ticks++;
+        }
+
+        assertEquals(ScanPhase.CANCELLED, manager.progress().phase(),
+                "SolveOutcome.cancelled() 必须以 CANCELLED 结束");
+        assertEquals(0, applied.get(), "取消结果不得进入应用阶段");
+        assertFalse(manager.isCancelRequested(), "取消状态被观察后不得残留令牌");
+        worker.shutdownNow();
+    }
+
+    @Test
+    void solveOffThreadFalseFailedOutcomeEndsInFailedState() {
+        SolveWorker worker = new SolveWorker(snapshot -> outcome(false, true, "同步求解失败"));
+        AtomicInteger applied = new AtomicInteger();
+        ScanManager manager = pipelineManager(worker, false,
+                pipelineSession(1, 0, new AtomicInteger()), applied);
+
+        manager.requestScan();
+        int ticks = 0;
+        while (manager.isRunning() && ticks < TICK_GUARD) {
+            manager.tick();
+            ticks++;
+        }
+
+        assertEquals(ScanPhase.FAILED, manager.progress().phase(),
+                "内联求解返回 failed 时必须以 FAILED 结束");
+        assertTrue(manager.progress().detail().contains("同步求解失败"));
+        assertEquals(0, applied.get());
+        worker.shutdownNow();
+    }
+
+    @Test
+    void solveOffThreadFalseCancelledOutcomeEndsInCancelledState() {
+        SolveWorker worker = new SolveWorker(snapshot -> outcome(true, false, ""));
+        AtomicInteger applied = new AtomicInteger();
+        ScanManager manager = pipelineManager(worker, false,
+                pipelineSession(1, 0, new AtomicInteger()), applied);
+
+        manager.requestScan();
+        int ticks = 0;
+        while (manager.isRunning() && ticks < TICK_GUARD) {
+            manager.tick();
+            ticks++;
+        }
+
+        assertEquals(ScanPhase.CANCELLED, manager.progress().phase(),
+                "内联求解返回 cancelled 时必须以 CANCELLED 结束");
+        assertEquals(0, applied.get());
+        assertFalse(manager.isCancelRequested());
+        worker.shutdownNow();
+    }
+
+    @Test
+    void cancelDuringCollectingStashesPartialSnapshot() {
+        AtomicReference<PipelineSnapshot> stashed = new AtomicReference<>();
+        AtomicInteger finishCalls = new AtomicInteger();
+        ScanPipeline.CollectSession session = new ScanPipeline.CollectSession() {
+            private int cursor;
+            private boolean done;
+
+            @Override
+            public boolean isDone() {
+                return done;
+            }
+
+            @Override
+            public int itemCount() {
+                return 5;
+            }
+
+            @Override
+            public int recipeCount() {
+                return 0;
+            }
+
+            @Override
+            public int processedItems() {
+                return cursor;
+            }
+
+            @Override
+            public int processedRecipes() {
+                return 0;
+            }
+
+            @Override
+            public void step(int budget) {
+                cursor = (int) Math.min(5L, (long) cursor + Math.max(1, budget));
+                done = cursor >= 5;
+            }
+
+            @Override
+            public PipelineSnapshot finish() {
+                finishCalls.incrementAndGet();
+                done = true;
+                return PipelineSnapshot.empty();
+            }
+        };
+        SolveWorker worker = new SolveWorker(snapshot -> emptyOutcome());
+        ScanManager manager = new ScanManager(new BatchProcessor(1, false),
+                () -> session,
+                (snapshot, solveOutcome) -> 0,
+                TICK_BUDGET_NANOS, new ScanDiagnostics(), null, new ScanCancellation(),
+                worker, true, stashed::set, null);
+
+        manager.requestScan();
+        manager.tick();
+        assertEquals(ScanPhase.COLLECTING_SNAPSHOT, manager.progress().phase());
+        manager.cancel();
+        manager.tick();
+
+        assertEquals(ScanPhase.CANCELLED, manager.progress().phase());
+        assertEquals(1, finishCalls.get(), "取消时必须完成采集会话以取得部分快照");
+        assertNotNull(stashed.get(), "部分快照必须交给管线暂存，供取消报告使用");
+        worker.shutdownNow();
+    }
+
+    @Test
+    void cancelRequestedByCollectorStepStashesPartialSnapshot() {
+        AtomicReference<PipelineSnapshot> stashed = new AtomicReference<>();
+        ScanCancellation cancellation = new ScanCancellation();
+        AtomicInteger finishCalls = new AtomicInteger();
+        ScanPipeline.CollectSession session = new ScanPipeline.CollectSession() {
+            private boolean done;
+
+            @Override
+            public boolean isDone() {
+                return done;
+            }
+
+            @Override
+            public int itemCount() {
+                return 5;
+            }
+
+            @Override
+            public int recipeCount() {
+                return 0;
+            }
+
+            @Override
+            public int processedItems() {
+                return 0;
+            }
+
+            @Override
+            public int processedRecipes() {
+                return 0;
+            }
+
+            @Override
+            public void step(int budget) {
+                cancellation.request();
+            }
+
+            @Override
+            public PipelineSnapshot finish() {
+                finishCalls.incrementAndGet();
+                done = true;
+                return PipelineSnapshot.empty();
+            }
+        };
+        SolveWorker worker = new SolveWorker(snapshot -> emptyOutcome());
+        ScanManager manager = new ScanManager(new BatchProcessor(1, false),
+                () -> session,
+                (snapshot, solveOutcome) -> 0,
+                TICK_BUDGET_NANOS, new ScanDiagnostics(), null, cancellation,
+                worker, true, stashed::set, null);
+
+        manager.requestScan();
+        manager.tick();
+
+        assertEquals(ScanPhase.COLLECTING_SNAPSHOT, manager.progress().phase(),
+                "采集批内请求取消时本 tick 只需记录进度");
+        assertEquals(1, finishCalls.get(), "采集批内取消同样必须暂存部分快照");
+        assertNotNull(stashed.get());
+        manager.tick();
+        assertEquals(ScanPhase.CANCELLED, manager.progress().phase());
+        worker.shutdownNow();
+    }
+
+    @Test
+    void legacyApplyingAndSavingTicksDoNotRecordBatchSamples() {
+        BatchProcessor processor = new BatchProcessor(10, false);
+        ScanManager manager = new ScanManager(processor,
+                () -> data(0, 0), snapshot -> { },
+                TICK_BUDGET_NANOS, new ScanDiagnostics(), null, new ScanCancellation());
+
+        manager.requestScan();
+        int ticks = 0;
+        while (manager.isRunning() && ticks < TICK_GUARD) {
+            manager.tick();
+            ticks++;
+        }
+
+        assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
+        assertEquals(2L, processor.batchesProcessed(),
+                "只有采集与求解阶段可记录批量样本，APPLYING/SAVING 不得污染自适应批量");
+    }
+
+    @Test
+    void inlineSolveTickDoesNotRecordBatchSample() {
+        BatchProcessor processor = new BatchProcessor(1, false);
+        SolveWorker worker = new SolveWorker(snapshot -> emptyOutcome());
+        ScanManager manager = new ScanManager(processor,
+                () -> pipelineSession(0, 0, new AtomicInteger()),
+                (snapshot, solveOutcome) -> 0,
+                TICK_BUDGET_NANOS, new ScanDiagnostics(), null, new ScanCancellation(),
+                worker, false);
+
+        manager.requestScan();
+        manager.tick();
+
+        assertEquals(ScanPhase.APPLYING, manager.progress().phase());
+        assertEquals(0L, processor.batchesProcessed(),
+                "内联求解与采集同 tick 时不得把求解耗时记入批量样本");
+        worker.shutdownNow();
+    }
+
+    @Test
+    void requestScanInvokesPipelineStartHook() {
+        AtomicInteger hooks = new AtomicInteger();
+        SolveWorker worker = new SolveWorker(snapshot -> emptyOutcome());
+        ScanManager manager = new ScanManager(new BatchProcessor(1, false),
+                () -> pipelineSession(0, 0, new AtomicInteger()),
+                (snapshot, solveOutcome) -> 0,
+                TICK_BUDGET_NANOS, new ScanDiagnostics(), null, new ScanCancellation(),
+                worker, true, null, hooks::incrementAndGet);
+
+        assertTrue(manager.requestScan());
+        assertEquals(1, hooks.get(), "requestScan 必须通知管线清空上一轮报告状态");
+        worker.shutdownNow();
+    }
+
+    private static SolveOutcome outcome(boolean cancelled, boolean failed, String detail) {
+        return new SolveOutcome(PipelineSnapshot.empty(), List.of(),
+                new SolveResult(Map.of(), Map.of(), List.of(), Set.of(), 0, false, 0L, 0),
+                0, 1, 0, 0, 0, Set.of(), 0, cancelled, failed, detail,
+                System.nanoTime(), 0L);
     }
 
     private static ScanManager pipelineManager(SolveWorker worker, boolean solveOffThread,

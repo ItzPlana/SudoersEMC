@@ -426,8 +426,9 @@ final class ScanCollector implements ScanPipeline.CollectSession {
             }
         }
         existingCursor += take;
-        if (existingCursor % ScanPipeline.EXISTING_VALUE_CANCEL_CHECK_INTERVAL == 0
-                && cancellation.getAsBoolean()) {
+        // 每个批次结束时都检查取消。此前用 cursor % 256 作为门控，批次通常不是 256 的倍数，
+        // 该检查点实际上几乎不会触发；批次边界本身就是低成本的取消时机。
+        if (cancellation.getAsBoolean()) {
             finishPartial();
             return;
         }
@@ -477,7 +478,10 @@ final class ScanCollector implements ScanPipeline.CollectSession {
                 partialExisting.put(item.key(), item.existingValue());
             }
         }
-        snapshot = new PipelineSnapshot(partialItems, recipes, partialExisting, 0, 0, 0, List.of());
+        // 部分快照仍要保留已扫描到的配方失败统计与明细；此前一律置零会让取消后的诊断报告低报。
+        snapshot = new PipelineSnapshot(partialItems, recipes, partialExisting,
+                unsupportedRecipes, invalidRecipes, failedRecipes + recipeEnumerationFailures,
+                failedRecipeDetails);
         stage = Stage.DONE;
         done = true;
     }

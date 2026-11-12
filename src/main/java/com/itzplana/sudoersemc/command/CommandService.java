@@ -306,6 +306,12 @@ public final class CommandService {
      */
     public CommandResult approve(String itemId) {
         try {
+            // 分片求解会跨多个 tick 持有较早的 store 快照。若此时允许审批写入新的
+            // APPROVED/owned 条目，applySolved 可能用旧候选覆盖它，retireStaleOwnedEntries
+            // 也可能把它当作陈旧条目删除。审批必须等当前扫描结束后再执行。
+            if (scanManager != null && scanManager.isRunning()) {
+                return CommandResult.failure("扫描进行中，请等待扫描完成后再审批隔离降价");
+            }
             if (itemId == null || itemId.isBlank()) {
                 return CommandResult.failure("请提供物品 id，例如 minecraft:stone");
             }

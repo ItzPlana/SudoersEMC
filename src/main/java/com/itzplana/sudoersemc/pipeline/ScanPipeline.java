@@ -112,9 +112,6 @@ public final class ScanPipeline {
     /** 应用循环每处理多少个候选检查一次取消信号。 */
     static final int APPLY_CANCEL_CHECK_INTERVAL = 64;
 
-    /** 既有值收集每处理多少个物品检查一次取消信号。 */
-    static final int EXISTING_VALUE_CANCEL_CHECK_INTERVAL = 256;
-
     private final GeneratedEntryStore store;
     private volatile QuarantinedDropsStore quarantinedDropsStore;
     private final ScanStateStore stateStore;
@@ -626,6 +623,18 @@ public final class ScanPipeline {
     }
 
     /**
+     * 开始一轮新的扫描周期，清空上一轮遗留的报告状态。
+     *
+     * <p>调度器在 {@code requestScan()} 时调用本方法。这样即使新扫描在首个采集 tick 之前
+     * 就被取消，部分报告也不会错误地复用上一次扫描的完整报告标记或快照。</p>
+     */
+    public void beginScanCycle() {
+        fullReportWritten = false;
+        stashedSnapshot.set(null);
+        lastSnapshotForReport = null;
+    }
+
+    /**
      * 安全准备外部基线来源。任何异常都只记录警告，本轮按空基线继续。
      */
     private void prepareExternalBaseline(@Nullable MinecraftServer server) {
@@ -649,7 +658,7 @@ public final class ScanPipeline {
      * @return 增量采集会话；服务器未就绪时返回已经完成的空会话
      */
     public CollectSession beginCollect(@Nullable MinecraftServer server) {
-        fullReportWritten = false;
+        beginScanCycle();
         if (server == null) {
             LOGGER.warn("SudoersEMC 扫描采集被调用时服务器尚未就绪，返回空快照");
             return ScanCollector.completed(PipelineSnapshot.empty());
@@ -772,7 +781,36 @@ public final class ScanPipeline {
      * 所有物品的 resolver 值。工作线程随后只读取这些不可变结果，不再访问文件或注册表。
      */
     void prepareSolveInputs(@Nullable List<ItemSnapshot> items) {
-        this.preparedManualDetector = resolveManualDetector();
+        // 手工值判定必须在服务器线程完成并固化为纯集合：ProjectEManualValues 的 #tag 分支会
+        // 访问 ForgeRegistries.ITEMS，绝不能在 sudoersemc-solver 线程执行。固化的范围覆盖本轮
+        // 快照物品与 store 中已有条目，与工作线程实际会查询的两个集合保持一致。
+        Predicate<ItemKey> detector = resolveManualDetector();
+        if (detector == null) {
+            this.preparedManualDetector = null;
+        } else {
+            Set<ItemKey> manualItems = new HashSet<>();
+            if (items != null) {
+                for (ItemSnapshot item : items) {
+                    if (item != null && isManuallySet(detector, item.key())) {
+                        manualItems.add(item.key());
+                    }
+                }
+            }
+            GeneratedEntryStore currentStore = store;
+            if (currentStore != null) {
+                try {
+                    for (ItemKey stored : currentStore.snapshotAll().keySet()) {
+                        if (stored != null && isManuallySet(detector, stored)) {
+                            manualItems.add(stored);
+                        }
+                    }
+                } catch (RuntimeException failure) {
+                    LOGGER.warn("SudoersEMC 读取归属快照以固化手工值判定失败，本轮按已扫描物品判定", failure);
+                }
+            }
+            Set<ItemKey> frozen = Set.copyOf(manualItems);
+            this.preparedManualDetector = frozen::contains;
+        }
         this.manualDetectorPrepared = true;
 
         ResolverRegistry registry = resolverRegistry;
@@ -1424,7 +1462,9 @@ public final class ScanPipeline {
 
             boolean cancelledDuringSolve = false;
             for (int round = 1; round <= MAX_SOLVE_ROUNDS; round++) {
-                if (isCancelled()) {
+                // Future.cancel(true) 只设置中断标志；协作式令牌可能已被调度器清空，因此两者
+                // 都必须检查，否则不响应中断的 CPU 求解会继续跑完整轮。
+                if (isCancelled() || Thread.currentThread().isInterrupted()) {
                     cancelledDuringSolve = true;
                     break;
                 }
@@ -1508,25 +1548,29 @@ public final class ScanPipeline {
         long startedAtNanos = outcome.startedAtNanos();
 
         try {
-            int released = releaseDetectedOwnership(
-                    outcome.ownershipDetected(), outcome.protectedItems());
+            // 取消与失败必须先于所有权释放检查：releaseDetectedOwnership 会写 store，属于应用
+            // 阶段的副作用。契约要求失败/取消结果不得产生任何写入。
             lastOwnershipExternalModifications = outcome.ownershipDetected();
-            lastOwnershipReleased = released;
-
             if (outcome.failed()) {
                 long durationMillis = elapsedMillis(startedAtNanos);
                 lastSolvedCount = 0;
                 lastUnresolvedCount = 0;
                 lastSolverRoundCount = 0;
                 lastDurationMillis = durationMillis;
+                lastOwnershipReleased = 0;
                 LOGGER.error("SudoersEMC 扫描管线求解与应用失败，本轮返回全零结果：{}",
                         outcome.failureDetail());
                 writePartialReport(data, diagnostics, false, "扫描失败");
                 return PipelineResult.zeroed(durationMillis);
             }
             if (outcome.cancelled() || isCancelled()) {
+                lastOwnershipReleased = 0;
                 return cancelledResult(data, startedAtNanos);
             }
+
+            int released = releaseDetectedOwnership(
+                    outcome.ownershipDetected(), outcome.protectedItems());
+            lastOwnershipReleased = released;
 
             List<Candidate> candidates = outcome.candidates();
             SolveResult lastSolveResult = outcome.solveResult();

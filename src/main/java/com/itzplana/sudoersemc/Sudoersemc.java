@@ -686,7 +686,9 @@ public final class Sudoersemc {
                 },
                 cancellation,
                 worker,
-                solveOffThread);
+                solveOffThread,
+                pipeline::stash,
+                pipeline::beginScanCycle);
     }
 
     /**

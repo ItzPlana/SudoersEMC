@@ -7,6 +7,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
@@ -27,6 +28,9 @@ public final class SolveWorker implements AutoCloseable {
 
     /** 工作线程固定名称。 */
     public static final String THREAD_NAME = "sudoersemc-solver";
+
+    /** 关闭时等待工作线程退出的最长时间（秒）。 */
+    private static final long SHUTDOWN_TIMEOUT_SECONDS = 5L;
 
     private static final Logger LOGGER = LoggerFactory.getLogger("sudoersemc/task/SolveWorker");
 
@@ -96,11 +100,20 @@ public final class SolveWorker implements AutoCloseable {
     }
 
     /**
-     * 立即关闭线程池并中断正在执行的任务。重复调用没有副作用。
+     * 立即关闭线程池并中断正在执行的任务，最多等待 {@value #SHUTDOWN_TIMEOUT_SECONDS} 秒让
+     * 工作线程退出。重复调用没有副作用。
      */
     public void shutdownNow() {
         if (closed.compareAndSet(false, true)) {
             executor.shutdownNow();
+            try {
+                if (!executor.awaitTermination(SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                    LOGGER.warn("SudoersEMC 求解工作线程未在 {} 秒内终止", SHUTDOWN_TIMEOUT_SECONDS);
+                }
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                LOGGER.warn("SudoersEMC 等待求解工作线程终止时被中断");
+            }
             LOGGER.debug("SudoersEMC 求解工作线程已关闭");
         }
     }

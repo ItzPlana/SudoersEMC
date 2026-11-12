@@ -18,6 +18,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
@@ -155,6 +156,67 @@ class ScanCollectorTest {
                 .filter(item -> item.key().hasVariant())
                 .count();
         assertEquals(1L, variantCount);
+    }
+
+    @Test
+    void existingStageChecksCancellationAtEveryBatchBoundary() {
+        AtomicInteger checks = new AtomicInteger();
+        AtomicBoolean cancelled = new AtomicBoolean(false);
+        ScanCollector session = ScanCollector.forTesting(
+                List.of(STONE, DIRT, OAK_LOG),
+                ids -> new ItemScanner.Batch(
+                        ids.stream()
+                                .map(id -> ItemSnapshot.of(ItemKey.of(id), false, 0L))
+                                .toList(),
+                        0, 0, 0, 0),
+                List.of(),
+                null,
+                false,
+                1,
+                () -> {
+                    checks.incrementAndGet();
+                    return cancelled.get();
+                },
+                null);
+
+        session.step(1);
+        session.step(1);
+        session.step(1);
+        session.step(1);
+        assertEquals("EXISTING", session.stageName());
+        checks.set(0);
+
+        session.step(1);
+
+        assertEquals(2, checks.get(),
+                "EXISTING 阶段每个批次边界都必须检查取消，而不是仅在 cursor%256==0 时检查");
+    }
+
+    @Test
+    void cancelledPartialSnapshotKeepsRecipeFailureCounters() {
+        AtomicBoolean cancelled = new AtomicBoolean(false);
+        ScanCollector session = ScanCollector.forTesting(
+                List.of(STONE),
+                ids -> new ItemScanner.Batch(List.of(), 0, 0, 0, 0),
+                List.of(DIRT_RECIPE),
+                ids -> new RecipeScanner.ScanResult(
+                        List.of(recipesFor(ids).get(0)), 2, 3, 4,
+                        List.of("bad_recipe: boom")),
+                false,
+                1,
+                cancelled::get,
+                null);
+
+        session.step(1);
+        session.step(1);
+        cancelled.set(true);
+        PipelineSnapshot snapshot = session.finish();
+
+        assertEquals(2, snapshot.unsupportedRecipes());
+        assertEquals(3, snapshot.invalidRecipes());
+        assertEquals(4, snapshot.failedRecipes());
+        assertEquals(List.of("bad_recipe: boom"), snapshot.failedRecipeDetails(),
+                "取消后的部分快照必须保留已扫描到的失败明细");
     }
 
     /**
