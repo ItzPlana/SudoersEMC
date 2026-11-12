@@ -50,6 +50,28 @@ public final class TagPricing {
     }
 
     /**
+     * 保守的材料类别基准值。
+     *
+     * <p>这些数值只是让未定价物品落入合理量级的锚点，并不代表同一类别内所有材料价值相同；
+     * 精确到材料的覆盖值后续由配置提供。默认不包含任何按物品覆盖。</p>
+     *
+     * @return 使用默认类别基准值的标签定价器
+     */
+    public static TagPricing defaults() {
+        EnumMap<MaterialCategory, Long> baseValues = new EnumMap<>(MaterialCategory.class);
+        baseValues.put(MaterialCategory.INGOT, 256L);
+        baseValues.put(MaterialCategory.NUGGET, 28L);
+        baseValues.put(MaterialCategory.STORAGE_BLOCK, 2304L);
+        baseValues.put(MaterialCategory.GEM, 512L);
+        baseValues.put(MaterialCategory.DUST, 64L);
+        baseValues.put(MaterialCategory.RAW_MATERIAL, 128L);
+        baseValues.put(MaterialCategory.PLATE, 256L);
+        baseValues.put(MaterialCategory.ROD, 128L);
+        baseValues.put(MaterialCategory.ORE, 128L);
+        return new TagPricing(baseValues, Map.of());
+    }
+
+    /**
      * 计算物品的标签基准价格。
      *
      * <p>先检查按物品配置的覆盖值；覆盖值与标签列表是否为空无关。没有覆盖值时，按传入顺序

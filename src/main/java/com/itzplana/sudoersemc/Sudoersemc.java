@@ -20,11 +20,12 @@ import com.itzplana.sudoersemc.safety.OverflowProtection;
 import com.itzplana.sudoersemc.solver.SolveSettings;
 import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
 import com.itzplana.sudoersemc.storage.OverflowResetLog;
+import com.itzplana.sudoersemc.storage.QuarantinedDropsStore;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
-import com.itzplana.sudoersemc.storage.SudoersemcPaths;
 import com.itzplana.sudoersemc.task.BatchProcessor;
 import com.itzplana.sudoersemc.task.ScanManager;
 import com.mojang.logging.LogUtils;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.BooleanSupplier;
@@ -39,6 +40,7 @@ import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.event.lifecycle.FMLCommonSetupEvent;
 import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
 import net.minecraftforge.server.ServerLifecycleHooks;
+import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 
 /**
@@ -61,6 +63,8 @@ public final class Sudoersemc {
     private static volatile ScanManager scanManager;
     private static volatile ScanPipeline scanPipeline;
     private static volatile ReportManager reportManager;
+    private static volatile OverflowResetLog overflowResetLog;
+    private static volatile QuarantinedDropsStore quarantinedDropsStore;
     private static volatile CommandService commandService;
     private static volatile boolean pendingReload;
 
@@ -90,6 +94,12 @@ public final class Sudoersemc {
             stateStore.load();
             scanStateStore = stateStore;
 
+            OverflowResetLog resetLog = new OverflowResetLog();
+            overflowResetLog = resetLog;
+            QuarantinedDropsStore dropsStore = new QuarantinedDropsStore();
+            dropsStore.load();
+            quarantinedDropsStore = dropsStore;
+
             // 落盘文件必须就绪，集成管理器才能创建 provider。
             OptionalIntegrationManager.setSink(store);
             OptionalIntegrationManager.init();
@@ -103,7 +113,8 @@ public final class Sudoersemc {
             }
 
             reportManager = new ReportManager();
-            ScanPipeline pipeline = createScanPipeline(store, stateStore, reportManager);
+            ScanPipeline pipeline = createScanPipeline(store, stateStore, reportManager,
+                    resetLog, dropsStore);
             scanPipeline = pipeline;
 
             scanManager = createScanManagerIfEnabled(pipeline, SudoersemcConfig.GENERAL_ENABLED::get);
@@ -126,14 +137,18 @@ public final class Sudoersemc {
      * 模组启动。ProjectE 后端通过 {@link OptionalIntegrationManager} 探测，未安装时管线仍然可以
      * 仅依靠配方与兜底定价工作。</p>
      *
-     * @param store         生成值存储
-     * @param stateStore    扫描状态存储
-     * @param reportManager 诊断报告管理器
+     * @param store                生成值存储
+     * @param stateStore           扫描状态存储
+     * @param reportManager        诊断报告管理器
+     * @param resetLog             溢出审计日志；{@code null} 时新建一个仅本次使用的实例
+     * @param dropsStore           隔离记录存储；{@code null} 时新建一个仅本次使用的实例
      * @return 可直接交给扫描调度器使用的管线
      */
     private static ScanPipeline createScanPipeline(GeneratedEntryStore store,
                                                    ScanStateStore stateStore,
-                                                   ReportManager reportManager) {
+                                                   ReportManager reportManager,
+                                                   @Nullable OverflowResetLog resetLog,
+                                                   @Nullable QuarantinedDropsStore dropsStore) {
         OverflowProtection.Settings overflowSettings;
         try {
             overflowSettings = SudoersemcConfig.overflowSettings();
@@ -142,9 +157,9 @@ public final class Sudoersemc {
             LOGGER.warn("SudoersEMC 无法读取溢出保护配置，使用默认值", e);
             overflowSettings = new OverflowProtection.Settings();
         }
+        OverflowResetLog auditLog = resetLog == null ? new OverflowResetLog() : resetLog;
         OverflowPipeline overflowPipeline = new OverflowPipeline(
-                new OverflowProtection(overflowSettings),
-                new OverflowResetLog(SudoersemcPaths.file("overflow_resets.json")));
+                new OverflowProtection(overflowSettings), auditLog);
 
         LargeDropProtection.Settings dropSettings;
         try {
@@ -158,18 +173,9 @@ public final class Sudoersemc {
             LOGGER.warn("SudoersEMC 无法读取大幅降价保护配置，使用默认值", e);
             dropSettings = LargeDropProtection.Settings.defaults();
         }
-        LargeDropProtection dropProtection = new LargeDropProtection(dropSettings);
+        LargeDropProtection dropProtection = new LargeDropProtection(dropSettings, dropsStore);
 
-        boolean protectCreativeOnly;
-        try {
-            protectCreativeOnly = SudoersemcConfig.SAFETY_PROTECT_CREATIVE_ONLY_ITEMS.get();
-        } catch (RuntimeException e) {
-            LOGGER.warn("SudoersEMC 无法读取创造物品保护配置，默认启用保护", e);
-            protectCreativeOnly = true;
-        }
-        CreativeItemProtection creativeProtection = new CreativeItemProtection(
-                new CreativeItemProtection.Settings(
-                        protectCreativeOnly, Set.of(), Map.of(), Set.of()));
+        CreativeItemProtection creativeProtection = createCreativeProtection();
 
         PricingSettings pricingSettings;
         try {
@@ -207,7 +213,53 @@ public final class Sudoersemc {
                 fallbackPricing,
                 solveSettings);
         pipeline.setEmcProvider(OptionalIntegrationManager.provider().orElse(null));
+        applyPipelineConfig(pipeline);
         return pipeline;
+    }
+
+    /**
+     * 把管线相关配置开关应用到刚构造的实例。
+     *
+     * <p>任一开关读取失败都只记录警告，不阻止启动；管线保留自身安全默认值。</p>
+     */
+    private static void applyPipelineConfig(ScanPipeline pipeline) {
+        try {
+            pipeline.setSolveRecipesEnabled(SudoersemcConfig.RECIPE_SOLVE_RECIPES.get());
+            pipeline.setGenerateReportsEnabled(SudoersemcConfig.DIAGNOSTIC_GENERATE_REPORTS.get());
+            pipeline.setUseProjectEIntegrationBaselines(
+                    SudoersemcConfig.FALLBACK_USE_PROJECTE_INTEGRATION_BASELINES.get());
+            pipeline.setOverflowScope(SudoersemcConfig.parseOverflowScope(
+                    SudoersemcConfig.OVERFLOW_OVERWRITE_SCOPE.get()));
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法读取管线配置开关，使用管线默认值", e);
+        }
+    }
+
+    /**
+     * 创建创造物品保护。
+     *
+     * <p>{@code safety.creativeItemExclusions} / {@code creativeItemSpecialValues} /
+     * {@code creativeNamespaces} 三个列表键由 {@link CreativeItemProtection#parseSettings}
+     * 容错解析：非法条目会被跳过并汇总为一条警告，不会阻止模组启动。</p>
+     */
+    private static CreativeItemProtection createCreativeProtection() {
+        try {
+            boolean enabled = SudoersemcConfig.SAFETY_PROTECT_CREATIVE_ONLY_ITEMS.get();
+            CreativeItemProtection.ParsedSettings parsed = CreativeItemProtection.parseSettings(
+                    enabled,
+                    List.copyOf(SudoersemcConfig.SAFETY_CREATIVE_ITEM_EXCLUSIONS.get()),
+                    List.copyOf(SudoersemcConfig.SAFETY_CREATIVE_ITEM_SPECIAL_VALUES.get()),
+                    List.copyOf(SudoersemcConfig.SAFETY_CREATIVE_NAMESPACES.get()));
+            if (!parsed.skippedEntries().isEmpty()) {
+                LOGGER.warn("SudoersEMC 创造物品保护配置有 {} 条无效条目已被忽略：{}",
+                        parsed.skippedEntries().size(), parsed.skippedEntries());
+            }
+            return new CreativeItemProtection(parsed.settings());
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法读取创造物品保护配置，默认启用保护", e);
+            return new CreativeItemProtection(new CreativeItemProtection.Settings(
+                    true, Set.of(), Map.of(), Set.of()));
+        }
     }
 
     /**
@@ -250,55 +302,106 @@ public final class Sudoersemc {
             adaptive = true;
         }
         BatchProcessor processor = new BatchProcessor(Math.max(1, itemsPerTick), adaptive);
+        PipelineApplier applier = new PipelineApplier(pipeline);
         return new ScanManager(
                 processor,
-                () -> ScanManager.oneShot(collectSnapshot(pipeline)).begin(),
-                data -> applySnapshot(pipeline),
+                () -> {
+                    if (pipeline == null) {
+                        throw new IllegalStateException("扫描采集失败：扫描管线未初始化");
+                    }
+                    MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
+                    if (server == null) {
+                        LOGGER.warn("SudoersEMC 扫描请求到达时服务器尚未就绪，本次扫描失败");
+                        throw new IllegalStateException("扫描采集失败：服务器尚未就绪");
+                    }
+                    return pipeline.beginCollection(server);
+                },
+                applier,
                 TICK_BUDGET_NANOS);
     }
 
     /**
-     * 采集阶段回调：读取当前服务器并生成不可变快照。
+     * 应用阶段协调器：在服务器线程启动异步求解、轮询完成，然后重新回到服务器线程做重映射与落盘。
      *
-     * <p>服务器或管线尚未就绪时抛出 {@link IllegalStateException}，由 {@link ScanManager} 转为
-     * {@code FAILED}；绝不在失败时暂存空快照，避免调度器把失败扫描记录为成功的空扫描。</p>
+     * <p>求解本身只读取不可变快照与定价规则，不接触注册表、RecipeManager、ProjectE API 或文件
+     * 系统；{@link ScanPipeline#applyCompletedSolve()} 负责安全判定、存储写入与报告落盘。</p>
      */
-    private static ScanManager.SnapshotData collectSnapshot(ScanPipeline pipeline) {
-        if (pipeline == null) {
-            throw new IllegalStateException("扫描采集失败：扫描管线未初始化");
-        }
-        MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
-        if (server == null) {
-            LOGGER.warn("SudoersEMC 扫描请求到达时服务器尚未就绪，本次扫描失败");
-            throw new IllegalStateException("扫描采集失败：服务器尚未就绪");
+    private static final class PipelineApplier implements ScanManager.ResultApplier {
+
+        @Nullable
+        private final ScanPipeline pipeline;
+
+        private boolean started;
+        private boolean finished;
+
+        private PipelineApplier(@Nullable ScanPipeline pipeline) {
+            this.pipeline = pipeline;
         }
 
-        PipelineSnapshot snapshot = pipeline.collect(server);
-        pipeline.stash(snapshot);
-        return new ScanManager.SnapshotData(
-                "真实扫描管线", snapshot.itemCount(), snapshot.recipeCount());
+        @Override
+        public void apply(ScanManager.SnapshotData data) {
+            if (finished) {
+                return;
+            }
+            if (pipeline == null) {
+                finished = true;
+                return;
+            }
+            if (!started) {
+                started = true;
+                if (!pipeline.startStashedSolve()) {
+                    finished = true;
+                }
+                return;
+            }
+            if (!pipeline.isSolveComplete()) {
+                return;
+            }
+            pipeline.applyCompletedSolve();
+            flushRuntimeStoresAndRemap();
+            finished = true;
+        }
+
+        @Override
+        public boolean isComplete(ScanManager.SnapshotData data) {
+            return finished;
+        }
+
+        @Override
+        public boolean usesAsyncSolve() {
+            return true;
+        }
+
+        @Override
+        public void reset() {
+            if (pipeline != null) {
+                pipeline.cancelPendingSolve();
+            }
+            started = false;
+            finished = false;
+        }
+
+        private void flushRuntimeStoresAndRemap() {
+            MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
+            if (server != null) {
+                try {
+                    OptionalIntegrationManager.provider()
+                            .ifPresent(provider -> provider.requestRemap(server));
+                } catch (RuntimeException e) {
+                    LOGGER.warn("SudoersEMC 请求 ProjectE 重映射失败，已生成条目仍会保存", e);
+                }
+            }
+            flushRuntimeStoresOnServerThread();
+        }
     }
 
     /**
-     * 应用阶段回调：求解暂存快照、请求 ProjectE 重映射并落盘。
+     * 在服务器线程刷新所有运行时存储。
      *
-     * <p>所有步骤都在服务器线程执行。重映射失败只记录警告，不会阻止已经生成的条目写入磁盘。</p>
+     * <p>存储自身保证失败时不抛出、保留脏标记等待下次重试；这里仍然按组件逐个隔离，避免
+     * 一个存储的意外问题阻止其它存储落盘。</p>
      */
-    private static void applySnapshot(ScanPipeline pipeline) {
-        if (pipeline != null) {
-            pipeline.applyStashed();
-        }
-
-        MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
-        if (server != null) {
-            try {
-                OptionalIntegrationManager.provider()
-                        .ifPresent(provider -> provider.requestRemap(server));
-            } catch (RuntimeException e) {
-                LOGGER.warn("SudoersEMC 请求 ProjectE 重映射失败，已生成条目仍会保存", e);
-            }
-        }
-
+    private static void flushRuntimeStoresOnServerThread() {
         GeneratedEntryStore store = entryStore;
         if (store != null) {
             store.saveIfDirty();
@@ -306,6 +409,14 @@ public final class Sudoersemc {
         ScanStateStore stateStore = scanStateStore;
         if (stateStore != null) {
             stateStore.saveIfDirty();
+        }
+        OverflowResetLog resetLog = overflowResetLog;
+        if (resetLog != null) {
+            resetLog.save();
+        }
+        QuarantinedDropsStore dropsStore = quarantinedDropsStore;
+        if (dropsStore != null) {
+            dropsStore.saveIfDirty();
         }
     }
 
@@ -373,24 +484,38 @@ public final class Sudoersemc {
     }
 
     /**
-     * 服务器启动后按 {@code [general] alwaysRescan} 请求扫描。
+     * 服务器启动后按 {@code [general] alwaysRescan} 与缓存状态请求扫描。
      *
-     * <p>只有扫描调度器存在（即 {@code [general] enabled = true}）时才会真正提交请求；
-     * 已有扫描在进行中时保持现状。</p>
+     * <p>判定顺序：{@code alwaysRescan=true} 时无条件重扫；否则上次扫描时刻或已生成条目
+     * 任一缺失时仍然请求扫描；两者都存在时视为已有可用缓存并跳过，避免每次启动重复全量
+     * 求解。只有扫描调度器存在（即 {@code [general] enabled = true}）时才会真正提交请求。</p>
      */
     private void requestStartupScanIfConfigured() {
-        if (!shouldRequestScanOnStart(SudoersemcConfig.GENERAL_ALWAYS_RESCAN::get)) {
-            return;
-        }
+        boolean alwaysRescan = shouldRequestScanOnStart(SudoersemcConfig.GENERAL_ALWAYS_RESCAN::get);
         ScanManager manager = scanManager;
         if (manager == null) {
-            LOGGER.info("SudoersEMC [general] alwaysRescan = true，但扫描调度器未启用，跳过启动扫描");
+            if (alwaysRescan) {
+                LOGGER.info("SudoersEMC [general] alwaysRescan = true，但扫描调度器未启用，跳过启动扫描");
+            }
             return;
         }
+
+        ScanStateStore stateStore = scanStateStore;
+        GeneratedEntryStore store = entryStore;
+        long lastScanEpochMillis = stateStore == null ? 0L : stateStore.lastScanEpochMillis();
+        int generatedEntryCount = store == null ? 0 : store.size();
+        boolean hasReusableCache = lastScanEpochMillis > 0L && generatedEntryCount > 0;
+        if (!alwaysRescan && hasReusableCache) {
+            LOGGER.info("SudoersEMC 已有可用扫描缓存（上次扫描={}，已生成条目={}），跳过启动扫描",
+                    lastScanEpochMillis, generatedEntryCount);
+            return;
+        }
+
         if (manager.requestScan()) {
-            LOGGER.info("SudoersEMC [general] alwaysRescan = true：已请求启动扫描");
+            LOGGER.info("SudoersEMC 已请求启动扫描（alwaysRescan={}，上次扫描={}，已生成条目={}）",
+                    alwaysRescan, lastScanEpochMillis, generatedEntryCount);
         } else {
-            LOGGER.info("SudoersEMC [general] alwaysRescan = true，但已有扫描在进行中，跳过启动扫描");
+            LOGGER.info("SudoersEMC 已有扫描在进行中，跳过启动扫描");
         }
     }
 
@@ -429,7 +554,8 @@ public final class Sudoersemc {
         }
 
         try {
-            ScanPipeline rebuiltPipeline = createScanPipeline(entryStore, scanStateStore, reportManager);
+            ScanPipeline rebuiltPipeline = createScanPipeline(
+                    entryStore, scanStateStore, reportManager, overflowResetLog, quarantinedDropsStore);
             ScanManager rebuilt = createScanManagerIfEnabled(
                     rebuiltPipeline, SudoersemcConfig.GENERAL_ENABLED::get);
             CommandService rebuiltService = new CommandService(
@@ -496,19 +622,12 @@ public final class Sudoersemc {
 
     private void onServerStopping(ServerStoppingEvent event) {
         resetScanManager(scanManager);
-        GeneratedEntryStore store = entryStore;
-        if (store != null) {
-            store.saveIfDirty();
-        }
-        ScanStateStore stateStore = scanStateStore;
-        if (stateStore != null) {
-            stateStore.saveIfDirty();
-        }
         ScanManager manager = scanManager;
         if (manager != null) {
             manager.cancel();
             manager.reset();
         }
+        flushRuntimeStoresOnServerThread();
         pendingReload = false;
         // 不保留指向旧世界的命令服务；下一次 ServerStartedEvent 会重新注入。
         SudoemcCommands.setService(null);

@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.itzplana.sudoersemc.core.ItemKey;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import net.minecraft.resources.ResourceLocation;
@@ -129,5 +130,34 @@ class CreativeItemProtectionTest {
                 true, Set.of(), Map.of(DIAMOND_ID, 0L), Set.of()));
         assertThrows(IllegalArgumentException.class, () -> new CreativeItemProtection.Settings(
                 true, Set.of(), Map.of(DIAMOND_ID, -1L), Set.of()));
+    }
+
+    @Test
+    void configStringsAreParsedAndInvalidEntriesAreSkipped() {
+        CreativeItemProtection.ParsedSettings parsed = CreativeItemProtection.parseSettings(
+                true,
+                List.of("minecraft:bedrock", "not a valid id"),
+                List.of("minecraft:diamond=64", "minecraft:emerald=0", "broken"),
+                List.of("create", "Invalid Namespace"));
+
+        assertEquals(Set.of(BEDROCK_ID), parsed.settings().explicitExclusions());
+        assertEquals(Map.of(DIAMOND_ID, 64L), parsed.settings().specialValues());
+        assertEquals(Set.of("create"), parsed.settings().creativeOnlyNamespaces());
+        assertEquals(4, parsed.skippedEntries().size(),
+                "非法条目必须被跳过并进入诊断列表");
+    }
+
+    @Test
+    void parsedSettingsAreWiredIntoProductionDecisions() {
+        CreativeItemProtection protection = new CreativeItemProtection(
+                CreativeItemProtection.parseSettings(
+                        true,
+                        List.of("minecraft:bedrock"),
+                        List.of("minecraft:diamond=64"),
+                        List.of("create")).settings());
+
+        assertFalse(protection.decide(BEDROCK, true, true).priceable());
+        assertEquals(64L, protection.decide(DIAMOND, true, true).specialValue());
+        assertFalse(protection.decide(CREATIVE_CRATE, true, true).priceable());
     }
 }

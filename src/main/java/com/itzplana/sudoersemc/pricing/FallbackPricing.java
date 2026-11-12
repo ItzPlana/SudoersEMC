@@ -4,7 +4,6 @@ import com.itzplana.sudoersemc.core.ItemKey;
 import com.itzplana.sudoersemc.core.PriceSource;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import net.minecraft.world.item.Rarity;
@@ -118,11 +117,23 @@ public final class FallbackPricing {
      */
     public static FallbackPricing withDefaults(PricingSettings settings) {
         return new FallbackPricing(
-                new TagPricing(Map.of(), Map.of()),
+                TagPricing.defaults(),
                 RarityPricing.defaults(),
                 TierPricing.defaults(),
                 settings
         );
+    }
+
+    /**
+     * 返回定价链使用的层级规则。
+     *
+     * <p>扫描管线需要复用 {@link TierPricing#price} 的排除语义（{@code Optional.of(0L)}），
+     * 以便在被排除物品存在配方时也能提前拒绝定价，而不是只能依赖兜底链。</p>
+     *
+     * @return 当前实例使用的层级定价器，永不为 {@code null}
+     */
+    public TierPricing tierPricing() {
+        return tierPricing;
     }
 
     /**
