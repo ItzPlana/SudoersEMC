@@ -95,8 +95,27 @@ class DiagnosticReportTest {
         assertLine(text, "未解析物品", "7");
         assertLine(text, "隔离的降价", "3");
         assertLine(text, "失败配方", "2");
+        assertLine(text, "customCounter", "9");
         assertLine(text, "扫描耗时", "1234 ms");
         assertLine(text, "峰值堆内存", "50.0 MiB");
+    }
+
+    @Test
+    void extraCountersAreRenderedInNameOrder() {
+        DiagnosticReport report = new DiagnosticReport(
+                0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L,
+                Map.of("zeta", 2L, "alpha", 1L));
+
+        String text = report.formatText();
+        int failedRecipes = text.indexOf("失败配方");
+        int alpha = text.indexOf("alpha");
+        int zeta = text.indexOf("zeta");
+        int duration = text.indexOf("扫描耗时");
+
+        assertTrue(failedRecipes >= 0 && failedRecipes < alpha,
+                "额外计数器应追加在固定指标之后");
+        assertTrue(alpha < zeta, "额外计数器应按名称字典序输出");
+        assertTrue(zeta < duration, "额外计数器应位于扫描耗时之前");
     }
 
     @Test

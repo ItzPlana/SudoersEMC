@@ -24,6 +24,7 @@ import net.minecraft.resources.ResourceLocation;
  * @param converged          是否在达到轮数上限前观察到“没有任何值变化”的完整一轮
  * @param elapsedMillis      求解耗时，单位毫秒
  * @param recipesEvaluated   评估器调用总次数（跨轮次累计，包含失败调用）
+ * @param cyclicItems        结束时仍没有 EMC 且位于循环依赖中的物品，按物品升序；没有环时为空
  */
 public record SolveResult(
         Map<ItemKey, Long> values,
@@ -33,7 +34,8 @@ public record SolveResult(
         int passesUsed,
         boolean converged,
         long elapsedMillis,
-        int recipesEvaluated
+        int recipesEvaluated,
+        Set<ItemKey> cyclicItems
 ) {
 
     public SolveResult {
@@ -41,6 +43,7 @@ public record SolveResult(
         Objects.requireNonNull(traces, "traces");
         Objects.requireNonNull(unresolvedRecipes, "unresolvedRecipes");
         Objects.requireNonNull(unresolvedItems, "unresolvedItems");
+        Objects.requireNonNull(cyclicItems, "cyclicItems");
         if (passesUsed < 0) {
             throw new IllegalArgumentException("passesUsed 不能为负数，实际为 " + passesUsed);
         }
@@ -54,6 +57,22 @@ public record SolveResult(
         traces = Collections.unmodifiableMap(new TreeMap<>(traces));
         unresolvedRecipes = List.copyOf(unresolvedRecipes);
         unresolvedItems = Collections.unmodifiableSet(new TreeSet<>(unresolvedItems));
+        cyclicItems = Collections.unmodifiableSet(new TreeSet<>(cyclicItems));
+    }
+
+    /**
+     * 兼容没有循环诊断的调用方：等价于 {@code cyclicItems} 为空集的完整构造。
+     */
+    public SolveResult(Map<ItemKey, Long> values,
+                       Map<ItemKey, SolveTrace> traces,
+                       List<ResourceLocation> unresolvedRecipes,
+                       Set<ItemKey> unresolvedItems,
+                       int passesUsed,
+                       boolean converged,
+                       long elapsedMillis,
+                       int recipesEvaluated) {
+        this(values, traces, unresolvedRecipes, unresolvedItems, passesUsed, converged,
+                elapsedMillis, recipesEvaluated, Set.of());
     }
 
     /**
