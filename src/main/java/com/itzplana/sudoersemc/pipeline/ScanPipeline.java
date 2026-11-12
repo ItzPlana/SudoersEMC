@@ -144,7 +144,9 @@ public final class ScanPipeline {
      * 设置溢出保护作用域。
      *
      * <p>生产环境默认 {@link OverflowScope#OWNED_ONLY}，只允许改写 SudoersEMC 自己拥有的条目。
-     * 传入 {@code null} 时恢复该默认值，绝不隐式扩大作用域。</p>
+     * {@link OverflowScope#ENTIRE_CUSTOM_EMC} 仅扩大扫描范围到 ProjectE 的
+     * {@code custom_emc.json}，不会授权改写非自有条目；传入 {@code null} 时恢复默认值，
+     * 绝不隐式扩大作用域。</p>
      *
      * @param scope 作用域，允许为 {@code null}
      */
@@ -153,12 +155,13 @@ public final class ScanPipeline {
     }
 
     /**
-     * 设置是否允许改写 ProjectE 的 {@code custom_emc.json}。
+     * 设置是否允许改写 ProjectE 的 {@code custom_emc.json} 中归 SudoersEMC 所有的条目。
      *
      * <p>默认 {@code false}。只有同时启用 {@link OverflowScope#ENTIRE_CUSTOM_EMC} 作用域时才会
-     * 产生实际文件写入；这是避免误改管理员手动配置的第二道保险。</p>
+     * 产生实际文件写入；这是避免误改管理员手动配置的第二道保险。无论该开关如何设置，
+     * 非自有（管理员手动）条目都不会被改写。</p>
      *
-     * @param enabled 是否允许改写 ProjectE 文件
+     * @param enabled 是否允许改写 ProjectE 文件中的自有条目
      */
     public void setProjectEFileRewriteEnabled(boolean enabled) {
         this.allowProjectEFileRewrite = enabled;
@@ -615,10 +618,12 @@ public final class ScanPipeline {
     }
 
     /**
-     * 在作用域与显式开关都允许时改写 ProjectE 的 {@code custom_emc.json}。
+     * 在作用域与显式开关都允许时处理 ProjectE 的 {@code custom_emc.json}。
      *
-     * <p>干跑模式（{@code store == null}）一律跳过，避免测试或预览路径意外写入真实配置目录。
-     * 文件改写失败只记录警告，绝不中断本轮扫描。</p>
+     * <p>红线：只重置 {@code store::isOwned} 的自有条目；管理员手动配置的条目即使超过阈值也
+     * 永不改写。{@link OverflowScope#ENTIRE_CUSTOM_EMC} 仅表示扫描整个文件，不构成改写非自有
+     * 条目的授权。干跑模式（{@code store == null}）一律跳过，避免测试或预览路径意外写入真实
+     * 配置目录。文件改写成功时立即落盘审计；失败只记录警告，绝不中断本轮扫描。</p>
      */
     private void rewriteProjectECustomEmcIfEnabled() {
         if (overflowScope != OverflowScope.ENTIRE_CUSTOM_EMC || !allowProjectEFileRewrite) {
@@ -635,13 +640,14 @@ public final class ScanPipeline {
             ProjectECustomEmcFile target = projectECustomEmcFile == null
                     ? new ProjectECustomEmcFile()
                     : new ProjectECustomEmcFile(projectECustomEmcFile);
+            // 生产接线固定只允许自有条目：ENTIRE_CUSTOM_EMC 不是改写管理员手动值的授权。
             ProjectECustomEmcFile.RewriteResult result = target.rewriteAboveThreshold(
                     overflowPipeline.protection(),
                     store::isOwned,
-                    // ENTIRE_CUSTOM_EMC 本身就是改写整个文件的显式 opt-in。
-                    true,
                     overflowPipeline::recordCustomEmcReset);
             if (result.wroteFile()) {
+                // 破坏性写盘已成功，立即落盘审计，避免进程崩溃时只剩 .bak 备份。
+                overflowPipeline.flushAudit();
                 LOGGER.info("ProjectE custom_emc.json 受控改写完成：rewritten={} skipped={} notOwned={} backup={}",
                         result.rewritten(), result.skipped(), result.notOwned(), result.backup());
             } else {
