@@ -43,7 +43,9 @@ public final class DefaultMaterialResolver implements NbtMaterialResolver {
     private final ToLongFunction<ItemKey> emcLookup;
 
     /**
-     * @param emcLookup 从物品键查询 EMC 的函数，0 表示未知；不得为 {@code null}
+     * @param emcLookup 从物品键查询基准变体 EMC 的函数，0 表示未知；不得为 {@code null}。
+     *                  传入值必须尚未执行 ProjectE 的 {@code DamageProcessor}/
+     *                  {@code StoredEMCProcessor}，本解析器会自行折价并叠加存储 EMC。
      */
     public DefaultMaterialResolver(ToLongFunction<ItemKey> emcLookup) {
         this.emcLookup = Objects.requireNonNull(emcLookup, "emcLookup");
