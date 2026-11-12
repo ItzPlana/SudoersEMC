@@ -11,11 +11,11 @@ import java.util.Objects;
  * 是否完成。批量由 {@link BatchProcessor} 根据上一批实际耗时与 {@link #tickBudgetNanos} 自适应
  * 决定，因此采集工作量按配置上限跨 tick 推进，而不是在一个 tick 内完成全量遍历。</p>
  *
- * <p><strong>阶段范围（Phase 7）：</strong>本类只提供状态机、分片采集协议与批量记账组件，
- * 不包含生产接线。本分支没有 {@code ScanPipeline}，{@code Sudoersemc} 也未创建或驱动
- * {@code ScanManager}。生产接线从 Phase 11 开始（命令/生命周期代码注册 tick 驱动，并注入
- * 占位采集器），真实管线采集与持久化在 Phase 12 接入，生产级分片采集实现
- * （{@code ScanCollector}）在 Phase 27 落地。因此本阶段不能单独构成可运行的扫描路径。</p>
+ * <p><strong>生产接线（Phase 7）：</strong>{@code Sudoersemc} 在服务器启动时创建本类，
+ * 注册 {@code ServerTickEvent} 驱动 {@link #tick()}，并注入 {@code ScanCollectionPipeline}
+ * 提供的分片采集器、指纹提供器、结果应用器与持久化回调。采集使用真实的
+ * {@code ItemScanner}/{@code RecipeScanner} 会话，按 {@code performance.itemsPerTick}
+ * 与 {@code performance.adaptiveBatchSizing} 跨 tick 推进。</p>
  *
  * <p><strong>线程约定：</strong>快照采集（{@link SnapshotCollector} 与 {@link CollectSession}）、
  * 结果应用（{@link ResultApplier}）与指纹提供器（{@link FingerprintSupplier}）必须在服务器
@@ -27,9 +27,9 @@ import java.util.Objects;
  * 可以安全读取最近一次完整进度；{@link #cancel()} 也可以从其他线程调用，实际取消会在下一次
  * tick 被观察到。</p>
  *
- * <p><strong>持久化：</strong>本阶段 {@code saveStep()} 只把阶段推进到
- * {@link ScanPhase#COMPLETED}，不访问磁盘。Phase 12 的应用回调负责把结果写入
- * {@code GeneratedEntryStore} / {@code ScanStateStore} 并调用 {@code saveIfDirty()}。</p>
+ * <p><strong>持久化：</strong>{@code saveStep()} 会先调用构造时注入的 {@link SaveHandler}；
+ * 生产实现由 {@code ScanCollectionPipeline} 写入 {@code scan_state.json} 并落盘
+ * {@code GeneratedEntryStore}。未注入回调时（单元测试）只发布 {@link ScanPhase#COMPLETED}。</p>
  *
  * <p>任何回调抛出的运行时异常都会被捕获并转换为 {@link ScanPhase#FAILED}，异常消息写入
  * 进度细节，绝不允许异常穿透 tick 循环破坏服务器主循环。</p>
@@ -154,6 +154,21 @@ public final class ScanManager {
     }
 
     /**
+     * 持久化阶段回调，必须在服务器线程执行。
+     *
+     * <p>在 {@link ScanPhase#SAVING} 阶段调用一次；抛出的运行时异常会让扫描进入
+     * {@link ScanPhase#FAILED}。生产实现负责写入扫描状态与生成值存储。</p>
+     */
+    @FunctionalInterface
+    public interface SaveHandler {
+
+        /**
+         * 落盘本阶段产生的扫描状态与生成值。
+         */
+        void save();
+    }
+
+    /**
      * 回调之间传递的最小数据载体。
      *
      * <p>当前阶段只携带标签、物品数量与配方数量，使 {@link ScanManager} 保持对 Minecraft
@@ -182,6 +197,7 @@ public final class ScanManager {
     private final ResultApplier applier;
     private final long tickBudgetNanos;
     private final FingerprintSupplier fingerprintSupplier;
+    private final SaveHandler saveHandler;
 
     private volatile ScanProgress progress = ScanProgress.idle();
     private volatile boolean cancelRequested;
@@ -212,15 +228,18 @@ public final class ScanManager {
                        SnapshotCollector collector,
                        ResultApplier applier,
                        long tickBudgetNanos) {
-        this(batchProcessor, collector, applier, tickBudgetNanos, null);
+        this(batchProcessor, collector, applier, tickBudgetNanos, null, null);
     }
 
     /**
-     * 创建带快照一致性校验的调度器。
+     * 创建带快照一致性校验的调度器，不执行持久化回调。
      *
      * <p>{@code fingerprintSupplier} 会在采集开始时与采集完成时各调用一次，并在应用前
      * 再次调用。采集期间指纹变化或应用前指纹与采集时不一致都会让本次扫描进入
      * {@link ScanPhase#FAILED}，从而避免把基于旧注册表/配方的结果写入 EMC。</p>
+     *
+     * <p>该构造器适用于只验证状态机的单元测试；生产接线必须使用带
+     * {@link SaveHandler} 的六参构造器，否则扫描完成后不会落盘。</p>
      *
      * @param batchProcessor      批量决策器，不能为 {@code null}
      * @param collector           分片采集会话工厂，不能为 {@code null}
@@ -234,6 +253,28 @@ public final class ScanManager {
                        ResultApplier applier,
                        long tickBudgetNanos,
                        FingerprintSupplier fingerprintSupplier) {
+        this(batchProcessor, collector, applier, tickBudgetNanos, fingerprintSupplier, null);
+    }
+
+    /**
+     * 创建带快照一致性校验与持久化回调的调度器。
+     *
+     * <p>生产接线使用本构造器：{@code saveHandler} 在 {@link ScanPhase#SAVING}
+     * 阶段执行一次，负责把扫描状态与生成值写入磁盘。</p>
+     *
+     * @param batchProcessor      批量决策器，不能为 {@code null}
+     * @param collector           分片采集会话工厂，不能为 {@code null}
+     * @param applier             结果应用回调，不能为 {@code null}
+     * @param tickBudgetNanos     每 tick 的时间预算（纳秒），不得为负
+     * @param fingerprintSupplier 输入指纹提供器；生产接线必须提供非 {@code null} 实现
+     * @param saveHandler         持久化回调；{@code null} 仅用于不落盘的单元测试
+     */
+    public ScanManager(BatchProcessor batchProcessor,
+                       SnapshotCollector collector,
+                       ResultApplier applier,
+                       long tickBudgetNanos,
+                       FingerprintSupplier fingerprintSupplier,
+                       SaveHandler saveHandler) {
         this.batchProcessor = Objects.requireNonNull(batchProcessor, "batchProcessor");
         this.collector = Objects.requireNonNull(collector, "collector");
         this.applier = Objects.requireNonNull(applier, "applier");
@@ -242,6 +283,7 @@ public final class ScanManager {
         }
         this.tickBudgetNanos = tickBudgetNanos;
         this.fingerprintSupplier = fingerprintSupplier;
+        this.saveHandler = saveHandler;
     }
 
     /**
@@ -504,10 +546,11 @@ public final class ScanManager {
     }
 
     /**
-     * 求解阶段：按批量推进配方数量，完成后进入应用阶段。
+     * 求解阶段：按批量推进配方进度，完成后进入应用阶段。
      *
-     * <p>Phase 7 尚未接入真实求解器；本阶段只按 {@code batch} 推进进度记账，不会执行
-     * 配方计算。真实求解在 Phase 12 的管线中接入。</p>
+     * <p>Phase 7 的生产管线在 APPLYING 阶段使用现有 {@code RecipeSolver} 对不可变快照求解，
+     * 因此本阶段只负责进度语义与阶段切换，不会访问服务器注册表。Phase 12 会把求解拆到
+     * 独立管线阶段并允许移到工作线程；本阶段保持批量进度契约不变。</p>
      *
      * @return 本 tick 推进的实际配方数量，用于自适应批量记账
      */
@@ -547,13 +590,16 @@ public final class ScanManager {
     }
 
     /**
-     * 持久化阶段：本阶段只发布完成状态，不访问磁盘。
+     * 持久化阶段：调用注入的 {@link SaveHandler}，随后发布完成状态。
      *
-     * <p>Phase 7 没有存储接线；Phase 12 的管线应用回调负责写入生成值/扫描状态并调用
-     * {@code saveIfDirty()}。因此当前状态机的 {@link ScanPhase#COMPLETED} 仅表示内存流程
-     * 结束，不代表已经落盘。</p>
+     * <p>生产实现负责写入 {@code scan_state.json} 与 {@code GeneratedEntryStore}；
+     * 回调抛出的运行时异常会被 {@link #tickInternal(ScanProgress)} 捕获并转为
+     * {@link ScanPhase#FAILED}，不会把未落盘的结果标记为完成。</p>
      */
     private void saveStep() {
+        if (saveHandler != null) {
+            saveHandler.save();
+        }
         progress = progress.advance(ScanPhase.COMPLETED, 0, 0, "扫描已完成");
     }
 
