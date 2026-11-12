@@ -12,6 +12,9 @@ import java.util.OptionalLong;
  * <p>缓存最多保存 {@code maxEntries} 个 {@link ItemKey}。容量已满时，最久未使用的条目在
  * 容量满时被淘汰。所有访问可变状态的方法都在同一把锁上同步，可从多个线程安全访问；命中与
  * 未命中计数只统计 {@link #get(ItemKey)} 调用，{@link #clear()} 会同时清空计数。</p>
+ *
+ * <p>容量按条目数计算，不限制单个 {@code variantHash} 的字节长度；调用方仍需为变体哈希
+ * 设置长度上限，避免超大容器 NBT 占用过多内存。</p>
  */
 public final class VariantCache {
 

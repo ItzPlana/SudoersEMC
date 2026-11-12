@@ -257,7 +257,7 @@ public final class RecipeScanner {
     private RecipeSnapshot describeSingleOutput(ResourceLocation id, RecipeKind kind,
                                                 NonNullList<Ingredient> ingredients, ItemStack result) {
         List<RecipeInput> inputs = convertIngredients(ingredients);
-        if (inputs.isEmpty()) {
+        if (inputs == null || inputs.isEmpty()) {
             return null;
         }
         List<RecipeOutput> outputs = convertStacks(List.of(result));
@@ -275,7 +275,7 @@ public final class RecipeScanner {
         }
         NonNullList<Ingredient> ingredients = recipe.getIngredients();
         List<RecipeInput> inputs = convertIngredients(ingredients);
-        if (inputs.isEmpty()) {
+        if (inputs == null || inputs.isEmpty()) {
             return null;
         }
 
@@ -377,6 +377,7 @@ public final class RecipeScanner {
      * Converts Minecraft ingredients. Tag ingredients become multi-choice options so the evaluator
      * can pick the cheapest member.
      */
+    @Nullable
     private static List<RecipeInput> convertIngredients(NonNullList<Ingredient> ingredients) {
         List<RecipeInput> converted = new ArrayList<>();
         for (Ingredient ingredient : ingredients) {
@@ -387,11 +388,11 @@ public final class RecipeScanner {
             try {
                 stacks = ingredient.getItems();
             } catch (RuntimeException e) {
-                continue;
+                return null;
             }
             List<ItemKey> candidates = new ArrayList<>(stacks.length);
             for (ItemStack stack : stacks) {
-                if (stack.isEmpty()) {
+                if (stack.isEmpty() || IngredientStacks.isEmptyTagPlaceholder(stack)) {
                     continue;
                 }
                 ResourceLocation id = BuiltInRegistries.ITEM.getKey(stack.getItem());
@@ -400,7 +401,7 @@ public final class RecipeScanner {
                 }
             }
             if (candidates.isEmpty()) {
-                continue;
+                return null;
             }
             converted.add(RecipeInput.of(new IngredientOption(candidates)));
         }

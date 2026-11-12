@@ -5,6 +5,7 @@ import com.itzplana.sudoersemc.safety.OverflowProtection;
 import com.itzplana.sudoersemc.safety.CreativeItemProtection;
 import com.itzplana.sudoersemc.solver.RecipeSelectionStrategy;
 import com.mojang.logging.LogUtils;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -16,6 +17,7 @@ import net.minecraftforge.fml.ModLoadingContext;
 import net.minecraftforge.fml.config.ModConfig;
 import net.minecraftforge.fml.event.config.ModConfigEvent;
 import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
+import net.minecraftforge.fml.loading.FMLPaths;
 import org.slf4j.Logger;
 
 /**
@@ -312,6 +314,8 @@ public final class SudoersemcConfig {
             return;
         }
         registered = true;
+        // 在 Forge 解析 TOML 之前执行 v1 -> v2 迁移；失败时保留原文件。
+        ConfigFileMigration.migrate(commonConfigPath());
         ModLoadingContext.get().registerConfig(ModConfig.Type.COMMON, SPEC);
 
         IEventBus modEventBus = FMLJavaModLoadingContext.get().getModEventBus();
@@ -560,5 +564,19 @@ public final class SudoersemcConfig {
                     "[overflow] Conflicting configuration: overwriteScope = entire_custom_emc but "
                             + "allowProjectEFileRewrite = false. ProjectE's custom_emc.json will not be rewritten.");
         }
+    }
+
+    private static Path commonConfigPath() {
+        return FMLPaths.CONFIGDIR.get().resolve("sudoersemc-common.toml");
+    }
+
+    /**
+     * 兼容旧命令路径：配置未加载时明确失败；已加载时校验当前快照。
+     */
+    public static ConfigValidationResult reloadFromDisk() {
+        if (!SPEC.isLoaded()) {
+            return ConfigValidationResult.failed(List.of("配置尚未加载"), List.of());
+        }
+        return ConfigValidator.validateCurrent();
     }
 }
