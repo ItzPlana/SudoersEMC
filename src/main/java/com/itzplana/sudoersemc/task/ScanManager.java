@@ -1,6 +1,8 @@
 package com.itzplana.sudoersemc.task;
 
 import java.util.Objects;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * 由服务器 tick 驱动的单次扫描状态机。
@@ -11,11 +13,11 @@ import java.util.Objects;
  * 是否完成。批量由 {@link BatchProcessor} 根据上一批实际耗时与 {@link #tickBudgetNanos} 自适应
  * 决定，因此采集工作量按配置上限跨 tick 推进，而不是在一个 tick 内完成全量遍历。</p>
  *
- * <p><strong>阶段范围（Phase 7）：</strong>本类只提供状态机、分片采集协议与批量记账组件，
- * 不包含生产接线。本分支没有 {@code ScanPipeline}，{@code Sudoersemc} 也未创建或驱动
- * {@code ScanManager}。生产接线从 Phase 11 开始（命令/生命周期代码注册 tick 驱动，并注入
- * 占位采集器），真实管线采集与持久化在 Phase 12 接入，生产级分片采集实现
- * （{@code ScanCollector}）在 Phase 27 落地。因此本阶段不能单独构成可运行的扫描路径。</p>
+ * <p><strong>生产接线（Phase 12）：</strong>{@code Sudoersemc} 使用
+ * {@code ScanPipeline.beginCollection(server)} 作为 {@link SnapshotCollector}，采集会话按批
+ * 推进物品与配方；应用阶段通过 {@link ResultApplier#isComplete(SnapshotData)} 支持异步求解
+ * 轮询，纯计算在工作线程完成后再回到服务器线程写入存储。Phase 27 会在此基础上进一步拆分
+ * 采集器与工作线程实现。</p>
  *
  * <p><strong>线程约定：</strong>快照采集（{@link SnapshotCollector} 与 {@link CollectSession}）、
  * 结果应用（{@link ResultApplier}）与指纹提供器（{@link FingerprintSupplier}）必须在服务器
@@ -28,13 +30,16 @@ import java.util.Objects;
  * tick 被观察到。</p>
  *
  * <p><strong>持久化：</strong>本阶段 {@code saveStep()} 只把阶段推进到
- * {@link ScanPhase#COMPLETED}，不访问磁盘。Phase 12 的应用回调负责把结果写入
- * {@code GeneratedEntryStore} / {@code ScanStateStore} 并调用 {@code saveIfDirty()}。</p>
+ * {@link ScanPhase#COMPLETED}，不访问磁盘。Phase 12 的应用回调在异步求解完成后回到服务器
+ * 线程写入 {@code GeneratedEntryStore} / {@code ScanStateStore}，再由接线层调用
+ * {@code saveIfDirty()}。</p>
  *
  * <p>任何回调抛出的运行时异常都会被捕获并转换为 {@link ScanPhase#FAILED}，异常消息写入
  * 进度细节，绝不允许异常穿透 tick 循环破坏服务器主循环。</p>
  */
 public final class ScanManager {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger("sudoersemc/task/ScanManager");
 
     /**
      * 分片采集会话工厂，必须在服务器线程执行。
@@ -148,9 +153,44 @@ public final class ScanManager {
         /**
          * 把求解结果写入实际后端。
          *
+         * <p>实现可以在第一次调用时启动后台求解并立即返回；此时
+         * {@link #isComplete(SnapshotData)} 返回 {@code false}，状态机保持 APPLYING，
+         * 后续 tick 继续调用本方法轮询。</p>
+         *
          * @param data 采集阶段产生的快照数据
          */
         void apply(SnapshotData data);
+
+        /**
+         * 应用阶段是否已经完成。
+         *
+         * <p>默认实现表示同步应用：{@link #apply(SnapshotData)} 返回时结果已经落盘。</p>
+         *
+         * @param data 采集阶段产生的快照数据
+         * @return {@code true} 表示可以进入 SAVING
+         */
+        default boolean isComplete(SnapshotData data) {
+            return true;
+        }
+
+        /**
+         * 在新扫描开始、取消或失败时清理未完成的异步状态。默认无操作。
+         */
+        default void reset() {
+        }
+
+        /**
+         * 是否由应用回调在工作线程完成求解。
+         *
+         * <p>返回 {@code true} 时 {@link ScanManager} 跳过仅推进数字的 SOLVING 阶段，直接从
+         * COLLECTING 进入 APPLYING，由异步回调轮询真实求解进度；默认 {@code false} 保持原有
+         * 同步阶段划分。</p>
+         *
+         * @return 是否使用异步求解
+         */
+        default boolean usesAsyncSolve() {
+            return false;
+        }
     }
 
     /**
@@ -318,6 +358,7 @@ public final class ScanManager {
         collectFingerprintBefore = null;
         collectedFingerprint = null;
         lastBatchNanos = 0L;
+        applier.reset();
         long now = System.currentTimeMillis();
         progress = new ScanProgress(ScanPhase.COLLECTING_SNAPSHOT, 0, 0, now, now, "等待采集快照");
         return true;
@@ -411,6 +452,11 @@ public final class ScanManager {
                 }
             }
         } catch (RuntimeException e) {
+            try {
+                applier.reset();
+            } catch (RuntimeException resetFailure) {
+                LOGGER.warn("清理应用阶段回调失败：{}", resetFailure.getMessage(), resetFailure);
+            }
             ScanProgress failed = progress;
             progress = failed.advance(ScanPhase.FAILED, failed.processed(), failed.total(),
                     failureDetail(e));
@@ -445,6 +491,7 @@ public final class ScanManager {
         collectFingerprintBefore = null;
         collectedFingerprint = null;
         lastBatchNanos = 0L;
+        applier.reset();
         progress = ScanProgress.idle();
     }
 
@@ -552,6 +599,11 @@ public final class ScanManager {
     private void beginSolving() {
         SnapshotData data = snapshot;
         int total = data == null ? 0 : data.recipeCount();
+        if (applier.usesAsyncSolve()) {
+            // 异步求解的真实工作由应用回调轮询，SOLVING 只会拖长假进度，因此直接进入 APPLYING。
+            progress = progress.advance(ScanPhase.APPLYING, 0, 0, "开始后台求解");
+            return;
+        }
         progress = progress.advance(ScanPhase.SOLVING, 0, total, "开始求解配方");
     }
 
@@ -595,6 +647,10 @@ public final class ScanManager {
         }
         verifyFingerprintBeforeApply();
         applier.apply(data);
+        if (!applier.isComplete(data)) {
+            progress = progress.advance(ScanPhase.APPLYING, 0, 0, "等待后台求解完成");
+            return;
+        }
         progress = progress.advance(ScanPhase.SAVING, 0, 0, "结果已应用，开始持久化");
     }
 
