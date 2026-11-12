@@ -4,8 +4,11 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
@@ -25,10 +28,21 @@ class ScanManagerTest {
         return new ScanManager.SnapshotData("主世界", itemCount, recipeCount);
     }
 
+    private static ScanFingerprint fingerprint(String itemId) {
+        return ScanFingerprint.of(List.of(itemId), List.of(), List.of(), List.of(), List.of());
+    }
+
     private static ScanManager manager(BatchProcessor processor,
                                        ScanManager.SnapshotCollector collector,
                                        ScanManager.ResultApplier applier) {
         return new ScanManager(processor, collector, applier, TICK_BUDGET_NANOS);
+    }
+
+    private static ScanManager manager(BatchProcessor processor,
+                                       ScanManager.SnapshotCollector collector,
+                                       ScanManager.ResultApplier applier,
+                                       ScanManager.FingerprintSupplier fingerprintSupplier) {
+        return new ScanManager(processor, collector, applier, TICK_BUDGET_NANOS, fingerprintSupplier);
     }
 
     @Test
@@ -109,6 +123,47 @@ class ScanManagerTest {
     }
 
     @Test
+    void cancelDuringCollectionIsObservedOnNextTick() {
+        AtomicInteger collections = new AtomicInteger();
+        AtomicInteger applications = new AtomicInteger();
+        ScanManager manager = manager(new BatchProcessor(1, false),
+                () -> {
+                    collections.incrementAndGet();
+                    return data(5, 5);
+                },
+                snapshot -> applications.incrementAndGet());
+
+        manager.requestScan();
+        manager.tick();
+        assertTrue(manager.isRunning(), "第一次 tick 后仍应处于采集阶段");
+        assertEquals(ScanPhase.COLLECTING_SNAPSHOT, manager.progress().phase());
+
+        manager.cancel();
+        manager.tick();
+
+        assertEquals(ScanPhase.CANCELLED, manager.progress().phase());
+        assertEquals(1, collections.get(), "取消后不得再次调用采集器");
+        assertEquals(0, applications.get(), "取消后不得调用应用器");
+    }
+
+    @Test
+    void cancelFromAnotherThreadIsObservedOnNextTick() throws InterruptedException {
+        ScanManager manager = manager(new BatchProcessor(1, false),
+                () -> data(100, 100), snapshot -> { });
+
+        manager.requestScan();
+        manager.tick();
+
+        Thread canceller = new Thread(manager::cancel, "scan-canceller");
+        canceller.start();
+        canceller.join(5_000L);
+        assertFalse(canceller.isAlive(), "取消线程必须结束");
+
+        manager.tick();
+        assertEquals(ScanPhase.CANCELLED, manager.progress().phase());
+    }
+
+    @Test
     void collectorFailureEndsInFailedState() {
         ScanManager manager = manager(new BatchProcessor(1, false),
                 () -> {
@@ -145,6 +200,62 @@ class ScanManagerTest {
     }
 
     @Test
+    void applyIsRejectedWhenFingerprintChangesAfterCollection() {
+        AtomicReference<ScanFingerprint> current = new AtomicReference<>(fingerprint("minecraft:stone"));
+        AtomicInteger applications = new AtomicInteger();
+        ScanManager manager = manager(new BatchProcessor(10, false),
+                () -> data(0, 0),
+                snapshot -> applications.incrementAndGet(),
+                current::get);
+
+        manager.requestScan();
+        manager.tick();
+        current.set(fingerprint("minecraft:dirt"));
+        manager.tick();
+        manager.tick();
+
+        assertEquals(ScanPhase.FAILED, manager.progress().phase());
+        assertEquals(0, applications.get(), "指纹不一致时不得应用过期结果");
+        assertTrue(manager.progress().detail().contains("重新扫描"));
+    }
+
+    @Test
+    void applyProceedsWhenFingerprintStaysStable() {
+        AtomicReference<ScanFingerprint> current = new AtomicReference<>(fingerprint("minecraft:stone"));
+        AtomicInteger applications = new AtomicInteger();
+        ScanManager manager = manager(new BatchProcessor(10, false),
+                () -> data(0, 0),
+                snapshot -> applications.incrementAndGet(),
+                current::get);
+
+        manager.requestScan();
+        int ticks = 0;
+        while (manager.isRunning() && ticks++ < TICK_GUARD) {
+            manager.tick();
+        }
+
+        assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
+        assertEquals(1, applications.get(), "指纹稳定时应正常应用一次");
+    }
+
+    @Test
+    void fingerprintChangeDuringCollectionFailsScan() {
+        AtomicInteger calls = new AtomicInteger();
+        AtomicInteger applications = new AtomicInteger();
+        ScanManager manager = manager(new BatchProcessor(10, false),
+                () -> data(0, 0),
+                snapshot -> applications.incrementAndGet(),
+                () -> fingerprint(calls.getAndIncrement() == 0 ? "minecraft:stone" : "minecraft:dirt"));
+
+        manager.requestScan();
+        manager.tick();
+
+        assertEquals(ScanPhase.FAILED, manager.progress().phase());
+        assertEquals(0, applications.get(), "采集期间输入变化时不得进入应用阶段");
+        assertTrue(manager.progress().detail().contains("采集期间"));
+    }
+
+    @Test
     void exceptionWithoutMessageUsesClassName() {
         ScanManager manager = manager(new BatchProcessor(1, false),
                 () -> {
@@ -176,6 +287,43 @@ class ScanManagerTest {
     }
 
     @Test
+    void reentrantTickAndRequestScanFromCallbackAreIgnored() {
+        AtomicInteger collections = new AtomicInteger();
+        AtomicBoolean nestedRequestResult = new AtomicBoolean(true);
+        ScanManager[] holder = new ScanManager[1];
+        holder[0] = manager(new BatchProcessor(10, false),
+                () -> {
+                    collections.incrementAndGet();
+                    holder[0].tick();
+                    nestedRequestResult.set(holder[0].requestScan());
+                    return data(0, 0);
+                },
+                snapshot -> { });
+
+        holder[0].requestScan();
+        holder[0].tick();
+
+        assertEquals(1, collections.get(), "重入 tick 不得再次调用采集器");
+        assertFalse(nestedRequestResult.get(), "回调内 requestScan 必须被拒绝");
+        assertEquals(ScanPhase.SOLVING, holder[0].progress().phase());
+    }
+
+    @Test
+    void resetFromCallbackIsRejected() {
+        ScanManager[] holder = new ScanManager[1];
+        holder[0] = manager(new BatchProcessor(10, false),
+                () -> {
+                    assertThrows(IllegalStateException.class, () -> holder[0].reset());
+                    return data(0, 0);
+                },
+                snapshot -> { });
+
+        holder[0].requestScan();
+        assertDoesNotThrow(holder[0]::tick, "回调内 reset 异常应由断言捕获，不穿透 tick");
+        assertEquals(ScanPhase.SOLVING, holder[0].progress().phase());
+    }
+
+    @Test
     void zeroWorkStillCompletes() {
         ScanManager manager = manager(new BatchProcessor(1, false),
                 () -> data(0, 0), snapshot -> { });
@@ -192,12 +340,29 @@ class ScanManagerTest {
     }
 
     @Test
+    void adaptiveSamplesAreOnlyRecordedForCollectingAndSolving() {
+        BatchProcessor processor = new BatchProcessor(10, true);
+        ScanManager manager = manager(processor, () -> data(0, 0), snapshot -> { });
+
+        manager.requestScan();
+        int ticks = 0;
+        while (manager.isRunning() && ticks++ < TICK_GUARD) {
+            manager.tick();
+        }
+
+        assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
+        assertEquals(2L, processor.batchesProcessed(),
+                "只有采集与求解阶段计入自适应样本");
+    }
+
+    @Test
     void newScanCanStartAfterCompletion() {
         ScanManager manager = manager(new BatchProcessor(10, false),
                 () -> data(0, 0), snapshot -> { });
 
         manager.requestScan();
-        while (manager.isRunning()) {
+        int ticks = 0;
+        while (manager.isRunning() && ticks++ < TICK_GUARD) {
             manager.tick();
         }
         assertEquals(ScanPhase.COMPLETED, manager.progress().phase());

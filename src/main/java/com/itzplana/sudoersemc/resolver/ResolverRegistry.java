@@ -16,8 +16,9 @@ import org.slf4j.LoggerFactory;
  * 有序的 NBT 材料解析器注册表。
  *
  * <p>解析按注册顺序进行，第一个同时满足 {@link NbtMaterialResolver#supports(ItemStack)}
- * 且返回非空结果的解析器获胜。解析器可能来自第三方模组，因此任何异常都会被记录并跳过，
- * 绝不向调用方传播；单个解析器失败不会中断后续解析。</p>
+ * 且返回非空结果的解析器获胜。解析器可能来自第三方模组，因此 {@link RuntimeException}
+ * 会被记录并跳过，单个解析器失败不会中断后续解析；{@link Error}（例如
+ * {@link OutOfMemoryError}）不会被吞掉，会继续向上传播，避免资源耗尽后留下不一致状态。</p>
  *
  * <p>本类线程安全：内部使用写时复制列表，允许在扫描线程读取的同时安全注册。</p>
  */
@@ -83,8 +84,8 @@ public final class ResolverRegistry {
     /**
      * 依次尝试所有解析器。
      *
-     * <p>{@code supports} 或 {@code resolve} 抛出异常时只记录警告并继续尝试下一个解析器，
-     * 防止某个模组的错误数据破坏整个扫描流程。</p>
+     * <p>{@code supports} 或 {@code resolve} 抛出 {@link RuntimeException} 时只记录警告并
+     * 继续尝试下一个解析器，防止某个模组的错误数据破坏整个扫描流程。</p>
      *
      * @param stack 待定价的堆叠
      * @return 第一个成功解析出的 EMC；没有解析器能够定价时返回空
@@ -113,13 +114,13 @@ public final class ResolverRegistry {
                     }
                     return value;
                 }
-                if (value != null && value.isPresent() && DebugLog.isEnabled()) {
+if (value != null && value.isPresent() && DebugLog.isEnabled()) {
                     final long index = callIndex;
                     DebugLog.headOrSampled("resolver", index, 20L, 500L,
                             () -> "ignored non-positive value=" + value.getAsLong()
                                     + " resolver=" + resolver.getClass().getName());
                 }
-            } catch (Throwable t) {
+            } catch (RuntimeException t) {
                 LOGGER.warn("NBT 材料解析器 {} 处理物品 {} 时抛出异常，已跳过",
                         resolver.getClass().getName(), stack.getItem(), t);
                 if (DebugLog.isEnabled()) {
