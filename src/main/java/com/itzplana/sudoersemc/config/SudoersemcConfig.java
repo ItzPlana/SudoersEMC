@@ -197,11 +197,13 @@ public final class SudoersemcConfig {
         // [nbt]
         BUILDER.comment("ItemStack NBT variant scanning.").push("nbt");
         NBT_SCAN_NBT_VARIANTS = BUILDER.comment(
-                        "Scan economically relevant NBT variants of items.")
+                        "Scan economically relevant NBT variants of items.",
+                        "Consumed by the Phase 17 variant pipeline; disabling it skips variant generation.")
                 .define("scanNbtVariants", true);
         NBT_MAX_NBT_VARIANTS_PER_ITEM = BUILDER.comment(
-                        "Maximum number of NBT variants scanned per item; must be >= 1.")
-                .defineInRange("maxNbtVariantsPerItem", 100, 1, Integer.MAX_VALUE);
+                        "Maximum number of NBT variants scanned per item, in [1, 1000].",
+                        "Consumed by the Phase 17 variant pipeline; larger values are rejected at this boundary.")
+                .defineInRange("maxNbtVariantsPerItem", 100, 1, 1000);
         BUILDER.pop();
 
         // [diagnostic]

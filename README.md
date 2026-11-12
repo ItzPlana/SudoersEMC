@@ -37,7 +37,7 @@ SudoersEMC 是一个**独立实现**的 Minecraft Forge 1.20.1 模组。它扫�
 
 ## 当前状态
 
-项目按阶段推进。当前代码基线为 Phase 18（分支 `phase-18-chain-creative`），**620 个单元测试通过**；Phase 18 已接线，真实环境尚未验证。
+项目按阶段推进。当前代码基线为 Phase 18（分支 `phase-18-chain-creative`），**624 个单元测试通过**；Phase 18 已接线，真实环境尚未验证。
 
 | 阶段       | 内容                                                                                                                                  | 状态                                  |
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
@@ -47,7 +47,7 @@ SudoersEMC 是一个**独立实现**的 Minecraft Forge 1.20.1 模组。它扫�
 | Phase 15   | `ENTIRE_CUSTOM_EMC` 受控改写（双开关、时间戳备份、原子替换、未知字段保留）                                                            | ✅ 完成（已实机验证）                 |
 | Phase 16   | 配置生命周期（热重载、交叉字段校验接线、`fallback.minEmc` 配置键）                                                                    | ✅ 完成                               |
 | Phase 17   | NBT 变体端到端接线（配方输出 NBT → `VariantScanner` → 带 `variantHash` 的 `ItemSnapshot`）                                            | ✅ 完成（449 个测试；真实环境未验证） |
-| Phase 18   | solve → fallback 多轮收敛；创造物品保护配置化（`safety.creativeItemExclusions` / `creativeItemSpecialValues` / `creativeNamespaces`） | ✅ 完成（620 个测试；真实环境未验证） |
+| Phase 18   | solve → fallback 多轮收敛；创造物品保护配置化（`safety.creativeItemExclusions` / `creativeItemSpecialValues` / `creativeNamespaces`） | ✅ 完成（624 个测试；真实环境未验证） |
 
 Phase 1 曾在专用服务器上验证写入生效、重启后自动恢复、手动值不被覆盖与缺少 ProjectE 时的降级行为；该记录属于历史验证，不代表当前全链路已在所有模组组合下复测。Phase 15 的双开关改写已在独立环境实机验证：默认配置与单独开启任一开关都不会改动 `custom_emc.json`；双开关同时开启时，严格超过阈值的条目被重置，并生成时间戳备份与 `overflow_resets.json` 审计记录。Phase 17 的 NBT 变体路径只有单元测试；由于原版配方不产生 NBT 输出，真实环境尚未验证。
 
@@ -200,12 +200,21 @@ randomSeed = 0                  # 0 = 每次启动重新随机
 
 [nbt]
 scanNbtVariants = true          # Phase 17 已接线；真实环境尚未验证
-maxNbtVariantsPerItem = 100     # Phase 17 已接线；实际扫描受硬上限 1000 限制
+maxNbtVariantsPerItem = 100     # Phase 17 已接线；范围 [1, 1000]，真实环境尚未验证
 
 [diagnostic]
 debugLogging = false            # 当前未生效（生产代码未读取）
 generateReports = true
 ```
+
+> **[nbt] 说明**：`scanNbtVariants = false` 会跳过变体生成；`maxNbtVariantsPerItem`
+> 的 Forge 范围为 `[1, 1000]`，与 `VariantScanner.HARD_VARIANT_CEILING = 1000` 一致。
+
+### 标签兜底定价的风险
+
+`fallback.useTagPricing = true` 时，未定价物品会按材料标签类别使用默认锚点（默认按铁系取值）。
+标签只表示材料关系，不保证同一类别内不同材料的真实价值相同；在 ProjectE 已为廉价可再生产材料定价、但未为对应块/锭定价的模组包中，可能出现 EMC 套利。
+当前版本尚未提供按材料/标签的覆盖配置；如发现异常定价，建议关闭 `useTagPricing`，或先用 ProjectE 手动 EMC 值（`custom_emc.json`）覆盖相关材料，使 EXISTING 优先命中。
 
 ### 溢出保护
 
@@ -252,7 +261,7 @@ ProjectE 原生值与 `custom_emc.json` 中的手动值不会进入这条候选�
 - **运行时交叉字段校验**已由 Phase 16 接线：`ConfigValidator.validateCurrent()` 在配置加载/重载事件与 `/sudoemc reload` 时执行 `validateCrossField(...)`。`overflow.threshold <= resetMax`、`overflow.resetMin > resetMax`、`overflow.resetMin < 1`、`bucketCount < 1`、`weightCap < 1` 会拒绝重建并保留上一份有效组件；`overwriteScope = entire_custom_emc` 且 `allowProjectEFileRewrite = false` 只记录警告，不改写文件。
 - 非法的 `overflow.overwriteScope` 会在解析时回退为 `owned_only` 并记录警告，不会拒绝重建。
 - `safety.maxAllowedDropRatio` 的 Forge 范围是 `[0.0, 1.0]`；若设为 `0.0`，`LargeDropProtection.Settings` 构造会失败，扫描管线回退到默认 `0.5`（不是拒绝整个配置）。
-- `nbt.maxNbtVariantsPerItem` 的 Forge 范围是 `[1, Integer.MAX_VALUE]`；运行时不拒绝大于 `1000` 的值，但 `VariantScanner` 会用硬上限 `1000` 截断实际扫描数量。
+- `nbt.maxNbtVariantsPerItem` 的 Forge 范围是 `[1, 1000]`；越界值在加载时被纠正，运行时校验也会拒绝重建并保留上一份有效组件。
 - 启动时若溢出设置构造失败，扫描管线会回退到内置默认值；运行期重建采用「全有或全无」：新组件全部构建成功后才替换旧组件。
 - `/sudoemc reload` 会用当前已加载的配置值重建运行时组件；扫描进行中时返回「将在扫描结束后生效」，校验失败时返回「已保留上一份有效配置」。它不会主动重新读取磁盘上的 TOML；直接编辑配置文件后，Forge 检测到变化时会触发 `ModConfigEvent.Reloading`，走同一重建路径。
 - `ConfigValidator` 与 `ConfigWatcher` 已接入生产配置加载流程；`ConfigMigrations` 尚未接入，schema 迁移当前不生效。
@@ -275,21 +284,21 @@ ProjectE 原生值与 `custom_emc.json` 中的手动值不会进入这条候选�
 | `overflow.allowProjectEFileRewrite`                                                  | `false`      | 是否允许改写 ProjectE 的 `custom_emc.json`                                               |
 | `overflow.randomSeed`                                                                | `0`          | `0` 表示每次启动重新随机                                                                 |
 | `safety.maxAllowedDropRatio`                                                         | `0.5`        | 单次生成值允许的最大相对跌幅                                                             |
-| `nbt.maxNbtVariantsPerItem`                                                          | `100`        | 每个物品最多保留的 NBT 变体数；实际还受硬上限 `1000` 限制                                |
+| `nbt.maxNbtVariantsPerItem`                                                          | `100`        | 每个物品最多保留的 NBT 变体数；范围 `[1, 1000]`                                          |
 | `safety.creativeItemExclusions` / `creativeItemSpecialValues` / `creativeNamespaces` | 空列表       | 排除项同时作用于配方与兜底；固定值覆盖正常求解并作为下游输入；命名空间仅总开关开启时生效 |
 
 ### 交叉字段校验（Phase 16 已接线）
 
-| 条件                                                                       | 当前行为                                                                |
-| -------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| `overflow.threshold <= resetMax`                                           | 加载阶段记录警告；运行时重建被拒绝，保留上一份有效组件                  |
-| `overflow.resetMin > resetMax`                                             | 同上                                                                    |
-| `overflow.resetMin < 1` / `bucketCount < 1` / `weightCap < 1`              | Forge `defineInRange` 在加载时纠正越界值；运行时校验也会拒绝重建        |
-| `overwriteScope = entire_custom_emc` 且 `allowProjectEFileRewrite = false` | 只记录警告；不改写 `custom_emc.json`                                    |
-| 非法 `overwriteScope`                                                      | 回退为 `owned_only` 并记录警告；不拒绝重建                              |
-| `nbt.maxNbtVariantsPerItem > 1000`                                         | 运行时不拒绝；`VariantScanner` 以硬上限 `1000` 截断实际扫描数量         |
-| `safety.maxAllowedDropRatio = 0.0`                                         | Forge 接受；`LargeDropProtection.Settings` 构造失败，管线回退默认 `0.5` |
-| `fallback.minEmc < 0`                                                      | Forge `defineInRange` 在加载时纠正到 `0`                                |
+| 条件                                                                       | 当前行为                                                                 |
+| -------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `overflow.threshold <= resetMax`                                           | 加载阶段记录警告；运行时重建被拒绝，保留上一份有效组件                   |
+| `overflow.resetMin > resetMax`                                             | 同上                                                                     |
+| `overflow.resetMin < 1` / `bucketCount < 1` / `weightCap < 1`              | Forge `defineInRange` 在加载时纠正越界值；运行时校验也会拒绝重建         |
+| `overwriteScope = entire_custom_emc` 且 `allowProjectEFileRewrite = false` | 只记录警告；不改写 `custom_emc.json`                                     |
+| 非法 `overwriteScope`                                                      | 回退为 `owned_only` 并记录警告；不拒绝重建                               |
+| `nbt.maxNbtVariantsPerItem` 不在 `[1, 1000]` 内                            | Forge `defineInRange` 在加载时纠正越界值；运行时校验拒绝重建并保留旧组件 |
+| `safety.maxAllowedDropRatio = 0.0`                                         | Forge 接受；`LargeDropProtection.Settings` 构造失败，管线回退默认 `0.5`  |
+| `fallback.minEmc < 0`                                                      | Forge `defineInRange` 在加载时纠正到 `0`                                 |
 
 ### 警告条件
 
@@ -353,7 +362,7 @@ ProjectE 原生值与 `custom_emc.json` 中的手动值不会进入这条候选�
 ./gradlew test
 ```
 
-测试覆盖：加权采样分布与权重重置、阈值边界、幂等性、持久化往返、损坏文件容错、schema 版本保护、归属刷新、`custom_emc.json` 受控改写（备份、原子替换、未知字段保留）、配置热重载决策、NBT 变体规范化与扫描接线、兜底种子沿配方链传播（含默认 `PricingSettings`）、创造排除阻断配方与下游、固定值覆盖配方并作为下游输入、0 值既有 EMC 重新定价，以及求解轮数在报告与 `scan_state.json` 中的可观测性。当前基线共 **620 个单元测试通过**。
+测试覆盖：加权采样分布与权重重置、阈值边界、幂等性、持久化往返、损坏文件容错、schema 版本保护、归属刷新、`custom_emc.json` 受控改写（备份、原子替换、未知字段保留）、配置热重载决策、NBT 变体规范化与扫描接线、兜底种子沿配方链传播（含默认 `PricingSettings`）、创造排除阻断配方与下游、固定值覆盖配方并作为下游输入、0 值既有 EMC 重新定价，以及求解轮数在报告与 `scan_state.json` 中的可观测性。当前基线共 **624 个单元测试通过**。
 
 ---
 
@@ -369,7 +378,7 @@ ProjectE 原生值与 `custom_emc.json` 中的手动值不会进入这条候选�
 
 ## English Summary
 
-SudoersEMC is an independent Minecraft Forge 1.20.1 mod that generates EMC values for items that ProjectE does not price. Current baseline: Phase 18 branch `phase-18-chain-creative`, **620 unit tests passing**; Phase 18 is wired, real-environment verification is still pending.
+SudoersEMC is an independent Minecraft Forge 1.20.1 mod that generates EMC values for items that ProjectE does not price. Current baseline: Phase 18 branch `phase-18-chain-creative`, **624 unit tests passing**; Phase 18 is wired, real-environment verification is still pending.
 
 - **Queries** go through ProjectE's public `IEMCProxy`.
 - **Writes** use ProjectE's official `@EMCMapper` extension point (`priority = -1000`, `setValueBefore`), never ProjectE internals.
