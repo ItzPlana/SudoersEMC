@@ -138,11 +138,28 @@ public final class RecipeScanner {
          * @return 本次实际检查的配方数；全部处理完时返回 0
          */
         public int step(int maxItems) {
+            return step(maxItems, Long.MAX_VALUE);
+        }
+
+        /**
+         * 检查最多 {@code maxItems} 条配方，并在每条配方之间检查截止时间。
+         *
+         * <p>单条配方的描述无法被抢占，因此截止时间是最佳努力：本方法会在当前配方处理完后
+         * 立即返回，而不会中断正在进行的转换。</p>
+         *
+         * @param maxItems      本次允许处理的最大配方数，必须大于等于 1
+         * @param deadlineNanos {@link System#nanoTime()} 截止时间；{@link Long#MAX_VALUE} 表示不限
+         * @return 本次实际检查的配方数；全部处理完时返回 0
+         */
+        public int step(int maxItems, long deadlineNanos) {
             if (maxItems < 1) {
                 throw new IllegalArgumentException("maxItems 必须 >= 1，实际为 " + maxItems);
             }
             int work = 0;
             while (work < maxItems && index < ids.size()) {
+                if (deadlineReached(deadlineNanos)) {
+                    break;
+                }
                 ResourceLocation id = ids.get(index++);
                 work++;
                 scanOne(id);
@@ -151,6 +168,10 @@ public final class RecipeScanner {
                 logSummary();
             }
             return work;
+        }
+
+        private static boolean deadlineReached(long deadlineNanos) {
+            return deadlineNanos != Long.MAX_VALUE && System.nanoTime() >= deadlineNanos;
         }
 
         /**
