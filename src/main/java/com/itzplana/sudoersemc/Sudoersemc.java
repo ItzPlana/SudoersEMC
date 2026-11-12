@@ -339,6 +339,11 @@ public final class Sudoersemc {
     private static CreativeItemProtection createCreativeProtection() {
         try {
             boolean protectCreativeOnly = SudoersemcConfig.SAFETY_PROTECT_CREATIVE_ONLY_ITEMS.get();
+            if (!protectCreativeOnly) {
+                LOGGER.warn("SudoersEMC 创造物品保护已关闭：creativeNamespaces 不再生效，"
+                        + "创造专属物品可能获得 EMC 值；creativeItemExclusions 与 "
+                        + "creativeItemSpecialValues 仍然生效");
+            }
             CreativeItemProtection.ParsedSettings parsed = CreativeItemProtection.parseSettings(
                     protectCreativeOnly,
                     List.copyOf(SudoersemcConfig.SAFETY_CREATIVE_ITEM_EXCLUSIONS.get()),

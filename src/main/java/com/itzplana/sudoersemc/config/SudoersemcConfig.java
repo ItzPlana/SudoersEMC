@@ -130,18 +130,23 @@ public final class SudoersemcConfig {
                         "Largest allowed relative drop in a generated value, in [0, 1].")
                 .defineInRange("maxAllowedDropRatio", 0.5D, 0.0D, 1.0D);
         SAFETY_PROTECT_CREATIVE_ONLY_ITEMS = BUILDER.comment(
-                        "Do not generate survival-obtainable values for creative-only items.")
+                        "Do not generate survival-obtainable values for creative-only items.",
+                        "Disabling this only turns off creativeNamespaces; creativeItemExclusions",
+                        "and creativeItemSpecialValues still apply.")
                 .define("protectCreativeOnlyItems", true);
         SAFETY_CREATIVE_ITEM_EXCLUSIONS = BUILDER.comment(
-                        "Exact item ids that must never be auto-priced (format: namespace:path).")
+                        "Exact item ids that must never be auto-priced (format: namespace:path).",
+                        "Applies to both recipe solving and fallback pricing.")
                 .defineListAllowEmpty("creativeItemExclusions", List.of(),
                         entry -> entry instanceof String);
         SAFETY_CREATIVE_ITEM_SPECIAL_VALUES = BUILDER.comment(
-                        "Fixed EMC values that override normal solving (format: namespace:path=positive long).")
+                        "Fixed EMC values that override normal solving (format: namespace:path=positive long).",
+                        "Existing external/manual EMC values still take priority.")
                 .defineListAllowEmpty("creativeItemSpecialValues", List.of(),
                         entry -> entry instanceof String);
         SAFETY_CREATIVE_NAMESPACES = BUILDER.comment(
-                        "Namespaces whose items are treated as creative-only and never auto-priced.")
+                        "Namespaces whose items are treated as creative-only and never auto-priced.",
+                        "Only effective while protectCreativeOnlyItems is true.")
                 .defineListAllowEmpty("creativeNamespaces", List.of(),
                         entry -> entry instanceof String);
         BUILDER.pop();

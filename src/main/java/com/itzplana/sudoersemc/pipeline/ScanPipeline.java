@@ -88,7 +88,8 @@ public final class ScanPipeline {
      * 每次兜底补种后都需要重新求解，让新种子向配方上游传播。按求解器 {@code maxPasses=1}
      * 的最坏情况估算，4 轮可以覆盖“兜底种子 + 3 层中间产物”的常见模组链
      * （例如矿石 → 锭 → 齿轮/块）；默认 {@code maxPasses=20} 时通常 2 到 3 轮即收敛。
-     * 上限同时把异常配方图的开销限制在常量级，达到上限后直接使用当前种子定价。</p>
+     * 循环内不会给任何配方输出补种，只有收敛后的最终兜底才会处理它们，避免兜底值抢占
+     * 本应由配方成本决定的中间产物。上限同时把异常配方图的开销限制在常量级。</p>
      */
     static final int MAX_SOLVE_ROUNDS = 4;
 
@@ -546,10 +547,11 @@ public final class ScanPipeline {
      *
      * <p>本方法不访问注册表，只使用快照中的纯数据。处理顺序固定为：</p>
      * <ol>
-     *   <li>以已有 EMC 为初始种子，最多执行 {@link #MAX_SOLVE_ROUNDS} 轮
-     *       “配方求解 → 兜底补种”循环：每轮把本轮求解值并入种子，再对仍无种子的物品
-     *       执行兜底定价；本轮既没有新增求解值也没有新增兜底值时提前收敛；</li>
-     *   <li>收敛后统一合并候选：同一物品只保留一条，配方来源优先于任何兜底来源；</li>
+     *   <li>以已有 EMC 与创造保护固定值为初始种子，最多执行 {@link #MAX_SOLVE_ROUNDS} 轮
+     *       “配方求解 → 兜底补种”循环：循环内只给没有配方的叶子物品补种，把兜底值沿配方链
+     *       向上传播；本轮既没有新增求解值也没有新增兜底值时提前收敛；</li>
+     *   <li>收敛后再对仍无值的物品执行一次最终兜底，避免兜底种子抢占配方输出；</li>
+     *   <li>统一合并候选：同一物品只保留一条，配方/固定值来源优先于任何兜底来源；</li>
      *   <li>每个候选值先经过大幅降价保护，再经过溢出保护，最后才写入存储；</li>
      *   <li>更新扫描指纹、写出诊断报告并返回汇总结果。安全层、存储写入与报告只执行一次。</li>
      * </ol>
@@ -576,20 +578,35 @@ public final class ScanPipeline {
             Map<ItemKey, Candidate> fallbackCandidates = new TreeMap<>();
             Map<ItemKey, Long> seeds = initialSeeds(data);
 
+            CreativeProtectionPlan protection = planCreativeProtection(data, seeds, minimumEmc);
+            for (Map.Entry<ItemKey, Long> entry : protection.specialValues().entrySet()) {
+                ItemKey item = entry.getKey();
+                long value = entry.getValue();
+                seeds.put(item, value);
+                recipeCandidates.put(item,
+                        new Candidate(item, value, PriceSource.SPECIAL_VALUE, null));
+            }
+            Set<ItemKey> recipeOutputs = recipeOutputItems(data);
+
             SolveResult lastSolveResult = skippedSolveResult();
             int roundsUsed = 0;
             for (int round = 1; round <= MAX_SOLVE_ROUNDS; round++) {
                 roundsUsed = round;
-                SolveResult roundResult = solveRound(data, seeds);
+                SolveResult roundResult = solveRound(data, seeds, protection.deniedItems());
                 lastSolveResult = roundResult;
 
-                boolean solvedProgress = mergeSolvedValues(roundResult, recipeCandidates, seeds);
-                int fallbackAdded = addFallbackCandidates(data, seeds, fallbackCandidates);
+                boolean solvedProgress = mergeSolvedValues(roundResult, recipeCandidates, seeds,
+                        protection.deniedItems(), protection.specialValues());
+                int fallbackAdded = addFallbackCandidates(
+                        data, seeds, fallbackCandidates, recipeOutputs);
                 if (!solvedProgress && fallbackAdded == 0) {
                     break;
                 }
             }
             lastSolverRoundCount = roundsUsed;
+
+            // 收敛后再兜底：配方输出在循环内不会被兜底种子抢先定价，此处只处理仍然无值的物品。
+            addFallbackCandidates(data, seeds, fallbackCandidates, Set.of());
 
             List<Candidate> candidates =
                     selectFinalCandidates(recipeCandidates, fallbackCandidates, minimumEmc);
@@ -661,9 +678,9 @@ public final class ScanPipeline {
             lastDurationMillis = durationMillis;
 
             boolean appliedToStore = store != null;
-            updateScanState(data, durationMillis, applied, unresolved);
+            updateScanState(data, durationMillis, applied, unresolved, roundsUsed);
             writeDiagnosticReport(data, lastSolveResult, unresolved, applied, quarantined,
-                    overflowResets, durationMillis, appliedToStore, sourceCounts);
+                    overflowResets, durationMillis, roundsUsed, appliedToStore, sourceCounts);
 
             return new PipelineResult(
                     solvedByRecipe,
@@ -738,12 +755,13 @@ public final class ScanPipeline {
      * <p>关闭配方求解时返回空结果，但保留“每轮兜底补种”的循环结构：第一轮兜底命中后，
      * 第二轮没有新增值会立即退出。</p>
      */
-    private SolveResult solveRound(PipelineSnapshot data, Map<ItemKey, Long> seeds) {
+    private SolveResult solveRound(PipelineSnapshot data, Map<ItemKey, Long> seeds,
+                                   Set<ItemKey> deniedItems) {
         if (!solveRecipesEnabled) {
             LOGGER.debug("配方求解已按配置禁用，本轮仅使用既有值与兜底定价");
             return skippedSolveResult();
         }
-        SolveContext context = new SolveContext(seeds);
+        SolveContext context = new SolveContext(seeds, deniedItems);
         return new RecipeSolver().solve(
                 data.recipes(), context, EvaluatorRegistry.defaults(), solveSettings);
     }
@@ -752,27 +770,36 @@ public final class ScanPipeline {
      * 把一轮求解结果并入种子与配方候选。
      *
      * <p>同键取较小值，防止后续轮次抬高已生成值；仅当
-     * {@link SolveSettings#allowValueIncrease()} 为 {@code true} 时才接受新值覆盖。</p>
+     * {@link SolveSettings#allowValueIncrease()} 为 {@code true} 时才接受新值覆盖。
+     * 被创造保护拒绝的物品会被丢弃；配置了固定值的物品始终使用固定值，并记录为
+     * {@link PriceSource#SPECIAL_VALUE}。</p>
      *
      * @return 本轮是否新增或更新了任何种子
      */
     private boolean mergeSolvedValues(SolveResult solveResult,
                                       Map<ItemKey, Candidate> recipeCandidates,
-                                      Map<ItemKey, Long> seeds) {
+                                      Map<ItemKey, Long> seeds,
+                                      Set<ItemKey> deniedItems,
+                                      Map<ItemKey, Long> specialValues) {
         boolean changed = false;
         boolean allowIncrease = solveSettings.allowValueIncrease();
         for (Map.Entry<ItemKey, Long> entry : solveResult.values().entrySet()) {
             ItemKey item = entry.getKey();
             long solvedValue = entry.getValue();
-            if (solvedValue <= 0L) {
+            if (solvedValue <= 0L || deniedItems.contains(item)) {
                 continue;
+            }
+
+            Long specialValue = specialValues.get(item);
+            PriceSource source = PriceSource.RECIPE;
+            if (specialValue != null) {
+                solvedValue = specialValue;
+                source = PriceSource.SPECIAL_VALUE;
             }
 
             Long previous = seeds.get(item);
             long mergedValue;
-            if (previous == null) {
-                mergedValue = solvedValue;
-            } else if (allowIncrease) {
+            if (previous == null || source == PriceSource.SPECIAL_VALUE || allowIncrease) {
                 mergedValue = solvedValue;
             } else {
                 mergedValue = Math.min(previous, solvedValue);
@@ -782,12 +809,15 @@ public final class ScanPipeline {
                 changed = true;
             }
 
-            SolveTrace trace = solveResult.traces().get(item);
+            SolveTrace trace = source == PriceSource.RECIPE
+                    ? solveResult.traces().get(item)
+                    : null;
             ResourceLocation recipeId = trace == null ? null : trace.recipeId();
             Candidate existing = recipeCandidates.get(item);
-            if (existing == null || mergedValue < existing.value() || allowIncrease) {
+            if (existing == null || mergedValue < existing.value()
+                    || allowIncrease || source == PriceSource.SPECIAL_VALUE) {
                 recipeCandidates.put(item,
-                        new Candidate(item, mergedValue, PriceSource.RECIPE, recipeId));
+                        new Candidate(item, mergedValue, source, recipeId));
             }
         }
         return changed;
@@ -847,19 +877,26 @@ public final class ScanPipeline {
     /**
      * 为仍无种子的物品追加兜底候选，并把命中值并入种子。
      *
-     * <p>只处理既不在既有 EMC 中、也不在当前种子中的物品。创造物品保护决定物品是否允许自动
-     * 定价；固定值优先于兜底定价链。兜底链返回非正值、低于最小 EMC 或空结果时不产生候选。
-     * 命中值同时写入 {@code seeds}，使下一轮配方求解能够把兜底价格传播到上游中间产物。</p>
+     * <p>只处理既没有正值既有 EMC、也不在当前种子中的物品；0 值既有 EMC 等同于“没有值”。
+     * 创造物品保护决定物品是否允许自动定价；固定值优先于兜底定价链。兜底链返回非正值、
+     * 低于最小 EMC 或空结果时不产生候选。命中值同时写入 {@code seeds}，使下一轮配方求解
+     * 能够把兜底价格传播到上游中间产物。</p>
      *
+     * @param deferredItems 本次调用暂不处理的物品；循环内传入所有配方输出，最终兜底传入空集
      * @return 本轮新增的兜底候选数量
      */
     private int addFallbackCandidates(PipelineSnapshot snapshot, Map<ItemKey, Long> seeds,
-                                      Map<ItemKey, Candidate> candidates) {
+                                      Map<ItemKey, Candidate> candidates,
+                                      Set<ItemKey> deferredItems) {
         int added = 0;
         long minimumEmc = solveSettings.minimumEmc();
         for (ItemSnapshot itemSnapshot : snapshot.items()) {
             ItemKey item = itemSnapshot.key();
-            if (seeds.containsKey(item) || snapshot.existingValues().containsKey(item)) {
+            if (seeds.containsKey(item) || deferredItems.contains(item)) {
+                continue;
+            }
+            Long existingValue = snapshot.existingValues().get(item);
+            if (existingValue != null && existingValue > 0L) {
                 continue;
             }
 
@@ -876,8 +913,8 @@ public final class ScanPipeline {
 
             if (decision.specialValue() > 0L) {
                 if (decision.specialValue() >= minimumEmc) {
-                    Candidate candidate =
-                            new Candidate(item, decision.specialValue(), PriceSource.TIER, null);
+                    Candidate candidate = new Candidate(
+                            item, decision.specialValue(), PriceSource.SPECIAL_VALUE, null);
                     candidates.put(item, candidate);
                     seeds.put(item, candidate.value());
                     added++;
@@ -912,6 +949,89 @@ public final class ScanPipeline {
             added++;
         }
         return added;
+    }
+
+    /**
+     * 汇总创造物品保护在本轮扫描中的判定结果。
+     *
+     * <p>被排除的物品既不会获得配方/兜底值，也不会作为求解器的下游输入。固定值只在没有
+     * 正值既有 EMC 时生效：外部/手动值仍然优先，自有条目会先经过归属分离再重新定价。</p>
+     *
+     * @param snapshot 当前扫描快照
+     * @param seeds    初始种子，用于判断既有 EMC 是否受保护
+     * @param minimumEmc 生成值下限
+     * @return 禁止定价物品与生效的固定值
+     */
+    private CreativeProtectionPlan planCreativeProtection(PipelineSnapshot snapshot,
+                                                          Map<ItemKey, Long> seeds,
+                                                          long minimumEmc) {
+        Set<ItemKey> deniedItems = new HashSet<>();
+        Map<ItemKey, Long> specialValues = new LinkedHashMap<>();
+        for (ItemSnapshot itemSnapshot : snapshot.items()) {
+            ItemKey item = itemSnapshot.key();
+            CreativeItemProtection.Decision decision;
+            try {
+                decision = creativeProtection.decide(item, false, false);
+            } catch (RuntimeException failure) {
+                LOGGER.warn("创造物品保护判定失败，跳过物品 {}", item, failure);
+                continue;
+            }
+            if (!decision.priceable()) {
+                deniedItems.add(item);
+                continue;
+            }
+            long specialValue = decision.specialValue();
+            if (specialValue <= 0L) {
+                continue;
+            }
+            if (specialValue < minimumEmc) {
+                LOGGER.debug("物品 {} 的固定值 {} 低于最小 EMC {}，跳过",
+                        item, specialValue, minimumEmc);
+                continue;
+            }
+            if (seeds.containsKey(item)) {
+                // 既有 EMC（外部/手动值）优先于配置固定值。
+                continue;
+            }
+            specialValues.put(item, specialValue);
+        }
+        return new CreativeProtectionPlan(deniedItems, specialValues);
+    }
+
+    /**
+     * 收集所有会由配方产出的物品。
+     *
+     * <p>多轮兜底只给“叶子”物品补种：配方输出必须等待求解器按材料成本定价，否则第一轮
+     * 兜底种子会让 {@link RecipeSolver} 跳过发布，配方值永远无法覆盖兜底价。</p>
+     */
+    private static Set<ItemKey> recipeOutputItems(PipelineSnapshot snapshot) {
+        Set<ItemKey> outputs = new HashSet<>();
+        for (RecipeSnapshot recipe : snapshot.recipes()) {
+            if (recipe == null || recipe.outputs() == null) {
+                continue;
+            }
+            for (RecipeOutput output : recipe.outputs()) {
+                if (output != null && output.item() != null) {
+                    outputs.add(output.item());
+                }
+            }
+        }
+        return outputs;
+    }
+
+    /**
+     * 创造物品保护在本轮扫描中的预计算结果。
+     *
+     * @param deniedItems  禁止自动定价的物品
+     * @param specialValues 需要作为初始种子生效的固定值
+     */
+    private record CreativeProtectionPlan(Set<ItemKey> deniedItems,
+                                          Map<ItemKey, Long> specialValues) {
+
+        CreativeProtectionPlan {
+            deniedItems = Set.copyOf(deniedItems);
+            specialValues = Map.copyOf(specialValues);
+        }
     }
 
     /**
@@ -992,12 +1112,13 @@ public final class ScanPipeline {
      * 更新增量扫描状态。状态存储自身不会抛出异常，这里仍捕获运行时异常以保护结果返回路径。
      */
     private void updateScanState(PipelineSnapshot snapshot, long durationMillis,
-                                 int solvedCount, int unresolvedCount) {
+                                 int solvedCount, int unresolvedCount, int solverRounds) {
         if (stateStore == null) {
             return;
         }
         try {
-            stateStore.update(fingerprint(snapshot), durationMillis, solvedCount, unresolvedCount);
+            stateStore.update(fingerprint(snapshot), durationMillis, solvedCount, unresolvedCount,
+                    solverRounds);
         } catch (RuntimeException failure) {
             LOGGER.warn("更新扫描状态失败，本轮结果仍然有效", failure);
         }
@@ -1008,14 +1129,15 @@ public final class ScanPipeline {
      */
     private void writeDiagnosticReport(PipelineSnapshot snapshot, SolveResult solveResult,
                                        int unresolvedCount, int applied, int quarantined,
-                                       int overflowResets, long durationMillis,
+                                       int overflowResets, long durationMillis, int solverRounds,
                                        boolean appliedToStore, Map<String, Long> sourceCounts) {
         if (!generateReportsEnabled || reportManager == null) {
             return;
         }
         try {
             reportManager.writeReport(buildReport(snapshot, solveResult, unresolvedCount,
-                    quarantined, overflowResets, durationMillis, appliedToStore, sourceCounts));
+                    quarantined, overflowResets, durationMillis, solverRounds, appliedToStore,
+                    sourceCounts));
         } catch (RuntimeException failure) {
             LOGGER.warn("写入诊断报告失败，本轮结果仍然有效", failure);
         }
@@ -1031,15 +1153,18 @@ public final class ScanPipeline {
     private static DiagnosticReport buildReport(PipelineSnapshot snapshot, SolveResult solveResult,
                                                 int unresolvedCount, int quarantined,
                                                 int overflowResets, long durationMillis,
-                                                boolean appliedToStore,
+                                                int solverRounds, boolean appliedToStore,
                                                 Map<String, Long> sourceCounts) {
         Map<String, Long> extraCounters = new LinkedHashMap<>();
         extraCounters.put("unsupportedRecipes", (long) snapshot.unsupportedRecipes());
         extraCounters.put("invalidRecipes", (long) snapshot.invalidRecipes());
         extraCounters.put("failedRecipes", (long) snapshot.failedRecipes());
         extraCounters.put("solverPasses", (long) solveResult.passesUsed());
+        extraCounters.put("solverRounds", (long) solverRounds);
         extraCounters.put("recipesEvaluated", (long) solveResult.recipesEvaluated());
         extraCounters.put("solverConverged", solveResult.converged() ? 1L : 0L);
+        extraCounters.put("specialValues",
+                sourceCounts.getOrDefault(PriceSource.SPECIAL_VALUE.name(), 0L));
         extraCounters.put("overflowResets", (long) overflowResets);
         extraCounters.put("dryRun", appliedToStore ? 0L : 1L);
 

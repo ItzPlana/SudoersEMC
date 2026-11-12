@@ -572,6 +572,143 @@ class ScanPipelineTest {
     }
 
     @Test
+    void fallbackSeedPropagatesThroughRecipeChainWithDefaultPricing() throws IOException {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_chain_default.json"));
+        ScanStateStore stateStore = new ScanStateStore(
+                tempDir.resolve("scan_state_chain_default.json"));
+        ReportManager reportManager = new ReportManager(tempDir);
+        // 无标签的 COMMON 矿石在默认配置下命中 RARITY=16，正是 reviewer 指出的“锭/齿轮停留在 16”场景。
+        ItemSnapshot ore = ItemSnapshot.of(ORE, false, 0L, List.of(), Rarity.COMMON);
+        PipelineSnapshot snapshot = snapshot(
+                List.of(ore, item(INGOT, 0L), item(GEAR, 0L)),
+                List.of(oreToIngotRecipe(), gearRecipe()),
+                Map.of());
+        ScanPipeline pipeline = pipeline(
+                store, stateStore, reportManager, null, null, null,
+                FallbackPricing.withDefaults(PricingSettings.defaults()));
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(2, result.solvedByRecipe(), "默认配置下锭与齿轮仍应由配方定价");
+        assertEquals(1, result.solvedByFallback(), "矿石应由稀有度兜底定价");
+        assertEquals(3, result.applied());
+        GeneratedEmcEntry ingot = store.snapshotAll().get(INGOT);
+        GeneratedEmcEntry gear = store.snapshotAll().get(GEAR);
+        assertNotNull(ingot);
+        assertNotNull(gear);
+        assertEquals(PriceSource.RECIPE, ingot.source());
+        assertEquals(PriceSource.RECIPE, gear.source());
+        assertEquals(16L, ingot.value(), "锭必须继承矿石的 RARITY 兜底价，而不是停留在兜底值");
+        assertEquals(4L * ingot.value(), gear.value(),
+                "配方输出不得被第一轮兜底种子抢占");
+        assertTrue(pipeline.lastSolverRoundCount() > 1,
+                "兜底种子传播需要多轮收敛，实际轮数为 " + pipeline.lastSolverRoundCount());
+        assertTrue(stateStore.lastSolverRounds() > 1, "扫描状态必须记录实际求解轮数");
+
+        String report = Files.readString(reportManager.reportFile());
+        assertTrue(hasCounterLine(report, "solverRounds", pipeline.lastSolverRoundCount()),
+                "last_report.txt 应记录多轮收敛轮数");
+    }
+
+    @Test
+    void creativeExclusionBlocksRecipePricingAndDownstream() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_recipe_exclusion.json"));
+        CreativeItemProtection protection = new CreativeItemProtection(
+                new CreativeItemProtection.Settings(true, Set.of(INGOT_ID), Map.of(), Set.of()));
+        ItemSnapshot ore = ItemSnapshot.of(ORE, false, 0L, List.of("forge:ores/test"), Rarity.COMMON);
+        PipelineSnapshot snapshot = snapshot(
+                List.of(ore, item(INGOT, 0L), item(GEAR, 0L)),
+                List.of(oreToIngotRecipe(), gearRecipe()),
+                Map.of());
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, protection, null, tagOnlyFallback());
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1, result.solvedByFallback(), "只有矿石应通过标签兜底定价");
+        assertEquals(0, result.solvedByRecipe(), "被排除物品的配方值不得发布");
+        assertFalse(store.snapshotAll().containsKey(INGOT), "排除项不得获得 RECIPE 值");
+        assertFalse(store.snapshotAll().containsKey(GEAR),
+                "被排除物品也不得作为下游配方的输入");
+        assertNotNull(store.snapshotAll().get(ORE));
+    }
+
+    @Test
+    void creativeSpecialValueOverridesRecipePricing() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_recipe_special.json"));
+        CreativeItemProtection protection = new CreativeItemProtection(
+                new CreativeItemProtection.Settings(
+                        true, Set.of(), Map.of(INGOT_ID, 777L), Set.of()));
+        ItemSnapshot ore = ItemSnapshot.of(ORE, false, 0L, List.of("forge:ores/test"), Rarity.COMMON);
+        PipelineSnapshot snapshot = snapshot(
+                List.of(ore, item(INGOT, 0L), item(GEAR, 0L)),
+                List.of(oreToIngotRecipe(), gearRecipe()),
+                Map.of());
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, protection, null, tagOnlyFallback());
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        GeneratedEmcEntry ingot = store.snapshotAll().get(INGOT);
+        GeneratedEmcEntry gear = store.snapshotAll().get(GEAR);
+        assertNotNull(ingot);
+        assertNotNull(gear);
+        assertEquals(777L, ingot.value(), "固定值必须覆盖配方求解值");
+        assertEquals(PriceSource.SPECIAL_VALUE, ingot.source());
+        assertEquals(4L * 777L, gear.value(), "固定值必须作为下游配方的输入");
+        assertEquals(PriceSource.RECIPE, gear.source());
+        assertEquals(2, result.solvedByFallback(), "矿石兜底与固定值都计入非配方来源统计");
+        assertEquals(1, result.solvedByRecipe());
+        assertEquals(1L, result.sourceBreakdown().get(PriceSource.SPECIAL_VALUE.name()),
+                "固定值必须记录为独立来源");
+    }
+
+    @Test
+    void creativeSpecialValueDoesNotOverrideExternalExistingEmc() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_special_external.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 50L, PriceSource.EXISTING, null, false, 0L));
+        CreativeItemProtection protection = new CreativeItemProtection(
+                new CreativeItemProtection.Settings(
+                        true, Set.of(), Map.of(RESULT_ID, 64L), Set.of()));
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(RESULT, 50L)), List.of(), Map.of(RESULT, 50L));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, protection, null, disabledFallback());
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(0, result.applied(), "外部/手动既有值优先于配置固定值");
+        GeneratedEmcEntry existing = store.snapshotAll().get(RESULT);
+        assertNotNull(existing);
+        assertEquals(50L, existing.value());
+        assertFalse(existing.owned());
+    }
+
+    @Test
+    void zeroValuedExistingEmcIsStillPriced() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_zero_existing.json"));
+        ItemSnapshot zero = ItemSnapshot.of(RESULT, true, 0L);
+        PipelineSnapshot snapshot = snapshot(
+                List.of(zero), List.of(), Map.of(RESULT, 0L));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null, genericFallback(7L));
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1, result.solvedByFallback(), "0 值既有 EMC 等同于没有值");
+        assertEquals(1, result.applied());
+        GeneratedEmcEntry staged = store.snapshotAll().get(RESULT);
+        assertNotNull(staged);
+        assertEquals(7L, staged.value());
+        assertEquals(PriceSource.FALLBACK, staged.source());
+    }
+
+    @Test
     void emptyWorldStopsAfterSingleRoundWithZeroResult() {
         GeneratedEntryStore store = new GeneratedEntryStore(
                 tempDir.resolve("generated_empty_rounds.json"));
@@ -625,7 +762,7 @@ class ScanPipelineTest {
         GeneratedEmcEntry staged = store.snapshotAll().get(RESULT);
         assertNotNull(staged);
         assertEquals(64L, staged.value(), "特殊值必须优先于 RARE 稀有度的默认值");
-        assertEquals(PriceSource.TIER, staged.source());
+        assertEquals(PriceSource.SPECIAL_VALUE, staged.source());
     }
 
     @Test

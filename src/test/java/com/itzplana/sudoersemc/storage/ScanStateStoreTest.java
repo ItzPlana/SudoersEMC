@@ -57,7 +57,7 @@ class ScanStateStoreTest {
         ScanStateStore store = new ScanStateStore(file);
         ScanFingerprint fingerprint = fingerprint();
 
-        store.update(fingerprint, 1234L, 100, 5);
+        store.update(fingerprint, 1234L, 100, 5, 3);
         assertTrue(store.isDirty());
 
         store.save();
@@ -68,6 +68,7 @@ class ScanStateStoreTest {
         assertTrue(json.contains("\"lastScanDurationMillis\": 1234"));
         assertTrue(json.contains("\"lastSolvedCount\": 100"));
         assertTrue(json.contains("\"lastUnresolvedCount\": 5"));
+        assertTrue(json.contains("\"lastSolverRounds\": 3"));
 
         ScanStateStore reloaded = new ScanStateStore(file);
         reloaded.load();
@@ -77,6 +78,7 @@ class ScanStateStoreTest {
         assertEquals(1234L, reloaded.lastScanDurationMillis());
         assertEquals(100, reloaded.lastSolvedCount());
         assertEquals(5, reloaded.lastUnresolvedCount());
+        assertEquals(3, reloaded.lastSolverRounds());
         assertTrue(reloaded.lastScanEpochMillis() > 0L);
         assertFalse(reloaded.isDirty());
     }

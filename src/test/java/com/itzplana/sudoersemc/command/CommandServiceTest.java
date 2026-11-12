@@ -82,14 +82,14 @@ class CommandServiceTest {
     @Test
     void statusUsesScanStateStoreForLastScanSummary() {
         ScanStateStore stateStore = new ScanStateStore(tempDir.resolve(ScanStateStore.FILE_NAME));
-        stateStore.update(ScanFingerprint.of(null, null, null, null, null), 1234L, 56, 7);
+        stateStore.update(ScanFingerprint.of(null, null, null, null, null), 1234L, 56, 7, 3);
         CommandService service = new CommandService(idleManager(), null, null, stateStore);
 
         CommandResult result = service.status();
 
         assertTrue(result.success());
         assertTrue(result.joinLines().contains("上次扫描: 1234 ms"));
-        assertTrue(result.joinLines().contains("上次结果: 已定价 56 项，未解析 7 项"));
+        assertTrue(result.joinLines().contains("上次结果: 已定价 56 项，未解析 7 项，求解轮数 3"));
     }
 
     @Test
