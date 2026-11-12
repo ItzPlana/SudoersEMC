@@ -185,11 +185,17 @@ public final class QuarantinedDropsStore {
         }
     }
 
-    /** 若存在尚未写盘的变更则保存。 */
-    public void saveIfDirty() {
+    /**
+     * 若存在尚未写盘的变更则保存。
+     *
+     * @return 没有待保存变更或保存成功时为 {@code true}；保存失败（包括不支持的 schema 版本）
+     *         时为 {@code false}
+     */
+    public boolean saveIfDirty() {
         if (dirty.get()) {
-            save();
+            return save();
         }
+        return true;
     }
 
     /**
@@ -197,14 +203,17 @@ public final class QuarantinedDropsStore {
      *
      * <p>不支持的更高版本会阻止写入。首次重写已存在的文件前会生成带时间戳的 {@code .bak}。
      * 写入或备份失败时保留脏标记，调用方可在下一次 {@link #saveIfDirty()} 时重试。</p>
+     *
+     * @return 写入成功或无需写入时为 {@code true}；版本不受支持、备份或写入失败时为
+     *         {@code false}
      */
-    public void save() {
+    public boolean save() {
         synchronized (lock) {
             if (unsupportedSchemaVersion) {
                 LOGGER.warn(
                         "不保存 {}：该文件由不受支持的 schemaVersion {} 写入",
                         file, loadedSchemaVersion);
-                return;
+                return false;
             }
             // 先清除脏标记：并发记录会重新置位，留给下一次保存。
             dirty.set(false);
@@ -221,16 +230,19 @@ public final class QuarantinedDropsStore {
                 if (backupPending && !JsonFileIO.backupIfExists(file)) {
                     dirty.set(true);
                     LOGGER.warn("保存隔离记录到 {} 失败：无法创建备份，保留待保存状态等待重试", file);
-                    return;
+                    return false;
                 }
                 if (!JsonFileIO.writeAtomically(file, dto)) {
                     dirty.set(true);
-                    return;
+                    LOGGER.warn("保存隔离记录到 {} 失败：原子写入未完成，保留待保存状态等待重试", file);
+                    return false;
                 }
                 backupPending = false;
+                return true;
             } catch (RuntimeException e) {
                 dirty.set(true);
                 LOGGER.warn("保存隔离记录到 {} 失败", file, e);
+                return false;
             }
         }
     }
@@ -238,9 +250,10 @@ public final class QuarantinedDropsStore {
     /**
      * 记录一条隔离降价。
      *
-     * <p>同一物品已有记录时直接替换，保证一个物品最多一条待审记录；替换不会保留旧的审批状态，
-     * 因为新隔离是一次全新的判定。写入后若超过上限，会按时间戳淘汰最旧的条目。{@code null}
-     * 会被忽略。</p>
+     * <p>同一物品已有记录时直接替换，保证一个物品最多一条待审记录。若新旧记录表示同一次
+     * 经济判定（旧值、拟写入值、降幅与原因完全相同），则保留已有审批状态，避免下一次扫描
+     * 静默清除管理员审批；拟写入值等发生变化时视为新的隔离事件，审批状态重置为未批准。
+     * 写入后若超过上限，会按时间戳淘汰最旧的条目。{@code null} 会被忽略。</p>
      *
      * @param drop 隔离记录；构造时已经完成数值校验
      */
@@ -250,6 +263,10 @@ public final class QuarantinedDropsStore {
         }
         synchronized (lock) {
             try {
+                QuarantinedDrop existing = entries.get(drop.key());
+                if (existing != null && existing.approved() && sameDecision(existing, drop)) {
+                    drop = drop.withApproved(true);
+                }
                 entries.put(drop.key(), drop);
                 trimToCapacity();
                 dirty.set(true);
@@ -257,6 +274,14 @@ public final class QuarantinedDropsStore {
                 LOGGER.warn("记录隔离降价失败：{}", drop.key(), e);
             }
         }
+    }
+
+    /** 判断两条记录是否描述同一次经济判定；时间戳与审批状态不参与比较。 */
+    private static boolean sameDecision(QuarantinedDrop left, QuarantinedDrop right) {
+        return left.previousValue() == right.previousValue()
+                && left.proposedValue() == right.proposedValue()
+                && Double.compare(left.dropRatio(), right.dropRatio()) == 0
+                && left.reason().equals(right.reason());
     }
 
     /**

@@ -33,6 +33,21 @@ public interface EmcProvider {
     long getValue(ItemStack stack);
 
     /**
+     * 查询完整 NBT 对应的精确 EMC 值，不回退到基础物品。
+     *
+     * <p>ProjectE 的 {@link #getValue(ItemStack)} 对带 NBT 的堆叠会先查精确映射，
+     * 未命中时回退基础物品值并叠加 NBT 处理器。变体扫描需要区分“该 NBT 自身已有值”
+     * 与“仅继承基础物品值”，因此提供该精确查询。默认实现退回 {@link #getValue(ItemStack)}，
+     * 供没有精确 NBT 概念的后端使用。</p>
+     *
+     * @param stack 待查询堆叠
+     * @return 精确 NBT 映射值；没有 NBT 专属映射时返回 {@code 0}
+     */
+    default long getExactValue(ItemStack stack) {
+        return getValue(stack);
+    }
+
+    /**
      * Records a generated value as owned by SudoersEMC.
      *
      * <p>This only stages the value in the ownership store. The actual ProjectE write happens

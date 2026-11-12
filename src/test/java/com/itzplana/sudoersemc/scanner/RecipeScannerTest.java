@@ -5,21 +5,36 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.itzplana.sudoersemc.core.ItemKey;
 import java.util.List;
+import java.util.Optional;
+import java.util.stream.Stream;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.NonNullList;
+import net.minecraft.core.RegistryAccess;
+import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.TagParser;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.Bootstrap;
+import net.minecraft.tags.TagKey;
+import net.minecraft.world.inventory.CraftingContainer;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.crafting.CraftingBookCategory;
+import net.minecraft.world.item.crafting.CraftingRecipe;
 import net.minecraft.world.item.crafting.Ingredient;
+import net.minecraft.world.item.crafting.Recipe;
+import net.minecraft.world.item.crafting.RecipeManager;
+import net.minecraft.world.item.crafting.RecipeSerializer;
+import net.minecraft.world.item.crafting.RecipeType;
 import net.minecraft.world.item.crafting.ShapedRecipe;
 import net.minecraft.world.item.crafting.ShapelessRecipe;
+import net.minecraft.world.level.Level;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -30,8 +45,11 @@ import org.junit.jupiter.api.Test;
  */
 class RecipeScannerTest {
 
+    private static final ResourceLocation RECIPE_ID = new ResourceLocation("sudoersemc_test", "recipe");
     private static final ResourceLocation DIAMOND_SWORD_ID =
             new ResourceLocation("minecraft", "diamond_sword");
+    private static final ResourceLocation STONE_ID = new ResourceLocation("minecraft", "stone");
+    private final RecipeScanner scanner = new RecipeScanner();
 
     static {
         SharedConstants.tryDetectVersion();
@@ -146,6 +164,197 @@ class RecipeScannerTest {
         assertEquals("1", snapshot.attribute("gridHeight"));
         assertEquals(1, snapshot.outputs().size());
         assertEquals(4, snapshot.primaryOutput().count(), "结果堆叠数量必须保留");
+    }
+
+    @Test
+    void recipeEnumerationFailureIsReportedAsUnknownTotal() {
+        RecipeScanner.ScanResult result = scanner.scan(new ExplodingRecipeManager());
+
+        assertTrue(result.enumerationFailed(), "枚举失败必须使用独立标志");
+        assertEquals(0, result.failed(), "不得把枚举失败伪造成一条失败配方");
+        assertEquals(0, result.total(), "枚举失败时配方总数未知");
+        assertEquals(1, result.failedRecipeDetails().size());
+        assertTrue(result.failedRecipeDetails().get(0).contains("recipe-manager"));
+    }
+
+    @Test
+    void failedRecipeDetailsAreCappedButFailureCountKeepsGrowing() {
+        int brokenRecipes = RecipeScanner.MAX_FAILED_DETAILS + 10;
+        RecipeScanner.ScanResult result = scanner.scan(new FailingRecipeManager(brokenRecipes));
+
+        assertFalse(result.enumerationFailed());
+        assertEquals(brokenRecipes, result.failed(), "失败总数必须继续累加");
+        assertEquals(RecipeScanner.MAX_FAILED_DETAILS, result.failedRecipeDetails().size(),
+                "失败明细必须限制在内存上限内");
+    }
+
+
+    @Test
+    void zeroDamageOnlyTagIsNormalizedToPlainItem() {
+        ItemStack stack = new ItemStack(Items.STONE);
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 0);
+        stack.setTag(tag);
+
+        RecipeOutput output = RecipeScanner.convertStack(stack);
+
+        assertNotNull(output);
+        assertNull(output.outputNbt(), "仅 Damage:0 不应生成配方输出 NBT");
+        assertEquals(ItemKey.of(STONE_ID), output.item(), "仅 Damage:0 不应产生伪变体身份");
+    }
+
+    @Test
+    void linkageErrorDuringRecipeLookupCountsAsFailed() {
+        RecipeManager manager = new RecipeManager() {
+
+            @Override
+            public Stream<ResourceLocation> getRecipeIds() {
+                return Stream.of(RECIPE_ID);
+            }
+
+            @Override
+            public Optional<? extends Recipe<?>> byKey(ResourceLocation id) {
+                throw new NoClassDefFoundError("broken recipe class");
+            }
+        };
+
+        RecipeScanner.ScanResult result = scanner.scan(manager);
+
+        assertEquals(0, result.recipes().size());
+        assertEquals(1, result.failed(), "单条配方链接失败必须计入 failed");
+        assertEquals(1, result.total());
+    }
+
+    @Test
+    void linkageErrorWhileDescribingRecipeCountsAsFailed() {
+        Recipe<CraftingContainer> brokenResult = new CraftingRecipe() {
+
+            @Override
+            public boolean matches(CraftingContainer container, Level level) {
+                return false;
+            }
+
+            @Override
+            public ItemStack assemble(CraftingContainer container, RegistryAccess access) {
+                return ItemStack.EMPTY;
+            }
+
+            @Override
+            public boolean canCraftInDimensions(int width, int height) {
+                return true;
+            }
+
+            @Override
+            public ItemStack getResultItem(RegistryAccess access) {
+                throw new NoClassDefFoundError("broken recipe result");
+            }
+
+            @Override
+            public ResourceLocation getId() {
+                return RECIPE_ID;
+            }
+
+            @Override
+            public RecipeSerializer<?> getSerializer() {
+                return null;
+            }
+
+            @Override
+            public RecipeType<?> getType() {
+                return RecipeType.CRAFTING;
+            }
+
+            @Override
+            public CraftingBookCategory category() {
+                return CraftingBookCategory.MISC;
+            }
+
+            @Override
+            public NonNullList<Ingredient> getIngredients() {
+                return NonNullList.of(Ingredient.EMPTY, Ingredient.of(Items.DIRT));
+            }
+        };
+
+        RecipeManager manager = new RecipeManager() {
+
+            @Override
+            public Stream<ResourceLocation> getRecipeIds() {
+                return Stream.of(RECIPE_ID);
+            }
+
+            @Override
+            public Optional<? extends Recipe<?>> byKey(ResourceLocation id) {
+                return Optional.of(brokenResult);
+            }
+        };
+
+        RecipeScanner.ScanResult result = scanner.scan(manager);
+
+        assertEquals(0, result.recipes().size());
+        assertEquals(1, result.failed(), "单条配方描述时的 LinkageError 必须计入 failed");
+        assertEquals(1, result.total());
+    }
+
+    @Test
+    void nonDamageableNbtOutputUsesVariantIdentityAndKeepsRawNbt() {
+        ItemStack stack = new ItemStack(Items.STONE);
+        CompoundTag display = new CompoundTag();
+        display.putString("Name", "{\"text\":\"只影响展示\"}");
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Marker", 7);
+        tag.put("display", display);
+        stack.setTag(tag);
+
+        RecipeOutput output = RecipeScanner.convertStack(stack);
+
+        assertNotNull(output);
+        assertEquals(ItemKey.of(STONE_ID, "{Marker:7}"), output.item(),
+                "求解与变体扫描必须使用同一规范化身份");
+        assertEquals(tag.toString(), output.outputNbt(),
+                "注册 ProjectE 仍需要包含 display 的原始 SNBT");
+    }
+
+
+    private static TagKey<Item> unboundTag() {
+        return TagKey.create(Registries.ITEM, new ResourceLocation("sudoersemc_test", "unbound"));
+    }
+
+    /** 模拟配方管理器整体枚举失败。 */
+    private static final class ExplodingRecipeManager extends RecipeManager {
+
+        @Override
+        public Stream<ResourceLocation> getRecipeIds() {
+            throw new IllegalStateException("枚举爆炸");
+        }
+    }
+
+    /** 模拟大量配方在读取时抛异常，用于验证失败明细上限。 */
+    private static final class FailingRecipeManager extends RecipeManager {
+
+        private final int recipeCount;
+
+        private FailingRecipeManager(int recipeCount) {
+            this.recipeCount = recipeCount;
+        }
+
+        @Override
+        public Stream<ResourceLocation> getRecipeIds() {
+            return java.util.stream.IntStream.range(0, recipeCount)
+                    .mapToObj(index -> new ResourceLocation("sudoersemc_test", "broken_" + index));
+        }
+
+        @Override
+        public Optional<? extends Recipe<?>> byKey(ResourceLocation id) {
+            throw new IllegalStateException("配方损坏");
+        }
+    }
+
+    private static ShapedRecipe shaped(int width, int height, Ingredient first, Ingredient second,
+                                       ItemStack result) {
+        NonNullList<Ingredient> ingredients = NonNullList.withSize(width * height, Ingredient.EMPTY);
+        ingredients.set(0, first);
+        ingredients.set(1, second);
+        return new ShapedRecipe(RECIPE_ID, "", CraftingBookCategory.MISC, width, height, ingredients, result);
     }
 
     @Test

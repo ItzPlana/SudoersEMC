@@ -31,6 +31,14 @@ public final class SudoersemcConfig {
 
     private static final Logger LOGGER = LogUtils.getLogger();
 
+    /**
+     * 扫描指纹/定价语义版本。
+     *
+     * <p>任何会改变生成价格的算法、解析或缓存格式变更都必须递增该值；它参与配置通道指纹，
+     * 确保升级后即使注册表与配置未变，也不会静默复用旧算法生成的价格。</p>
+     */
+    public static final int SCAN_FINGERPRINT_VERSION = 1;
+
     private static final ForgeConfigSpec.Builder BUILDER = new ForgeConfigSpec.Builder();
 
     /** 非法配方选择策略只警告一次，避免热重载时刷屏。 */
@@ -97,10 +105,14 @@ public final class SudoersemcConfig {
     static {
         // [general]
         BUILDER.comment("General operation switches.").push("general");
-        GENERAL_ENABLED = BUILDER.comment("Master switch for automatic EMC generation.")
+        GENERAL_ENABLED = BUILDER.comment(
+                        "Master switch for the scan service.",
+                        "When false no ScanManager is created: startup auto scanning and manual",
+                        "/sudoemc rescan-all are both unavailable.")
                 .define("enabled", true);
         GENERAL_ALWAYS_RESCAN = BUILDER.comment(
-                        "Rescan all items on every server start instead of reusing cached state.")
+                        "Rescan all items on every server start instead of reusing cached state.",
+                        "Only takes effect when [general] enabled is true.")
                 .define("alwaysRescan", false);
         BUILDER.pop();
 
@@ -149,12 +161,15 @@ public final class SudoersemcConfig {
                         "Use a generic fallback value for items no other source can price.")
                 .define("useFallbackForUnsolvable", true);
         FALLBACK_USE_TAG_PRICING = BUILDER.comment(
-                        "Derive values from item tags and material relationships.")
+                        "Derive values from item tags and material relationships.",
+                        "Category anchors are iron-based; cheap renewable materials may be overvalued",
+                        "when ProjectE has no explicit value for the matching block/ingot.")
                 .define("useTagPricing", true);
         FALLBACK_USE_RARITY_PRICING = BUILDER.comment("Derive values from item rarity.")
                 .define("useRarityPricing", true);
         FALLBACK_USE_PROJECTE_INTEGRATION_BASELINES = BUILDER.comment(
-                        "Use ProjectE integration baselines when available.")
+                        "Use ProjectE integration baselines when available.",
+                        "Reserved for Phase 25; this Phase 16 build does not read this key yet.")
                 .define("useProjectEIntegrationBaselines", true);
         FALLBACK_MIN_EMC = BUILDER.comment(
                         "Minimum EMC value for fallback pricing; lower candidates are discarded.",
@@ -181,18 +196,23 @@ public final class SudoersemcConfig {
                 .defineListAllowEmpty("dropProtectionExemptItems", List.of(),
                         entry -> entry instanceof String);
         SAFETY_PROTECT_CREATIVE_ONLY_ITEMS = BUILDER.comment(
-                        "Do not generate survival-obtainable values for creative-only items.")
+                        "Do not generate survival-obtainable values for creative-only items.",
+                        "Disabling this only turns off creativeNamespaces; creativeItemExclusions",
+                        "and creativeItemSpecialValues still apply.")
                 .define("protectCreativeOnlyItems", true);
         SAFETY_CREATIVE_ITEM_EXCLUSIONS = BUILDER.comment(
-                        "Exact item ids that must never be auto-priced (format: namespace:path).")
+                        "Exact item ids that must never be auto-priced (format: namespace:path).",
+                        "Applies to both recipe solving and fallback pricing.")
                 .defineListAllowEmpty("creativeItemExclusions", List.of(),
                         entry -> entry instanceof String);
         SAFETY_CREATIVE_ITEM_SPECIAL_VALUES = BUILDER.comment(
-                        "Fixed EMC values that override normal solving (format: namespace:path=positive long).")
+                        "Fixed EMC values that override normal solving (format: namespace:path=positive long).",
+                        "Existing external/manual EMC values still take priority.")
                 .defineListAllowEmpty("creativeItemSpecialValues", List.of(),
                         entry -> entry instanceof String);
         SAFETY_CREATIVE_NAMESPACES = BUILDER.comment(
-                        "Namespaces whose items are treated as creative-only and never auto-priced.")
+                        "Namespaces whose items are treated as creative-only and never auto-priced.",
+                        "Only effective while protectCreativeOnlyItems is true.")
                 .defineListAllowEmpty("creativeNamespaces", List.of(),
                         entry -> entry instanceof String);
         SAFETY_AUTO_DETECT_CREATIVE_ONLY_ITEMS = BUILDER.comment(
@@ -239,11 +259,13 @@ public final class SudoersemcConfig {
         OVERFLOW_OVERWRITE_SCOPE = BUILDER.comment(
                         "Which values overflow protection may reset.",
                         "owned_only: only entries generated and owned by SudoersEMC",
-                        "entire_custom_emc: also rewrite ProjectE's config/ProjectE/custom_emc.json",
+                        "entire_custom_emc: also scan ProjectE's config/ProjectE/custom_emc.json for entries owned by SudoersEMC",
+                        "Administrator-configured (non-owned) entries are never rewritten.",
                         "Unknown values fall back to owned_only.")
                 .define("overwriteScope", "owned_only");
         OVERFLOW_ALLOW_PROJECTE_FILE_REWRITE = BUILDER.comment(
-                        "Explicit opt-in required before ProjectE's custom_emc.json may be rewritten.")
+                        "Explicit opt-in required before SudoersEMC-owned entries in ProjectE's custom_emc.json may be rewritten;",
+                        "administrator-configured (non-owned) entries are never rewritten.")
                 .define("allowProjectEFileRewrite", false);
         OVERFLOW_RANDOM_SEED = BUILDER.comment(
                         "Sampler seed; 0 requests a fresh random seed at startup.")
@@ -262,7 +284,8 @@ public final class SudoersemcConfig {
 
         // [diagnostic]
         BUILDER.comment("Diagnostic logging and reports.").push("diagnostic");
-        DIAGNOSTIC_DEBUG_LOGGING = BUILDER.comment("Enable verbose diagnostic logging.")
+        DIAGNOSTIC_DEBUG_LOGGING = BUILDER.comment("Enable verbose diagnostic logging.",
+                        "Reserved for Phase 25; this Phase 16 build does not read this key yet.")
                 .define("debugLogging", false);
         DIAGNOSTIC_GENERATE_REPORTS = BUILDER.comment("Write diagnostic reports after scans.")
                 .define("generateReports", true);
@@ -410,6 +433,9 @@ public final class SudoersemcConfig {
     public static List<String> scanFingerprintEntries() {
         List<String> entries = new ArrayList<>();
         try {
+            // 指纹/定价语义版本的显式盐：算法或格式变化必须递增该常量，
+            // 否则升级后会复用旧算法生成的价格。
+            addEntry(entries, "fingerprint.version", SCAN_FINGERPRINT_VERSION);
             addEntry(entries, "recipe.solveRecipes", RECIPE_SOLVE_RECIPES.get());
             addEntry(entries, "recipe.maxRecipePasses", RECIPE_MAX_RECIPE_PASSES.get());
             addEntry(entries, "recipe.allowRecipeValueIncrease", RECIPE_ALLOW_RECIPE_VALUE_INCREASE.get());

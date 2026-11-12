@@ -8,7 +8,9 @@ import com.mojang.logging.LogUtils;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
+import moze_intel.projecte.api.ItemInfo;
 import moze_intel.projecte.api.proxy.IEMCProxy;
+import moze_intel.projecte.emc.EMCMappingHandler;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.item.ItemStack;
@@ -77,6 +79,26 @@ public final class ProjectECompat implements EmcProvider {
             return IEMCProxy.INSTANCE.getValue(stack);
         } catch (Throwable t) {
             degrade("IEMCProxy.getValue(ItemStack)", t);
+            return 0L;
+        }
+    }
+
+    /**
+     * 查询完整 NBT 的精确 EMC 映射。
+     *
+     * <p>{@code IEMCProxy.getValue(ItemStack)} 在 NBT 未命中时会回退基础物品值，
+     * 无法区分“该 NBT 自身已有映射”与“仅继承基础物品”。这里直接查询 ProjectE 的
+     * 映射表，避免变体扫描把基础物品值误当成 NBT 专属值，也避免覆盖外部 NBT 值。</p>
+     */
+    @Override
+    public long getExactValue(ItemStack stack) {
+        if (stack == null || stack.isEmpty() || !isAvailable()) {
+            return 0L;
+        }
+        try {
+            return Math.max(0L, EMCMappingHandler.getStoredEmcValue(ItemInfo.fromStack(stack)));
+        } catch (Throwable t) {
+            degrade("EMCMappingHandler.getStoredEmcValue(ItemInfo)", t);
             return 0L;
         }
     }

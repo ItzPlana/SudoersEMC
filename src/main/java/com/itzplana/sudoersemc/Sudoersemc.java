@@ -47,6 +47,7 @@ import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.event.server.ServerStartedEvent;
 import net.minecraftforge.event.server.ServerStoppingEvent;
 import net.minecraftforge.eventbus.api.IEventBus;
+import net.minecraftforge.fml.ModList;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.event.config.ModConfigEvent;
 import net.minecraftforge.fml.event.lifecycle.FMLCommonSetupEvent;
@@ -342,7 +343,8 @@ public final class Sudoersemc {
         try {
             LargeDropProtection.ParsedSettings parsed = LargeDropProtection.parseSettings(
                     SudoersemcConfig.SAFETY_LARGE_DROP_PROTECTION.get(),
-                    SudoersemcConfig.SAFETY_MAX_ALLOWED_DROP_RATIO.get(),
+                    sanitizeMaxAllowedDropRatio(
+                            SudoersemcConfig.SAFETY_MAX_ALLOWED_DROP_RATIO.get()),
                     List.copyOf(SudoersemcConfig.SAFETY_DROP_PROTECTION_EXEMPT_NAMESPACES.get()),
                     List.copyOf(SudoersemcConfig.SAFETY_DROP_PROTECTION_EXEMPT_ITEMS.get()));
             if (!parsed.skippedEntries().isEmpty()) {
@@ -366,6 +368,11 @@ public final class Sudoersemc {
     private static CreativeItemProtection createCreativeProtection() {
         try {
             boolean protectCreativeOnly = SudoersemcConfig.SAFETY_PROTECT_CREATIVE_ONLY_ITEMS.get();
+            if (!protectCreativeOnly) {
+                LOGGER.warn("SudoersEMC 创造物品保护已关闭：creativeNamespaces 不再生效，"
+                        + "创造专属物品可能获得 EMC 值；creativeItemExclusions 与 "
+                        + "creativeItemSpecialValues 仍然生效");
+            }
             CreativeItemProtection.ParsedSettings parsed = CreativeItemProtection.parseSettings(
                     protectCreativeOnly,
                     List.copyOf(SudoersemcConfig.SAFETY_CREATIVE_ITEM_EXCLUSIONS.get()),
@@ -515,6 +522,23 @@ public final class Sudoersemc {
     }
 
     /**
+     * 把配置中的最大允许降幅夹到 {@link LargeDropProtection.Settings} 接受的 {@code (0.0, 1.0]} 区间。
+     *
+     * <p>配置边界已经拒绝 0.0，但旧配置文件、手工编辑或未来迁移仍可能绕过边界检查。这里再做一次
+     * 防御：任何非有限、非正或大于 1 的值都按 {@link Double#MIN_VALUE} 处理，语义是“任何正降幅
+     * 都隔离”。绝不静默退回默认的 0.5，避免管理员以为关闭了降价却被允许 50% 降价。</p>
+     *
+     * @param configured 配置读取到的最大允许降幅
+     * @return 位于 {@code (0.0, 1.0]} 的可用值
+     */
+    static double sanitizeMaxAllowedDropRatio(double configured) {
+        if (!Double.isFinite(configured) || configured <= 0.0D || configured > 1.0D) {
+            return Double.MIN_VALUE;
+        }
+        return configured;
+    }
+
+    /**
      * 创建扫描调度器并接入真实管线。
      *
      * <p>接线采用“采集暂存、应用取出”的方式：采集回调在服务器线程完成注册表与配方读取后把
@@ -544,13 +568,30 @@ public final class Sudoersemc {
             // 调度器与管线共享同一个取消令牌：cancel() 后采集/求解/应用循环都能在检查点提前退出。
             pipeline.setCancellationCheck(cancellation::isRequested);
         }
+        ScanManager.ResultApplier applier = new ScanManager.ResultApplier() {
+            @Override
+            public void apply(ScanManager.SnapshotData data) {
+                applySnapshot(pipeline);
+            }
+
+            @Override
+            public void onCompleted() {
+                // 最后一个 tick 的耗时/内存样本已经记录，此时写报告才能包含 APPLYING/SAVING。
+                if (pipeline != null) {
+                    pipeline.writePendingReport();
+                }
+            }
+        };
         return new ScanManager(
                 processor,
-                () -> collectSnapshot(pipeline),
-                data -> applySnapshot(pipeline),
+                () -> ScanManager.oneShot(collectSnapshot(pipeline)).begin(),
+                applier,
                 TICK_BUDGET_NANOS,
                 diagnostics,
                 (phase, progress, telemetry) -> {
+                    if (pipeline == null) {
+                        return;
+                    }
                     if (phase == ScanPhase.CANCELLED) {
                         pipeline.writeCancelledReport(telemetry);
                     } else if (phase == ScanPhase.FAILED) {
@@ -561,9 +602,13 @@ public final class Sudoersemc {
     }
 
     /**
-     * 构造外部基线的指纹条目：ProjectE 手动 EMC 物品值与手动标签。
+     * 构造外部基线的指纹条目：ProjectE 手动 EMC 物品值、手动标签与 ProjectE 版本。
      *
-     * <p>文件缺失或未安装 ProjectE 时返回空列表；读取失败按空处理，绝不影响启动。</p>
+     * <p>ProjectE 原生 EMC 是求解种子的一部分：即使物品/配方/标签与手动配置都没有变化，
+     * 升级 ProjectE 也可能改变基线。这里把版本纳入基线通道；无法确定版本时使用固定标记。</p>
+     *
+     * <p>文件缺失或未安装 ProjectE 时仍会输出 {@code projecte=false}；读取失败返回固定的
+     * {@code fingerprint-error:baseline}，与“确实没有手动值”区分开，让指纹必然变化。</p>
      */
     private static List<String> baselineFingerprintEntries() {
         try {
@@ -577,10 +622,29 @@ public final class Sudoersemc {
                 entries.add("tag:#" + tagId);
             }
             entries.add("projecte=" + OptionalIntegrationManager.isProjectEAvailable());
+            entries.add("projecte.version=" + projecteVersion());
             return entries;
         } catch (RuntimeException failure) {
-            LOGGER.warn("SudoersEMC 读取外部基线指纹失败，按空基线处理", failure);
-            return List.of();
+            LOGGER.warn("SudoersEMC 读取外部基线指纹失败，使用固定错误标记", failure);
+            return List.of("fingerprint-error:baseline");
+        }
+    }
+
+    /**
+     * 读取 ProjectE 模组版本；模组列表不可用或读取失败时返回固定标记。
+     */
+    private static String projecteVersion() {
+        try {
+            ModList modList = ModList.get();
+            if (modList == null) {
+                return "unavailable";
+            }
+            return modList.getModContainerById("projecte")
+                    .map(container -> container.getModInfo().getVersion().toString())
+                    .orElse("absent");
+        } catch (RuntimeException | LinkageError failure) {
+            LOGGER.debug("SudoersEMC 无法读取 ProjectE 版本，使用固定标记", failure);
+            return "unknown";
         }
     }
 
@@ -622,15 +686,19 @@ public final class Sudoersemc {
     /**
      * 采集阶段回调：读取当前服务器并生成不可变快照。
      *
-     * <p>服务器尚未就绪时返回空快照，避免调度器因为空指针进入失败状态。</p>
+     * <p>服务器尚未就绪或采集整体失败时抛出 {@link IllegalStateException}，由调度器转入
+     * {@link ScanPhase#FAILED} 并写出 {@code scanFailed=1} 的部分诊断报告，避免把采集失败
+     * 静默伪装成一次正常空扫描。</p>
      */
     private static ScanManager.SnapshotData collectSnapshot(ScanPipeline pipeline) {
+        if (pipeline == null) {
+            throw new IllegalStateException("扫描采集失败：扫描管线未初始化");
+        }
         MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
         if (server == null) {
-            LOGGER.warn("SudoersEMC 扫描请求到达时服务器尚未就绪，本轮采集空快照");
-            PipelineSnapshot empty = PipelineSnapshot.empty();
-            pipeline.stash(empty);
-            return new ScanManager.SnapshotData("服务器未就绪", 0, 0);
+            LOGGER.warn("SudoersEMC 扫描请求到达时服务器尚未就绪，本轮采集失败");
+            // 抛出而不是返回空快照：让 ScanManager 进入 FAILED 并写出 scanFailed=1 的部分报告。
+            throw new IllegalStateException("服务器尚未就绪，无法采集扫描快照");
         }
 
         PipelineSnapshot snapshot = pipeline.collect(server);
@@ -667,8 +735,89 @@ public final class Sudoersemc {
         if (stateStore != null) {
             stateStore.saveIfDirty();
         }
+
+        QuarantinedDropsStore quarantineStore = quarantinedDropsStore;
+        if (quarantineStore != null && !quarantineStore.saveIfDirty()) {
+            LOGGER.warn("SudoersEMC 扫描结束后保存隔离记录失败，将在停服或下次审批时重试");
+        }
     }
 
+    /**
+     * 按 {@code [general] enabled} 决定是否用给定管线创建扫描调度器。
+     *
+     * <p>配置尚未加载或读取失败时沿用与 {@link #createScanManager(ScanPipeline)} 相同的容错策略：
+     * 记录警告并按启用处理，绝不因为读取开关失败而让模组失去扫描能力。</p>
+     *
+     * @param pipeline        真实扫描管线，可为 {@code null}（测试用调度器）
+     * @param enabledSupplier 开关读取器；测试可注入固定值
+     * @return 启用时返回新的调度器，关闭时返回 {@code null}
+     */
+    static ScanManager createScanManagerIfEnabled(ScanPipeline pipeline, BooleanSupplier enabledSupplier) {
+        boolean enabled = true;
+        try {
+            enabled = enabledSupplier.getAsBoolean();
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法读取 [general] enabled，按启用处理", e);
+        }
+        if (!enabled) {
+            LOGGER.info("SudoersEMC [general] enabled = false：不创建扫描调度器，自动扫描已关闭");
+            return null;
+        }
+        return createScanManager(pipeline);
+    }
+
+    /**
+     * 启动自动扫描所需的配置值。
+     *
+     * @param enabled      是否启用启动自动扫描
+     * @param alwaysRescan 是否忽略缓存强制重扫
+     */
+    record StartupScanSettings(boolean enabled, boolean alwaysRescan) {
+
+        /**
+         * 读取启动自动扫描配置。任一读取失败都按禁用处理（fail-closed），避免在无法确认
+         * 管理员意图时自动写入经济数据。
+         *
+         * @param enabledSupplier      {@code [general] enabled} 读取器
+         * @param alwaysRescanSupplier {@code [general] alwaysRescan} 读取器
+         * @return 启动自动扫描配置；读取失败时为 {@code enabled=false, alwaysRescan=false}
+         */
+        static StartupScanSettings read(BooleanSupplier enabledSupplier,
+                                        BooleanSupplier alwaysRescanSupplier) {
+            try {
+                return new StartupScanSettings(
+                        enabledSupplier.getAsBoolean(), alwaysRescanSupplier.getAsBoolean());
+            } catch (RuntimeException e) {
+                LOGGER.warn("SudoersEMC 无法读取自动扫描配置，自动扫描按禁用处理", e);
+                return new StartupScanSettings(false, false);
+            }
+        }
+    }
+
+    /**
+     * 统计 SudoersEMC 拥有的生成条目数量。
+     *
+     * <p>{@link GeneratedEntryStore#size()} 包含 adopt/人工条目（{@code owned=false}），
+     * 不能用来判断“是否已有自动扫描缓存”。只有 owned 条目代表本模组实际生成的值。</p>
+     *
+     * @param store 生成值存储，允许为 {@code null}
+     * @return owned 条目数量；存储缺失或统计失败时为 0
+     */
+    static int countOwnedGeneratedEntries(GeneratedEntryStore store) {
+        if (store == null) {
+            return 0;
+        }
+        try {
+            return store.snapshotOwnedValues().size();
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法统计已生成条目，按 0 处理", e);
+            return 0;
+        }
+    }
+
+    /**
+     * 处理配置文件加载/重载事件；校验与重建逻辑统一委托给 {@link ConfigWatcher}。
+     */
     private static void onModConfigEvent(ModConfigEvent event) {
         if (event == null || event.getConfig() == null
                 || event.getConfig().getSpec() != SudoersemcConfig.SPEC) {
@@ -715,21 +864,15 @@ public final class Sudoersemc {
                     OptionalIntegrationManager.isProjectEAvailable() ? "detected" : "absent");
         }
 
-        boolean enabled;
-        boolean alwaysRescan;
-        try {
-            enabled = SudoersemcConfig.GENERAL_ENABLED.get();
-            alwaysRescan = SudoersemcConfig.GENERAL_ALWAYS_RESCAN.get();
-        } catch (RuntimeException e) {
-            // 配置尚未加载或读取失败时退回安全默认值，绝不阻止服务器启动。
-            LOGGER.warn("SudoersEMC 无法读取自动扫描配置，使用默认值（启用自动扫描、不强制重扫）", e);
-            enabled = true;
-            alwaysRescan = false;
-        }
+        StartupScanSettings scanSettings = StartupScanSettings.read(
+                SudoersemcConfig.GENERAL_ENABLED::get,
+                SudoersemcConfig.GENERAL_ALWAYS_RESCAN::get);
+        boolean enabled = scanSettings.enabled();
+        boolean alwaysRescan = scanSettings.alwaysRescan();
 
         ScanStateStore stateStore = scanStateStore;
         long lastScanEpochMillis = stateStore == null ? 0L : stateStore.lastScanEpochMillis();
-        int generatedEntryCount = store == null ? 0 : store.size();
+        int generatedEntryCount = countOwnedGeneratedEntries(store);
 
         boolean fingerprintsMatch = false;
         if (enabled && !alwaysRescan && lastScanEpochMillis > 0L && generatedEntryCount > 0

@@ -28,7 +28,7 @@ import java.util.Map;
  * @param itemsSolvedByFallback   通过兜底规则得到价格的物品数量
  * @param unresolvedItems         最终仍未解析出价格的物品数量
  * @param quarantinedDrops        因降幅超阈值而被隔离的降价数量
- * @param failedRecipes           扫描或求解失败的配方数量
+ * @param failedRecipes           配方扫描阶段失败的配方数量；求解器异常不计入此字段
  * @param totalDurationMillis     本次扫描总耗时毫秒数
  * @param peakHeapBytes           扫描期间观察到的峰值堆内存字节数
  * @param extraCounters           额外的具名计数器；不能包含 {@code null} 键或负值
@@ -215,6 +215,17 @@ public record DiagnosticReport(
 
     private void appendRecipeScanSection(StringBuilder text) {
         long failedTotal = Math.max(failedRecipes, counter("failedRecipes", 0L));
+
+        // 枚举失败时总数与分类计数都不可信；明确显示“不可用”，绝不伪造 0 或 1。
+        if (counter("recipeEnumerationFailed", 0L) > 0L) {
+            text.append("----- 配方扫描 -----\n");
+            appendLine(text, "配方扫描统计", "不可用（配方枚举失败）");
+            if (!failedRecipeDetails.isEmpty()) {
+                appendFailedRecipeDetails(text, failedRecipeDetails.size());
+            }
+            return;
+        }
+
         boolean hasCounters = hasAnyCounter("totalRecipes", "usableRecipes",
                 "unsupportedRecipes", "invalidRecipes", "failedRecipes");
         boolean hasDetails = !failedRecipeDetails.isEmpty();
@@ -243,7 +254,7 @@ public record DiagnosticReport(
         appendLine(text, "可用配方", Long.toString(usable));
         appendLine(text, "不支持配方", Long.toString(unsupported));
         appendLine(text, "无效配方", Long.toString(invalid));
-        appendLine(text, "失败配方", Long.toString(failedTotal));
+        appendLine(text, "扫描失败配方", Long.toString(failedTotal));
         appendFailedRecipeDetails(text, failedTotal);
     }
 

@@ -6,6 +6,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.Supplier;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.item.ItemStack;
@@ -29,6 +30,9 @@ import org.slf4j.LoggerFactory;
  *
  * <p>日志按失败点限流：同一个访问器在 JVM 生命周期内最多 warn 一次，后续重复出现只保留
  * 一条 debug；非 {@code goety:ritual} 类型是扫描热路径，完全不记录。</p>
+ *
+ * <p>类型闸门与字段读取都会隔离第三方配方类初始化失败产生的 {@link LinkageError}
+ * （例如 {@link NoClassDefFoundError}），确保单条损坏配方只被跳过，不会让整轮扫描失败。</p>
  */
 public final class GoetyRitualReader {
 
@@ -103,7 +107,7 @@ public final class GoetyRitualReader {
             typeId = recipe.getType() == null
                     ? null
                     : BuiltInRegistries.RECIPE_TYPE.getKey(recipe.getType());
-        } catch (RuntimeException failure) {
+        } catch (RuntimeException | LinkageError failure) {
             return null;
         }
         if (!RITUAL_ID.equals(typeId)) {
@@ -116,6 +120,9 @@ public final class GoetyRitualReader {
     /**
      * 包级测试钩子：跳过类型闸门，直接验证字段必需性与转换逻辑。
      *
+     * <p>访问器实现自身抛出的 {@link RuntimeException} 或 {@link LinkageError} 也按字段
+     * 读取失败处理，整条配方返回 {@code null}。</p>
+     *
      * @param recipe Goety 仪式配方对象
      * @param id     配方 id
      * @return 配方快照；任一必需字段失败时返回 {@code null}
@@ -126,19 +133,23 @@ public final class GoetyRitualReader {
             return null;
         }
 
-        GoetyRitualAccess.FieldRead<List<Ingredient>> ingredients = access.ingredients(recipe);
+        GoetyRitualAccess.FieldRead<List<Ingredient>> ingredients =
+                readField(() -> access.ingredients(recipe));
         if (!ingredients.ok()) {
             return skipRequired("ingredients", ingredients);
         }
-        GoetyRitualAccess.FieldRead<Ingredient> activation = access.activationItem(recipe);
+        GoetyRitualAccess.FieldRead<Ingredient> activation =
+                readField(() -> access.activationItem(recipe));
         if (!activation.ok()) {
             return skipRequired("activationItem", activation);
         }
-        GoetyRitualAccess.FieldRead<String> ritualType = access.ritualType(recipe);
+        GoetyRitualAccess.FieldRead<String> ritualType =
+                readField(() -> access.ritualType(recipe));
         if (!ritualType.ok() || ritualType.value() == null || ritualType.value().isBlank()) {
             return skipRequired("ritualType", ritualType);
         }
-        GoetyRitualAccess.FieldRead<ItemStack> result = access.result(recipe);
+        GoetyRitualAccess.FieldRead<ItemStack> result =
+                readField(() -> access.result(recipe));
         if (!result.ok()) {
             return skipRequired("result", result);
         }
@@ -177,6 +188,21 @@ public final class GoetyRitualReader {
                 // 暗黑祭坛与基座是催化剂，不属于被消耗的 inputs。
                 true,
                 Map.of(GoetyRitualEvaluator.ATTRIBUTE_RITUAL_TYPE, ritualType.value()));
+    }
+
+    /**
+     * 访问器实现自身的异常也按字段读取失败处理。
+     *
+     * <p>生产实现已经捕获反射调用的 {@link Throwable}，这里再做一层防御，避免未来替换
+     * {@link GoetyRitualAccess} 时单个字段异常穿透到整轮扫描。</p>
+     */
+    private static <T> GoetyRitualAccess.FieldRead<T> readField(
+            Supplier<GoetyRitualAccess.FieldRead<T>> reader) {
+        try {
+            return reader.get();
+        } catch (RuntimeException | LinkageError failure) {
+            return GoetyRitualAccess.FieldRead.failed(failure);
+        }
     }
 
     /**

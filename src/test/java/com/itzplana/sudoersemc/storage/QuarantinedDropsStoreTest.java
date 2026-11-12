@@ -102,6 +102,35 @@ class QuarantinedDropsStoreTest {
     }
 
     @Test
+    void recordPreservesApprovalForSameDecision() {
+        QuarantinedDropsStore store =
+                new QuarantinedDropsStore(tempDir.resolve(QuarantinedDropsStore.FILE_NAME));
+        store.record(drop(STONE, 100_000L, 100L, 1L));
+        assertTrue(store.approve(ItemKey.of(STONE)));
+
+        // 同一经济判定再次隔离（仅时间戳不同）不得静默清除审批。
+        store.record(drop(STONE, 100_000L, 100L, 2L));
+
+        QuarantinedDropsStore.QuarantinedDrop entry = store.entries().get(0);
+        assertTrue(entry.approved(), "同一次经济判定重新隔离时必须保留审批状态");
+        assertEquals(2L, entry.timestamp(), "重复隔离仍需刷新最后发生时间");
+    }
+
+    @Test
+    void recordResetsApprovalWhenDecisionChanges() {
+        QuarantinedDropsStore store =
+                new QuarantinedDropsStore(tempDir.resolve(QuarantinedDropsStore.FILE_NAME));
+        store.record(drop(STONE, 100_000L, 100L, 1L));
+        assertTrue(store.approve(ItemKey.of(STONE)));
+
+        // 拟写入值变化说明出现了一次新的降价事件，旧审批不能沿用。
+        store.record(drop(STONE, 100_000L, 50L, 2L));
+
+        assertFalse(store.entries().get(0).approved(),
+                "新的经济判定必须重置审批状态，避免审批旧值后自动放行新值");
+    }
+
+    @Test
     void retentionCapDropsOldestEntries() {
         QuarantinedDropsStore store =
                 new QuarantinedDropsStore(tempDir.resolve(QuarantinedDropsStore.FILE_NAME));
@@ -273,7 +302,7 @@ class QuarantinedDropsStoreTest {
         assertEquals(0, store.size());
 
         store.record(drop(STONE, 1000L, 10L, 2L));
-        assertDoesNotThrow(store::save);
+        assertFalse(store.save(), "更高 schema 版本必须阻止覆盖");
 
         assertEquals(content, Files.readString(file, StandardCharsets.UTF_8));
     }
@@ -290,14 +319,14 @@ class QuarantinedDropsStoreTest {
         store.record(drop(DIRT, 50_000L, 50L, 2L));
 
         blockTempFile(file);
-        store.save();
+        assertFalse(store.save(), "写入失败时 save() 必须返回 false");
         assertTrue(store.isDirty(), "写入失败后必须保留脏标记，saveIfDirty() 才能重试");
 
         unblockTempFile(file);
         Files.writeString(file, "\n/* external-change-marker */", StandardCharsets.UTF_8,
                 StandardOpenOption.APPEND);
 
-        store.saveIfDirty();
+        assertTrue(store.saveIfDirty(), "重试成功后 saveIfDirty() 必须返回 true");
 
         assertFalse(store.isDirty());
         QuarantinedDropsStore reloaded = new QuarantinedDropsStore(file);
