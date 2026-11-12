@@ -150,7 +150,16 @@ public final class GeneratedEmcMapper implements IEMCMapper<NormalizedSimpleStac
         }
     }
 
-    private static @Nullable NormalizedSimpleStack toSimpleStack(ItemKey key) throws Exception {
+    /**
+     * 将物品键转换为 ProjectE 的规范化堆叠表示。
+     *
+     * <p>变体哈希必须能还原真实堆叠的完整 NBT：ProjectE 的 {@code ItemInfo.equals}
+     * 比较完整 NBT，{@code EMCMappingHandler.getStoredEmcValue} 是精确 map 查找，容器
+     * 内容物的嵌套 {@code StoredEMC} 必须包含在变体键中，否则生成的映射永远不会命中。</p>
+     *
+     * <p>包级可见性仅用于端到端回归测试；生产调用方只应通过 {@code @EMCMapper} 入口。</p>
+     */
+    static @Nullable NormalizedSimpleStack toSimpleStack(ItemKey key) throws Exception {
         CompoundTag nbt = null;
         if (key.hasVariant()) {
             nbt = TagParser.parseTag(key.variantHash());
