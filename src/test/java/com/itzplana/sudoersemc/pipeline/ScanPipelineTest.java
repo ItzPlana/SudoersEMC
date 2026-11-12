@@ -30,6 +30,7 @@ import com.itzplana.sudoersemc.scanner.RecipeSnapshot;
 import com.itzplana.sudoersemc.solver.SolveSettings;
 import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
 import com.itzplana.sudoersemc.storage.OverflowResetLog;
+import com.itzplana.sudoersemc.storage.QuarantinedDropsStore;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
 import com.itzplana.sudoersemc.task.ScanFingerprint;
 import java.io.IOException;
@@ -168,6 +169,34 @@ class ScanPipelineTest {
     }
 
     @Test
+    void recipeAlternativeCostsArePersistedInGeneratedEntry() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_alternatives.json"));
+        ResourceLocation expensiveRecipeId =
+                new ResourceLocation("sudoersemc", "iron_block_from_two_ingots");
+        RecipeSnapshot cheap = recipe(INGOT, RESULT);
+        RecipeSnapshot expensive = RecipeSnapshot.of(
+                expensiveRecipeId,
+                RecipeKind.SHAPED,
+                List.of(new RecipeInput(IngredientOption.of(INGOT), 2)),
+                List.of(RecipeOutput.of(RESULT)));
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 5L), item(RESULT, 0L)),
+                List.of(cheap, expensive),
+                Map.of(INGOT, 5L));
+        ScanPipeline pipeline = pipeline(store, null, null, null, null, null, disabledFallback());
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1, result.solvedByRecipe());
+        GeneratedEmcEntry staged = store.snapshotAll().get(RESULT);
+        assertNotNull(staged);
+        assertEquals(5L, staged.value());
+        assertEquals(List.of(10L), staged.alternativeCosts(),
+                "另一条配方的成本必须随条目持久化");
+    }
+
+    @Test
     void unsolvableItemUsesFallbackPricing() {
         GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("generated_fallback.json"));
         PipelineSnapshot snapshot = snapshot(List.of(item(RESULT, 0L)), List.of(), Map.of());
@@ -224,6 +253,39 @@ class ScanPipelineTest {
         assertEquals(1, dropProtection.quarantineCount());
         assertEquals(1_000L, store.snapshotAll().get(RESULT).value(),
                 "被隔离的降价不得覆盖旧值");
+    }
+
+    @Test
+    void largePriceDropIsRecordedInPersistentQuarantineStore() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_drop_persist.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 1_000L, PriceSource.RECIPE, null, true, 0L));
+        QuarantinedDropsStore quarantineStore = new QuarantinedDropsStore(
+                tempDir.resolve(QuarantinedDropsStore.FILE_NAME));
+        LargeDropProtection dropProtection =
+                new LargeDropProtection(LargeDropProtection.Settings.defaults());
+
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 100L), item(RESULT, 0L)),
+                List.of(recipe(INGOT, RESULT)),
+                Map.of(INGOT, 100L));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, dropProtection, null, null, disabledFallback());
+        pipeline.setQuarantinedDropsStore(quarantineStore);
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1, result.quarantined());
+        assertEquals(1, quarantineStore.size(), "隔离记录存储必须新增一条记录");
+        QuarantinedDropsStore.QuarantinedDrop drop = quarantineStore.entries().get(0);
+        assertEquals(RESULT, drop.key());
+        assertEquals(1_000L, drop.previousValue());
+        assertEquals(100L, drop.proposedValue());
+        assertEquals(0.9D, drop.dropRatio(), 1.0E-9D);
+        assertEquals("drop-exceeds-threshold", drop.reason());
+        assertFalse(drop.approved());
+        assertTrue(drop.timestamp() > 0L);
+        assertTrue(quarantineStore.isDirty(), "记录后必须等待统一落盘");
     }
 
     @Test

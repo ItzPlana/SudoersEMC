@@ -13,10 +13,12 @@ import com.itzplana.sudoersemc.core.PriceSource;
 import com.itzplana.sudoersemc.diagnostic.DiagnosticReport;
 import com.itzplana.sudoersemc.diagnostic.ReportManager;
 import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
+import com.itzplana.sudoersemc.storage.QuarantinedDropsStore;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
 import com.itzplana.sudoersemc.task.BatchProcessor;
 import com.itzplana.sudoersemc.task.ScanFingerprint;
 import com.itzplana.sudoersemc.task.ScanManager;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
@@ -44,6 +46,15 @@ class CommandServiceTest {
                 () -> new ScanManager.SnapshotData("主世界", 0, 0),
                 snapshot -> { },
                 1_000_000L);
+    }
+
+    private QuarantinedDropsStore quarantineStoreWith(ResourceLocation itemId) {
+        QuarantinedDropsStore store = new QuarantinedDropsStore(
+                tempDir.resolve(QuarantinedDropsStore.FILE_NAME));
+        store.record(new QuarantinedDropsStore.QuarantinedDrop(
+                ItemKey.of(itemId), 100L, 10L, 0.9D,
+                "drop-exceeds-threshold", 1_730_000_000_000L, false));
+        return store;
     }
 
     private static DiagnosticReport sampleReport() {
@@ -282,6 +293,82 @@ class CommandServiceTest {
 
         assertTrue(result.success());
         assertTrue(result.joinLines().contains("归属: 非 SudoersEMC 所有"));
+    }
+
+    @Test
+    void approveMarksRecordAndPersistsIt() {
+        QuarantinedDropsStore quarantineStore = quarantineStoreWith(STONE);
+        CommandService service = new CommandService(
+                null, null, null, null, null, quarantineStore);
+
+        CommandResult result = service.approve("minecraft:stone");
+
+        assertTrue(result.success());
+        assertTrue(result.joinLines().contains("已批准"));
+        assertEquals(1, quarantineStore.size());
+        assertTrue(quarantineStore.entries().get(0).approved());
+        assertFalse(quarantineStore.isDirty(), "审批后必须立即落盘");
+        assertTrue(Files.isRegularFile(quarantineStore.file()), "隔离记录文件必须存在");
+    }
+
+    @Test
+    void approveMissingRecordFails() {
+        QuarantinedDropsStore quarantineStore = new QuarantinedDropsStore(
+                tempDir.resolve(QuarantinedDropsStore.FILE_NAME));
+        CommandService service = new CommandService(
+                null, null, null, null, null, quarantineStore);
+
+        CommandResult result = service.approve("minecraft:stone");
+
+        assertFalse(result.success());
+        assertEquals(List.of("未找到 minecraft:stone 的隔离降价记录"), result.lines());
+    }
+
+    @Test
+    void approveRejectsInvalidItemId() {
+        QuarantinedDropsStore quarantineStore = quarantineStoreWith(STONE);
+        CommandService service = new CommandService(
+                null, null, null, null, null, quarantineStore);
+
+        CommandResult result = service.approve("minecraft:stone with space");
+
+        assertFalse(result.success());
+        assertEquals(List.of("无效的物品 id: minecraft:stone with space"), result.lines());
+        assertFalse(quarantineStore.entries().get(0).approved(),
+                "非法 id 不得影响已有隔离记录");
+    }
+
+    @Test
+    void explainShowsPersistedAlternativeCosts() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve(GeneratedEntryStore.FILE_NAME));
+        assertTrue(store.stage(new GeneratedEmcEntry(
+                ItemKey.of(STONE), 42L, PriceSource.RECIPE, STONE, true, 123L,
+                List.of(7L, 9L))));
+        CommandService service = new CommandService(null, null, store, null);
+
+        CommandResult result = service.explain("minecraft:stone");
+
+        assertTrue(result.success());
+        assertTrue(result.joinLines().contains("备选成本: 7, 9"));
+    }
+
+    @Test
+    void explainLimitsAlternativesToFiveAndExplainsTruncation() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve(GeneratedEntryStore.FILE_NAME));
+        assertTrue(store.stage(new GeneratedEmcEntry(
+                ItemKey.of(STONE), 42L, PriceSource.RECIPE, STONE, true, 123L,
+                List.of(1L, 2L, 3L, 4L, 5L, 6L, 7L))));
+        CommandService service = new CommandService(null, null, store, null);
+
+        CommandResult result = service.explain("minecraft:stone");
+
+        assertTrue(result.success());
+        String text = result.joinLines();
+        assertTrue(text.contains("备选成本: 1, 2, 3, 4, 5"));
+        assertTrue(text.contains("共 7 条"));
+        assertTrue(!text.contains("6, 7"));
     }
 
     @Test

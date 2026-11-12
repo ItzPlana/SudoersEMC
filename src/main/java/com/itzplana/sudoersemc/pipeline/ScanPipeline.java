@@ -27,6 +27,7 @@ import com.itzplana.sudoersemc.solver.SolveResult;
 import com.itzplana.sudoersemc.solver.SolveSettings;
 import com.itzplana.sudoersemc.solver.SolveTrace;
 import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
+import com.itzplana.sudoersemc.storage.QuarantinedDropsStore;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
 import com.itzplana.sudoersemc.task.ScanFingerprint;
 import java.nio.file.Path;
@@ -70,9 +71,9 @@ import org.slf4j.LoggerFactory;
  * 更容易测试、诊断与避免重复应用。</p>
  *
  * <p><strong>空值语义：</strong>{@code store} 为 {@code null} 表示干跑模式，所有计数与报告照常
- * 计算，但不会写入任何持久化条目。其余协作者为 {@code null} 时按“关闭该能力”处理：降价保护与
- * 创造物品保护使用安全默认值，兜底定价与溢出保护在缺失时直接跳过。这样单元测试可以在没有完整
- * 运行时环境的情况下验证管线主干。</p>
+ * 计算，但不会写入任何持久化条目，也不会写隔离记录文件。其余协作者为 {@code null} 时按
+ * “关闭该能力”处理：降价保护与创造物品保护使用安全默认值，兜底定价与溢出保护在缺失时直接
+ * 跳过。这样单元测试可以在没有完整运行时环境的情况下验证管线主干。</p>
  *
  * <p><strong>异常契约：</strong>{@link #collect(MinecraftServer)} 与
  * {@link #solveAndApply(PipelineSnapshot)} 都不会向调用方抛出异常。任何失败都会记录日志并返回
@@ -94,6 +95,7 @@ public final class ScanPipeline {
     static final int MAX_SOLVE_ROUNDS = 4;
 
     private final GeneratedEntryStore store;
+    private volatile QuarantinedDropsStore quarantinedDropsStore;
     private final ScanStateStore stateStore;
     private final ReportManager reportManager;
     private final LargeDropProtection dropProtection;
@@ -166,6 +168,19 @@ public final class ScanPipeline {
      */
     public void setEmcProvider(@Nullable EmcProvider provider) {
         this.emcProvider = provider;
+    }
+
+    /**
+     * 注入隔离记录存储。
+     *
+     * <p>注入后，每当大幅降价保护判定隔离时，管线会把旧值、拟写入值、降幅、原因与时间戳
+     * 写入该存储，供管理员通过 {@code /sudoemc approve} 审批。传入 {@code null} 时只保留原有
+     * 的内存计数与日志行为。干跑模式（生成条目存储为 {@code null}）永远不会写隔离文件。</p>
+     *
+     * @param newStore 隔离记录存储，允许为 {@code null}
+     */
+    public void setQuarantinedDropsStore(@Nullable QuarantinedDropsStore newStore) {
+        this.quarantinedDropsStore = newStore;
     }
 
     /**
@@ -621,6 +636,7 @@ public final class ScanPipeline {
                 PriceDropDecision decision = evaluateDropProtection(candidate, previousValue);
                 if (!decision.allowed()) {
                     quarantined++;
+                    recordQuarantine(candidate, decision);
                     LOGGER.debug("物品 {} 的拟写入值 {} 因大幅降价被隔离（旧值 {}，降幅 {}）",
                             candidate.item(), candidate.value(), previousValue, decision.dropRatio());
                     continue;
@@ -639,7 +655,8 @@ public final class ScanPipeline {
                             candidate.source(),
                             candidate.recipeId(),
                             true,
-                            System.currentTimeMillis()));
+                            System.currentTimeMillis(),
+                            candidate.alternativeCosts()));
                     if (!staged) {
                         LOGGER.debug("物品 {} 的生成值未被存储接受，可能已有非 SudoersEMC 拥有的条目",
                                 candidate.item());
@@ -844,10 +861,11 @@ public final class ScanPipeline {
 
             SolveTrace trace = solveResult.traces().get(item);
             ResourceLocation recipeId = trace == null ? null : trace.recipeId();
+            List<Long> alternativeCosts = trace == null ? List.of() : trace.alternativeCosts();
             Candidate existing = recipeCandidates.get(item);
             if (existing == null || mergedValue < existing.value() || allowIncrease) {
                 recipeCandidates.put(item,
-                        new Candidate(item, mergedValue, PriceSource.RECIPE, recipeId));
+                        new Candidate(item, mergedValue, PriceSource.RECIPE, recipeId, alternativeCosts));
             }
         }
         return changed;
@@ -1007,6 +1025,34 @@ public final class ScanPipeline {
             added++;
         }
         return added;
+    }
+
+    /**
+     * 把一次被隔离的降价写入持久化隔离记录。
+     *
+     * <p>干跑模式（生成条目存储为 {@code null}）或未注入隔离存储时不产生任何磁盘写入，原有
+     * 的计数与日志行为保持不变。记录失败只影响隔离文件，不影响本轮扫描结果。</p>
+     *
+     * @param candidate 被隔离的候选值
+     * @param decision  降价保护判定结果
+     */
+    private void recordQuarantine(Candidate candidate, PriceDropDecision decision) {
+        QuarantinedDropsStore target = quarantinedDropsStore;
+        if (target == null || store == null) {
+            return;
+        }
+        try {
+            target.record(new QuarantinedDropsStore.QuarantinedDrop(
+                    candidate.item(),
+                    decision.previousValue(),
+                    decision.proposedValue(),
+                    decision.dropRatio(),
+                    decision.reason(),
+                    System.currentTimeMillis(),
+                    false));
+        } catch (RuntimeException failure) {
+            LOGGER.warn("写入隔离记录失败，物品 {} 的隔离计数仍然有效", candidate.item(), failure);
+        }
     }
 
     /**
@@ -1187,12 +1233,25 @@ public final class ScanPipeline {
      *
      * <p>可见性为包内可见，便于同包测试直接验证“同一物品只保留配方来源”的合并规则。</p>
      *
-     * @param item     物品身份
-     * @param value    经过求解或兜底定价得到的原始数值，保证 {@code > 0}
-     * @param source   数值来源
-     * @param recipeId 产生该值的配方，兜底定价结果为 {@code null}
+     * @param item             物品身份
+     * @param value            经过求解或兜底定价得到的原始数值，保证 {@code > 0}
+     * @param source           数值来源
+     * @param recipeId         产生该值的配方，兜底定价结果为 {@code null}
+     * @param alternativeCosts 同一轮求解中的其它配方成本；兜底来源为空列表
      */
     record Candidate(ItemKey item, long value, PriceSource source,
-                     @Nullable ResourceLocation recipeId) {
+                     @Nullable ResourceLocation recipeId, List<Long> alternativeCosts) {
+
+        Candidate {
+            alternativeCosts = alternativeCosts == null ? List.of() : List.copyOf(alternativeCosts);
+        }
+
+        /**
+         * 兼容旧测试与调用点的构造器：不携带备选成本。
+         */
+        Candidate(ItemKey item, long value, PriceSource source,
+                  @Nullable ResourceLocation recipeId) {
+            this(item, value, source, recipeId, List.of());
+        }
     }
 }

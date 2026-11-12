@@ -84,6 +84,35 @@ public record PriceExplanation(
     }
 
     /**
+     * 构造带备注的解释。
+     *
+     * <p>该工厂方法与旧版 {@link #of(ItemKey, long, PriceSource, ResourceLocation, boolean,
+     * String, List)} 并存，旧调用点无需修改。</p>
+     *
+     * @param item             物品身份
+     * @param value            当前 EMC 值
+     * @param source           定价来源
+     * @param recipeId         配方 id，可为 {@code null}
+     * @param owned            SudoersEMC 是否拥有该条目
+     * @param ownership        归属描述
+     * @param alternativeCosts 备选成本，可为 {@code null}
+     * @param note             额外备注，可为 {@code null}
+     * @return 完整解释快照
+     */
+    public static PriceExplanation of(
+            ItemKey item,
+            long value,
+            PriceSource source,
+            @Nullable ResourceLocation recipeId,
+            boolean owned,
+            String ownership,
+            List<Long> alternativeCosts,
+            @Nullable String note) {
+        return new PriceExplanation(
+                item, value, source, recipeId, owned, ownership, alternativeCosts, note);
+    }
+
+    /**
      * 生成多行中文解释文本。
      *
      * <p>缺省字段统一显示为“无”，保证命令输出始终包含全部七行，便于玩家对照与日志粘贴。

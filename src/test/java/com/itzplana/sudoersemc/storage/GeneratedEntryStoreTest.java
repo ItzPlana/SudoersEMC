@@ -14,6 +14,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.stream.Stream;
 import net.minecraft.resources.ResourceLocation;
 import org.junit.jupiter.api.Test;
@@ -68,6 +69,91 @@ class GeneratedEntryStoreTest {
         assertEquals(PriceSource.FALLBACK, dirt.source());
         assertNull(dirt.recipeId());
         assertFalse(dirt.owned());
+    }
+
+    @Test
+    void schemaVersionTwoRoundTripPreservesAlternativeCosts() throws IOException {
+        Path file = tempDir.resolve(GeneratedEntryStore.FILE_NAME);
+        GeneratedEntryStore store = new GeneratedEntryStore(file);
+        long timestamp = 1_730_000_000_000L;
+
+        assertTrue(store.stage(new GeneratedEmcEntry(
+                ItemKey.of(STONE), 42L, PriceSource.RECIPE, STONE, true, timestamp,
+                List.of(7L, 9L))));
+        store.save();
+
+        String json = Files.readString(file, StandardCharsets.UTF_8);
+        assertEquals(2, GeneratedEntryStore.SCHEMA_VERSION);
+        assertTrue(json.contains("\"schemaVersion\": 2"));
+        assertTrue(json.contains("\"alternatives\""));
+
+        GeneratedEntryStore reloaded = new GeneratedEntryStore(file);
+        reloaded.load();
+        GeneratedEmcEntry entry = reloaded.snapshotAll().get(ItemKey.of(STONE));
+        assertNotNull(entry);
+        assertEquals(List.of(7L, 9L), entry.alternativeCosts());
+    }
+
+    @Test
+    void schemaVersionOneLoadsWithoutAlternativeCosts() throws IOException {
+        Path file = tempDir.resolve(GeneratedEntryStore.FILE_NAME);
+        String content = """
+                {
+                  "schemaVersion": 1,
+                  "entries": [
+                    {
+                      "item": "minecraft:stone",
+                      "variant": null,
+                      "value": 7,
+                      "source": "RECIPE",
+                      "recipe": "minecraft:stone",
+                      "owned": true,
+                      "timestamp": 4
+                    }
+                  ]
+                }
+                """;
+        Files.writeString(file, content, StandardCharsets.UTF_8);
+
+        GeneratedEntryStore store = new GeneratedEntryStore(file);
+        assertDoesNotThrow(store::load);
+
+        assertEquals(1, store.size());
+        GeneratedEmcEntry stone = store.snapshotAll().get(ItemKey.of(STONE));
+        assertNotNull(stone);
+        assertEquals(7L, stone.value());
+        assertTrue(stone.alternativeCosts().isEmpty(),
+                "版本 1 文件必须按无备选成本加载");
+    }
+
+    @Test
+    void invalidAlternativeCostsAreSkippedIndividually() throws IOException {
+        Path file = tempDir.resolve(GeneratedEntryStore.FILE_NAME);
+        String content = """
+                {
+                  "schemaVersion": 2,
+                  "entries": [
+                    {
+                      "item": "minecraft:stone",
+                      "variant": null,
+                      "value": 7,
+                      "source": "RECIPE",
+                      "recipe": null,
+                      "owned": true,
+                      "timestamp": 4,
+                      "alternatives": [10, -1, "abc", null, 20]
+                    }
+                  ]
+                }
+                """;
+        Files.writeString(file, content, StandardCharsets.UTF_8);
+
+        GeneratedEntryStore store = new GeneratedEntryStore(file);
+        assertDoesNotThrow(store::load);
+
+        GeneratedEmcEntry stone = store.snapshotAll().get(ItemKey.of(STONE));
+        assertNotNull(stone);
+        assertEquals(List.of(10L, 20L), stone.alternativeCosts());
     }
 
     @Test

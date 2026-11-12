@@ -5,6 +5,8 @@ import com.itzplana.sudoersemc.core.GeneratedValueSource;
 import com.itzplana.sudoersemc.core.ItemKey;
 import com.itzplana.sudoersemc.core.OwnedEntrySink;
 import com.itzplana.sudoersemc.core.PriceSource;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonPrimitive;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -45,8 +47,13 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
 
     private static final Logger LOGGER = LoggerFactory.getLogger("sudoersemc/storage/GeneratedEntryStore");
 
-    /** Current on-disk schema version. */
-    public static final int SCHEMA_VERSION = 1;
+    /**
+     * 当前磁盘 schema 版本。
+     *
+     * <p>版本 1 不包含备选成本；版本 2 为每个条目新增 {@code alternatives} 数组。读取时兼容
+     * 版本 1，但只会写出当前版本；更高版本仍然拒绝覆盖。</p>
+     */
+    public static final int SCHEMA_VERSION = 2;
 
     /** File name inside {@link SudoersemcPaths#dataDir()}. */
     public static final String FILE_NAME = "generated_entries.json";
@@ -84,10 +91,9 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
     /**
      * Loads the backing file into memory.
      *
-     * <p>Missing file: empty state, no warning. Corrupt JSON: empty state with a warning; the
-     * original bytes stay on disk and are backed up before the next save. Unknown
-     * {@code schemaVersion}: nothing is loaded and {@link #save()} refuses to overwrite the file.
-     * Malformed entries are skipped individually.</p>
+     * <p>文件缺失：空状态且无警告。JSON 损坏：空状态并记录警告，原始字节保留到下次覆盖前
+     * 备份。{@code schemaVersion} 为 1 时按无备选成本加载，为 2 时读取备选成本；更高或非法
+     * 的版本不加载任何条目，且 {@link #save()} 拒绝覆盖原文件。单条格式错误的记录会被跳过。</p>
      */
     public void load() {
         synchronized (loadSaveLock) {
@@ -110,23 +116,26 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
                     LOGGER.warn("Could not parse {}; starting with an empty generated-entry set", file);
                     return;
                 }
-                if (dto.schemaVersion != SCHEMA_VERSION) {
+                // 版本 1 是旧格式（没有备选成本），版本 2 是当前格式。两者都可读，
+                // 但只会写出当前版本；更高或非法的版本保持原文件不动。
+                if (dto.schemaVersion < 1 || dto.schemaVersion > SCHEMA_VERSION) {
                     unsupportedSchemaVersion = true;
                     loadedSchemaVersion = dto.schemaVersion;
                     backupPending = false;
                     LOGGER.warn(
-                            "{} uses unsupported schemaVersion {} (this build supports {}); "
+                            "{} uses unsupported schemaVersion {} (this build supports 1..{}); "
                                     + "keeping the file untouched and refusing to save over it",
                             file, dto.schemaVersion, SCHEMA_VERSION);
                     return;
                 }
+                boolean includeAlternatives = dto.schemaVersion >= 2;
                 if (dto.entries == null) {
                     return;
                 }
 
                 int skipped = 0;
                 for (EntryDto dtoEntry : dto.entries) {
-                    GeneratedEmcEntry entry = toEntry(dtoEntry);
+                    GeneratedEmcEntry entry = toEntry(dtoEntry, includeAlternatives);
                     if (entry == null) {
                         skipped++;
                         continue;
@@ -295,7 +304,7 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
         return file;
     }
 
-    private static GeneratedEmcEntry toEntry(EntryDto dto) {
+    private static GeneratedEmcEntry toEntry(EntryDto dto, boolean includeAlternatives) {
         if (dto == null || dto.item == null || dto.item.isBlank()) {
             return null;
         }
@@ -315,9 +324,58 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
             // An unparseable recipe id does not make the value itself invalid; drop the reference.
             recipeId = ResourceLocation.tryParse(dto.recipe);
         }
+        List<Long> alternativeCosts = includeAlternatives
+                ? parseAlternativeCosts(dto.alternatives)
+                : List.of();
         try {
-            return new GeneratedEmcEntry(
-                    ItemKey.of(itemId, dto.variant), dto.value, source, recipeId, dto.owned, dto.timestamp);
+            return new GeneratedEmcEntry(ItemKey.of(itemId, dto.variant), dto.value, source,
+                    recipeId, dto.owned, dto.timestamp, alternativeCosts);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /**
+     * 解析磁盘上的备选成本数组。
+     *
+     * <p>字段缺失或为 {@code null} 时返回空列表；单个元素的 {@code null}、非数字或负值会被
+     * 跳过，不影响同一物品的其它字段。</p>
+     *
+     * @param raw 原始 JSON 元素列表，可为 {@code null}
+     * @return 不可变的合法备选成本列表
+     */
+    private static List<Long> parseAlternativeCosts(List<JsonElement> raw) {
+        if (raw == null || raw.isEmpty()) {
+            return List.of();
+        }
+        List<Long> costs = new ArrayList<>(raw.size());
+        for (JsonElement element : raw) {
+            Long cost = parseAlternativeCost(element);
+            if (cost != null) {
+                costs.add(cost);
+            }
+        }
+        return List.copyOf(costs);
+    }
+
+    /**
+     * 把单个 JSON 元素解析为非负 long；无法解析时返回 {@code null}。
+     */
+    private static Long parseAlternativeCost(JsonElement element) {
+        if (element == null || !element.isJsonPrimitive()) {
+            return null;
+        }
+        try {
+            JsonPrimitive primitive = element.getAsJsonPrimitive();
+            long value;
+            if (primitive.isNumber()) {
+                value = primitive.getAsLong();
+            } else if (primitive.isString()) {
+                value = Long.parseLong(primitive.getAsString().trim());
+            } else {
+                return null;
+            }
+            return value >= 0L ? value : null;
         } catch (RuntimeException e) {
             return null;
         }
@@ -335,15 +393,17 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
     }
 
     /**
-     * On-disk document. Field order is deliberate: Gson writes declared fields in order, which
-     * keeps diffs of this file stable.
+     * 磁盘文档。字段顺序固定，保证 Gson 每次写出的字节顺序一致。
+     *
+     * <p>{@code schemaVersion=2} 时每个条目额外写出 {@code alternatives} 数组；版本 1 的旧
+     * 文件没有该字段，读取时按空列表处理。</p>
      */
     static final class EntriesFileDto {
         int schemaVersion;
         List<EntryDto> entries = new ArrayList<>();
     }
 
-    /** One entry in the on-disk document. */
+    /** 磁盘文档中的单条记录。 */
     static final class EntryDto {
         String item;
         String variant;
@@ -352,6 +412,7 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
         String recipe;
         boolean owned;
         long timestamp;
+        List<JsonElement> alternatives = new ArrayList<>();
 
         static EntryDto from(GeneratedEmcEntry entry) {
             EntryDto dto = new EntryDto();
@@ -362,6 +423,10 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
             dto.recipe = entry.recipeId() == null ? null : entry.recipeId().toString();
             dto.owned = entry.owned();
             dto.timestamp = entry.timestamp();
+            dto.alternatives = new ArrayList<>(entry.alternativeCosts().size());
+            for (Long cost : entry.alternativeCosts()) {
+                dto.alternatives.add(new JsonPrimitive(cost));
+            }
             return dto;
         }
     }

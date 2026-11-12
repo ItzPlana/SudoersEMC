@@ -23,6 +23,7 @@ import com.itzplana.sudoersemc.safety.OverflowProtection;
 import com.itzplana.sudoersemc.solver.SolveSettings;
 import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
 import com.itzplana.sudoersemc.storage.OverflowResetLog;
+import com.itzplana.sudoersemc.storage.QuarantinedDropsStore;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
 import com.itzplana.sudoersemc.task.AutoScanPolicy;
 import com.itzplana.sudoersemc.task.BatchProcessor;
@@ -74,6 +75,7 @@ public final class Sudoersemc {
     }
 
     private static volatile GeneratedEntryStore entryStore;
+    private static volatile QuarantinedDropsStore quarantinedDropsStore;
     private static volatile ScanStateStore scanStateStore;
     private static volatile ReportManager reportManager;
     private static volatile ScanManager scanManager;
@@ -115,6 +117,10 @@ public final class Sudoersemc {
             stateStore.load();
             scanStateStore = stateStore;
 
+            QuarantinedDropsStore quarantineStore = new QuarantinedDropsStore();
+            quarantineStore.load();
+            quarantinedDropsStore = quarantineStore;
+
             overflowResetLog = new OverflowResetLog();
             reportManager = new ReportManager();
 
@@ -138,7 +144,10 @@ public final class Sudoersemc {
                         reportManager,
                         store,
                         stateStore,
-                        () -> requestReload("command"));
+                        () -> requestReload("command"),
+                        quarantineStore,
+                        OptionalIntegrationManager.provider().orElse(null),
+                        OptionalIntegrationManager.manualValues());
                 SudoemcCommands.setService(commandService);
                 LOGGER.warn("SudoersEMC 初始运行时组件构建失败，已保留可重载的命令服务，等待配置修正");
             }
@@ -163,6 +172,7 @@ public final class Sudoersemc {
     private static synchronized boolean rebuildRuntimeFromConfig(String reason) {
         String label = reason == null || reason.isBlank() ? "unknown" : reason;
         GeneratedEntryStore store = entryStore;
+        QuarantinedDropsStore quarantineStore = quarantinedDropsStore;
         ScanStateStore stateStore = scanStateStore;
         ReportManager reports = reportManager;
         if (store == null || stateStore == null || reports == null) {
@@ -196,7 +206,8 @@ public final class Sudoersemc {
         }
 
         try {
-            RuntimeComponents components = createRuntimeComponents(store, stateStore, reports);
+            RuntimeComponents components =
+                    createRuntimeComponents(store, quarantineStore, stateStore, reports);
             fallbackPricing = components.fallbackPricing();
             solveSettings = components.solveSettings();
             overflowPipeline = components.overflowPipeline();
@@ -256,6 +267,7 @@ public final class Sudoersemc {
      * <p>调用方在全部构建成功后再一次性发布，保证重建的“全有或全无”语义。</p>
      */
     private static RuntimeComponents createRuntimeComponents(GeneratedEntryStore store,
+                                                             @Nullable QuarantinedDropsStore quarantineStore,
                                                              ScanStateStore stateStore,
                                                              ReportManager reports) {
         OverflowPipeline newOverflowPipeline = createOverflowPipeline(overflowResetLog);
@@ -265,6 +277,7 @@ public final class Sudoersemc {
         SolveSettings newSolveSettings = createSolveSettings();
         ScanPipeline pipeline = createScanPipeline(
                 store,
+                quarantineStore,
                 stateStore,
                 reports,
                 newOverflowPipeline,
@@ -278,7 +291,10 @@ public final class Sudoersemc {
                 reports,
                 store,
                 stateStore,
-                () -> requestReload("command"));
+                () -> requestReload("command"),
+                quarantineStore,
+                OptionalIntegrationManager.provider().orElse(null),
+                OptionalIntegrationManager.manualValues());
         return new RuntimeComponents(
                 newFallbackPricing,
                 newSolveSettings,
@@ -396,6 +412,7 @@ public final class Sudoersemc {
      * 每次重建后需要立即生效的开关：配方求解、诊断报告、溢出作用域与 ProjectE 文件改写。</p>
      */
     private static ScanPipeline createScanPipeline(GeneratedEntryStore store,
+                                                   @Nullable QuarantinedDropsStore quarantineStore,
                                                    ScanStateStore stateStore,
                                                    ReportManager reports,
                                                    OverflowPipeline newOverflowPipeline,
@@ -413,6 +430,7 @@ public final class Sudoersemc {
                 newFallbackPricing,
                 newSolveSettings);
         pipeline.setEmcProvider(OptionalIntegrationManager.provider().orElse(null));
+        pipeline.setQuarantinedDropsStore(quarantineStore);
 
         OverflowScope overflowScope = OverflowScope.OWNED_ONLY;
         boolean allowProjectEFileRewrite = false;
@@ -630,6 +648,10 @@ public final class Sudoersemc {
         if (stateStore != null) {
             stateStore.saveIfDirty();
         }
+        QuarantinedDropsStore quarantineStore = quarantinedDropsStore;
+        if (quarantineStore != null) {
+            quarantineStore.saveIfDirty();
+        }
         OverflowResetLog resetLog = overflowResetLog;
         if (resetLog != null) {
             resetLog.save();
@@ -648,6 +670,13 @@ public final class Sudoersemc {
      */
     public static ScanStateStore scanStateStore() {
         return scanStateStore;
+    }
+
+    /**
+     * @return 隔离降价记录存储，common setup 完成前为 {@code null}
+     */
+    public static QuarantinedDropsStore quarantinedDropsStore() {
+        return quarantinedDropsStore;
     }
 
     /**
