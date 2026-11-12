@@ -37,7 +37,7 @@ SudoersEMC 是一个**独立实现**的 Minecraft Forge 1.20.1 模组。它扫�
 
 ## 当前状态
 
-项目按阶段推进。当前代码基线为 Phase 27 实现提交 `f707574`（合并提交 `d431850`，分支 `phase-27-sharded-scan`），**740 个单元测试通过**（0 failures / 0 errors / 0 skipped）；Phase 18–27 已完成，Goety 与 NBT 变体的真实环境验证、真实模组创造物品识别、Phase 23 取消路径的实机触发、以及 ProjectE-Integration 外部基线的真实数据验证仍待进行。
+项目按阶段推进。当前代码基线为 Phase 27 实现提交 `f707574`（合并提交 `d431850`，分支 `phase-27-sharded-scan`），**741 个单元测试通过**（0 failures / 0 errors / 0 skipped）；Phase 18–27 已完成，Goety 与 NBT 变体的真实环境验证、真实模组创造物品识别、Phase 23 取消路径的实机触发、以及 ProjectE-Integration 外部基线的真实数据验证仍待进行。
 
 | 阶段       | 内容                                                                                                                                                                                                                                                                                                                         | 状态                                                                               |
 | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
@@ -424,7 +424,7 @@ Forge 1.20.1 没有公开的「解析前」配置钩子。Phase 25 在 `Sudoerse
 ./gradlew test
 ```
 
-测试覆盖：加权采样分布与权重重置、阈值边界、幂等性、持久化往返、损坏文件容错、schema 版本保护（含 v1→v2 兼容）、归属刷新、陈旧条目清理、`custom_emc.json` 受控改写（备份、原子替换、未知字段保留）、配置热重载决策、NBT 变体规范化（含空 NBT 与默认 `{Damage:0}`）、隔离记录存储与审批、备选成本持久化与 `explain` 输出、Goety 读取失败语义、Phase 22 的诊断报告计数器与失败明细、tick 耗时最大/平均/P95（最近秩法）、峰值堆采样、`extraCounters` 持久化、取消/失败部分报告、Phase 23 的五通道指纹与变化通道、启动跳过策略、协作式取消检查点、有界 LRU 求解缓存命中/未命中与配方选择策略（含非法值回退），以及扫描接线、Phase 24 的降价豁免解析与判定、创造物品自动识别与优先级、外部修改检测与所有权释放、shaped/shapeless 统计、非 3x3 网格、容器返还扫描与成本抵扣、多输出拆分计价，以及配置校验/报告计数器、Phase 25 的解析前配置迁移（默认版本、备份、原子替换失败路径、高版本/超大版本/非法版本拒绝、幂等、未知键保留）、外部基线 JSON 解析与不可用退化、基础候选优先级/排除/最小 EMC/降价隔离/溢出阈值、debug 日志开关与每秒限流、resolver 注册顺序/异常隔离/非正值忽略/指纹变化，以及诊断报告外部基线计数；Phase 26 新增审批应用安全规则、审计模式、幂等与存储写入测试，Phase 27 新增确定性分页、增量采集会话、纯求解/应用一致性、工作线程、状态机非阻塞轮询、停服重置与自适应批量起始增长测试。当前基线共 **740 个单元测试通过**（0 failures / 0 errors / 0 skipped；基线 722 + 本次 PR 复审新增 18）。
+测试覆盖：加权采样分布与权重重置、阈值边界、幂等性、持久化往返、损坏文件容错、schema 版本保护（含 v1→v2 兼容）、归属刷新、陈旧条目清理、`custom_emc.json` 受控改写（备份、原子替换、未知字段保留）、配置热重载决策、NBT 变体规范化（含空 NBT 与默认 `{Damage:0}`）、隔离记录存储与审批、备选成本持久化与 `explain` 输出、Goety 读取失败语义、Phase 22 的诊断报告计数器与失败明细、tick 耗时最大/平均/P95（最近秩法）、峰值堆采样、`extraCounters` 持久化、取消/失败部分报告、Phase 23 的五通道指纹与变化通道、启动跳过策略、协作式取消检查点、有界 LRU 求解缓存命中/未命中与配方选择策略（含非法值回退），以及扫描接线、Phase 24 的降价豁免解析与判定、创造物品自动识别与优先级、外部修改检测与所有权释放、shaped/shapeless 统计、非 3x3 网格、容器返还扫描与成本抵扣、多输出拆分计价，以及配置校验/报告计数器、Phase 25 的解析前配置迁移（默认版本、备份、原子替换失败路径、高版本/超大版本/非法版本拒绝、幂等、未知键保留）、外部基线 JSON 解析与不可用退化、基础候选优先级/排除/最小 EMC/降价隔离/溢出阈值、debug 日志开关与每秒限流、resolver 注册顺序/异常隔离/非正值忽略/指纹变化，以及诊断报告外部基线计数；Phase 26 新增审批应用安全规则、审计模式、幂等与存储写入测试，Phase 27 新增确定性分页、增量采集会话、纯求解/应用一致性、工作线程、状态机非阻塞轮询、停服重置与自适应批量起始增长测试。当前基线共 **741 个单元测试通过**（0 failures / 0 errors / 0 skipped；基线 722 + 本次 PR 复审新增 19）。
 
 ---
 
@@ -440,7 +440,7 @@ Forge 1.20.1 没有公开的「解析前」配置钩子。Phase 25 在 `Sudoerse
 
 ## English Summary
 
-SudoersEMC is an independent Minecraft Forge 1.20.1 mod that generates EMC values for items that ProjectE does not price. Current baseline: Phase 27 implementation commit `f707574` (merge `d431850`, branch `phase-27-sharded-scan`), **740 unit tests passing** (0 failures / 0 errors / 0 skipped); Phases 18–27 are complete, while live Goety and NBT-variant verification, real modded creative-item coverage, a live cancellation trigger, and real ProjectE-Integration baseline data are still pending.
+SudoersEMC is an independent Minecraft Forge 1.20.1 mod that generates EMC values for items that ProjectE does not price. Current baseline: Phase 27 implementation commit `f707574` (merge `d431850`, branch `phase-27-sharded-scan`), **741 unit tests passing** (0 failures / 0 errors / 0 skipped); Phases 18–27 are complete, while live Goety and NBT-variant verification, real modded creative-item coverage, a live cancellation trigger, and real ProjectE-Integration baseline data are still pending.
 
 - **Queries** go through ProjectE's public `IEMCProxy`.
 - **Writes** use ProjectE's official `@EMCMapper` extension point (`priority = -1000`, `setValueBefore`), never ProjectE internals.

@@ -1645,6 +1645,41 @@ class ScanPipelineTest {
     }
 
     @Test
+    void serverNullCompletedSessionFreezesManualDetectorBeforeWorkerSolve() throws Exception {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("server_null_manual_detector.json"));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null, disabledFallback());
+
+        Set<String> detectorThreads = ConcurrentHashMap.newKeySet();
+        pipeline.setManualValueDetectorSupplier(() -> {
+            detectorThreads.add(Thread.currentThread().getName());
+            return key -> true;
+        });
+
+        ScanPipeline.CollectSession session = pipeline.beginCollect(null);
+        assertTrue(session.isDone(), "服务器未就绪时应返回已完成的空会话");
+        session.finish();
+
+        String callerThread = Thread.currentThread().getName();
+        assertTrue(detectorThreads.contains(callerThread),
+                "空会话也必须在调用线程固化手工值判定器，不能留给工作线程");
+
+        ExecutorService executor = Executors.newSingleThreadExecutor(
+                runnable -> new Thread(runnable, "phase27-solver-test"));
+        try {
+            SolveOutcome outcome = executor.submit(() -> pipeline.solveOnly(PipelineSnapshot.empty()))
+                    .get(10L, TimeUnit.SECONDS);
+            assertFalse(outcome.failed(), outcome.failureDetail());
+        } finally {
+            executor.shutdownNow();
+        }
+
+        assertFalse(detectorThreads.contains("phase27-solver-test"),
+                "工作线程不得再调用会访问 Forge 注册表的手工值判定器");
+    }
+
+    @Test
     void cancelledOutcomeDoesNotReleaseOwnership() {
         GeneratedEntryStore store = new GeneratedEntryStore(
                 tempDir.resolve("cancelled_ownership.json"));

@@ -661,6 +661,9 @@ public final class ScanPipeline {
         beginScanCycle();
         if (server == null) {
             LOGGER.warn("SudoersEMC 扫描采集被调用时服务器尚未就绪，返回空快照");
+            // 空会话不会经过 ScanCollector.finishInternal，必须在这里同样固化手工值判定器；
+            // 否则首轮扫描的 solveOnly 会在工作线程解析 ProjectEManualValues 并访问 Forge 注册表。
+            prepareSolveInputs(List.of());
             return ScanCollector.completed(PipelineSnapshot.empty());
         }
         prepareExternalBaseline(server);
