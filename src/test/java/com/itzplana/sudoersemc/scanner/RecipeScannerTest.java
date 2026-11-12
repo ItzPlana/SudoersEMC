@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 
 import com.itzplana.sudoersemc.core.ItemKey;
 import java.util.List;
+import java.util.stream.Stream;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.NonNullList;
 import net.minecraft.nbt.CompoundTag;
@@ -18,6 +19,7 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.crafting.CraftingBookCategory;
 import net.minecraft.world.item.crafting.Ingredient;
+import net.minecraft.world.item.crafting.RecipeManager;
 import net.minecraft.world.item.crafting.ShapedRecipe;
 import net.minecraft.world.item.crafting.ShapelessRecipe;
 import org.junit.jupiter.api.Test;
@@ -179,5 +181,35 @@ class RecipeScannerTest {
         assertNotNull(snapshot);
         assertTrue(snapshot.containerRemainders().isEmpty(),
                 "关闭扫描开关后不得读取 remaining items");
+    }
+    @Test
+    void orderedRecipeIdsHandlesImmutableStreamToListResult() {
+        ResourceLocation first = new ResourceLocation("sudoersemc_test", "aaa_recipe");
+        ResourceLocation second = new ResourceLocation("sudoersemc_test", "zzz_recipe");
+        RecipeManager manager = new FixedRecipeManager(List.of(second, first));
+
+        List<ResourceLocation> sorted = new RecipeScanner().orderedRecipeIds(manager);
+
+        assertEquals(List.of(first, second), sorted, "必须按 ResourceLocation 自然顺序排序");
+        assertEquals(List.of(second, first), manager.getRecipeIds().toList(),
+                "输入列表本身不得被排序修改");
+    }
+
+    /**
+     * 复现真实服务器场景：{@code Stream.toList()} 返回不可变列表，直接 sort 会抛
+     * {@link UnsupportedOperationException}。
+     */
+    private static final class FixedRecipeManager extends RecipeManager {
+
+        private final List<ResourceLocation> ids;
+
+        private FixedRecipeManager(List<ResourceLocation> ids) {
+            this.ids = ids;
+        }
+
+        @Override
+        public Stream<ResourceLocation> getRecipeIds() {
+            return ids.stream();
+        }
     }
 }
