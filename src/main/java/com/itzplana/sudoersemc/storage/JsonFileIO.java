@@ -83,16 +83,18 @@ public final class JsonFileIO {
      *
      * @param file destination
      * @param data object to serialize; must not be {@code null}
+     * @return {@code true} when the document was written and moved into place; {@code false} when
+     *         the arguments are invalid or any write/serialization step failed
      */
-    public static void writeAtomically(Path file, Object data) {
+    public static boolean writeAtomically(Path file, Object data) {
         if (file == null || data == null) {
             LOGGER.warn("Refusing to write JSON: file={} data={}", file, data);
-            return;
+            return false;
         }
         Path fileName = file.getFileName();
         if (fileName == null) {
             LOGGER.warn("Refusing to write JSON to a path without a file name: {}", file);
-            return;
+            return false;
         }
 
         Path temp = file.resolveSibling(fileName + TEMP_SUFFIX);
@@ -115,9 +117,11 @@ public final class JsonFileIO {
                 LOGGER.debug("Atomic move not supported for {}; falling back to a plain replace", file);
                 Files.move(temp, file, StandardCopyOption.REPLACE_EXISTING);
             }
+            return true;
         } catch (IOException | RuntimeException e) {
             LOGGER.warn("Failed to write JSON file {}", file, e);
             deleteQuietly(temp);
+            return false;
         }
     }
 
@@ -126,21 +130,23 @@ public final class JsonFileIO {
      *
      * <p>Called before the first destructive rewrite of a file that was loaded from disk, so a
      * bug or a partially generated dataset never permanently destroys the previous content. No-op
-     * if the source does not exist. Failures are logged and swallowed.</p>
+     * if the source does not exist. Failures are logged and reported through the return value.</p>
      *
      * @param file file to back up
+     * @return {@code true} if the file did not exist or was copied successfully; {@code false}
+     *         when an existing file could not be copied
      */
-    public static void backupIfExists(Path file) {
+    public static boolean backupIfExists(Path file) {
         if (file == null) {
-            return;
+            return false;
         }
         try {
             if (!Files.isRegularFile(file)) {
-                return;
+                return true;
             }
             Path fileName = file.getFileName();
             if (fileName == null) {
-                return;
+                return true;
             }
             Path parent = file.toAbsolutePath().getParent();
             if (parent != null) {
@@ -149,8 +155,10 @@ public final class JsonFileIO {
             Path backup = file.resolveSibling(fileName + "." + System.currentTimeMillis() + BACKUP_SUFFIX);
             Files.copy(file, backup, StandardCopyOption.REPLACE_EXISTING);
             LOGGER.debug("Backed up {} to {}", file, backup);
+            return true;
         } catch (IOException | RuntimeException e) {
             LOGGER.warn("Could not back up {} before rewriting it", file, e);
+            return false;
         }
     }
 
