@@ -17,8 +17,13 @@
 
 - 扫描管线尚未接线：采集器仍返回 `"待接入真实扫描", 0, 0`，当前构建不会生成任何 EMC 值。
 - `ENTIRE_CUSTOM_EMC` 的 ProjectE 文件改写未实现。
-- `ConfigValidator` / `ConfigWatcher` / `ConfigMigrations` 尚未接入生产配置流程。
 - Goety 真实环境与大型模组包性能未验证。
+
+### 修正
+
+- 修正 README 中与实现不符的发布声明：`entire_custom_emc` 文件改写、`custom_emc.json` 可写例外、ProjectE Integration 映射优先级、`/sudoemc explain` 覆盖范围、「不阻塞主线程」的预算语义、数据文件表与配置键接线状态。
+- 修正 CHANGELOG 中已过期的「配置校验/迁移未接入」条目。
+- 配置校验、schema 迁移与重载失败回退已在 Phase 8 修复中接入 `SudoersemcConfig` 的加载/重载流程，原「尚未接入」的限制条目已移除。
 
 ### 许可
 
