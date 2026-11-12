@@ -24,14 +24,14 @@ SudoersEMC 是一个**独立实现**的 Minecraft Forge 1.20.1 模组。它扫�
 
 ### 核心原则
 
-| 原则             | 说明                                                                         |
-| ---------------- | ---------------------------------------------------------------------------- |
-| **不覆盖手动值** | `config/ProjectE/custom_emc.json` 中由管理员配置的条目永远不会被改写         |
-| **归属可追踪**   | 每个生成值都记录来源（配方 / 标签 / 稀有度 / 层级 / 兜底）、配方 ID 与时间戳 |
-| **计算可解释**   | 任意一个 EMC 值都能回答「它从哪里来、为什么是这个数」                        |
-| **安全优先**     | 大幅降价会被隔离；超出上限的数值会被重置到受控区间                           |
-| **不阻塞主线程** | 扫描分批次执行，重计算在快照之上离线完成                                     |
-| **可选依赖**     | 未安装 ProjectE 时模组正常加载，只是不生成任何值                             |
+| 原则             | 说明                                                                                                                           |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| **不覆盖手动值** | `config/ProjectE/custom_emc.json` 中由管理员配置的条目永远不会被改写；`entire_custom_emc` 也只重置其中归 SudoersEMC 所有的条目 |
+| **归属可追踪**   | 每个生成值都记录来源（配方 / 标签 / 稀有度 / 层级 / 兜底）、配方 ID 与时间戳                                                   |
+| **计算可解释**   | 任意一个 EMC 值都能回答「它从哪里来、为什么是这个数」                                                                          |
+| **安全优先**     | 大幅降价会被隔离；超出上限的数值会被重置到受控区间                                                                             |
+| **不阻塞主线程** | 扫描分批次执行，重计算在快照之上离线完成                                                                                       |
+| **可选依赖**     | 未安装 ProjectE 时模组正常加载，只是不生成任何值                                                                               |
 
 ---
 
@@ -172,6 +172,17 @@ debugLogging = false                     # Phase 25 接线；Phase 16 构建暂�
 generateReports = true
 ```
 
+### 自动扫描开关
+
+`[general] enabled` 是扫描服务总开关：设为 `false` 时不会创建扫描调度器，服务器启动自动扫描与手动 `/sudoemc rescan-all` 都不可用。
+`alwaysRescan = true` 仅在自动扫描启用时生效；开启后每次服务器启动都会忽略缓存重新扫描。
+
+### 标签兜底定价的风险
+
+`fallback.useTagPricing = true` 时，未定价物品会按材料标签类别使用默认锚点（默认按铁系取值）。
+标签只表示材料关系，不保证同一类别内不同材料的真实价值相同；在 ProjectE 已为廉价可再生产材料定价、但未为对应块/锭定价的模组包中，可能出现 EMC 套利。
+当前版本尚未提供按材料/标签的覆盖配置；如发现异常定价，建议关闭 `useTagPricing`，或先用 ProjectE 手动 EMC 值（`custom_emc.json`）覆盖相关材料，使 EXISTING 优先命中。
+
 ### 溢出保护
 
 当某个 EMC 值**严格大于** `threshold` 时，它会被替换为 `[resetMin, resetMax]` 区间内的加权随机值：
@@ -183,10 +194,12 @@ generateReports = true
 
 ### 改写范围
 
-| 取值                 | 行为                                                                                                          |
-| -------------------- | ------------------------------------------------------------------------------------------------------------- |
-| `owned_only`（默认） | 只重置由 SudoersEMC 自己生成的条目                                                                            |
-| `entire_custom_emc`  | 额外重置 ProjectE `custom_emc.json` 中所有超限条目，需同时开启 `allowProjectEFileRewrite`，并会先做时间戳备份 |
+| 取值                 | 行为                                                                                                                                                               |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `owned_only`（默认） | 只重置由 SudoersEMC 自己生成的条目                                                                                                                                 |
+| `entire_custom_emc`  | 额外扫描 ProjectE `custom_emc.json`，但仍只重置其中归 SudoersEMC 所有的超限条目；需同时开启 `allowProjectEFileRewrite`，并会先做时间戳备份。管理员手动条目永不改写 |
+
+> 双开关只决定“是否允许写盘”，不会改变归属判定。非自有（管理员手动配置）的条目即使超过阈值也只计数并告警，永远不会被写入；`OWNED_ONLY` 下不会调用文件改写器。
 
 ---
 
@@ -194,19 +207,19 @@ generateReports = true
 
 ### 默认值
 
-| 配置项                              | 默认值       | 说明                                              |
-| ----------------------------------- | ------------ | ------------------------------------------------- |
-| `performance.itemsPerTick`          | `100`        | 服务端线程每 tick 最多处理的物品数                |
-| `recipe.maxRecipePasses`            | `20`         | 单次扫描的配方求解遍数上限                        |
-| `overflow.threshold`                | `999999`     | 严格大于该值的 EMC 会被重置                       |
-| `overflow.resetMin`                 | `100`        | 重置区间下界（含）                                |
-| `overflow.resetMax`                 | `999000`     | 重置区间上界（含）                                |
-| `overflow.bucketCount`              | `100`        | 加权采样桶数量                                    |
-| `overflow.weightCap`                | `20`         | 单个桶的权重上限                                  |
-| `overflow.overwriteScope`           | `owned_only` | 重置范围，可选 `owned_only` / `entire_custom_emc` |
-| `overflow.allowProjectEFileRewrite` | `false`      | 是否允许改写 ProjectE 的 `custom_emc.json`        |
-| `nbt.maxNbtVariantsPerItem`         | `100`        | 每个物品最多扫描的 NBT 变体数                     |
-| `safety.maxAllowedDropRatio`        | `0.5`        | 单次生成值允许的最大相对跌幅                      |
+| 配置项                              | 默认值       | 说明                                                      |
+| ----------------------------------- | ------------ | --------------------------------------------------------- |
+| `performance.itemsPerTick`          | `100`        | 服务端线程每 tick 最多处理的物品数                        |
+| `recipe.maxRecipePasses`            | `20`         | 单次扫描的配方求解遍数上限                                |
+| `overflow.threshold`                | `999999`     | 严格大于该值的 EMC 会被重置                               |
+| `overflow.resetMin`                 | `100`        | 重置区间下界（含）                                        |
+| `overflow.resetMax`                 | `999000`     | 重置区间上界（含）                                        |
+| `overflow.bucketCount`              | `100`        | 加权采样桶数量                                            |
+| `overflow.weightCap`                | `20`         | 单个桶的权重上限                                          |
+| `overflow.overwriteScope`           | `owned_only` | 重置范围，可选 `owned_only` / `entire_custom_emc`         |
+| `overflow.allowProjectEFileRewrite` | `false`      | 是否允许改写 `custom_emc.json` 中归 SudoersEMC 所有的条目 |
+| `nbt.maxNbtVariantsPerItem`         | `100`        | 每个物品最多扫描的 NBT 变体数                             |
+| `safety.maxAllowedDropRatio`        | `0.5`        | 单次生成值允许的最大相对跌幅                              |
 
 > **`minEmc` 说明**：当前构建没有 `minEmc` 配置键。求解器下限固定为
 > `SolveSettings.DEFAULT_MINIMUM_EMC = 1`（与 `EvaluationPolicy.DEFAULT_MINIMUM_EMC` 相同）。
@@ -280,13 +293,13 @@ generateReports = true
 
 ## 数据文件
 
-| 路径                                       | 说明                                                                                   |
-| ------------------------------------------ | -------------------------------------------------------------------------------------- |
-| `config/sudoersemc/generated_entries.json` | 生成值、来源、配方、归属与时间戳                                                       |
-| `config/sudoersemc/overflow_resets.json`   | 溢出重置审计记录                                                                       |
-| `config/ProjectE/custom_emc.json`          | ProjectE 手动配置（本模组只读，`entire_custom_emc` 模式除外）                          |
-| `config/sudoersemc/scan_state.json`        | 上次扫描指纹/耗时/计数；启动时加载、停服时按需保存（当前扫描管线未接线，通常不会生成） |
-| `config/sudoersemc/last_report.txt`        | 最近一次诊断报告；当前扫描管线未接线，不会自动生成                                     |
+| 路径                                       | 说明                                                                                                          |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------- |
+| `config/sudoersemc/generated_entries.json` | 生成值、来源、配方、归属与时间戳                                                                              |
+| `config/sudoersemc/overflow_resets.json`   | 溢出重置审计记录                                                                                              |
+| `config/ProjectE/custom_emc.json`          | ProjectE 手动配置；本模组只读。`entire_custom_emc` 仅扫描其中归 SudoersEMC 所有的条目，管理员手动条目永不改写 |
+| `config/sudoersemc/scan_state.json`        | 上次扫描指纹/耗时/计数；启动时加载、停服时按需保存（当前扫描管线未接线，通常不会生成）                        |
+| `config/sudoersemc/last_report.txt`        | 最近一次诊断报告；当前扫描管线未接线，不会自动生成                                                            |
 
 所有写入采用「临时文件 + 原子替换」，加载失败只告警不崩溃，遇到更高版本 schema 时拒绝覆盖。
 
@@ -337,7 +350,7 @@ SudoersEMC is an independent Minecraft Forge 1.20.1 mod that generates EMC value
 
 - **Queries** go through ProjectE's public `IEMCProxy`.
 - **Writes** use ProjectE's official `@EMCMapper` extension point, never ProjectE internals.
-- **Manual values** in `custom_emc.json` are never overwritten.
+- **Manual values** in `custom_emc.json` are never overwritten. `entire_custom_emc` only scans that file for entries owned by SudoersEMC.
 - **Ownership** is tracked per entry, so only values created by this mod can later be updated or removed.
 - **Overflow protection** resets values above `999999` into a weighted range of `100..999000`, with a hard per-bucket weight cap so the top of the range stays reachable without dominating.
 - **Optional integration**: ProjectE Integration values always win, and Goety ritual recipes (`goety:ritual`, `craft` type only) are evaluated when Goety is installed.

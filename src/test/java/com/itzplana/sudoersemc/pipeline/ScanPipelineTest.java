@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.gson.JsonArray;
@@ -31,7 +32,10 @@ import com.itzplana.sudoersemc.solver.SolveSettings;
 import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
 import com.itzplana.sudoersemc.storage.OverflowResetLog;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
+import com.itzplana.sudoersemc.task.BatchProcessor;
 import com.itzplana.sudoersemc.task.ScanFingerprint;
+import com.itzplana.sudoersemc.task.ScanManager;
+import com.itzplana.sudoersemc.task.ScanPhase;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -58,12 +62,19 @@ class ScanPipelineTest {
             new ResourceLocation("sudoersemc", "iron_block");
     private static final ResourceLocation DUST_ID =
             new ResourceLocation("sudoersemc", "iron_dust");
+    private static final ResourceLocation RAW_ID =
+            new ResourceLocation("sudoersemc", "raw_iron");
     private static final ResourceLocation RECIPE_ID =
             new ResourceLocation("sudoersemc", "iron_block_from_ingot");
+    private static final ResourceLocation RAW_TO_INGOT_ID =
+            new ResourceLocation("sudoersemc", "ingot_from_raw");
+    private static final ResourceLocation INGOT_TO_BLOCK_ID =
+            new ResourceLocation("sudoersemc", "iron_block_from_ingot_chain");
 
     private static final ItemKey INGOT = ItemKey.of(INGOT_ID);
     private static final ItemKey RESULT = ItemKey.of(RESULT_ID);
     private static final ItemKey DUST = ItemKey.of(DUST_ID);
+    private static final ItemKey RAW = ItemKey.of(RAW_ID);
 
     private static final ResourceLocation OWNED_OVERFLOW_ID =
             new ResourceLocation("sudoersemc", "owned_overflow");
@@ -93,6 +104,43 @@ class ScanPipelineTest {
         assertTrue(result.appliedToStore());
         assertEquals(0, store.size());
         assertFalse(store.isDirty());
+    }
+
+    @Test
+    void collectWithoutServerFailsInsteadOfReturningEmptySnapshot() {
+        ScanPipeline pipeline = pipeline(null, null, null, null, null, null, disabledFallback());
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> pipeline.collect(null));
+
+        assertTrue(failure.getMessage().contains("扫描采集失败"),
+                "采集失败必须带可诊断信息，不能静默返回空快照");
+    }
+
+    @Test
+    void failedCollectionDoesNotRecordCompletedScanState() {
+        ScanStateStore stateStore = new ScanStateStore(tempDir.resolve("scan_state_failure.json"));
+        ScanPipeline pipeline = pipeline(null, stateStore, null, null, null, null, disabledFallback());
+        ScanManager manager = new ScanManager(
+                new BatchProcessor(10, false),
+                () -> {
+                    PipelineSnapshot snapshot = pipeline.collect(null);
+                    pipeline.stash(snapshot);
+                    return new ScanManager.SnapshotData(
+                            "测试采集", snapshot.itemCount(), snapshot.recipeCount());
+                },
+                data -> pipeline.applyStashed(),
+                1_000_000L);
+
+        assertTrue(manager.requestScan());
+        manager.tick();
+
+        assertEquals(ScanPhase.FAILED, manager.progress().phase(),
+                "采集失败必须让扫描进入 FAILED");
+        assertEquals(0L, stateStore.lastScanEpochMillis(),
+                "失败采集不得写入扫描完成时间");
+        assertFalse(stateStore.isDirty(),
+                "失败采集不得把空指纹标记为待保存状态");
     }
 
     @Test
@@ -223,7 +271,8 @@ class ScanPipelineTest {
         GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("generated_overflow.json"));
         OverflowProtection.Settings overflowSettings = new OverflowProtection.Settings(
                 true, 100L, 1L, 10L, 10, 5, OverflowScope.OWNED_ONLY, false, 42L);
-        OverflowResetLog resetLog = new OverflowResetLog(tempDir.resolve("overflow_resets.json"));
+        Path auditFile = tempDir.resolve(OverflowResetLog.FILE_NAME);
+        OverflowResetLog resetLog = new OverflowResetLog(auditFile);
         OverflowPipeline overflowPipeline =
                 new OverflowPipeline(new OverflowProtection(overflowSettings), resetLog);
 
@@ -245,6 +294,10 @@ class ScanPipelineTest {
         assertNotNull(staged);
         assertTrue(staged.value() >= 1L && staged.value() <= 10L,
                 "溢出回落值必须落在 [resetMin, resetMax] 内，实际为 " + staged.value());
+
+        assertTrue(Files.isRegularFile(auditFile), "扫描应用后审计日志必须已原子落盘");
+        OverflowResetLog persisted = new OverflowResetLog(auditFile);
+        assertEquals(1, persisted.entries().size(), "本轮溢出重置必须在扫描结束时持久化");
     }
 
     @Test
@@ -432,6 +485,54 @@ class ScanPipelineTest {
     }
 
     @Test
+    void ownedMultiLevelChainRefreshesFromOwnedLeafFallback() throws IOException {
+        ReportManager reportManager = new ReportManager(tempDir);
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_owned_chain.json"));
+        store.stage(new GeneratedEmcEntry(RAW, 5L, PriceSource.TAG, null, true, 0L));
+        store.stage(new GeneratedEmcEntry(INGOT, 5L, PriceSource.RECIPE, null, true, 0L));
+        store.stage(new GeneratedEmcEntry(RESULT, 5L, PriceSource.RECIPE, null, true, 0L));
+
+        ItemSnapshot raw = ItemSnapshot.of(RAW, true, 5L,
+                List.of("forge:raw_materials/iron"), Rarity.COMMON);
+        PipelineSnapshot snapshot = snapshot(
+                List.of(raw, item(INGOT, 5L), item(RESULT, 5L)),
+                List.of(recipe(RAW_TO_INGOT_ID, RAW, INGOT),
+                        recipe(INGOT_TO_BLOCK_ID, INGOT, RESULT)),
+                Map.of(RAW, 5L, INGOT, 5L, RESULT, 5L));
+        ScanPipeline pipeline = pipeline(store, null, reportManager, null, null, null,
+                FallbackPricing.withDefaults(PricingSettings.defaults()));
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(2, result.solvedByRecipe());
+        assertEquals(1, result.solvedByFallback());
+        assertEquals(3, result.applied());
+        assertEquals(0, result.unresolved());
+
+        GeneratedEmcEntry rawEntry = store.snapshotAll().get(RAW);
+        assertNotNull(rawEntry);
+        assertEquals(128L, rawEntry.value(), "自有原料应按 RAW_MATERIAL 标签刷新");
+        assertEquals(PriceSource.TAG, rawEntry.source());
+
+        GeneratedEmcEntry ingotEntry = store.snapshotAll().get(INGOT);
+        assertNotNull(ingotEntry);
+        assertEquals(128L, ingotEntry.value(), "一级产物必须使用原料的新兜底值");
+        assertEquals(PriceSource.RECIPE, ingotEntry.source());
+
+        GeneratedEmcEntry blockEntry = store.snapshotAll().get(RESULT);
+        assertNotNull(blockEntry);
+        assertEquals(128L, blockEntry.value(), "二级产物必须在同一轮沿链条刷新");
+        assertEquals(PriceSource.RECIPE, blockEntry.source());
+
+        String report = Files.readString(reportManager.reportFile());
+        assertTrue(hasCounterLine(report, "已有 EMC", 0L),
+                "分离后标准字段只统计非自有值");
+        assertTrue(hasCounterLine(report, "ownedRefreshed", 3L),
+                "诊断报告必须单独暴露本轮刷新的自有条目数");
+    }
+
+    @Test
     void ownedLargeDropRemainsQuarantined() {
         GeneratedEntryStore store = new GeneratedEntryStore(
                 tempDir.resolve("generated_owned_drop.json"));
@@ -552,11 +653,11 @@ class ScanPipelineTest {
     }
 
     @Test
-    void entireScopeWithRewriteEnabledRewritesAboveThresholdEntries() throws IOException {
+    void entireScopeWithRewriteEnabledRewritesOnlyOwnedEntries() throws IOException {
         Path customEmc = writeCustomEmc("enabled_custom_emc.json");
         GeneratedEntryStore store = customEmcStore();
-        OverflowResetLog resetLog = new OverflowResetLog(
-                tempDir.resolve("overflow_resets_enabled.json"));
+        Path auditFile = tempDir.resolve("overflow_resets_enabled.json");
+        OverflowResetLog resetLog = new OverflowResetLog(auditFile);
         ScanPipeline pipeline = pipeline(store, null, null, null, null,
                 customEmcOverflowPipeline(resetLog), disabledFallback());
         pipeline.setOverflowScope(OverflowScope.ENTIRE_CUSTOM_EMC);
@@ -565,14 +666,13 @@ class ScanPipelineTest {
 
         PipelineResult result = pipeline.solveAndApply(PipelineSnapshot.empty());
 
-        assertEquals(2, result.overflowResets());
-        assertEquals(2, resetLog.entries().size());
-        for (OverflowReset reset : resetLog.entries()) {
-            assertEquals(OverflowScope.ENTIRE_CUSTOM_EMC, reset.scope());
-            assertEquals(1_000L, reset.threshold());
-            assertTrue(reset.originalValue() > reset.threshold());
-            assertTrue(reset.resetValue() >= 100L && reset.resetValue() <= 900L);
-        }
+        assertEquals(1, result.overflowResets(), "只有自有超限条目会被改写");
+        assertEquals(1, resetLog.entries().size());
+        OverflowReset reset = resetLog.entries().get(0);
+        assertEquals(OverflowScope.ENTIRE_CUSTOM_EMC, reset.scope());
+        assertEquals(1_000L, reset.threshold());
+        assertTrue(reset.originalValue() > reset.threshold());
+        assertTrue(reset.resetValue() >= 100L && reset.resetValue() <= 900L);
 
         JsonObject root = JsonParser.parseString(Files.readString(customEmc)).getAsJsonObject();
         assertEquals("keep", root.get("note").getAsString());
@@ -581,10 +681,59 @@ class ScanPipelineTest {
         long manual = entries.get(1).getAsJsonObject().get("emc").getAsLong();
         long below = entries.get(2).getAsJsonObject().get("emc").getAsLong();
         assertTrue(owned >= 100L && owned <= 900L, "自有超限条目必须回落");
-        assertTrue(manual >= 100L && manual <= 900L,
-                "ENTIRE_CUSTOM_EMC 是显式 opt-in，非自有超限条目也应改写");
+        assertEquals(4_000L, manual, "管理员手动条目永不改写");
         assertEquals(1_000L, below, "等于阈值的条目不得改写");
         assertEquals(1L, countBackups(customEmc));
+
+        assertTrue(Files.isRegularFile(auditFile), "写盘成功后必须立即落盘审计");
+        assertTrue(Files.readString(auditFile).contains("ENTIRE_CUSTOM_EMC"));
+    }
+
+    @Test
+    void ownedScopeWithRewriteEnabledStillDoesNotTouchCustomEmc() throws IOException {
+        Path customEmc = writeCustomEmc("owned_scope_with_rewrite.json");
+        GeneratedEntryStore store = customEmcStore();
+        OverflowResetLog resetLog = new OverflowResetLog(
+                tempDir.resolve("overflow_resets_owned_with_rewrite.json"));
+        ScanPipeline pipeline = pipeline(store, null, null, null, null,
+                customEmcOverflowPipeline(resetLog), disabledFallback());
+        pipeline.setProjectEFileRewriteEnabled(true);
+        pipeline.setProjectECustomEmcFile(customEmc);
+
+        String before = Files.readString(customEmc);
+        PipelineResult result = pipeline.solveAndApply(PipelineSnapshot.empty());
+
+        assertEquals(0, result.overflowResets());
+        assertEquals(before, Files.readString(customEmc),
+                "OWNED_ONLY 下即使开启文件改写开关也不得改写 ProjectE 文件");
+        assertTrue(resetLog.entries().isEmpty());
+        assertEquals(0L, countBackups(customEmc));
+    }
+
+    @Test
+    void entireScopeWithRewriteEnabledSkipsWhenOnlyNonOwnedEntriesOverflow() throws IOException {
+        Path customEmc = tempDir.resolve("only_manual_custom_emc.json");
+        Files.writeString(customEmc, """
+                { "entries": [ { "item": "sudoersemc:manual_overflow", "emc": 4000 } ] }
+                """);
+        GeneratedEntryStore store = customEmcStore();
+        Path auditFile = tempDir.resolve("overflow_resets_only_manual.json");
+        OverflowResetLog resetLog = new OverflowResetLog(auditFile);
+        ScanPipeline pipeline = pipeline(store, null, null, null, null,
+                customEmcOverflowPipeline(resetLog), disabledFallback());
+        pipeline.setOverflowScope(OverflowScope.ENTIRE_CUSTOM_EMC);
+        pipeline.setProjectEFileRewriteEnabled(true);
+        pipeline.setProjectECustomEmcFile(customEmc);
+
+        String before = Files.readString(customEmc);
+        PipelineResult result = pipeline.solveAndApply(PipelineSnapshot.empty());
+
+        assertEquals(0, result.overflowResets());
+        assertEquals(before, Files.readString(customEmc),
+                "只有非自有超限条目时不得触碰文件");
+        assertEquals(0L, countBackups(customEmc));
+        assertTrue(resetLog.entries().isEmpty());
+        assertFalse(Files.exists(auditFile), "未发生写盘时不应产生新的审计文件");
     }
 
     @Test
@@ -801,8 +950,15 @@ class ScanPipelineTest {
      * 构造一条单输入单输出的确定性配方。
      */
     private static RecipeSnapshot recipe(ItemKey input, ItemKey output) {
+        return recipe(RECIPE_ID, input, output);
+    }
+
+    /**
+     * 构造带指定 id 的单输入单输出配方，便于测试多级链条。
+     */
+    private static RecipeSnapshot recipe(ResourceLocation id, ItemKey input, ItemKey output) {
         return RecipeSnapshot.of(
-                RECIPE_ID,
+                id,
                 RecipeKind.SHAPED,
                 List.of(RecipeInput.of(IngredientOption.of(input))),
                 List.of(RecipeOutput.of(output)));

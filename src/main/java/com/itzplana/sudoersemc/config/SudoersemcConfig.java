@@ -79,10 +79,14 @@ public final class SudoersemcConfig {
     static {
         // [general]
         BUILDER.comment("General operation switches.").push("general");
-        GENERAL_ENABLED = BUILDER.comment("Master switch for automatic EMC generation.")
+        GENERAL_ENABLED = BUILDER.comment(
+                        "Master switch for the scan service.",
+                        "When false no ScanManager is created: startup auto scanning and manual",
+                        "/sudoemc rescan-all are both unavailable.")
                 .define("enabled", true);
         GENERAL_ALWAYS_RESCAN = BUILDER.comment(
-                        "Rescan all items on every server start instead of reusing cached state.")
+                        "Rescan all items on every server start instead of reusing cached state.",
+                        "Only takes effect when [general] enabled is true.")
                 .define("alwaysRescan", false);
         BUILDER.pop();
 
@@ -114,7 +118,9 @@ public final class SudoersemcConfig {
                         "Use a generic fallback value for items no other source can price.")
                 .define("useFallbackForUnsolvable", true);
         FALLBACK_USE_TAG_PRICING = BUILDER.comment(
-                        "Derive values from item tags and material relationships.")
+                        "Derive values from item tags and material relationships.",
+                        "Category anchors are iron-based; cheap renewable materials may be overvalued",
+                        "when ProjectE has no explicit value for the matching block/ingot.")
                 .define("useTagPricing", true);
         FALLBACK_USE_RARITY_PRICING = BUILDER.comment("Derive values from item rarity.")
                 .define("useRarityPricing", true);
@@ -161,11 +167,13 @@ public final class SudoersemcConfig {
         OVERFLOW_OVERWRITE_SCOPE = BUILDER.comment(
                         "Which values overflow protection may reset.",
                         "owned_only: only entries generated and owned by SudoersEMC",
-                        "entire_custom_emc: also rewrite ProjectE's config/ProjectE/custom_emc.json",
+                        "entire_custom_emc: also scan ProjectE's config/ProjectE/custom_emc.json for entries owned by SudoersEMC",
+                        "Administrator-configured (non-owned) entries are never rewritten.",
                         "Unknown values fall back to owned_only.")
                 .define("overwriteScope", "owned_only");
         OVERFLOW_ALLOW_PROJECTE_FILE_REWRITE = BUILDER.comment(
-                        "Explicit opt-in required before ProjectE's custom_emc.json may be rewritten.")
+                        "Explicit opt-in required before SudoersEMC-owned entries in ProjectE's custom_emc.json may be rewritten;",
+                        "administrator-configured (non-owned) entries are never rewritten.")
                 .define("allowProjectEFileRewrite", false);
         OVERFLOW_RANDOM_SEED = BUILDER.comment(
                         "Sampler seed; 0 requests a fresh random seed at startup.")
