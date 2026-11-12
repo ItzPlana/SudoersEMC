@@ -6,22 +6,31 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
 import com.itzplana.sudoersemc.core.ItemKey;
+import java.util.Optional;
 import java.util.stream.Stream;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.NonNullList;
+import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.TagParser;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.tags.TagKey;
+import net.minecraft.world.inventory.CraftingContainer;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.crafting.CraftingBookCategory;
+import net.minecraft.world.item.crafting.CraftingRecipe;
 import net.minecraft.world.item.crafting.Ingredient;
+import net.minecraft.world.item.crafting.Recipe;
+import net.minecraft.world.item.crafting.RecipeManager;
+import net.minecraft.world.item.crafting.RecipeSerializer;
+import net.minecraft.world.item.crafting.RecipeType;
 import net.minecraft.world.item.crafting.ShapedRecipe;
 import net.minecraft.world.item.crafting.ShapelessRecipe;
+import net.minecraft.world.level.Level;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -36,6 +45,7 @@ class RecipeScannerTest {
     private static final ResourceLocation RECIPE_ID = new ResourceLocation("sudoersemc_test", "recipe");
     private static final ResourceLocation DIAMOND_SWORD_ID =
             new ResourceLocation("minecraft", "diamond_sword");
+    private static final ResourceLocation STONE_ID = new ResourceLocation("minecraft", "stone");
     private final RecipeScanner scanner = new RecipeScanner();
 
     @BeforeAll
@@ -164,6 +174,132 @@ class RecipeScannerTest {
         assertNull(output.outputNbt(), "默认 {Damage:0} 必须归一为 null，避免生成伪变体");
         assertFalse(output.hasOutputNbt());
     }
+
+    @Test
+    void zeroDamageOnlyTagIsNormalizedToPlainItem() {
+        ItemStack stack = new ItemStack(Items.STONE);
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 0);
+        stack.setTag(tag);
+
+        RecipeOutput output = RecipeScanner.convertStack(stack);
+
+        assertNotNull(output);
+        assertNull(output.outputNbt(), "仅 Damage:0 不应生成配方输出 NBT");
+        assertEquals(ItemKey.of(STONE_ID), output.item(), "仅 Damage:0 不应产生伪变体身份");
+    }
+
+    @Test
+    void linkageErrorDuringRecipeLookupCountsAsFailed() {
+        RecipeManager manager = new RecipeManager() {
+
+            @Override
+            public Stream<ResourceLocation> getRecipeIds() {
+                return Stream.of(RECIPE_ID);
+            }
+
+            @Override
+            public Optional<? extends Recipe<?>> byKey(ResourceLocation id) {
+                throw new NoClassDefFoundError("broken recipe class");
+            }
+        };
+
+        RecipeScanner.ScanResult result = scanner.scan(manager);
+
+        assertEquals(0, result.recipes().size());
+        assertEquals(1, result.failed(), "单条配方链接失败必须计入 failed");
+        assertEquals(1, result.total());
+    }
+
+    @Test
+    void linkageErrorWhileDescribingRecipeCountsAsFailed() {
+        Recipe<CraftingContainer> brokenResult = new CraftingRecipe() {
+
+            @Override
+            public boolean matches(CraftingContainer container, Level level) {
+                return false;
+            }
+
+            @Override
+            public ItemStack assemble(CraftingContainer container, RegistryAccess access) {
+                return ItemStack.EMPTY;
+            }
+
+            @Override
+            public boolean canCraftInDimensions(int width, int height) {
+                return true;
+            }
+
+            @Override
+            public ItemStack getResultItem(RegistryAccess access) {
+                throw new NoClassDefFoundError("broken recipe result");
+            }
+
+            @Override
+            public ResourceLocation getId() {
+                return RECIPE_ID;
+            }
+
+            @Override
+            public RecipeSerializer<?> getSerializer() {
+                return null;
+            }
+
+            @Override
+            public RecipeType<?> getType() {
+                return RecipeType.CRAFTING;
+            }
+
+            @Override
+            public CraftingBookCategory category() {
+                return CraftingBookCategory.MISC;
+            }
+
+            @Override
+            public NonNullList<Ingredient> getIngredients() {
+                return NonNullList.of(Ingredient.EMPTY, Ingredient.of(Items.DIRT));
+            }
+        };
+
+        RecipeManager manager = new RecipeManager() {
+
+            @Override
+            public Stream<ResourceLocation> getRecipeIds() {
+                return Stream.of(RECIPE_ID);
+            }
+
+            @Override
+            public Optional<? extends Recipe<?>> byKey(ResourceLocation id) {
+                return Optional.of(brokenResult);
+            }
+        };
+
+        RecipeScanner.ScanResult result = scanner.scan(manager);
+
+        assertEquals(0, result.recipes().size());
+        assertEquals(1, result.failed(), "单条配方描述时的 LinkageError 必须计入 failed");
+        assertEquals(1, result.total());
+    }
+
+    @Test
+    void nonDamageableNbtOutputUsesVariantIdentityAndKeepsRawNbt() {
+        ItemStack stack = new ItemStack(Items.STONE);
+        CompoundTag display = new CompoundTag();
+        display.putString("Name", "{\"text\":\"只影响展示\"}");
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Marker", 7);
+        tag.put("display", display);
+        stack.setTag(tag);
+
+        RecipeOutput output = RecipeScanner.convertStack(stack);
+
+        assertNotNull(output);
+        assertEquals(ItemKey.of(STONE_ID, "{Marker:7}"), output.item(),
+                "求解与变体扫描必须使用同一规范化身份");
+        assertEquals(tag.toString(), output.outputNbt(),
+                "注册 ProjectE 仍需要包含 display 的原始 SNBT");
+    }
+
 
     private static TagKey<Item> unboundTag() {
         return TagKey.create(Registries.ITEM, new ResourceLocation("sudoersemc_test", "unbound"));

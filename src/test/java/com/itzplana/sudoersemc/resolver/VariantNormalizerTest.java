@@ -6,10 +6,12 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 
 import com.itzplana.sudoersemc.core.ItemKey;
 import java.util.UUID;
+import net.minecraft.SharedConstants;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.TagParser;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.Bootstrap;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -19,8 +21,16 @@ import org.junit.jupiter.api.Test;
  */
 class VariantNormalizerTest {
 
-    private static final ResourceLocation SUDOERSEMC_TOKEN =
+    static {
+        // keyFor 通过 BuiltInRegistries 查找物品，测试前必须先完成原版注册表引导。
+        SharedConstants.tryDetectVersion();
+        Bootstrap.bootStrap();
+    }
+private static final ResourceLocation SUDOERSEMC_TOKEN =
             new ResourceLocation("sudoersemc", "token");
+    private static final ResourceLocation DIAMOND_SWORD_ID =
+            new ResourceLocation("minecraft", "diamond_sword");
+
 
     @Test
     void displayOnlyTagNormalisesToNull() {
@@ -61,6 +71,18 @@ class VariantNormalizerTest {
         tag.putInt("Damage", 17);
 
         assertEquals("{Damage:17}", VariantNormalizer.normalize(tag));
+    }
+
+    @Test
+    void defaultZeroDamageOnlyNormalisesToNull() {
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 0);
+
+        assertNull(VariantNormalizer.normalize(tag),
+                "只含默认 Damage:0 的标签不得生成伪变体");
+        assertEquals(ItemKey.of(SUDOERSEMC_TOKEN),
+                VariantNormalizer.keyFor(SUDOERSEMC_TOKEN, tag),
+                "非可损物品的默认 Damage:0 也必须归为普通物品");
     }
 
     @Test
@@ -122,13 +144,6 @@ class VariantNormalizerTest {
         assertEquals("{BlockEntityTag:{id:\"minecraft:chest\"}}", VariantNormalizer.normalize(tag));
     }
 
-    @Test
-    void storedEmcIsPreserved() {
-        CompoundTag tag = new CompoundTag();
-        tag.putLong("stored_emc", 4096L);
-
-        assertEquals("{stored_emc:4096L}", VariantNormalizer.normalize(tag));
-    }
 
     @Test
     void insertionOrderDoesNotAffectResult() {
@@ -142,7 +157,7 @@ class VariantNormalizerTest {
         second.putString("Potion", "minecraft:healing");
         second.putInt("Damage", 1);
 
-        assertEquals("{Damage:1,Potion:\"minecraft:healing\",stored_emc:7L}",
+        assertEquals("{Damage:1,Potion:\"minecraft:healing\"}",
                 VariantNormalizer.normalize(first));
         assertEquals(VariantNormalizer.normalize(first), VariantNormalizer.normalize(second));
     }
@@ -255,6 +270,123 @@ class VariantNormalizerTest {
     }
 
     @Test
+    void keyForTreatsZeroDamageAsPlainItemForNonDamageableItem() {
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 0);
+
+        assertEquals(ItemKey.of(SUDOERSEMC_TOKEN),
+                VariantNormalizer.keyFor(SUDOERSEMC_TOKEN, tag),
+                "非可损物品只含 Damage:0 时不得产生 variantHash");
+    }
+
+    @Test
+    void keyForKeepsOtherVariantDataOnDamageableItems() {
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 17);
+        tag.put("Enchantments", sharpnessFive());
+
+        assertEquals(ItemKey.of(DIAMOND_SWORD_ID,
+                        "{Damage:0,Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}"),
+                VariantNormalizer.keyFor(DIAMOND_SWORD_ID, tag));
+    }
+
+    @Test
+    void keyForCollapsesDamageValuesOnTheSameDamageableVariant() {
+        CompoundTag first = new CompoundTag();
+        first.putInt("Damage", 1);
+        first.put("Enchantments", sharpnessFive());
+        CompoundTag second = new CompoundTag();
+        second.putInt("Damage", 400);
+        second.put("Enchantments", sharpnessFive());
+
+        ItemKey expected = ItemKey.of(DIAMOND_SWORD_ID,
+                "{Damage:0,Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}");
+        assertEquals(expected, VariantNormalizer.keyFor(DIAMOND_SWORD_ID, first));
+        assertEquals(expected, VariantNormalizer.keyFor(DIAMOND_SWORD_ID, second));
+    }
+
+    @Test
+    void keyForKeepsExplicitZeroDamageAlongsideOtherVariantData() {
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 0);
+        tag.put("Enchantments", sharpnessFive());
+
+        assertEquals(ItemKey.of(DIAMOND_SWORD_ID,
+                        "{Damage:0,Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}"),
+                VariantNormalizer.keyFor(DIAMOND_SWORD_ID, tag));
+    }
+
+    @Test
+    void keyForDoesNotInventDamageKeyForDamageableItems() {
+        CompoundTag tag = new CompoundTag();
+        tag.put("Enchantments", sharpnessFive());
+
+        assertEquals(ItemKey.of(DIAMOND_SWORD_ID,
+                        "{Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}"),
+                VariantNormalizer.keyFor(DIAMOND_SWORD_ID, tag));
+    }
+
+    @Test
+    void keyForStripsStoredEmcFromDamageableVariantKey() {
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 5);
+        tag.put("Enchantments", sharpnessFive());
+        tag.putLong("StoredEMC", 4096L);
+        tag.putLong("stored_emc", 1024L);
+
+        assertEquals(ItemKey.of(DIAMOND_SWORD_ID,
+                        "{Damage:0,Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}"),
+                VariantNormalizer.keyFor(DIAMOND_SWORD_ID, tag));
+    }
+
+    @Test
+    void keyForKeepsDamageOnNonDamageableItemsWithOtherVariantData() {
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 17);
+        tag.put("Enchantments", sharpnessFive());
+
+        assertEquals(ItemKey.of(SUDOERSEMC_TOKEN,
+                        "{Damage:17,Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}"),
+                VariantNormalizer.keyFor(SUDOERSEMC_TOKEN, tag));
+    }
+
+    @Test
+    void keyForDropsVariantWhenOnlyDamageAndDisplayDataRemain() {
+        CompoundTag display = new CompoundTag();
+        display.putString("Name", "{\"text\":\"custom\"}");
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 17);
+        tag.putLong("StoredEMC", 4096L);
+        tag.put("display", display);
+
+        assertEquals(ItemKey.of(DIAMOND_SWORD_ID),
+                VariantNormalizer.keyFor(DIAMOND_SWORD_ID, tag));
+    }
+
+    private static ListTag sharpnessFive() {
+        CompoundTag enchantment = new CompoundTag();
+        enchantment.putString("id", "minecraft:sharpness");
+        enchantment.putShort("lvl", (short) 5);
+        ListTag enchantments = new ListTag();
+        enchantments.add(enchantment);
+        return enchantments;
+    }
+
+    @Test
+    void normalizeDoesNotMutateInput() {
+        CompoundTag display = new CompoundTag();
+        display.putString("Name", "{\"text\":\"名称\"}");
+
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 0);
+        tag.put("display", display);
+        CompoundTag copy = tag.copy();
+
+        assertNull(VariantNormalizer.normalize(tag));
+        assertEquals(copy, tag, "normalize 不得修改输入标签");
+    }
+
+    @Test
     void defaultDamageZeroIsStillRecognisedAfterDisplayStripping() {
         CompoundTag display = new CompoundTag();
         display.putString("Name", "{\"text\":\"名称\"}");
@@ -270,9 +402,60 @@ class VariantNormalizerTest {
     void defaultDamageIsKeptWhenOtherEconomicKeysArePresent() {
         CompoundTag tag = new CompoundTag();
         tag.putInt("Damage", 0);
-        tag.putLong("stored_emc", 64L);
+        tag.putLong("Marker", 64L);
 
-        assertEquals("{Damage:0,stored_emc:64L}", VariantNormalizer.normalize(tag),
+        assertEquals("{Damage:0,Marker:64L}", VariantNormalizer.normalize(tag),
                 "存在其它经济字段时 Damage 必须作为组合变体的一部分保留");
+    }
+
+    @Test
+    void longDamageAboveIntRangeIsNotTruncatedToZero() {
+        CompoundTag tag = new CompoundTag();
+        tag.putLong("Damage", 4294967296L);
+
+        assertEquals("{Damage:4294967296L}", VariantNormalizer.normalize(tag),
+                "LongTag 2^32 不能被 getAsInt() 截断为 0");
+    }
+
+    @Test
+    void fractionalDamageIsNotTruncatedToZero() {
+        CompoundTag tag = new CompoundTag();
+        tag.putDouble("Damage", 0.5D);
+
+        assertEquals("{Damage:0.5d}", VariantNormalizer.normalize(tag),
+                "0.5 不能因整数转换被误判为默认伤害");
+    }
+
+    @Test
+    void zeroDamageOfEveryNumericTypeIsStillDropped() {
+        CompoundTag byteDamage = new CompoundTag();
+        byteDamage.putByte("Damage", (byte) 0);
+        CompoundTag shortDamage = new CompoundTag();
+        shortDamage.putShort("Damage", (short) 0);
+        CompoundTag intDamage = new CompoundTag();
+        intDamage.putInt("Damage", 0);
+        CompoundTag longDamage = new CompoundTag();
+        longDamage.putLong("Damage", 0L);
+        CompoundTag floatDamage = new CompoundTag();
+        floatDamage.putFloat("Damage", 0.0F);
+        CompoundTag doubleDamage = new CompoundTag();
+        doubleDamage.putDouble("Damage", 0.0D);
+
+        assertNull(VariantNormalizer.normalize(byteDamage));
+        assertNull(VariantNormalizer.normalize(shortDamage));
+        assertNull(VariantNormalizer.normalize(intDamage));
+        assertNull(VariantNormalizer.normalize(longDamage));
+        assertNull(VariantNormalizer.normalize(floatDamage));
+        assertNull(VariantNormalizer.normalize(doubleDamage));
+    }
+
+    @Test
+    void keyForKeepsNonZeroFractionalDamageVariant() {
+        CompoundTag tag = new CompoundTag();
+        tag.putDouble("Damage", 0.5D);
+
+        assertEquals(ItemKey.of(SUDOERSEMC_TOKEN, "{Damage:0.5d}"),
+                VariantNormalizer.keyFor(SUDOERSEMC_TOKEN, tag),
+                "非零小数伤害必须保留为独立变体键");
     }
 }
