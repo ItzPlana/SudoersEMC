@@ -250,11 +250,8 @@ public final class ScanStateStore {
      */
     public void invalidate() {
         synchronized (lock) {
-            storedFingerprint = null;
-            lastScanEpochMillis = 0L;
-            lastScanDurationMillis = 0L;
-            lastSolvedCount = 0;
-            lastUnresolvedCount = 0;
+            // 复用“从未扫描”状态清理，确保指纹、时间戳与全部计数（含求解轮数）一起归零。
+            clearStateLocked();
             dirty.set(true);
         }
     }

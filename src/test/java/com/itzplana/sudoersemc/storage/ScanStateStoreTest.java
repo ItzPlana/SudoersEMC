@@ -117,9 +117,10 @@ class ScanStateStoreTest {
         Path file = tempDir.resolve(ScanStateStore.FILE_NAME);
         ScanStateStore store = new ScanStateStore(file);
         ScanFingerprint fingerprint = fingerprint();
-        store.update(fingerprint, 1234L, 100, 5);
+        store.update(fingerprint, 1234L, 100, 5, 3);
         store.save();
         assertFalse(store.isDirty());
+        assertEquals(3, store.lastSolverRounds());
 
         store.invalidate();
 
@@ -130,6 +131,7 @@ class ScanStateStoreTest {
         assertEquals(0L, store.lastScanDurationMillis());
         assertEquals(0, store.lastSolvedCount());
         assertEquals(0, store.lastUnresolvedCount());
+        assertEquals(0, store.lastSolverRounds(), "失效后求解轮数也必须归零");
 
         store.saveIfDirty();
         ScanStateStore reloaded = new ScanStateStore(file);
@@ -138,6 +140,7 @@ class ScanStateStoreTest {
         assertTrue(reloaded.fingerprint().isEmpty());
         assertEquals(0L, reloaded.lastScanEpochMillis());
         assertEquals(0, reloaded.lastSolvedCount());
+        assertEquals(0, reloaded.lastSolverRounds());
     }
 
     @Test
