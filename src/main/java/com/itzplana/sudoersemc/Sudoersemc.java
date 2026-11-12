@@ -21,6 +21,12 @@ import org.slf4j.Logger;
  * <p>Phase 1 wiring: persistence, ProjectE integration detection, and the ProjectE
  * {@code @EMCMapper} that publishes owned values. Scanning and pricing engines are added in later
  * phases.</p>
+ *
+ * <p><strong>Phase 7 note:</strong> the scan state machine ({@code task.ScanManager}) is provided
+ * by this branch but is intentionally not constructed or ticked here. Production wiring starts in
+ * Phase 11 (command/lifecycle code plus a placeholder collector) and Phase 12 (real
+ * {@code ScanPipeline} collection, apply and persistence). See the class Javadoc of
+ * {@code ScanManager} for the exact phase boundary.</p>
  */
 @Mod(Sudoersemc.MODID)
 public final class Sudoersemc {
