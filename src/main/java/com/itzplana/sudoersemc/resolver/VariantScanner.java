@@ -12,10 +12,12 @@ import net.minecraft.world.item.ItemStack;
 /**
  * 从观测到的 NBT 变体列表生成去重后的 {@link ItemKey} 列表。
  *
- * <p>每个标签先经 {@link VariantNormalizer#normalize(CompoundTag)} 规范化；规范化结果为
- * {@code null} 的标签（例如只包含自定义名称）会被丢弃。相同规范化结果只保留一个键。扫描
- * 最多返回 {@code maxVariantsPerItem} 个键，并额外受 {@link #HARD_VARIANT_CEILING} 限制，
- * 避免异常数据导致内存失控。结果按 {@link ItemKey#compareTo(ItemKey)} 排序且不可变。</p>
+ * <p>每个标签先经 {@link VariantNormalizer#keyFor(ResourceLocation, CompoundTag)} 规范化；
+ * 没有经济变体数据的标签（例如只包含自定义名称，或只包含可损坏物品的 {@code Damage}）
+ * 会被丢弃。相同规范化结果只保留一个键。扫描最多返回 {@code maxVariantsPerItem} 个键，
+ * 并额外受 {@link #HARD_VARIANT_CEILING} 限制；超过上限时保留字典序最小的键，因此结果
+ * 与输入顺序无关，避免世界遍历顺序影响 EMC 归属。结果按
+ * {@link ItemKey#compareTo(ItemKey)} 排序且不可变。</p>
  */
 public final class VariantScanner {
 
@@ -53,12 +55,12 @@ public final class VariantScanner {
         int limit = Math.min(maxVariantsPerItem, HARD_VARIANT_CEILING);
         TreeSet<ItemKey> unique = new TreeSet<>();
         for (CompoundTag observed : observedVariants) {
-            if (unique.size() >= limit) {
-                break;
-            }
-            String normalized = VariantNormalizer.normalize(observed);
-            if (normalized != null) {
-                unique.add(ItemKey.of(itemId, normalized));
+            ItemKey key = VariantNormalizer.keyFor(itemId, observed);
+            if (key.hasVariant()) {
+                unique.add(key);
+                if (unique.size() > limit) {
+                    unique.pollLast();
+                }
             }
         }
         return List.copyOf(unique);

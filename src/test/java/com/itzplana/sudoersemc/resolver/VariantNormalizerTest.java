@@ -6,10 +6,12 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 
 import com.itzplana.sudoersemc.core.ItemKey;
 import java.util.UUID;
+import net.minecraft.SharedConstants;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.TagParser;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.Bootstrap;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -19,8 +21,16 @@ import org.junit.jupiter.api.Test;
  */
 class VariantNormalizerTest {
 
+    static {
+        // keyFor 会查询物品注册表以判断物品是否可损坏，因此测试前必须先完成引导。
+        SharedConstants.tryDetectVersion();
+        Bootstrap.bootStrap();
+    }
+
     private static final ResourceLocation SUDOERSEMC_TOKEN =
             new ResourceLocation("sudoersemc", "token");
+    private static final ResourceLocation DIAMOND_SWORD_ID =
+            new ResourceLocation("minecraft", "diamond_sword");
 
     @Test
     void displayOnlyTagNormalisesToNull() {
@@ -123,11 +133,25 @@ class VariantNormalizerTest {
     }
 
     @Test
-    void storedEmcIsPreserved() {
+    void projectEStoredEmcIsStripped() {
         CompoundTag tag = new CompoundTag();
+        tag.putLong("StoredEMC", 4096L);
         tag.putLong("stored_emc", 4096L);
+        tag.putString("Potion", "minecraft:healing");
 
-        assertEquals("{stored_emc:4096L}", VariantNormalizer.normalize(tag));
+        assertEquals("{Potion:\"minecraft:healing\"}", VariantNormalizer.normalize(tag));
+    }
+
+    @Test
+    void storedEmcIsStrippedAtEveryNestingLevel() {
+        CompoundTag nested = new CompoundTag();
+        nested.putLong("StoredEMC", 4096L);
+        nested.putLong("stored_emc", 1024L);
+        nested.putInt("value", 1);
+        CompoundTag tag = new CompoundTag();
+        tag.put("BlockEntityTag", nested);
+
+        assertEquals("{BlockEntityTag:{value:1}}", VariantNormalizer.normalize(tag));
     }
 
     @Test
@@ -135,14 +159,12 @@ class VariantNormalizerTest {
         CompoundTag first = new CompoundTag();
         first.putInt("Damage", 1);
         first.putString("Potion", "minecraft:healing");
-        first.putLong("stored_emc", 7L);
 
         CompoundTag second = new CompoundTag();
-        second.putLong("stored_emc", 7L);
         second.putString("Potion", "minecraft:healing");
         second.putInt("Damage", 1);
 
-        assertEquals("{Damage:1,Potion:\"minecraft:healing\",stored_emc:7L}",
+        assertEquals("{Damage:1,Potion:\"minecraft:healing\"}",
                 VariantNormalizer.normalize(first));
         assertEquals(VariantNormalizer.normalize(first), VariantNormalizer.normalize(second));
     }
@@ -238,8 +260,56 @@ class VariantNormalizerTest {
 
         CompoundTag damage = new CompoundTag();
         damage.putInt("Damage", 3);
-
         assertEquals(ItemKey.of(SUDOERSEMC_TOKEN, "{Damage:3}"),
                 VariantNormalizer.keyFor(SUDOERSEMC_TOKEN, damage));
+    }
+
+    @Test
+    void keyForStripsDamageForDamageableItems() {
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 17);
+
+        assertEquals(ItemKey.of(DIAMOND_SWORD_ID),
+                VariantNormalizer.keyFor(DIAMOND_SWORD_ID, tag));
+    }
+
+    @Test
+    void keyForTreatsZeroDamageAsPlainItem() {
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 0);
+
+        assertEquals(ItemKey.of(DIAMOND_SWORD_ID),
+                VariantNormalizer.keyFor(DIAMOND_SWORD_ID, tag));
+    }
+
+    @Test
+    void keyForKeepsOtherVariantDataOnDamageableItems() {
+        CompoundTag enchantment = new CompoundTag();
+        enchantment.putString("id", "minecraft:sharpness");
+        enchantment.putShort("lvl", (short) 5);
+        ListTag enchantments = new ListTag();
+        enchantments.add(enchantment);
+
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 17);
+        tag.put("Enchantments", enchantments);
+
+        assertEquals(ItemKey.of(DIAMOND_SWORD_ID,
+                        "{Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}"),
+                VariantNormalizer.keyFor(DIAMOND_SWORD_ID, tag));
+    }
+
+    @Test
+    void normalizeDoesNotMutateInput() {
+        CompoundTag display = new CompoundTag();
+        display.putString("Name", "{\"text\":\"custom\"}");
+        CompoundTag tag = new CompoundTag();
+        tag.put("display", display);
+        tag.putInt("Damage", 7);
+        CompoundTag before = tag.copy();
+
+        VariantNormalizer.normalize(tag);
+
+        assertEquals(before, tag);
     }
 }
