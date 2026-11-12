@@ -91,6 +91,86 @@ class DefaultMaterialResolverTest {
     }
 
     @Test
+    void containerAddsStoredEmcFromContainedItemTag() {
+        DefaultMaterialResolver resolver = new DefaultMaterialResolver(
+                key -> key.equals(DIAMOND_KEY) ? 128L : 0L);
+        CompoundTag entry = itemEntry("minecraft:diamond", 1);
+        entry.put("tag", storedEmcTag(500L));
+
+        assertEquals(OptionalLong.of(128L + 500L), resolver.resolve(container(entry)));
+    }
+
+    @Test
+    void containedStoredEmcIsAddedAfterDamageDiscount() {
+        DefaultMaterialResolver resolver = new DefaultMaterialResolver(
+                key -> key.equals(DIAMOND_SWORD_KEY) ? 1000L : 0L);
+        int maxDamage = new ItemStack(Items.DIAMOND_SWORD).getMaxDamage();
+        int damage = maxDamage / 2;
+        CompoundTag itemTag = storedEmcTag(500L);
+        itemTag.putInt("Damage", damage);
+        CompoundTag entry = itemEntry("minecraft:diamond_sword", 1);
+        entry.put("tag", itemTag);
+
+        long discounted = 1000L * (maxDamage - damage + 1L) / maxDamage;
+        assertEquals(OptionalLong.of(discounted + 500L), resolver.resolve(container(entry)));
+    }
+
+    @Test
+    void containedStoredEmcSaturatesInsteadOfOverflowing() {
+        DefaultMaterialResolver resolver = new DefaultMaterialResolver(
+                key -> key.equals(DIAMOND_KEY) ? Long.MAX_VALUE : 0L);
+        CompoundTag entry = itemEntry("minecraft:diamond", 1);
+        entry.put("tag", storedEmcTag(1L));
+
+        assertEquals(OptionalLong.of(Long.MAX_VALUE), resolver.resolve(container(entry)));
+    }
+
+    @Test
+    void unknownContainedBaseValueWithStoredEmcReturnsEmpty() {
+        DefaultMaterialResolver resolver = new DefaultMaterialResolver(key -> 0L);
+        CompoundTag entry = itemEntry("minecraft:diamond", 1);
+        entry.put("tag", storedEmcTag(4096L));
+
+        assertTrue(resolver.resolve(container(entry)).isEmpty());
+    }
+
+    @Test
+    void negativeContainedStoredEmcIsIgnored() {
+        DefaultMaterialResolver resolver = new DefaultMaterialResolver(
+                key -> key.equals(DIAMOND_KEY) ? 128L : 0L);
+        CompoundTag entry = itemEntry("minecraft:diamond", 1);
+        entry.put("tag", storedEmcTag(-4096L));
+
+        assertEquals(OptionalLong.of(128L), resolver.resolve(container(entry)));
+    }
+
+    @Test
+    void containedEnchantedVariantUsesVariantKeyAndStoredEmc() {
+        ItemKey enchantedKey = ItemKey.of(DIAMOND_SWORD_ID,
+                "{Damage:0,Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}");
+        DefaultMaterialResolver resolver = new DefaultMaterialResolver(
+                key -> key.equals(enchantedKey) ? 2000L : 0L);
+        CompoundTag enchantment = new CompoundTag();
+        enchantment.putString("id", "minecraft:sharpness");
+        enchantment.putShort("lvl", (short) 5);
+        ListTag enchantments = new ListTag();
+        enchantments.add(enchantment);
+        CompoundTag itemTag = storedEmcTag(300L);
+        itemTag.putInt("Damage", 0);
+        itemTag.put("Enchantments", enchantments);
+        CompoundTag entry = itemEntry("minecraft:diamond_sword", 1);
+        entry.put("tag", itemTag);
+
+        assertEquals(OptionalLong.of(2300L), resolver.resolve(container(entry)));
+    }
+
+    private static CompoundTag storedEmcTag(long storedEmc) {
+        CompoundTag tag = new CompoundTag();
+        tag.putLong("StoredEMC", storedEmc);
+        return tag;
+    }
+
+    @Test
     void multiItemContainerReturnsEmpty() {
         DefaultMaterialResolver resolver = new DefaultMaterialResolver(key -> 100L);
         ItemStack stack = container(

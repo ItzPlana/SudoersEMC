@@ -125,8 +125,8 @@ class ScanPipelineTest {
                 () -> {
                     PipelineSnapshot snapshot = pipeline.collect(null);
                     pipeline.stash(snapshot);
-                    return new ScanManager.SnapshotData(
-                            "测试采集", snapshot.itemCount(), snapshot.recipeCount());
+                    return ScanManager.oneShot(new ScanManager.SnapshotData(
+                            "测试采集", snapshot.itemCount(), snapshot.recipeCount())).begin();
                 },
                 data -> pipeline.applyStashed(),
                 1_000_000L);
