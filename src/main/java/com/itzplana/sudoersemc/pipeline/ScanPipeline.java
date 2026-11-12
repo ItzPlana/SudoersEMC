@@ -4,12 +4,15 @@ import com.itzplana.sudoersemc.core.GeneratedEmcEntry;
 import com.itzplana.sudoersemc.core.ItemKey;
 import com.itzplana.sudoersemc.core.OverflowScope;
 import com.itzplana.sudoersemc.core.PriceSource;
+import com.itzplana.sudoersemc.diagnostic.DebugLog;
 import com.itzplana.sudoersemc.diagnostic.DiagnosticReport;
 import com.itzplana.sudoersemc.diagnostic.ReportManager;
 import com.itzplana.sudoersemc.integration.EmcProvider;
+import com.itzplana.sudoersemc.integration.ExternalBaselineSource;
 import com.itzplana.sudoersemc.integration.ProjectECustomEmcFile;
 import com.itzplana.sudoersemc.pricing.FallbackPricing;
 import com.itzplana.sudoersemc.pricing.TierPricing;
+import com.itzplana.sudoersemc.resolver.ResolverRegistry;
 import com.itzplana.sudoersemc.resolver.VariantScanner;
 import com.itzplana.sudoersemc.safety.CreativeItemProtection;
 import com.itzplana.sudoersemc.safety.LargeDropProtection;
@@ -130,6 +133,10 @@ public final class ScanPipeline {
     private volatile boolean priceSecondaryOutputs = false;
     private volatile boolean preserveExternallyModifiedValues = true;
     private volatile Supplier<Predicate<ItemKey>> manualValueDetectorSupplier = () -> item -> false;
+    /** 外部基线来源；默认不可用，行为与 Phase 24 完全一致。 */
+    private volatile ExternalBaselineSource externalBaselineSource = ExternalBaselineSource.unavailable();
+    /** 第三方 NBT 材料解析器注册表；默认空表，不重建 ItemStack、不解析 SNBT。 */
+    private volatile ResolverRegistry resolverRegistry = ResolverRegistry.defaults();
 
     private final AtomicReference<PipelineSnapshot> stashedSnapshot = new AtomicReference<>();
     private volatile RecipeSolver recipeSolver = new RecipeSolver();
@@ -146,6 +153,7 @@ public final class ScanPipeline {
     private volatile int lastSolverCacheMisses;
     private volatile int lastOwnershipExternalModifications;
     private volatile int lastOwnershipReleased;
+    private volatile int lastResolverApplied;
 
     private volatile EmcProvider emcProvider;
     private volatile OverflowScope overflowScope = OverflowScope.OWNED_ONLY;
@@ -320,6 +328,26 @@ public final class ScanPipeline {
     }
 
     /**
+     * 注入外部基线来源。传入 {@code null} 恢复不可用来源，行为与 Phase 24 完全一致。
+     *
+     * @param source 外部基线来源，允许为 {@code null}
+     */
+    public void setExternalBaselineSource(@Nullable ExternalBaselineSource source) {
+        this.externalBaselineSource = source == null
+                ? ExternalBaselineSource.unavailable()
+                : source;
+    }
+
+    /**
+     * 注入 NBT 材料解析器注册表。传入 {@code null} 或空表时不会为任何物品重建 ItemStack。
+     *
+     * @param registry 解析器注册表，允许为 {@code null}
+     */
+    public void setResolverRegistry(@Nullable ResolverRegistry registry) {
+        this.resolverRegistry = registry == null ? ResolverRegistry.defaults() : registry;
+    }
+
+    /**
      * 按当前评估策略重建求解器。重建会丢弃评估缓存，但保留已累计的命中/未命中计数器。
      */
     private synchronized void rebuildRecipeSolver() {
@@ -408,6 +436,9 @@ public final class ScanPipeline {
         if (server == null) {
             return null;
         }
+        // 启动指纹与随后扫描应用阶段的基线指纹必须来自同一份数据，否则每次启动都会误判为
+        // “基线通道变化”并触发无意义的重扫。
+        prepareExternalBaseline(server);
         try {
             ItemScanner identityScanner = new ItemScanner(new ItemScanner.EmcQuery() {
                 @Override
@@ -585,6 +616,18 @@ public final class ScanPipeline {
     }
 
     /**
+     * 安全准备外部基线来源。任何异常都只记录警告，本轮按空基线继续。
+     */
+    private void prepareExternalBaseline(@Nullable MinecraftServer server) {
+        ExternalBaselineSource source = externalBaselineSource;
+        try {
+            source.prepare(server);
+        } catch (Throwable failure) {
+            LOGGER.warn("SudoersEMC 准备外部基线失败，本轮按空基线处理", failure);
+        }
+    }
+
+    /**
      * 采集一次扫描所需的全部数据。
      *
      * <p><strong>必须由服务器线程调用。</strong>本方法读取物品注册表与配方管理器，并把实时对象
@@ -599,6 +642,7 @@ public final class ScanPipeline {
             LOGGER.warn("SudoersEMC 扫描采集被调用时服务器尚未就绪，返回空快照");
             return PipelineSnapshot.empty();
         }
+        prepareExternalBaseline(server);
 
         try {
             ItemScanner.EmcQuery query = new ItemScanner.EmcQuery() {
@@ -807,6 +851,14 @@ public final class ScanPipeline {
                 LOGGER.debug("生成物品 {} 的 NBT 变体失败，跳过", entry.getKey(), failure);
                 continue;
             }
+            if (DebugLog.isEnabled()) {
+                final long index = processedEntries;
+                final int observed = entry.getValue().size();
+                final int produced = variantKeys.size();
+                DebugLog.headOrSampled("variant", index, 20L, 500L,
+                        () -> "item=" + entry.getKey() + " observed=" + observed
+                                + " variants=" + produced);
+            }
             for (ItemKey variantKey : variantKeys) {
                 if (!variantKey.hasVariant() || !seen.add(variantKey)) {
                     continue;
@@ -820,6 +872,10 @@ public final class ScanPipeline {
             return List.of();
         }
         variants.sort(Comparator.comparing(ItemSnapshot::key));
+        if (DebugLog.isEnabled()) {
+            DebugLog.log("variant", "collected variants=" + variants.size()
+                    + " observedItems=" + observedByItem.size());
+        }
         return List.copyOf(variants);
     }
 
@@ -1154,6 +1210,7 @@ public final class ScanPipeline {
         lastSnapshotForReport = data;
         lastOwnershipExternalModifications = 0;
         lastOwnershipReleased = 0;
+        lastResolverApplied = 0;
         long cacheHitsBefore = recipeSolver.cacheHits();
         long cacheMissesBefore = recipeSolver.cacheMisses();
         long startedAtNanos = System.nanoTime();
@@ -1225,6 +1282,7 @@ public final class ScanPipeline {
 
             int applied = 0;
             int quarantined = 0;
+            int externalBaselineApplied = 0;
             Map<String, Long> sourceCounts = new LinkedHashMap<>();
             boolean cancelledDuringApply = false;
             int applyIndex = 0;
@@ -1267,9 +1325,20 @@ public final class ScanPipeline {
                         continue;
                     }
                 }
-
                 applied++;
                 sourceCounts.merge(candidate.source().name(), 1L, Long::sum);
+                if (candidate.source() == PriceSource.EXTERNAL_BASELINE) {
+                    externalBaselineApplied++;
+                }
+                if (DebugLog.isEnabled()) {
+                    final long index = applyIndex;
+                    final long before = previousValue;
+                    final long after = finalValue;
+                    DebugLog.headOrSampled("apply", index, 20L, 500L,
+                            () -> "applied item=" + candidate.item()
+                                    + " source=" + candidate.source()
+                                    + " previous=" + before + " final=" + after);
+                }
             }
 
             Set<ItemKey> candidateKeys = new HashSet<>(candidates.size());
@@ -1305,6 +1374,7 @@ public final class ScanPipeline {
                     lastOwnershipReleased, diagnostics);
             extraCounters.put("solverCacheHits", (long) lastSolverCacheHits);
             extraCounters.put("solverCacheMisses", (long) lastSolverCacheMisses);
+            addExternalBaselineCounters(extraCounters, externalBaselineApplied);
             if (cancelledDuringApply) {
                 extraCounters.put("scanCancelled", 1L);
                 extraCounters.put("partialReport", 1L);
@@ -1481,10 +1551,16 @@ public final class ScanPipeline {
                                       Map<ItemKey, Long> seeds) {
         boolean changed = false;
         boolean allowIncrease = solveSettings.allowValueIncrease();
+        long index = 0L;
         for (Map.Entry<ItemKey, Long> entry : solveResult.values().entrySet()) {
             ItemKey item = entry.getKey();
+            index++;
             if (isExcludedFromPricing(item)) {
                 LOGGER.debug("物品 {} 被排除规则命中，跳过配方候选", item);
+                if (DebugLog.isEnabled()) {
+                    DebugLog.headOrSampled("recipe-merge", index, 20L, 500L,
+                            () -> "skip excluded item=" + item);
+                }
                 continue;
             }
             long solvedValue = entry.getValue();
@@ -1513,6 +1589,14 @@ public final class ScanPipeline {
             if (existing == null || mergedValue < existing.value() || allowIncrease) {
                 recipeCandidates.put(item,
                         new Candidate(item, mergedValue, PriceSource.RECIPE, recipeId, alternativeCosts));
+            }
+            if (DebugLog.isEnabled()) {
+                final long logIndex = index;
+                final long value = mergedValue;
+                final long previousValue = previous == null ? 0L : previous;
+                DebugLog.headOrSampled("recipe-merge", logIndex, 20L, 500L,
+                        () -> "merge item=" + item + " value=" + value
+                                + " previous=" + previousValue);
             }
         }
         return changed;
@@ -1547,6 +1631,49 @@ public final class ScanPipeline {
             LOGGER.warn("排除规则判定失败，按排除处理：{}", item, failure);
             return true;
         }
+    }
+
+    /**
+     * 通过第三方 resolver 注册表为物品解析 EMC。
+     *
+     * <p>空注册表直接返回 0，不重建 {@link ItemStack}、不解析 SNBT，保证默认行为与 Phase 24
+     * 完全一致。任何异常都退化为“无值”，继续 TAG/RARITY/FALLBACK。</p>
+     */
+    private long resolveWithRegistry(ItemKey key) {
+        ResolverRegistry registry = resolverRegistry;
+        if (key == null || registry == null || registry.size() == 0) {
+            return 0L;
+        }
+        ItemStack stack = stackFor(key);
+        if (stack.isEmpty()) {
+            return 0L;
+        }
+        try {
+            return Math.max(0L, registry.resolve(stack).orElse(0L));
+        } catch (RuntimeException | LinkageError failure) {
+            LOGGER.debug("NBT resolver 解析物品 {} 失败，按无值处理", key, failure);
+            return 0L;
+        }
+    }
+
+    /**
+     * 从 {@link ItemKey} 重建一个用于 resolver 的堆叠。变体 SNBT 无法解析时返回空堆叠。
+     */
+    private static ItemStack stackFor(ItemKey key) {
+        Item item = BuiltInRegistries.ITEM.get(key.itemId());
+        if (item == null || item == Items.AIR) {
+            return ItemStack.EMPTY;
+        }
+        ItemStack stack = new ItemStack(item);
+        if (key.hasVariant()) {
+            try {
+                CompoundTag tag = TagParser.parseTag(key.variantHash());
+                stack.setTag(tag);
+            } catch (Exception failure) {
+                return ItemStack.EMPTY;
+            }
+        }
+        return stack;
     }
 
     /**
@@ -1613,13 +1740,29 @@ public final class ScanPipeline {
                                       Map<ItemKey, Candidate> candidates) {
         int added = 0;
         long minimumEmc = solveSettings.minimumEmc();
+        Predicate<ItemKey> manualDetector = manualDetector();
+        int index = 0;
         for (ItemSnapshot itemSnapshot : snapshot.items()) {
             ItemKey item = itemSnapshot.key();
+            index++;
             if (seeds.containsKey(item) || snapshot.existingValues().containsKey(item)) {
+                continue;
+            }
+            // 手动值优先于任何自动来源：即使该物品没有 owned 条目，也不能被 baseline/TAG/RARITY
+            // 重新接管。判定器在每轮开头创建一次，避免逐物品执行文件 stat。
+            if (manualDetector != null && isManuallySet(manualDetector, item)) {
+                if (DebugLog.isEnabled()) {
+                    DebugLog.headOrSampled("fallback", index, 20L, 500L,
+                            () -> "skip manual-protected item=" + item);
+                }
                 continue;
             }
             if (isExcludedFromPricing(item)) {
                 LOGGER.debug("物品 {} 被排除规则命中，跳过兜底定价", item);
+                if (DebugLog.isEnabled()) {
+                    DebugLog.headOrSampled("fallback", index, 20L, 500L,
+                            () -> "skip excluded item=" + item);
+                }
                 continue;
             }
 
@@ -1645,24 +1788,62 @@ public final class ScanPipeline {
                 continue;
             }
 
+            // NBT resolver 最具体；只有它没有命中时才读取 PEI 等外部基线。
+            long resolverValue = resolveWithRegistry(item);
+            long baseline = resolverValue;
+            if (baseline <= 0L) {
+                try {
+                    baseline = externalBaselineSource.lookup(item).orElse(0L);
+                } catch (RuntimeException | LinkageError failure) {
+                    LOGGER.debug("读取外部基线失败，按 0 处理：{}", item, failure);
+                    baseline = 0L;
+                }
+            }
+
             if (fallbackPricing == null) {
+                if (baseline <= 0L || baseline < minimumEmc) {
+                    continue;
+                }
+                Candidate candidate =
+                        new Candidate(item, baseline, PriceSource.EXTERNAL_BASELINE, null);
+                candidates.put(item, candidate);
+                seeds.put(item, candidate.value());
+                added++;
+                if (resolverValue > 0L) {
+                    lastResolverApplied++;
+                }
+                if (DebugLog.isEnabled()) {
+                    DebugLog.headOrSampled("fallback", index, 20L, 500L,
+                            () -> "hit item=" + item + " source=EXTERNAL_BASELINE value="
+                                    + candidate.value());
+                }
                 continue;
             }
 
             Optional<FallbackPricing.PricedValue> priced;
             try {
                 priced = fallbackPricing.price(new FallbackPricing.PricingRequest(
-                        item, itemSnapshot.tagPaths(), itemSnapshot.rarity(), 0L, 0L));
+                        item, itemSnapshot.tagPaths(), itemSnapshot.rarity(), 0L, baseline));
             } catch (RuntimeException failure) {
                 LOGGER.warn("兜底定价失败，跳过物品 {}", item, failure);
                 continue;
             }
             if (priced.isEmpty()) {
+                if (DebugLog.isEnabled()) {
+                    final long baselineForLog = baseline;
+                    DebugLog.headOrSampled("fallback", index, 20L, 500L,
+                            () -> "miss item=" + item + " baseline=" + baselineForLog);
+                }
                 continue;
             }
 
             FallbackPricing.PricedValue pricedValue = priced.get();
             if (pricedValue.value() <= 0L || pricedValue.value() < minimumEmc) {
+                if (DebugLog.isEnabled()) {
+                    DebugLog.headOrSampled("fallback", index, 20L, 500L,
+                            () -> "discard item=" + item + " value=" + pricedValue.value()
+                                    + " minEmc=" + minimumEmc);
+                }
                 continue;
             }
             Candidate candidate =
@@ -1670,6 +1851,17 @@ public final class ScanPipeline {
             candidates.put(item, candidate);
             seeds.put(item, candidate.value());
             added++;
+            if (resolverValue > 0L && pricedValue.source() == PriceSource.EXTERNAL_BASELINE) {
+                lastResolverApplied++;
+            }
+            if (DebugLog.isEnabled()) {
+                DebugLog.headOrSampled("fallback", index, 20L, 500L,
+                        () -> "hit item=" + item + " source=" + pricedValue.source()
+                                + " value=" + pricedValue.value());
+            }
+        }
+        if (DebugLog.isEnabled()) {
+            DebugLog.log("fallback", "round added=" + added + " totalCandidates=" + candidates.size());
         }
         return added;
     }
@@ -1861,6 +2053,7 @@ public final class ScanPipeline {
             Map<String, Long> counters = buildExtraCounters(data, skippedSolveResult(), 0, 0,
                     durationMillis, store != null, 0, 0,
                     lastOwnershipExternalModifications, lastOwnershipReleased, selected);
+            addExternalBaselineCounters(counters, 0L);
             counters.put("partialReport", 1L);
             counters.put("scanCancelled", cancelled ? 1L : 0L);
             counters.put("scanFailed", cancelled ? 0L : 1L);
@@ -1870,6 +2063,41 @@ public final class ScanPipeline {
         } catch (RuntimeException failure) {
             LOGGER.warn("写出部分诊断报告失败，本轮结果仍然有效", failure);
         }
+    }
+
+    /**
+     * 追加外部基线与 resolver 相关的诊断计数器。
+     *
+     * <p>所有读取都包在 try/catch 中：来源或注册表属于第三方/可选组件，任何异常都只能让
+     * 计数器退化为 0，绝不能影响本轮扫描结果。</p>
+     */
+    private void addExternalBaselineCounters(Map<String, Long> counters, long applied) {
+        if (counters == null) {
+            return;
+        }
+        boolean available = false;
+        int entries = 0;
+        int resolverRegistered = 0;
+        try {
+            ExternalBaselineSource source = externalBaselineSource;
+            if (source != null) {
+                available = source.isAvailable();
+                entries = Math.max(0, source.entryCount());
+            }
+        } catch (Throwable failure) {
+            LOGGER.debug("读取外部基线诊断计数失败，按不可用处理", failure);
+        }
+        try {
+            ResolverRegistry registry = resolverRegistry;
+            resolverRegistered = registry == null ? 0 : Math.max(0, registry.size());
+        } catch (Throwable failure) {
+            LOGGER.debug("读取 resolver 诊断计数失败，按 0 处理", failure);
+        }
+        counters.put("externalBaselineAvailable", available ? 1L : 0L);
+        counters.put("externalBaselineEntries", (long) entries);
+        counters.put("externalBaselineApplied", Math.max(0L, applied));
+        counters.put("resolverRegistered", (long) resolverRegistered);
+        counters.put("resolverApplied", (long) Math.max(0, lastResolverApplied));
     }
 
     /**
@@ -1971,6 +2199,7 @@ public final class ScanPipeline {
                 snapshot.itemCount(),
                 snapshot.existingValues().size(),
                 result.sourceBreakdown().getOrDefault(PriceSource.RECIPE.name(), 0L),
+                result.sourceBreakdown().getOrDefault(PriceSource.EXTERNAL_BASELINE.name(), 0L),
                 result.sourceBreakdown().getOrDefault(PriceSource.TAG.name(), 0L),
                 result.sourceBreakdown().getOrDefault(PriceSource.RARITY.name(), 0L),
                 result.sourceBreakdown().getOrDefault(PriceSource.TIER.name(), 0L),

@@ -21,6 +21,7 @@ import java.util.Map;
  * @param totalRegisteredItems    本次扫描遍历到的注册物品总数
  * @param itemsWithExistingEmc    其中已经有 EMC 值的物品数量
  * @param itemsSolvedByRecipe     通过配方求解得到价格的物品数量
+ * @param itemsSolvedByExternalBaseline 通过外部基线（PEI/解析器）得到价格的物品数量
  * @param itemsSolvedByTag        通过标签定价得到价格的物品数量
  * @param itemsSolvedByRarity     通过稀有度定价得到价格的物品数量
  * @param itemsSolvedByTier       通过层级规则得到价格的物品数量
@@ -37,6 +38,7 @@ public record DiagnosticReport(
         long totalRegisteredItems,
         long itemsWithExistingEmc,
         long itemsSolvedByRecipe,
+        long itemsSolvedByExternalBaseline,
         long itemsSolvedByTag,
         long itemsSolvedByRarity,
         long itemsSolvedByTier,
@@ -70,6 +72,7 @@ public record DiagnosticReport(
         requireNonNegative("totalRegisteredItems", totalRegisteredItems);
         requireNonNegative("itemsWithExistingEmc", itemsWithExistingEmc);
         requireNonNegative("itemsSolvedByRecipe", itemsSolvedByRecipe);
+        requireNonNegative("itemsSolvedByExternalBaseline", itemsSolvedByExternalBaseline);
         requireNonNegative("itemsSolvedByTag", itemsSolvedByTag);
         requireNonNegative("itemsSolvedByRarity", itemsSolvedByRarity);
         requireNonNegative("itemsSolvedByTier", itemsSolvedByTier);
@@ -108,7 +111,7 @@ public record DiagnosticReport(
     }
 
     /**
-     * 兼容 Phase 21 及更早调用点的构造器：不携带额外计数器与失败明细。
+     * 兼容 Phase 24 及更早调用点的构造器：不携带额外计数器与失败明细，外部基线计数为 0。
      */
     public DiagnosticReport(long totalRegisteredItems,
                             long itemsWithExistingEmc,
@@ -123,17 +126,41 @@ public record DiagnosticReport(
                             long totalDurationMillis,
                             long peakHeapBytes,
                             Map<String, Long> extraCounters) {
-        this(totalRegisteredItems, itemsWithExistingEmc, itemsSolvedByRecipe, itemsSolvedByTag,
-                itemsSolvedByRarity, itemsSolvedByTier, itemsSolvedByFallback, unresolvedItems,
-                quarantinedDrops, failedRecipes, totalDurationMillis, peakHeapBytes,
-                extraCounters, List.of());
+        this(totalRegisteredItems, itemsWithExistingEmc, itemsSolvedByRecipe, 0L,
+                itemsSolvedByTag, itemsSolvedByRarity, itemsSolvedByTier, itemsSolvedByFallback,
+                unresolvedItems, quarantinedDrops, failedRecipes, totalDurationMillis,
+                peakHeapBytes, extraCounters, List.of());
     }
 
     /**
-     * @return 所有通过定价来源求解出的物品数量之和，即配方、标签、稀有度、层级与兜底五项相加
+     * 兼容 Phase 22/24 调用点的构造器：携带失败明细，但不携带外部基线计数。
+     */
+    public DiagnosticReport(long totalRegisteredItems,
+                            long itemsWithExistingEmc,
+                            long itemsSolvedByRecipe,
+                            long itemsSolvedByTag,
+                            long itemsSolvedByRarity,
+                            long itemsSolvedByTier,
+                            long itemsSolvedByFallback,
+                            long unresolvedItems,
+                            long quarantinedDrops,
+                            long failedRecipes,
+                            long totalDurationMillis,
+                            long peakHeapBytes,
+                            Map<String, Long> extraCounters,
+                            List<String> failedRecipeDetails) {
+        this(totalRegisteredItems, itemsWithExistingEmc, itemsSolvedByRecipe, 0L,
+                itemsSolvedByTag, itemsSolvedByRarity, itemsSolvedByTier, itemsSolvedByFallback,
+                unresolvedItems, quarantinedDrops, failedRecipes, totalDurationMillis,
+                peakHeapBytes, extraCounters, failedRecipeDetails);
+    }
+
+    /**
+     * @return 所有通过定价来源求解出的物品数量之和，即配方、外部基线、标签、稀有度、层级与兜底相加
      */
     public long generatedTotal() {
         return itemsSolvedByRecipe
+                + itemsSolvedByExternalBaseline
                 + itemsSolvedByTag
                 + itemsSolvedByRarity
                 + itemsSolvedByTier
@@ -143,14 +170,16 @@ public record DiagnosticReport(
     /**
      * 按固定顺序返回非零的定价来源分布。
      *
-     * <p>顺序固定为 {@code RECIPE → TAG → RARITY → TIER → FALLBACK}，与枚举声明顺序无关，
-     * 这样同一份数据在任何构建中都会产生相同的键顺序。值为 0 的来源不会出现在结果里。</p>
+     * <p>顺序固定为 {@code RECIPE → EXTERNAL_BASELINE → TAG → RARITY → TIER → FALLBACK}，
+     * 与枚举声明顺序无关，这样同一份数据在任何构建中都会产生相同的键顺序。值为 0 的来源
+     * 不会出现在结果里。</p>
      *
      * @return 不可变的“来源名称 → 数量”映射
      */
     public Map<String, Long> sourceBreakdown() {
         Map<String, Long> breakdown = new LinkedHashMap<>();
         putIfPositive(breakdown, PriceSource.RECIPE, itemsSolvedByRecipe);
+        putIfPositive(breakdown, PriceSource.EXTERNAL_BASELINE, itemsSolvedByExternalBaseline);
         putIfPositive(breakdown, PriceSource.TAG, itemsSolvedByTag);
         putIfPositive(breakdown, PriceSource.RARITY, itemsSolvedByRarity);
         putIfPositive(breakdown, PriceSource.TIER, itemsSolvedByTier);
@@ -176,6 +205,7 @@ public record DiagnosticReport(
         appendLine(text, "注册物品总数", Long.toString(totalRegisteredItems));
         appendLine(text, "已有 EMC", Long.toString(itemsWithExistingEmc));
         appendLine(text, "配方求解", Long.toString(itemsSolvedByRecipe));
+        appendLine(text, "外部基线定价", Long.toString(itemsSolvedByExternalBaseline));
         appendLine(text, "标签定价", Long.toString(itemsSolvedByTag));
         appendLine(text, "稀有度定价", Long.toString(itemsSolvedByRarity));
         appendLine(text, "层级定价", Long.toString(itemsSolvedByTier));

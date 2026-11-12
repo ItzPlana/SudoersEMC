@@ -2,20 +2,25 @@ package com.itzplana.sudoersemc;
 
 import com.itzplana.sudoersemc.command.CommandService;
 import com.itzplana.sudoersemc.command.SudoemcCommands;
+import com.itzplana.sudoersemc.config.ConfigTomlMigration;
 import com.itzplana.sudoersemc.config.ConfigValidationResult;
 import com.itzplana.sudoersemc.config.ConfigValidator;
 import com.itzplana.sudoersemc.config.ConfigWatcher;
 import com.itzplana.sudoersemc.config.ReloadDecision;
 import com.itzplana.sudoersemc.config.SudoersemcConfig;
 import com.itzplana.sudoersemc.core.OverflowScope;
+import com.itzplana.sudoersemc.diagnostic.DebugLog;
 import com.itzplana.sudoersemc.diagnostic.ReportManager;
 import com.itzplana.sudoersemc.diagnostic.SmokeTestHook;
+import com.itzplana.sudoersemc.integration.ExternalBaselineSource;
 import com.itzplana.sudoersemc.integration.GeneratedEmcMapper;
 import com.itzplana.sudoersemc.integration.OptionalIntegrationManager;
+import com.itzplana.sudoersemc.integration.ProjectEIntegrationBaselineSource;
 import com.itzplana.sudoersemc.pipeline.PipelineSnapshot;
 import com.itzplana.sudoersemc.pipeline.ScanPipeline;
 import com.itzplana.sudoersemc.pricing.FallbackPricing;
 import com.itzplana.sudoersemc.pricing.PricingSettings;
+import com.itzplana.sudoersemc.resolver.ResolverRegistry;
 import com.itzplana.sudoersemc.safety.CreativeItemProtection;
 import com.itzplana.sudoersemc.safety.LargeDropProtection;
 import com.itzplana.sudoersemc.safety.OverflowPipeline;
@@ -37,6 +42,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import net.minecraft.server.MinecraftServer;
 import net.minecraftforge.common.ForgeConfigSpec;
 import net.minecraftforge.common.MinecraftForge;
@@ -74,6 +80,18 @@ public final class Sudoersemc {
 
     /** 配置事件与命令共用的重载协调器；失败摘要与冲突警告由它去重。 */
     private static final ConfigWatcher CONFIG_WATCHER = new ConfigWatcher();
+
+    /**
+     * 进程级 resolver 注册表。第三方模组在构造器/common setup 注册的解析器必须跨配置重建存活，
+     * 因此绝不能每次重建都新建实例。
+     */
+    private static final ResolverRegistry RESOLVER_REGISTRY = new ResolverRegistry();
+
+    /** 进程级 ProjectE-Integration 外部基线来源；配置关闭时改用不可用实例。 */
+    private static final ExternalBaselineSource PROJECTE_INTEGRATION_BASELINE =
+            new ProjectEIntegrationBaselineSource();
+
+    private static final AtomicBoolean BASELINE_CONFIG_WARNED = new AtomicBoolean(false);
 
     static {
         CONFIG_WATCHER.register(result -> rebuildRuntimeFromConfig("config-event"));
@@ -449,6 +467,10 @@ public final class Sudoersemc {
         pipeline.setQuarantinedDropsStore(quarantineStore);
         pipeline.setConfigFingerprintSupplier(SudoersemcConfig::scanFingerprintEntries);
         pipeline.setBaselineFingerprintSupplier(Sudoersemc::baselineFingerprintEntries);
+        pipeline.setExternalBaselineSource(externalBaselineSource());
+        pipeline.setResolverRegistry(RESOLVER_REGISTRY);
+        applyDebugLogging(readBoolean(
+                "diagnostic.debugLogging", SudoersemcConfig.DIAGNOSTIC_DEBUG_LOGGING, false));
 
         OverflowScope overflowScope = OverflowScope.OWNED_ONLY;
         boolean allowProjectEFileRewrite = false;
@@ -485,6 +507,15 @@ public final class Sudoersemc {
         pipeline.setManualValueDetectorSupplier(
                 () -> OptionalIntegrationManager.manualValues().snapshotPredicate());
         return pipeline;
+    }
+
+    /**
+     * 应用调试日志开关。包内可见，便于验证“重建跟随开关”的接线。
+     *
+     * @param enabled 是否输出诊断调试日志
+     */
+    static void applyDebugLogging(boolean enabled) {
+        DebugLog.setEnabled(enabled);
     }
 
     /**
@@ -556,9 +587,27 @@ public final class Sudoersemc {
     }
 
     /**
-     * 构造外部基线的指纹条目：ProjectE 手动 EMC 物品值与手动标签。
+     * 按当前配置选择外部基线来源。配置关闭或读取失败时返回共享的不可用实例。
+     */
+    private static ExternalBaselineSource externalBaselineSource() {
+        try {
+            return SudoersemcConfig.FALLBACK_USE_PROJECTE_INTEGRATION_BASELINES.get()
+                    ? PROJECTE_INTEGRATION_BASELINE
+                    : ExternalBaselineSource.unavailable();
+        } catch (RuntimeException failure) {
+            if (BASELINE_CONFIG_WARNED.compareAndSet(false, true)) {
+                LOGGER.warn("SudoersEMC 无法读取外部基线开关，按禁用处理", failure);
+            }
+            return ExternalBaselineSource.unavailable();
+        }
+    }
+
+    /**
+     * 构造外部基线的指纹条目：ProjectE 手动 EMC 物品值、手动标签、外部基线来源与 resolver
+     * 注册表组成。
      *
-     * <p>文件缺失或未安装 ProjectE 时返回空列表；读取失败按空处理，绝不影响启动。</p>
+     * <p>来源不可用时仍追加固定标记，确保安装/移除 PEI 会改变指纹并触发一次重扫。读取失败
+     * 按空处理，绝不影响启动。</p>
      */
     private static List<String> baselineFingerprintEntries() {
         try {
@@ -572,10 +621,16 @@ public final class Sudoersemc {
                 entries.add("tag:#" + tagId);
             }
             entries.add("projecte=" + OptionalIntegrationManager.isProjectEAvailable());
+
+            ExternalBaselineSource source = externalBaselineSource();
+            entries.add("external-baseline-id=" + source.id());
+            entries.add("external-baseline-available=" + source.isAvailable());
+            entries.addAll(source.fingerprintEntries());
+            entries.addAll(RESOLVER_REGISTRY.fingerprintEntries());
             return entries;
         } catch (RuntimeException failure) {
             LOGGER.warn("SudoersEMC 读取外部基线指纹失败，按空基线处理", failure);
-            return List.of();
+            return List.of("external-baseline=fingerprint-error");
         }
     }
 
@@ -632,6 +687,19 @@ public final class Sudoersemc {
                 || event.getConfig().getSpec() != SudoersemcConfig.SPEC) {
             return;
         }
+        // 迁移必须发生在运行时重建之前：Loading 与 Reloading 共用同一入口。迁移自身保证
+        // 幂等、高版本拒绝、损坏文件保留与内存值同步。
+        ConfigTomlMigration.MigrationOutcome migration =
+                ConfigTomlMigration.migrate(event.getConfig());
+        if (migration.status() == ConfigTomlMigration.Status.REFUSED_NEWER) {
+            LOGGER.error("SudoersEMC 配置版本高于当前构建，已拒绝迁移：{}", migration.notes());
+        } else if (migration.status() == ConfigTomlMigration.Status.FAILED_RETAINED) {
+            LOGGER.warn("SudoersEMC 配置迁移失败，继续使用当前配置：{}", migration.notes());
+        } else if (migration.status() == ConfigTomlMigration.Status.MIGRATED) {
+            LOGGER.info("SudoersEMC 配置已从 schema {} 迁移到 {}：{}",
+                    migration.fromVersion(), migration.toVersion(), migration.notes());
+        }
+
         if (entryStore == null || reportManager == null) {
             // 配置可能在 common setup 之前加载；此时没有可重建的组件，只记录调试信息。
             LOGGER.debug("SudoersEMC 配置事件早于 common setup，跳过运行时重建");
@@ -760,6 +828,17 @@ public final class Sudoersemc {
      */
     public static ScanStateStore scanStateStore() {
         return scanStateStore;
+    }
+
+    /**
+     * 第三方模组注册 NBT 材料解析器的进程级入口。
+     *
+     * <p>注册表跨配置重建存活；解析器会在服务器线程被调用，不得阻塞或执行重计算。</p>
+     *
+     * @return 共享注册表，永不为 {@code null}
+     */
+    public static ResolverRegistry resolverRegistry() {
+        return RESOLVER_REGISTRY;
     }
 
     /**
