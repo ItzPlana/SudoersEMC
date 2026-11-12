@@ -136,6 +136,33 @@ class ConfigValidatorTest {
     }
 
     @Test
+    void crossFieldValidationRejectsOutOfRangeNbtVariantLimit() {
+        assertTrue(ConfigValidator.validateCrossField(base().build()).valid());
+
+        assertEquals(
+                List.of("maxNbtVariantsPerItem 必须在 [1, 1000] 内，当前为 0"),
+                ConfigValidator.validateCrossField(
+                        base().maxNbtVariantsPerItem(0).build()).errors());
+        assertEquals(
+                List.of("maxNbtVariantsPerItem 必须在 [1, 1000] 内，当前为 1001"),
+                ConfigValidator.validateCrossField(
+                        base().maxNbtVariantsPerItem(1001).build()).errors());
+    }
+
+    @Test
+    void crossFieldValidationRejectsZeroAndNaNDropRatio() {
+        ConfigValidationResult zero = ConfigValidator.validateCrossField(
+                base().maxAllowedDropRatio(0.0D).build());
+        assertFalse(zero.valid());
+        assertEquals(
+                List.of("maxAllowedDropRatio 必须在 (0.0, 1.0] 内，当前为 0.0"),
+                zero.errors());
+
+        assertFalse(ConfigValidator.validateCrossField(
+                base().maxAllowedDropRatio(Double.NaN).build()).valid());
+    }
+
+    @Test
     void entireCustomEmcWithoutFileRewriteWarns() {
         ConfigValidationResult result = ConfigValidator.validate(
                 base().overwriteScope("entire_custom_emc").build());
@@ -309,6 +336,17 @@ class ConfigValidatorTest {
 
         assertFalse(result.valid());
         assertEquals(List.of("overflow.bucketCount 必须 >= 1，当前为 0"), result.errors());
+    }
+
+    @Test
+    void currentConfigAdapterRejectsZeroDropRatio() {
+        ConfigValidationResult result = ConfigValidator.validateCurrent(
+                () -> base().maxAllowedDropRatio(0.0D).build());
+
+        assertFalse(result.valid());
+        assertEquals(
+                List.of("maxAllowedDropRatio 必须在 (0.0, 1.0] 内，当前为 0.0"),
+                result.errors());
     }
 
     @Test
