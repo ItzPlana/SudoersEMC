@@ -22,12 +22,14 @@ class VariantScannerTest {
 
     private static final ResourceLocation STONE_ID = new ResourceLocation("minecraft", "stone");
     private static final ItemStack BASE_STACK;
+    private static final ItemStack DAMAGEABLE_STACK;
 
     static {
         // Forge 的 ItemStack 静态初始化需要 BuiltInRegistries，因此测试前必须先完成引导。
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
         BASE_STACK = new ItemStack(Items.STONE);
+        DAMAGEABLE_STACK = new ItemStack(Items.DIAMOND_SWORD);
     }
 
     private final VariantScanner scanner = new VariantScanner();
@@ -78,6 +80,27 @@ class VariantScannerTest {
     }
 
     @Test
+    void truncationKeepsSmallestVariantsRegardlessOfInputOrder() {
+        List<CompoundTag> variants = List.of(
+                markerTag(9), markerTag(2), markerTag(5), markerTag(1));
+
+        List<ItemKey> keys = scanner.scan(BASE_STACK, variants, 2);
+
+        assertEquals(List.of(
+                ItemKey.of(STONE_ID, "{Marker:1}"),
+                ItemKey.of(STONE_ID, "{Marker:2}")
+        ), keys);
+    }
+
+    @Test
+    void damageOnlyVariantsAreDroppedForDamageableItems() {
+        List<ItemKey> keys = scanner.scan(DAMAGEABLE_STACK,
+                List.of(damageTag(1), damageTag(2)), 10);
+
+        assertTrue(keys.isEmpty());
+    }
+
+    @Test
     void resultIsSortedDeterministically() {
         List<ItemKey> keys = scanner.scan(BASE_STACK,
                 List.of(damageTag(9), damageTag(1), damageTag(5)), 10);
@@ -108,6 +131,12 @@ class VariantScannerTest {
     private static CompoundTag damageTag(int damage) {
         CompoundTag tag = new CompoundTag();
         tag.putInt("Damage", damage);
+        return tag;
+    }
+
+    private static CompoundTag markerTag(int marker) {
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Marker", marker);
         return tag;
     }
 }
