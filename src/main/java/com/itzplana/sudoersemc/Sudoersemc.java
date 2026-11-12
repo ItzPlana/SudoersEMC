@@ -5,7 +5,6 @@ import com.itzplana.sudoersemc.command.SudoemcCommands;
 import com.itzplana.sudoersemc.config.ConfigValidationResult;
 import com.itzplana.sudoersemc.config.ReloadDecision;
 import com.itzplana.sudoersemc.config.SudoersemcConfig;
-import com.itzplana.sudoersemc.core.OverflowScope;
 import com.itzplana.sudoersemc.diagnostic.ReportManager;
 import com.itzplana.sudoersemc.diagnostic.SmokeTestHook;
 import com.itzplana.sudoersemc.integration.GeneratedEmcMapper;
@@ -217,46 +216,48 @@ public final class Sudoersemc {
                 solveSettings);
         pipeline.setEmcProvider(OptionalIntegrationManager.provider().orElse(null));
 
-        OverflowScope overflowScope = OverflowScope.OWNED_ONLY;
-        boolean allowProjectEFileRewrite = false;
-        try {
-            overflowScope = SudoersemcConfig.parseOverflowScope(
-                    SudoersemcConfig.OVERFLOW_OVERWRITE_SCOPE.get());
-            allowProjectEFileRewrite = SudoersemcConfig.OVERFLOW_ALLOW_PROJECTE_FILE_REWRITE.get();
-        } catch (RuntimeException e) {
-            // 配置尚未加载或读取失败时回退到最保守的组合，绝不阻止模组启动。
-            LOGGER.warn("SudoersEMC 无法读取溢出作用域配置，回退 owned_only 并禁用 ProjectE 文件改写", e);
-        }
+        // 使用已经通过 ConfigValidator 校验的不可变快照，避免二次读取原始配置造成
+        // 事实来源漂移；配置未加载时该快照已是安全默认值（OWNED_ONLY + false）。
+        applyOverflowSettings(pipeline, overflowSettings);
         applyRuntimeSwitches(
                 pipeline,
                 readBoolean("recipe.solveRecipes", SudoersemcConfig.RECIPE_SOLVE_RECIPES, true),
-                readBoolean("diagnostic.generateReports", SudoersemcConfig.DIAGNOSTIC_GENERATE_REPORTS, true),
-                overflowScope,
-                allowProjectEFileRewrite);
+                readBoolean("diagnostic.generateReports", SudoersemcConfig.DIAGNOSTIC_GENERATE_REPORTS, true));
         return pipeline;
     }
 
     /**
-     * 把配置开关应用到新构建的扫描管线。
+     * 把已校验的溢出配置快照应用到扫描管线。
      *
-     * <p>抽成独立方法便于在没有 Forge 配置环境的单元测试中验证四个开关的映射，
-     * 避免 {@code recipe.solveRecipes}、{@code diagnostic.generateReports}、
-     * {@code overflow.overwriteScope} 与 {@code overflow.allowProjectEFileRewrite}
-     * 再次退化成“只定义不消费”的配置键。</p>
+     * <p>作用域与 ProjectE 文件改写开关必须同时从同一个配置快照读取，避免运行期出现
+     * “作用域已扩大但改写开关仍是旧值”的组合。生产接线只能通过本方法设置这两个值，
+     * 不得绕过配置快照直接读取 Forge 原始配置。</p>
      *
-     * @param pipeline                 目标管线，不能为 {@code null}
-     * @param solveRecipes             是否启用配方求解
-     * @param generateReports          是否写出诊断报告
-     * @param overflowScope            溢出作用域，不能为 {@code null}
-     * @param allowProjectEFileRewrite 是否允许改写 ProjectE 中归本模组所有的条目
+     * @param pipeline 扫描管线，不能为 {@code null}
+     * @param settings 已通过 ConfigValidator 校验的溢出配置快照，不能为 {@code null}
+     */
+    static void applyOverflowSettings(ScanPipeline pipeline,
+                                      OverflowProtection.Settings settings) {
+        pipeline.setOverflowScope(settings.scope());
+        pipeline.setProjectEFileRewriteEnabled(settings.allowProjectEFileRewrite());
+    }
+
+    /**
+     * 把 phase-16 的运行时开关应用到新构建的扫描管线。
+     *
+     * <p>溢出作用域与 ProjectE 文件改写开关由
+     * {@link #applyOverflowSettings(ScanPipeline, OverflowProtection.Settings)}
+     * 从同一份已校验快照设置；本方法只负责配方求解与诊断报告两个开关，避免重复读取原始
+     * 配置造成事实来源漂移。抽成独立方法便于在没有 Forge 配置环境的单元测试中验证映射，
+     * 避免它们再次退化成“只定义不消费”的配置键。</p>
+     *
+     * @param pipeline        目标管线，不能为 {@code null}
+     * @param solveRecipes    是否启用配方求解
+     * @param generateReports 是否写出诊断报告
      */
     static void applyRuntimeSwitches(ScanPipeline pipeline,
                                      boolean solveRecipes,
-                                     boolean generateReports,
-                                     OverflowScope overflowScope,
-                                     boolean allowProjectEFileRewrite) {
-        pipeline.setOverflowScope(overflowScope);
-        pipeline.setProjectEFileRewriteEnabled(allowProjectEFileRewrite);
+                                     boolean generateReports) {
         pipeline.setSolveRecipesEnabled(solveRecipes);
         pipeline.setGenerateReportsEnabled(generateReports);
     }
