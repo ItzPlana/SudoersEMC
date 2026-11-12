@@ -69,8 +69,10 @@ public final class VariantNormalizer {
      * 也会递归清洗，因此容器内容中物品的自定义名称不会影响容器变体的身份。</p>
      *
      * <p>该方法不知道物品类型，因此不会剥离非默认的 {@code Damage}；但清洗后只剩默认
-     * {@code Damage:0} 时按无经济数据处理并返回 {@code null}。构建可损坏物品的变体身份
-     * 请使用 {@link #keyFor(ResourceLocation, CompoundTag)}。</p>
+     * {@code Damage:0} 时按无经济数据处理并返回 {@code null}。对不存在伤害语义的非可损坏
+     * 物品，若恰好只带 {@code {Damage:0}}，同样按宽松策略视为普通物品；调用方若需严格对齐
+     * ProjectE 的 {@code isDamageableItem()} 语义，应在调用前自行按物品类型限定。构建可损坏
+     * 物品的变体身份请使用 {@link #keyFor(ResourceLocation, CompoundTag)}。</p>
      *
      * @param tag 原始物品标签，允许为 {@code null}
      * @return 规范化的 SNBT；清洗后没有经济相关数据时返回 {@code null}
@@ -80,7 +82,7 @@ public final class VariantNormalizer {
             return null;
         }
         CompoundTag sanitized = sanitizeCompound(tag, false);
-        if (sanitized.isEmpty() || isOnlyDefaultDamage(sanitized)) {
+        if (sanitized.isEmpty() || isDefaultDamageOnly(sanitized)) {
             return null;
         }
         StringBuilder out = new StringBuilder();
@@ -89,18 +91,25 @@ public final class VariantNormalizer {
     }
 
     /**
-     * 判断清洗后的标签是否只剩默认的 {@code Damage:0}。
+     * 判断标签是否只包含数值精确为 0 的 {@code Damage}（默认伤害）。
      *
      * <p>配方输出常把 {@code {Damage:0}} 当作“无 NBT”写回；默认伤害值不携带任何经济信息，
      * 若保留会为普通物品生成伪变体 {@code variantHash={Damage:0}}。只有标签中仅有该字段且
      * 数值为 0 时才视为空；若还存在附魔、容器内容等经济字段，仍保留 {@code Damage}，
      * 维持与旧版本一致的变体身份。</p>
+     *
+     * <p>数值判定使用 {@link NumericTag#getAsDouble()} 而不是 {@code getInt()}，避免
+     * {@code 4294967296L}、{@code 0.5d} 等非零值被整数截断成 0 后误归一。该方法同时供
+     * {@link #normalize(CompoundTag)} 与配方输出预归一使用，确保所有入口共享同一判定。</p>
+     *
+     * @param tag 原始或已清洗的标签，允许为 {@code null}
+     * @return 仅包含数值精确为 0 的 {@code Damage} 时返回 {@code true}
      */
-    private static boolean isOnlyDefaultDamage(CompoundTag sanitized) {
-        if (sanitized.size() != 1) {
+    public static boolean isDefaultDamageOnly(@Nullable CompoundTag tag) {
+        if (tag == null || tag.size() != 1) {
             return false;
         }
-        Tag damage = sanitized.get(DAMAGE);
+        Tag damage = tag.get(DAMAGE);
         return damage instanceof NumericTag numeric && numeric.getAsDouble() == 0.0D;
     }
 
