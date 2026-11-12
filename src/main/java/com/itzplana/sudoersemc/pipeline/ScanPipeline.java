@@ -511,9 +511,11 @@ public final class ScanPipeline {
     }
 
     /**
-     * 查询一个变体身份下所有观测原始 NBT 的精确既有值。
+     * 查询一个变体身份的精确既有值。
      *
-     * <p>同一经济变体可能对应多个原始 SNBT；采用最大值可避免把任何一个已存在的 NBT 专属
+     * <p>注册侧会同时写入规范 SNBT 与观测到的原始 SNBT，因此这里也必须覆盖两类形态：
+     * 规范 key 可能已经被 ProjectE 的 NBT 处理器或其它模组注册，原始形态则对应真实堆叠。
+     * 同一经济变体可能对应多个原始 SNBT；采用最大值可避免把任何一个已存在的 NBT 专属
      * 值当成“无值”后覆盖。任一查询失败只按该形态无值处理。</p>
      *
      * @return 精确 NBT 既有值；没有专属映射时返回 {@code 0}
@@ -524,8 +526,19 @@ public final class ScanPipeline {
         if (emcQuery == null) {
             return 0L;
         }
-        long maxValue = 0L;
+        TreeSet<String> probes = new TreeSet<>();
+        String canonical = variantKey.variantHash();
+        if (canonical != null && !canonical.isBlank()) {
+            probes.add(canonical);
+        }
         for (String snbt : rawSnbts) {
+            if (snbt != null && !snbt.isBlank()) {
+                probes.add(snbt);
+            }
+        }
+
+        long maxValue = 0L;
+        for (String snbt : probes) {
             try {
                 CompoundTag tag = TagParser.parseTag(snbt);
                 ItemStack probe = new ItemStack(item);
@@ -946,8 +959,9 @@ AppliedSeparation separation = applyOwnershipSeparation(data);
                     continue;
                 }
                 TreeSet<String> forms = observed.computeIfAbsent(key, ignored -> new TreeSet<>());
-                if (forms.size() < VariantRegistration.MAX_OBSERVED_NBT_PER_VARIANT) {
-                    forms.add(snbt);
+                forms.add(snbt);
+                if (forms.size() > VariantRegistration.MAX_OBSERVED_NBT_PER_VARIANT) {
+                    forms.pollLast();
                 }
             }
         }

@@ -14,6 +14,7 @@ import com.itzplana.sudoersemc.core.GeneratedEmcEntry;
 import com.itzplana.sudoersemc.core.ItemKey;
 import com.itzplana.sudoersemc.core.OverflowScope;
 import com.itzplana.sudoersemc.core.PriceSource;
+import com.itzplana.sudoersemc.core.VariantRegistration;
 import com.itzplana.sudoersemc.diagnostic.ReportManager;
 import com.itzplana.sudoersemc.pricing.FallbackPricing;
 import com.itzplana.sudoersemc.pricing.PricingSettings;
@@ -43,10 +44,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Stream;
 import net.minecraft.SharedConstants;
+import net.minecraft.nbt.CompoundTag;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.world.item.ItemStack;
@@ -999,6 +1002,70 @@ class ScanPipelineTest {
         assertTrue(variant.hasExistingEmc(), "该 NBT 自身已有精确 EMC 时必须标记既有值");
         assertEquals(50L, variant.existingValue());
         assertEquals(50L, snapshot.existingValues().get(variantKey));
+    }
+
+    @Test
+    void collectSnapshotDataQueriesCanonicalVariantIdentityForExistingEmc() {
+        ItemSnapshot stoneBase = ItemSnapshot.of(STONE, false, 0L);
+        ItemKey variantKey = ItemKey.of(STONE_ID, "{Marker:7}");
+        String raw = "{Marker:7,display:{Name:\"variant\"}}";
+        RecipeSnapshot recipe = recipeWithNbt(variantKey, raw);
+        ItemScanner.EmcQuery query = new ItemScanner.EmcQuery() {
+            @Override
+            public boolean hasValue(ItemStack stack) {
+                return false;
+            }
+
+            @Override
+            public long getValue(ItemStack stack) {
+                return 0L;
+            }
+
+            @Override
+            public long getExactValue(ItemStack stack) {
+                CompoundTag tag = stack.getTag();
+                return tag != null && tag.contains("Marker") && !tag.contains("display") ? 50L : 0L;
+            }
+        };
+        ScanPipeline pipeline = pipeline(null, null, null, null, null, null, disabledFallback());
+
+        PipelineSnapshot snapshot = pipeline.collectSnapshotData(
+                List.of(stoneBase), new RecipeScanner.ScanResult(List.of(recipe), 0, 0, 0), query);
+
+        ItemSnapshot variant = snapshot.items().stream()
+                .filter(item -> item.key().equals(variantKey))
+                .findFirst()
+                .orElseThrow();
+        assertTrue(variant.hasExistingEmc(),
+                "注册侧还会写入规范 key，规范 NBT 自身的既有值也必须保护");
+        assertEquals(50L, variant.existingValue());
+        assertEquals(50L, snapshot.existingValues().get(variantKey));
+    }
+
+    @Test
+    void variantRegistrationKeepsSmallestObservedFormsWhenOverCap() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_variant_registration_cap.json"));
+        ItemKey variant = ItemKey.of(STONE_ID, "{Marker:7}");
+        List<RecipeSnapshot> recipes = new ArrayList<>();
+        for (int index = VariantRegistration.MAX_OBSERVED_NBT_PER_VARIANT + 5; index >= 0; index--) {
+            recipes.add(recipeWithNbt(variant,
+                    "{Marker:7,display:{Name:\"n" + String.format(Locale.ROOT, "%02d", index) + "\"}}"));
+        }
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 5L), ItemSnapshot.of(variant, false, 0L)),
+                recipes,
+                Map.of(INGOT, 5L));
+        ScanPipeline pipeline = pipeline(store, null, null, null, null, null, disabledFallback());
+
+        pipeline.solveAndApply(snapshot);
+
+        List<String> persisted = store.snapshotOwnedVariantNbts().get(variant);
+        assertNotNull(persisted);
+        assertEquals(VariantRegistration.MAX_OBSERVED_NBT_PER_VARIANT, persisted.size(),
+                "每个变体只保留固定数量的原始形态");
+        assertEquals("{Marker:7,display:{Name:\"n00\"}}", persisted.get(0),
+                "超出上限时必须保留字典序最小的形态，与采集阶段查询既有值的集合一致");
     }
 
     @Test
