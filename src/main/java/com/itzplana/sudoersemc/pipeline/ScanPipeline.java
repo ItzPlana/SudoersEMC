@@ -108,6 +108,9 @@ public final class ScanPipeline {
     /** 既有值收集每处理多少个物品检查一次取消信号。 */
     static final int EXISTING_VALUE_CANCEL_CHECK_INTERVAL = 256;
 
+    /** 兜底/合并/清理等全量循环每处理多少个条目检查一次取消信号。 */
+    static final int FULL_SWEEP_CANCEL_CHECK_INTERVAL = 256;
+
     private final GeneratedEntryStore store;
     private volatile QuarantinedDropsStore quarantinedDropsStore;
     private final ScanStateStore stateStore;
@@ -355,7 +358,8 @@ public final class ScanPipeline {
      * 根据物品、配方、配置与基线输入构造五通道指纹。
      *
      * <p>所有集合都先落入 {@link TreeSet} 再交给 {@link ScanFingerprint} 排序哈希，因此结果不受
-     * HashMap 遍历顺序影响。物品通道包含注册表 id 与稀有度，配方通道包含配方完整内容摘要。</p>
+     * HashMap 遍历顺序影响。物品通道包含注册表 id 与稀有度，配方通道包含配方完整内容摘要，
+     * 标签通道记录“物品 -> 标签”的映射而不是所有标签的并集。</p>
      *
      * @param items           物品快照，允许为空
      * @param recipes         配方快照，允许为空
@@ -375,7 +379,11 @@ public final class ScanPipeline {
                     continue;
                 }
                 itemEntries.add(item.registryId() + "|" + item.rarity().name());
-                tagEntries.addAll(item.tagPaths());
+                // 标签通道必须记录“物品 -> 标签”的映射，不能只记录并集：
+                // 两个物品互换标签时并集不变，但 TAG 定价结果会变化。
+                List<String> sortedTags = new ArrayList<>(item.tagPaths());
+                Collections.sort(sortedTags);
+                tagEntries.add(item.registryId() + "=" + String.join(",", sortedTags));
             }
         }
 
@@ -780,10 +788,25 @@ public final class ScanPipeline {
      */
     static OwnershipSeparation separateOwnedEntries(List<ItemSnapshot> items,
                                                     Predicate<ItemKey> owned) {
+        return separateOwnedEntries(items, owned, () -> false);
+    }
+
+    /**
+     * 带协作式取消检查的归属分离。每处理 {@value #FULL_SWEEP_CANCEL_CHECK_INTERVAL} 个物品
+     * 检查一次取消信号，命中后返回已完成的部分；调用方会在写入任何候选之前走取消路径。
+     */
+    static OwnershipSeparation separateOwnedEntries(List<ItemSnapshot> items,
+                                                    Predicate<ItemKey> owned,
+                                                    BooleanSupplier cancellation) {
         List<ItemSnapshot> separated = new ArrayList<>(items.size());
         Map<ItemKey, Long> existingValues = new TreeMap<>();
         int refreshedOwned = 0;
+        int inspected = 0;
         for (ItemSnapshot item : items) {
+            if (inspected++ % FULL_SWEEP_CANCEL_CHECK_INTERVAL == 0
+                    && cancellation.getAsBoolean()) {
+                break;
+            }
             ItemKey key = item.key();
             if (owned.test(key)) {
                 if (item.hasExistingEmc() || item.existingValue() > 0L) {
@@ -814,7 +837,8 @@ public final class ScanPipeline {
         if (store == null) {
             return snapshot;
         }
-        OwnershipSeparation separation = separateOwnedEntries(snapshot.items(), store::isOwned);
+        OwnershipSeparation separation = separateOwnedEntries(
+                snapshot.items(), store::isOwned, this::isCancelled);
         if (separation.refreshedOwned() == 0) {
             return snapshot;
         }
@@ -866,8 +890,10 @@ public final class ScanPipeline {
      *
      * <p>存储为 {@code null} 时进入干跑模式：计数与报告照常生成，但不会产生任何持久化写入。</p>
      *
-     * <p><strong>取消语义：</strong>求解或应用循环观察到取消时立即停止，已写入的条目各自保持
-     * 原子一致；本轮不会更新扫描指纹，并写出部分诊断报告，交由调度器发布 CANCELLED 状态。</p>
+     * <p><strong>取消语义：</strong>采集、求解、兜底、合并、应用与清理循环都会在检查点观察取消
+     * 信号；观察到后立即停止，已写入的条目各自保持原子一致。本轮不会写入新的扫描指纹，而是
+     * 显式让持久化状态失效，确保下一次启动必然重扫；同时写出部分诊断报告，交由调度器发布
+     * CANCELLED 状态。</p>
      *
      * @param snapshot 采集结果，允许为 {@code null}
      * @return 汇总结果；任何未预期异常都会转为全零结果
@@ -883,6 +909,9 @@ public final class ScanPipeline {
         try {
             data = applyOwnershipSeparation(data);
             lastSnapshotForReport = data;
+            if (isCancelled()) {
+                return cancelledResult(data, startedAtNanos);
+            }
             long minimumEmc = solveSettings.minimumEmc();
 
             Map<ItemKey, Candidate> recipeCandidates = new TreeMap<>();
@@ -902,7 +931,15 @@ public final class ScanPipeline {
                 lastSolveResult = roundResult;
 
                 boolean solvedProgress = mergeSolvedValues(roundResult, recipeCandidates, seeds);
+                if (isCancelled()) {
+                    cancelledDuringSolve = true;
+                    break;
+                }
                 int fallbackAdded = addFallbackCandidates(data, seeds, fallbackCandidates);
+                if (isCancelled()) {
+                    cancelledDuringSolve = true;
+                    break;
+                }
                 if (!solvedProgress && fallbackAdded == 0) {
                     break;
                 }
@@ -917,8 +954,11 @@ public final class ScanPipeline {
                 return cancelledResult(data, startedAtNanos);
             }
 
-            List<Candidate> candidates =
-                    selectFinalCandidates(recipeCandidates, fallbackCandidates, minimumEmc);
+            List<Candidate> candidates = selectFinalCandidates(
+                    recipeCandidates, fallbackCandidates, minimumEmc, this::isCancelled);
+            if (isCancelled()) {
+                return cancelledResult(data, startedAtNanos);
+            }
             int solvedByRecipe = 0;
             int solvedByFallback = 0;
             for (Candidate candidate : candidates) {
@@ -990,7 +1030,12 @@ public final class ScanPipeline {
             if (!cancelledDuringApply) {
                 retiredEntries = retireStaleOwnedEntries(
                         data, candidateKeys, data.existingValues());
-                rewriteProjectECustomEmcIfEnabled();
+                if (isCancelled()) {
+                    // 清理循环中途取消：不再改写 ProjectE 文件，交由取消路径统一失效指纹。
+                    cancelledDuringApply = true;
+                } else {
+                    rewriteProjectECustomEmcIfEnabled();
+                }
             }
 
             int overflowResets = overflowPipeline == null
@@ -1005,8 +1050,11 @@ public final class ScanPipeline {
 
             boolean appliedToStore = store != null;
             if (!cancelledDuringApply) {
-                // 取消时不能把未完成的候选集合写成新的扫描指纹，否则下一次启动会误判为未变化。
                 updateScanState(data, durationMillis, applied, unresolved);
+            } else {
+                // 取消时可能已有部分条目 stage 成功并被调度器落盘/重映射；
+                // 即使输入与旧指纹一致，也必须让下一次启动重新扫描，避免部分价格永久生效。
+                invalidateScanState();
             }
 
             Map<String, Long> extraCounters = buildExtraCounters(data, lastSolveResult,
@@ -1046,6 +1094,8 @@ public final class ScanPipeline {
             LOGGER.error("SudoersEMC 扫描管线求解与应用失败，本轮返回全零结果：{}",
                     failureDetail(failure), failure);
             // 失败也要留下部分报告；报告层自身保证不抛出异常。
+            // 失败前可能已经 stage 了部分条目；让下一次启动必然重扫，不能复用旧指纹。
+            invalidateScanState();
             writePartialReport(data, diagnostics, false, "扫描失败");
             return PipelineResult.zeroed(durationMillis);
         }
@@ -1062,6 +1112,8 @@ public final class ScanPipeline {
         lastSolvedCount = 0;
         lastUnresolvedCount = 0;
         lastDurationMillis = durationMillis;
+        // 取消时统一失效持久化指纹：手动 rescan-all 后取消也不能沿用旧缓存。
+        invalidateScanState();
         writePartialReport(data, diagnostics, true, "扫描已取消");
         fullReportWritten = true;
         return PipelineResult.zeroed(durationMillis);
@@ -1090,8 +1142,13 @@ public final class ScanPipeline {
             return 0;
         }
         int retired = 0;
+        int inspected = 0;
         try {
             for (Map.Entry<ItemKey, GeneratedEmcEntry> entry : store.snapshotAll().entrySet()) {
+                if (inspected++ % FULL_SWEEP_CANCEL_CHECK_INTERVAL == 0 && isCancelled()) {
+                    LOGGER.debug("清理陈旧自有条目时观察到取消信号，提前结束本轮清理");
+                    break;
+                }
                 GeneratedEmcEntry value = entry.getValue();
                 if (value == null || !value.owned()) {
                     continue;
@@ -1190,7 +1247,11 @@ public final class ScanPipeline {
                                       Map<ItemKey, Long> seeds) {
         boolean changed = false;
         boolean allowIncrease = solveSettings.allowValueIncrease();
+        int inspected = 0;
         for (Map.Entry<ItemKey, Long> entry : solveResult.values().entrySet()) {
+            if (inspected++ % FULL_SWEEP_CANCEL_CHECK_INTERVAL == 0 && isCancelled()) {
+                break;
+            }
             ItemKey item = entry.getKey();
             if (isExcludedFromPricing(item)) {
                 LOGGER.debug("物品 {} 被排除规则命中，跳过配方候选", item);
@@ -1272,10 +1333,26 @@ public final class ScanPipeline {
     static List<Candidate> selectFinalCandidates(Map<ItemKey, Candidate> recipeCandidates,
                                                  Map<ItemKey, Candidate> fallbackCandidates,
                                                  long minimumEmc) {
+        return selectFinalCandidates(recipeCandidates, fallbackCandidates, minimumEmc, () -> false);
+    }
+
+    /**
+     * 带协作式取消检查的最终候选合并。每处理 {@value #FULL_SWEEP_CANCEL_CHECK_INTERVAL} 个
+     * 候选检查一次取消信号，命中后返回已经选出的部分；调用方会在写入任何条目之前走取消路径。
+     */
+    static List<Candidate> selectFinalCandidates(Map<ItemKey, Candidate> recipeCandidates,
+                                                 Map<ItemKey, Candidate> fallbackCandidates,
+                                                 long minimumEmc,
+                                                 BooleanSupplier cancellation) {
         Map<ItemKey, Candidate> merged = new TreeMap<>(fallbackCandidates);
         merged.putAll(recipeCandidates);
         List<Candidate> selected = new ArrayList<>(merged.size());
+        int inspected = 0;
         for (Candidate candidate : merged.values()) {
+            if (inspected++ % FULL_SWEEP_CANCEL_CHECK_INTERVAL == 0
+                    && cancellation.getAsBoolean()) {
+                break;
+            }
             if (candidate.value() > 0L && candidate.value() >= minimumEmc) {
                 selected.add(candidate);
             }
@@ -1322,7 +1399,11 @@ public final class ScanPipeline {
                                       Map<ItemKey, Candidate> candidates) {
         int added = 0;
         long minimumEmc = solveSettings.minimumEmc();
+        int inspected = 0;
         for (ItemSnapshot itemSnapshot : snapshot.items()) {
+            if (inspected++ % FULL_SWEEP_CANCEL_CHECK_INTERVAL == 0 && isCancelled()) {
+                break;
+            }
             ItemKey item = itemSnapshot.key();
             if (seeds.containsKey(item) || snapshot.existingValues().containsKey(item)) {
                 continue;
@@ -1497,6 +1578,23 @@ public final class ScanPipeline {
             stateStore.update(fingerprint(snapshot), durationMillis, solvedCount, unresolvedCount);
         } catch (RuntimeException failure) {
             LOGGER.warn("更新扫描状态失败，本轮结果仍然有效", failure);
+        }
+    }
+
+    /**
+     * 取消或失败时让持久化扫描状态失效。
+     *
+     * <p>本轮可能已经 stage 了部分条目，调度器仍可能重映射并落盘；如果保留旧指纹，输入未变化
+     * 的下一次启动会跳过扫描，把这些部分价格永久沿用。清除指纹后退化为“需要扫描”。</p>
+     */
+    private void invalidateScanState() {
+        if (stateStore == null) {
+            return;
+        }
+        try {
+            stateStore.invalidate();
+        } catch (RuntimeException failure) {
+            LOGGER.warn("失效扫描状态失败，下一次启动可能错误跳过扫描", failure);
         }
     }
 

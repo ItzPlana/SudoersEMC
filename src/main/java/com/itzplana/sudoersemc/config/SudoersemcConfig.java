@@ -30,6 +30,14 @@ public final class SudoersemcConfig {
 
     private static final Logger LOGGER = LogUtils.getLogger();
 
+    /**
+     * 扫描指纹/定价语义版本。
+     *
+     * <p>任何会改变生成价格的算法、解析或缓存格式变更都必须递增该值；它参与配置通道指纹，
+     * 确保升级后即使注册表与配置未变，也不会静默复用旧算法生成的价格。</p>
+     */
+    public static final int SCAN_FINGERPRINT_VERSION = 1;
+
     private static final ForgeConfigSpec.Builder BUILDER = new ForgeConfigSpec.Builder();
 
     /** 非法配方选择策略只警告一次，避免热重载时刷屏。 */
@@ -353,6 +361,9 @@ public final class SudoersemcConfig {
     public static List<String> scanFingerprintEntries() {
         List<String> entries = new ArrayList<>();
         try {
+            // 指纹/定价语义版本的显式盐：算法或格式变化必须递增该常量，
+            // 否则升级后会复用旧算法生成的价格。
+            addEntry(entries, "fingerprint.version", SCAN_FINGERPRINT_VERSION);
             addEntry(entries, "recipe.solveRecipes", RECIPE_SOLVE_RECIPES.get());
             addEntry(entries, "recipe.maxRecipePasses", RECIPE_MAX_RECIPE_PASSES.get());
             addEntry(entries, "recipe.allowRecipeValueIncrease", RECIPE_ALLOW_RECIPE_VALUE_INCREASE.get());

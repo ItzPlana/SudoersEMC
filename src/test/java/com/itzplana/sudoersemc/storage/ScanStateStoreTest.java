@@ -111,6 +111,34 @@ class ScanStateStoreTest {
     }
 
     @Test
+    void invalidateClearsFingerprintAndPersistsUnmatchableState() throws IOException {
+        Path file = tempDir.resolve(ScanStateStore.FILE_NAME);
+        ScanStateStore store = new ScanStateStore(file);
+        ScanFingerprint fingerprint = fingerprint();
+        store.update(fingerprint, 1234L, 100, 5);
+        store.save();
+        assertFalse(store.isDirty());
+
+        store.invalidate();
+
+        assertTrue(store.isDirty());
+        assertTrue(store.fingerprint().isEmpty());
+        assertFalse(store.matches(fingerprint));
+        assertEquals(0L, store.lastScanEpochMillis());
+        assertEquals(0L, store.lastScanDurationMillis());
+        assertEquals(0, store.lastSolvedCount());
+        assertEquals(0, store.lastUnresolvedCount());
+
+        store.saveIfDirty();
+        ScanStateStore reloaded = new ScanStateStore(file);
+        reloaded.load();
+        assertFalse(reloaded.matches(fingerprint), "失效状态落盘后必须让下一次启动重扫");
+        assertTrue(reloaded.fingerprint().isEmpty());
+        assertEquals(0L, reloaded.lastScanEpochMillis());
+        assertEquals(0, reloaded.lastSolvedCount());
+    }
+
+    @Test
     void corruptJsonYieldsEmptyStateWithoutThrowing() throws IOException {
         Path file = tempDir.resolve(ScanStateStore.FILE_NAME);
         Files.writeString(file, "{ 这不是合法 JSON ][", StandardCharsets.UTF_8);

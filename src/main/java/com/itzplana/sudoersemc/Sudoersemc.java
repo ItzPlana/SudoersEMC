@@ -46,6 +46,7 @@ import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.event.server.ServerStartedEvent;
 import net.minecraftforge.event.server.ServerStoppingEvent;
 import net.minecraftforge.eventbus.api.IEventBus;
+import net.minecraftforge.fml.ModList;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.event.config.ModConfigEvent;
 import net.minecraftforge.fml.event.lifecycle.FMLCommonSetupEvent;
@@ -537,9 +538,13 @@ public final class Sudoersemc {
     }
 
     /**
-     * 构造外部基线的指纹条目：ProjectE 手动 EMC 物品值与手动标签。
+     * 构造外部基线的指纹条目：ProjectE 手动 EMC 物品值、手动标签与 ProjectE 版本。
      *
-     * <p>文件缺失或未安装 ProjectE 时返回空列表；读取失败按空处理，绝不影响启动。</p>
+     * <p>ProjectE 原生 EMC 是求解种子的一部分：即使物品/配方/标签与手动配置都没有变化，
+     * 升级 ProjectE 也可能改变基线。这里把版本纳入基线通道；无法确定版本时使用固定标记。</p>
+     *
+     * <p>文件缺失或未安装 ProjectE 时仍会输出 {@code projecte=false}；读取失败返回固定的
+     * {@code fingerprint-error:baseline}，与“确实没有手动值”区分开，让指纹必然变化。</p>
      */
     private static List<String> baselineFingerprintEntries() {
         try {
@@ -553,10 +558,29 @@ public final class Sudoersemc {
                 entries.add("tag:#" + tagId);
             }
             entries.add("projecte=" + OptionalIntegrationManager.isProjectEAvailable());
+            entries.add("projecte.version=" + projecteVersion());
             return entries;
         } catch (RuntimeException failure) {
-            LOGGER.warn("SudoersEMC 读取外部基线指纹失败，按空基线处理", failure);
-            return List.of();
+            LOGGER.warn("SudoersEMC 读取外部基线指纹失败，使用固定错误标记", failure);
+            return List.of("fingerprint-error:baseline");
+        }
+    }
+
+    /**
+     * 读取 ProjectE 模组版本；模组列表不可用或读取失败时返回固定标记。
+     */
+    private static String projecteVersion() {
+        try {
+            ModList modList = ModList.get();
+            if (modList == null) {
+                return "unavailable";
+            }
+            return modList.getModContainerById("projecte")
+                    .map(container -> container.getModInfo().getVersion().toString())
+                    .orElse("absent");
+        } catch (RuntimeException | LinkageError failure) {
+            LOGGER.debug("SudoersEMC 无法读取 ProjectE 版本，使用固定标记", failure);
+            return "unknown";
         }
     }
 

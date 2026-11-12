@@ -220,6 +220,25 @@ public final class ScanStateStore {
     }
 
     /**
+     * 让增量扫描状态失效：清除已保存指纹并把状态标记为待落盘。
+     *
+     * <p>取消或失败的一轮扫描可能已经写入部分条目；即使输入指纹与旧值完全一致，下一次启动
+     * 也必须重新扫描，否则这些部分价格会被永久沿用。清除指纹后 {@link #matches(ScanFingerprint)}
+     * 恒为 {@code false}，与“从未完成过扫描”语义一致；时间戳与计数也归零，避免报告把中断的
+     * 一轮误认为完整结果。</p>
+     */
+    public void invalidate() {
+        synchronized (lock) {
+            storedFingerprint = null;
+            lastScanEpochMillis = 0L;
+            lastScanDurationMillis = 0L;
+            lastSolvedCount = 0;
+            lastUnresolvedCount = 0;
+            dirty.set(true);
+        }
+    }
+
+    /**
      * @return 已保存的指纹；从未保存过时返回五个通道均为 {@link ScanFingerprint#EMPTY} 的指纹
      */
     public ScanFingerprint fingerprint() {

@@ -68,8 +68,8 @@ Phase 1 曾在专用服务器上验证写入生效、重启后自动恢复、手
 - **诊断报告计数器与失败明细** —— Phase 22 完成。`last_report.txt` 新增配方扫描区块，输出总数/可用/不支持/无效/失败计数，并展示最多 10 条失败配方明细（超出部分只显示剩余总数）；`PipelineResult.extraCounters` 同时承载求解轮数、隔离/清理数量、干跑标记等计数器。
 - **扫描耗时与峰值堆采样** —— Phase 22 完成。`ScanManager` 在每个 tick 边界采样耗时与堆内存；报告输出扫描总耗时、tick 采样数、tick 最大/平均/P95 耗时（最近秩法）以及峰值堆内存和报告时瞬时堆内存。
 - **取消/失败部分报告** —— Phase 22 完成。`ScanManager.AbortListener` 在取消或失败时通知管线，由 `ScanPipeline.writeCancelledReport` / `writeFailedReport` 写出部分报告，标记 `partialReport=1`、`scanCancelled`/`scanFailed` 与 `scanAborts`。
-- **五通道增量指纹与启动跳过** —— Phase 23 完成。`ScanFingerprint` 分别对物品（注册表 id + 稀有度，条目去重）、配方（完整内容摘要）、标签（物品标签并集）、配置（影响定价的配置白名单）与基线（ProjectE 手动值/标签）排序后计算 SHA-256 截断摘要；`ScanStateStore.compare(...)` 返回发生变化的通道。服务器启动时，在「已有缓存且未开启 `alwaysRescan`」的情况下计算当前指纹并比较，完全一致则跳过扫描；指纹计算失败退化为需要扫描。`/sudoemc rescan-all` 直接请求扫描，不受该跳过逻辑影响。
-- **协作式取消** —— Phase 23 完成。`ScanCancellation` 令牌由 `ScanManager` 与 `ScanPipeline` 共享；物品/配方扫描、NBT 变体生成、既有值读取、求解与应用循环均设有检查点。取消时不更新扫描指纹、不执行陈旧条目清理与 `custom_emc.json` 改写；已 stage 的条目可能保留，报告写出 `scanCancelled` / `partialReport` 标记。开发服扫描 <1s，实机取消未触发，该路径由单元测试覆盖。
+- **五通道增量指纹与启动跳过** —— Phase 23 完成。`ScanFingerprint` 分别对物品（注册表 id + 稀有度，条目去重）、配方（完整内容摘要）、标签（物品 → 标签映射，而不是所有标签的并集）、配置（影响定价的配置白名单 + 指纹/定价语义版本盐）与基线（ProjectE 手动值/标签 + ProjectE 版本）排序后计算 SHA-256 截断摘要；`ScanStateStore.compare(...)` 返回发生变化的通道。服务器启动时，在「已有缓存且未开启 `alwaysRescan`」的情况下计算当前指纹并比较，完全一致则跳过扫描；指纹计算失败退化为需要扫描。`/sudoemc rescan-all` 直接请求扫描，不受该跳过逻辑影响。
+- **协作式取消** —— Phase 23 完成。`ScanCancellation` 令牌由 `ScanManager` 与 `ScanPipeline` 共享；物品/配方扫描、NBT 变体生成、既有值读取、求解与应用循环均设有检查点。取消或失败时显式让持久化扫描指纹失效（而不是写入未完成结果），确保下一次启动必然重扫；不执行陈旧条目清理与 `custom_emc.json` 改写，已 stage 的条目可能保留。报告写出 `scanCancelled` / `partialReport` 标记。开发服扫描 <1s，实机取消未触发，该路径由单元测试覆盖。
 - **有界 LRU 求解缓存** —— Phase 23 完成。`RecipeSolver` 使用默认容量 8192 的访问序 LRU，键包含配方内容、评估策略、评估器注册表与输入值快照；`ScanPipeline` 持有单个 `RecipeSolver` 实例并跨求解轮次复用。报告新增 `solverCacheHits` / `solverCacheMisses` 计数器。
 - **配方选择策略** —— Phase 23 完成。新增 `[recipe] selectionStrategy`，支持 `lowest_cost`（默认，成本相同按配方 id）、`prefer_simple`（成本相同优先输入/输出/容器返还更少且非催化剂的配方，最后按 id）与 `stable_id`（成本相同按配方 id）。所有策略都以成本为第一排序键；非法值回退 `lowest_cost` 并只警告一次。
 
