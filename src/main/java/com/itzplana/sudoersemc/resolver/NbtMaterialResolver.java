@@ -12,6 +12,9 @@ import net.minecraft.world.item.ItemStack;
  *
  * <p>约束：{@link #resolve(ItemStack)} 返回的 EMC 必须大于 0；无法定价时应返回
  * {@link OptionalLong#empty()}，不得返回 0 或负数。实现不得修改传入的堆叠。</p>
+ *
+ * <p>线程约束：实现通常会访问 {@link ItemStack} 与物品注册表，因此只应在 server thread
+ * 调用；若调用方在其他线程执行，必须自行传入不会被并发修改的不可变快照。</p>
  */
 public interface NbtMaterialResolver {
 

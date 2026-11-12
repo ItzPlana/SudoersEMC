@@ -9,28 +9,30 @@ import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.Tag;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import org.jetbrains.annotations.Nullable;
 
 /**
- * 内置的 NBT 材料解析器，覆盖原版容器内容与 ProjectE 的 {@code stored_emc}。
+ * 内置的 NBT 材料解析器，覆盖原版容器内容。
  *
  * <p>规则：</p>
  * <ul>
- *   <li>{@code BlockEntityTag.Items} 中恰好只有一个非空堆叠时，装有一个物品的容器价值等于
- *       该物品；容器里有多个非空堆叠时无法给出唯一价格，返回空。</li>
- *   <li>{@code stored_emc} 表示 ProjectE 已存储的 EMC，会叠加在基础物品 EMC 之上；基础物品
- *       未知（查询结果为 0）时只返回存储量。</li>
+ *   <li>{@code BlockEntityTag.Items} 中恰好只有一个非空堆叠时，容器价值等于该物品的
+ *       单元 EMC 乘以 {@code Count}；容器里有多个非空堆叠时无法给出唯一价格，返回空。</li>
+ *   <li>容器内可损坏物品的 {@code Damage} 会按与 ProjectE {@code DamageProcessor}
+ *       相同的公式折价，避免把损坏物品按满耐久计价。</li>
+ *   <li>ProjectE 的 {@code StoredEMC} 由 {@code StoredEMCProcessor} 在 EMC 查询阶段
+ *       动态叠加，本解析器不再重复处理，否则会造成双重计价。</li>
  * </ul>
  *
  * <p>查询函数必须返回非负 EMC，0 表示未知。解析结果始终大于 0，避免把无法定价的物品
- * 当成免费物品。容器内容优先于 {@code stored_emc}；两者同时存在时以容器内容为准。</p>
+ * 当成免费物品。</p>
  */
 public final class DefaultMaterialResolver implements NbtMaterialResolver {
 
     private static final String BLOCK_ENTITY_TAG = "BlockEntityTag";
     private static final String ITEMS = "Items";
-    private static final String STORED_EMC = "stored_emc";
     private static final String ID = "id";
     private static final String COUNT = "Count";
     private static final String ITEM_TAG = "tag";
@@ -50,13 +52,7 @@ public final class DefaultMaterialResolver implements NbtMaterialResolver {
             return false;
         }
         CompoundTag tag = stack.getTag();
-        if (tag == null) {
-            return false;
-        }
-        if (tag.contains(STORED_EMC, Tag.TAG_ANY_NUMERIC)) {
-            return true;
-        }
-        return containerItems(tag) != null;
+        return tag != null && containerItems(tag) != null;
     }
 
     @Override
@@ -68,25 +64,7 @@ public final class DefaultMaterialResolver implements NbtMaterialResolver {
         if (tag == null) {
             return OptionalLong.empty();
         }
-
-        OptionalLong containerValue = resolveSingleItemContainer(tag);
-        if (containerValue.isPresent()) {
-            return containerValue;
-        }
-
-        if (!tag.contains(STORED_EMC, Tag.TAG_ANY_NUMERIC)) {
-            return OptionalLong.empty();
-        }
-
-        // 存储量为 0 时仍应回退到基础物品 EMC；负数按 0 处理，避免产生负价格。
-        long stored = Math.max(0L, tag.getLong(STORED_EMC));
-        long baseValue = 0L;
-        ResourceLocation itemId = BuiltInRegistries.ITEM.getKey(stack.getItem());
-        if (itemId != null) {
-            baseValue = Math.max(0L, emcLookup.applyAsLong(ItemKey.of(itemId)));
-        }
-        long total = saturatedAdd(baseValue, stored);
-        return total > 0L ? OptionalLong.of(total) : OptionalLong.empty();
+        return resolveSingleItemContainer(tag);
     }
 
     /**
@@ -122,8 +100,44 @@ public final class DefaultMaterialResolver implements NbtMaterialResolver {
         CompoundTag itemTag = single.contains(ITEM_TAG, Tag.TAG_COMPOUND)
                 ? single.getCompound(ITEM_TAG)
                 : null;
+        long unitValue = containedItemValue(itemId, itemTag);
+        if (unitValue <= 0L) {
+            return OptionalLong.empty();
+        }
+        long count = single.getByte(COUNT);
+        return OptionalLong.of(saturatedMultiply(unitValue, count));
+    }
+
+    /**
+     * 计算容器内单个物品的 EMC。可损坏物品按剩余耐久折价，公式与 ProjectE 的
+     * {@code DamageProcessor} 一致。
+     */
+    private long containedItemValue(ResourceLocation itemId, @Nullable CompoundTag itemTag) {
         long value = emcLookup.applyAsLong(VariantNormalizer.keyFor(itemId, itemTag));
-        return value > 0L ? OptionalLong.of(value) : OptionalLong.empty();
+        if (value <= 0L) {
+            return value;
+        }
+
+        Item item = BuiltInRegistries.ITEM.getOptional(itemId).orElse(null);
+        if (item == null || !item.canBeDepleted()) {
+            return value;
+        }
+
+        ItemStack contained = new ItemStack(item);
+        if (itemTag != null) {
+            contained.setTag(itemTag);
+        }
+        int maxDamage = contained.getMaxDamage();
+        int damage = contained.getDamageValue();
+        if (maxDamage <= 0 || damage <= 0 || damage > maxDamage) {
+            // ProjectE 在 damage > maxDamage 时放弃折价，这里保持一致。
+            return value;
+        }
+        long remaining = maxDamage - damage + 1L;
+        if (value > Long.MAX_VALUE / remaining) {
+            return Long.MAX_VALUE;
+        }
+        return value * remaining / maxDamage;
     }
 
     /**
@@ -141,12 +155,15 @@ public final class DefaultMaterialResolver implements NbtMaterialResolver {
     }
 
     /**
-     * 饱和加法：避免极端 EMC 数据在相加时溢出成负数。
+     * 饱和乘法：避免容器内大量物品的 EMC 相乘时溢出成负数。
      */
-    private static long saturatedAdd(long left, long right) {
-        if (left > Long.MAX_VALUE - right) {
+    private static long saturatedMultiply(long value, long count) {
+        if (value <= 0L || count <= 0L) {
+            return 0L;
+        }
+        if (value > Long.MAX_VALUE / count) {
             return Long.MAX_VALUE;
         }
-        return left + right;
+        return value * count;
     }
 }

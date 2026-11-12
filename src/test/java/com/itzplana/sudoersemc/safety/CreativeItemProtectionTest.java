@@ -2,6 +2,7 @@ package com.itzplana.sudoersemc.safety;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.itzplana.sudoersemc.core.ItemKey;
@@ -120,5 +121,13 @@ class CreativeItemProtectionTest {
         assertFalse(decision.priceable());
         assertEquals(0L, decision.specialValue());
         assertEquals("explicit-exclusion", decision.reason());
+    }
+
+    @Test
+    void nonPositiveSpecialValuesAreRejected() {
+        assertThrows(IllegalArgumentException.class, () -> new CreativeItemProtection.Settings(
+                true, Set.of(), Map.of(DIAMOND_ID, 0L), Set.of()));
+        assertThrows(IllegalArgumentException.class, () -> new CreativeItemProtection.Settings(
+                true, Set.of(), Map.of(DIAMOND_ID, -1L), Set.of()));
     }
 }
