@@ -56,12 +56,24 @@ public final class RecipeScanner {
      * @return every recipe this build can describe, plus counters for what it skipped
      */
     public ScanResult scan(RecipeManager manager) {
-        Objects.requireNonNull(manager, "manager");
-        List<RecipeSnapshot> snapshots = new ArrayList<>();
-        int unsupported = 0;
-        int invalid = 0;
-        int failed = 0;
+        ScanSession session = beginScan(manager);
+        while (!session.isDone()) {
+            session.step(Integer.MAX_VALUE);
+        }
+        return session.result();
+    }
 
+    /**
+     * 创建一个分片配方扫描会话。
+     *
+     * <p>会话开始时只枚举一次配方 id，不会描述任何配方；之后每个 {@link ScanSession#step(int)}
+     * 最多描述 {@code maxItems} 条配方。会话必须在服务器线程推进。</p>
+     *
+     * @param manager the active recipe manager
+     * @return 新的分片扫描会话
+     */
+    public ScanSession beginScan(RecipeManager manager) {
+        Objects.requireNonNull(manager, "manager");
         // getRecipeIds()/byKey() is the only 1.20.1 API that pairs an id with its recipe without
         // touching private state.
         List<ResourceLocation> ids;
@@ -69,44 +81,42 @@ public final class RecipeScanner {
             ids = manager.getRecipeIds().toList();
         } catch (RuntimeException e) {
             LOGGER.warn("Could not enumerate recipe ids", e);
-            return new ScanResult(List.of(), 0, 0, 0);
+            ids = List.of();
         }
+        return new ScanSession(this, manager, ids);
+    }
 
-        for (ResourceLocation id : ids) {
-            Optional<? extends Recipe<?>> maybeRecipe;
-            try {
-                maybeRecipe = manager.byKey(id);
-            } catch (RuntimeException e) {
-                failed++;
-                continue;
-            }
-            if (maybeRecipe.isEmpty()) {
-                invalid++;
-                continue;
-            }
-            Recipe<?> recipe = maybeRecipe.get();
-            try {
-                RecipeSnapshot snapshot = describe(recipe, id);
-                if (snapshot == null) {
-                    unsupported++;
-                    continue;
-                }
-                if (!snapshot.hasOutputs()) {
-                    invalid++;
-                    continue;
-                }
-                snapshots.add(snapshot);
-            } catch (RuntimeException e) {
-                failed++;
-                LOGGER.debug("Failed to describe recipe {}; skipping it", id, e);
-            }
+    /**
+     * 处理单条配方并把结果写入会话计数器。
+     */
+    private void scanRecipe(RecipeManager manager, ResourceLocation id, ScanSession session) {
+        Optional<? extends Recipe<?>> maybeRecipe;
+        try {
+            maybeRecipe = manager.byKey(id);
+        } catch (RuntimeException e) {
+            session.failed++;
+            return;
         }
-
-        if (unsupported > 0 || invalid > 0 || failed > 0) {
-            LOGGER.debug("Recipe scan: {} usable, {} unsupported, {} invalid, {} failed",
-                    snapshots.size(), unsupported, invalid, failed);
+        if (maybeRecipe.isEmpty()) {
+            session.invalid++;
+            return;
         }
-        return new ScanResult(List.copyOf(snapshots), unsupported, invalid, failed);
+        Recipe<?> recipe = maybeRecipe.get();
+        try {
+            RecipeSnapshot snapshot = describe(recipe, id);
+            if (snapshot == null) {
+                session.unsupported++;
+                return;
+            }
+            if (!snapshot.hasOutputs()) {
+                session.invalid++;
+                return;
+            }
+            session.snapshots.add(snapshot);
+        } catch (RuntimeException e) {
+            session.failed++;
+            LOGGER.debug("Failed to describe recipe {}; skipping it", id, e);
+        }
     }
 
     /**
@@ -282,6 +292,93 @@ public final class RecipeScanner {
             return null;
         }
         return new RecipeOutput(ItemKey.of(id), Math.max(1, stack.getCount()));
+    }
+
+    /**
+     * 分片配方扫描会话。
+     *
+     * <p>配方 id 在会话开始时一次性枚举，单条配方的描述工作按 {@link #step(int)} 的预算推进。
+     * 会话只能在服务器线程使用。</p>
+     */
+    public static final class ScanSession {
+
+        private final RecipeScanner scanner;
+        private final RecipeManager manager;
+        private final List<ResourceLocation> ids;
+        private final List<RecipeSnapshot> snapshots = new ArrayList<>();
+
+        private int cursor;
+        private int unsupported;
+        private int invalid;
+        private int failed;
+        private boolean completionLogged;
+
+        private ScanSession(RecipeScanner scanner, RecipeManager manager, List<ResourceLocation> ids) {
+            this.scanner = Objects.requireNonNull(scanner, "scanner");
+            this.manager = Objects.requireNonNull(manager, "manager");
+            this.ids = List.copyOf(Objects.requireNonNull(ids, "ids"));
+        }
+
+        /**
+         * @return 计划描述的配方数量
+         */
+        public int totalRecipes() {
+            return ids.size();
+        }
+
+        /**
+         * @return 已经处理的配方数量
+         */
+        public int processedRecipes() {
+            return cursor;
+        }
+
+        /**
+         * @return 是否已经处理完所有配方 id
+         */
+        public boolean isDone() {
+            return cursor >= ids.size();
+        }
+
+        /**
+         * 推进最多 {@code maxItems} 条配方。
+         *
+         * @param maxItems 本次允许处理的最大配方数，必须大于等于 1
+         * @return 本批实际处理的配方数量
+         */
+        public int step(int maxItems) {
+            if (maxItems < 1) {
+                throw new IllegalArgumentException("maxItems 必须 >= 1，实际为 " + maxItems);
+            }
+            int processed = 0;
+            while (processed < maxItems && cursor < ids.size()) {
+                ResourceLocation id = ids.get(cursor++);
+                scanner.scanRecipe(manager, id, this);
+                processed++;
+            }
+            if (cursor >= ids.size()) {
+                logCompletion();
+            }
+            return processed;
+        }
+
+        /**
+         * @return 本会话的扫描结果；可在未完成时调用，返回当前已处理的条目
+         */
+        public ScanResult result() {
+            return new ScanResult(List.copyOf(snapshots), unsupported, invalid, failed);
+        }
+
+        private void logCompletion() {
+            if (completionLogged) {
+                return;
+            }
+            completionLogged = true;
+            if (unsupported > 0 || invalid > 0 || failed > 0) {
+                LOGGER.debug("Recipe scan: {} usable, {} unsupported, {} invalid, {} failed",
+                        snapshots.size(), unsupported, invalid, failed);
+            }
+        }
     }
 
     /**

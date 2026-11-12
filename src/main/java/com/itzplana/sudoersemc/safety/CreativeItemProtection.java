@@ -1,9 +1,14 @@
 package com.itzplana.sudoersemc.safety;
 
 import com.itzplana.sudoersemc.core.ItemKey;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.regex.Pattern;
 import net.minecraft.resources.ResourceLocation;
 
 /**
@@ -20,6 +25,9 @@ import net.minecraft.resources.ResourceLocation;
  */
 public final class CreativeItemProtection {
 
+    /** 合法命名空间：小写字母、数字、下划线、连字符与点。 */
+    private static final Pattern NAMESPACE_PATTERN = Pattern.compile("[a-z0-9_.-]+");
+
     private final Settings settings;
 
     /**
@@ -27,6 +35,121 @@ public final class CreativeItemProtection {
      */
     public CreativeItemProtection(Settings settings) {
         this.settings = Objects.requireNonNull(settings, "settings");
+    }
+
+    /**
+     * 原始配置解析结果。
+     *
+     * @param settings       解析后的保护配置
+     * @param skippedEntries 无法解析、格式非法或特殊值非正数的原始条目，保持配置顺序
+     */
+    public record ParsedSettings(Settings settings, List<String> skippedEntries) {
+
+        public ParsedSettings {
+            Objects.requireNonNull(settings, "settings");
+            skippedEntries = skippedEntries == null ? List.of() : List.copyOf(skippedEntries);
+        }
+    }
+
+    /**
+     * 把配置字符串解析为 {@link Settings}，并收集被忽略的非法条目。
+     *
+     * <p>解析规则：排除项与命名空间条目必须是合法的 {@code namespace:path} / 命名空间；
+     * 特殊值必须是 {@code namespace:path=正整数}，非正数按非法条目处理；非法条目不会中断
+     * 解析，只会进入 {@link ParsedSettings#skippedEntries()}。</p>
+     *
+     * @param enabled               是否启用保护
+     * @param rawExclusions         原始排除项列表，允许为 {@code null}
+     * @param rawSpecialValues      原始特殊值列表，允许为 {@code null}
+     * @param rawCreativeNamespaces 原始命名空间列表，允许为 {@code null}
+     * @return 解析结果；永不为 {@code null}
+     */
+    public static ParsedSettings parseSettings(boolean enabled,
+                                               List<? extends String> rawExclusions,
+                                               List<? extends String> rawSpecialValues,
+                                               List<? extends String> rawCreativeNamespaces) {
+        Set<ResourceLocation> exclusions = new LinkedHashSet<>();
+        List<String> skippedEntries = new ArrayList<>();
+
+        if (rawExclusions != null) {
+            for (String raw : rawExclusions) {
+                ResourceLocation id = parseItemId(raw);
+                if (id == null) {
+                    skippedEntries.add(raw == null ? "" : raw);
+                } else {
+                    exclusions.add(id);
+                }
+            }
+        }
+
+        Map<ResourceLocation, Long> specialValues = new LinkedHashMap<>();
+        if (rawSpecialValues != null) {
+            for (String raw : rawSpecialValues) {
+                ParsedSpecialValue parsed = parseSpecialValue(raw);
+                if (parsed == null) {
+                    skippedEntries.add(raw == null ? "" : raw);
+                } else {
+                    specialValues.put(parsed.itemId(), parsed.value());
+                }
+            }
+        }
+
+        Set<String> creativeNamespaces = new LinkedHashSet<>();
+        if (rawCreativeNamespaces != null) {
+            for (String raw : rawCreativeNamespaces) {
+                String namespace = raw == null ? "" : raw.trim();
+                if (isValidNamespace(namespace)) {
+                    creativeNamespaces.add(namespace);
+                } else {
+                    skippedEntries.add(raw == null ? "" : raw);
+                }
+            }
+        }
+
+        Settings settings = new Settings(enabled, exclusions, specialValues, creativeNamespaces);
+        return new ParsedSettings(settings, skippedEntries);
+    }
+
+    private static ResourceLocation parseItemId(String raw) {
+        if (raw == null) {
+            return null;
+        }
+        String value = raw.trim();
+        return value.isEmpty() ? null : ResourceLocation.tryParse(value);
+    }
+
+    private static ParsedSpecialValue parseSpecialValue(String raw) {
+        if (raw == null) {
+            return null;
+        }
+        String value = raw.trim();
+        int separator = value.indexOf('=');
+        if (separator <= 0 || separator != value.lastIndexOf('=')) {
+            return null;
+        }
+        ResourceLocation itemId = parseItemId(value.substring(0, separator));
+        if (itemId == null) {
+            return null;
+        }
+        long parsedValue;
+        try {
+            parsedValue = Long.parseLong(value.substring(separator + 1).trim());
+        } catch (NumberFormatException failure) {
+            return null;
+        }
+        if (parsedValue <= 0L) {
+            return null;
+        }
+        return new ParsedSpecialValue(itemId, parsedValue);
+    }
+
+    private static boolean isValidNamespace(String namespace) {
+        return namespace != null
+                && !namespace.isEmpty()
+                && NAMESPACE_PATTERN.matcher(namespace).matches();
+    }
+
+    private record ParsedSpecialValue(ResourceLocation itemId, long value) {
     }
 
     /**
