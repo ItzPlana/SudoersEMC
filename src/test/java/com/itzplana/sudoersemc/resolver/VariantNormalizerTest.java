@@ -284,19 +284,95 @@ class VariantNormalizerTest {
 
     @Test
     void keyForKeepsOtherVariantDataOnDamageableItems() {
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 17);
+        tag.put("Enchantments", sharpnessFive());
+
+        assertEquals(ItemKey.of(DIAMOND_SWORD_ID,
+                        "{Damage:0,Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}"),
+                VariantNormalizer.keyFor(DIAMOND_SWORD_ID, tag));
+    }
+
+    @Test
+    void keyForCollapsesDamageValuesOnTheSameDamageableVariant() {
+        CompoundTag first = new CompoundTag();
+        first.putInt("Damage", 1);
+        first.put("Enchantments", sharpnessFive());
+        CompoundTag second = new CompoundTag();
+        second.putInt("Damage", 400);
+        second.put("Enchantments", sharpnessFive());
+
+        ItemKey expected = ItemKey.of(DIAMOND_SWORD_ID,
+                "{Damage:0,Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}");
+        assertEquals(expected, VariantNormalizer.keyFor(DIAMOND_SWORD_ID, first));
+        assertEquals(expected, VariantNormalizer.keyFor(DIAMOND_SWORD_ID, second));
+    }
+
+    @Test
+    void keyForKeepsExplicitZeroDamageAlongsideOtherVariantData() {
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 0);
+        tag.put("Enchantments", sharpnessFive());
+
+        assertEquals(ItemKey.of(DIAMOND_SWORD_ID,
+                        "{Damage:0,Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}"),
+                VariantNormalizer.keyFor(DIAMOND_SWORD_ID, tag));
+    }
+
+    @Test
+    void keyForDoesNotInventDamageKeyForDamageableItems() {
+        CompoundTag tag = new CompoundTag();
+        tag.put("Enchantments", sharpnessFive());
+
+        assertEquals(ItemKey.of(DIAMOND_SWORD_ID,
+                        "{Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}"),
+                VariantNormalizer.keyFor(DIAMOND_SWORD_ID, tag));
+    }
+
+    @Test
+    void keyForStripsStoredEmcFromDamageableVariantKey() {
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 5);
+        tag.put("Enchantments", sharpnessFive());
+        tag.putLong("StoredEMC", 4096L);
+        tag.putLong("stored_emc", 1024L);
+
+        assertEquals(ItemKey.of(DIAMOND_SWORD_ID,
+                        "{Damage:0,Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}"),
+                VariantNormalizer.keyFor(DIAMOND_SWORD_ID, tag));
+    }
+
+    @Test
+    void keyForKeepsDamageOnNonDamageableItemsWithOtherVariantData() {
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 17);
+        tag.put("Enchantments", sharpnessFive());
+
+        assertEquals(ItemKey.of(SUDOERSEMC_TOKEN,
+                        "{Damage:17,Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}"),
+                VariantNormalizer.keyFor(SUDOERSEMC_TOKEN, tag));
+    }
+
+    @Test
+    void keyForDropsVariantWhenOnlyDamageAndDisplayDataRemain() {
+        CompoundTag display = new CompoundTag();
+        display.putString("Name", "{\"text\":\"custom\"}");
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 17);
+        tag.putLong("StoredEMC", 4096L);
+        tag.put("display", display);
+
+        assertEquals(ItemKey.of(DIAMOND_SWORD_ID),
+                VariantNormalizer.keyFor(DIAMOND_SWORD_ID, tag));
+    }
+
+    private static ListTag sharpnessFive() {
         CompoundTag enchantment = new CompoundTag();
         enchantment.putString("id", "minecraft:sharpness");
         enchantment.putShort("lvl", (short) 5);
         ListTag enchantments = new ListTag();
         enchantments.add(enchantment);
-
-        CompoundTag tag = new CompoundTag();
-        tag.putInt("Damage", 17);
-        tag.put("Enchantments", enchantments);
-
-        assertEquals(ItemKey.of(DIAMOND_SWORD_ID,
-                        "{Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}"),
-                VariantNormalizer.keyFor(DIAMOND_SWORD_ID, tag));
+        return enchantments;
     }
 
     @Test
