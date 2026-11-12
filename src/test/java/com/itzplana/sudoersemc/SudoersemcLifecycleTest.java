@@ -7,15 +7,25 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 
 import com.itzplana.sudoersemc.core.GeneratedEmcEntry;
 import com.itzplana.sudoersemc.core.ItemKey;
+import com.itzplana.sudoersemc.core.OverflowScope;
 import com.itzplana.sudoersemc.core.PriceSource;
+import com.itzplana.sudoersemc.pipeline.PipelineResult;
+import com.itzplana.sudoersemc.pipeline.PipelineSnapshot;
+import com.itzplana.sudoersemc.pipeline.ScanPipeline;
+import com.itzplana.sudoersemc.safety.OverflowPipeline;
+import com.itzplana.sudoersemc.safety.OverflowProtection;
 import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
+import com.itzplana.sudoersemc.storage.OverflowResetLog;
 import com.itzplana.sudoersemc.task.BatchProcessor;
 import com.itzplana.sudoersemc.task.ScanManager;
 import com.itzplana.sudoersemc.task.ScanPhase;
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import net.minecraft.resources.ResourceLocation;
 import org.junit.jupiter.api.Test;
@@ -158,5 +168,69 @@ void configReloadEntryPointsShareTheClassLock() throws Exception {
         assertEquals(0.5D, Sudoersemc.sanitizeMaxAllowedDropRatio(0.5D));
         assertEquals(Double.MIN_VALUE,
                 Sudoersemc.sanitizeMaxAllowedDropRatio(Double.MIN_VALUE));
+    }
+
+    @Test
+    void runtimeConfigurationSwitchesAreAppliedToPipeline() throws Exception {
+        ScanPipeline pipeline = new ScanPipeline(null, null, null, null, null, null, null, null);
+
+        Sudoersemc.applyRuntimeSwitches(pipeline, false, false);
+
+        assertEquals(Boolean.FALSE, readField(pipeline, "solveRecipesEnabled"),
+                "recipe.solveRecipes=false 必须关闭管线配方求解");
+        assertEquals(Boolean.FALSE, readField(pipeline, "generateReportsEnabled"),
+                "diagnostic.generateReports=false 必须关闭诊断报告");
+    }
+
+    private static Object readField(Object target, String name) throws Exception {
+        Field field = target.getClass().getDeclaredField(name);
+        field.setAccessible(true);
+        return field.get(target);
+    }
+
+    /**
+     * 回归：配置快照必须真正接线到扫描管线。
+     *
+     * <p>历史上 phase-14 的合并曾把 {@code createScanPipeline} 中的
+     * {@code setOverflowScope}/{@code setProjectEFileRewriteEnabled} 覆盖掉，导致
+     * {@code overwriteScope} 与 {@code allowProjectEFileRewrite} 变成零消费配置。
+     * 本用例通过真实扫描应用路径验证两个开关都从同一份快照生效。</p>
+     */
+    @Test
+    void validatedOverflowSettingsAreAppliedToPipeline(@TempDir Path tempDir) throws IOException {
+        Path customEmc = tempDir.resolve("custom_emc.json");
+        Files.writeString(customEmc, """
+                { "entries": [ { "item": "sudoersemc:owned_overflow", "emc": 5000 } ] }
+                """);
+        GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("generated.json"));
+        assertTrue(store.stage(new GeneratedEmcEntry(
+                ItemKey.of(new ResourceLocation("sudoersemc", "owned_overflow")), 5L,
+                PriceSource.RECIPE, null, true, 0L)));
+
+        Path auditFile = tempDir.resolve("overflow_resets.json");
+        OverflowResetLog resetLog = new OverflowResetLog(auditFile);
+        OverflowProtection.Settings optIn = new OverflowProtection.Settings(
+                true, 1_000L, 100L, 900L, 10, 5,
+                OverflowScope.ENTIRE_CUSTOM_EMC, true, 42L);
+        ScanPipeline pipeline = new ScanPipeline(
+                store, null, null, null, null,
+                new OverflowPipeline(new OverflowProtection(optIn), resetLog),
+                null, null);
+        pipeline.setProjectECustomEmcFile(customEmc);
+
+        // 保守快照：必须把管线固定在 OWNED_ONLY + 禁止文件改写。
+        Sudoersemc.applyOverflowSettings(pipeline, new OverflowProtection.Settings());
+        PipelineResult conservative = pipeline.solveAndApply(PipelineSnapshot.empty());
+        assertEquals(0, conservative.overflowResets(), "默认配置快照不得改写 ProjectE 文件");
+        assertFalse(Files.exists(auditFile));
+
+        // 显式 opt-in 快照：两个开关必须同时生效，否则该配置仍是零消费配置。
+        Sudoersemc.applyOverflowSettings(pipeline, optIn);
+        PipelineResult optedIn = pipeline.solveAndApply(PipelineSnapshot.empty());
+        assertEquals(1, optedIn.overflowResets(),
+                "entire_custom_emc + allowProjectEFileRewrite 必须真正接线到管线");
+        assertEquals(1, resetLog.entries().size());
+        assertEquals(OverflowScope.ENTIRE_CUSTOM_EMC, resetLog.entries().get(0).scope());
+        assertTrue(Files.isRegularFile(auditFile), "写盘成功后必须立即落盘审计");
     }
 }

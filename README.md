@@ -164,13 +164,17 @@ allowProjectEFileRewrite = false
 randomSeed = 0                  # 0 = 非确定性
 
 [nbt]
-scanNbtVariants = true
-maxNbtVariantsPerItem = 100
+scanNbtVariants = true                   # Phase 17 接线，控制是否生成 NBT 变体
+maxNbtVariantsPerItem = 100              # Phase 17 接线，单物品变体数上限 [1, 1000]
 
 [diagnostic]
 debugLogging = false                     # Phase 25 接线；Phase 16 构建暂不读取
 generateReports = true
 ```
+
+> **[nbt] 说明**：Phase 17 已消费 `scanNbtVariants` 与 `maxNbtVariantsPerItem`：
+> 关闭开关会跳过变体生成，`maxNbtVariantsPerItem` 同时受
+> `VariantScanner.HARD_VARIANT_CEILING = 1000` 约束。
 
 ### 自动扫描开关
 
@@ -218,7 +222,7 @@ generateReports = true
 | `overflow.weightCap`                | `20`         | 单个桶的权重上限                                          |
 | `overflow.overwriteScope`           | `owned_only` | 重置范围，可选 `owned_only` / `entire_custom_emc`         |
 | `overflow.allowProjectEFileRewrite` | `false`      | 是否允许改写 `custom_emc.json` 中归 SudoersEMC 所有的条目 |
-| `nbt.maxNbtVariantsPerItem`         | `100`        | 每个物品最多扫描的 NBT 变体数                             |
+| `nbt.maxNbtVariantsPerItem`         | `100`        | 每个物品最多扫描的 NBT 变体数（Phase 17 消费）            |
 | `safety.maxAllowedDropRatio`        | `0.5`        | 单次生成值允许的最大相对跌幅                              |
 
 > **`minEmc` 说明**：当前构建没有 `minEmc` 配置键。求解器下限固定为
