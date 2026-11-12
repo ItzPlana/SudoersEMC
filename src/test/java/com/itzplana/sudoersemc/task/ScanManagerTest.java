@@ -643,4 +643,45 @@ class ScanManagerTest {
         assertEquals(0, manager.progress().total());
         assertEquals("等待采集快照", manager.progress().detail());
     }
+
+    @Test
+    void saveHandlerRunsOnceInSavingStage() {
+        AtomicInteger saves = new AtomicInteger();
+        ScanManager manager = new ScanManager(
+                new BatchProcessor(10, false),
+                collector(data(1, 1)),
+                snapshot -> { },
+                TICK_BUDGET_NANOS,
+                () -> fingerprint("minecraft:dirt"),
+                saves::incrementAndGet);
+
+        assertTrue(manager.requestScan());
+        for (int tick = 0; tick < TICK_GUARD && manager.isRunning(); tick++) {
+            manager.tick();
+        }
+
+        assertEquals(1, saves.get(), "save handler must run exactly once");
+        assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
+    }
+
+    @Test
+    void saveHandlerFailureTurnsScanIntoFailed() {
+        ScanManager manager = new ScanManager(
+                new BatchProcessor(10, false),
+                collector(data(1, 1)),
+                snapshot -> { },
+                TICK_BUDGET_NANOS,
+                () -> fingerprint("minecraft:dirt"),
+                () -> {
+                    throw new IllegalStateException("disk full");
+                });
+
+        assertTrue(manager.requestScan());
+        for (int tick = 0; tick < TICK_GUARD && manager.isRunning(); tick++) {
+            manager.tick();
+        }
+
+        assertEquals(ScanPhase.FAILED, manager.progress().phase());
+        assertTrue(manager.progress().detail().contains("disk full"));
+    }
 }
