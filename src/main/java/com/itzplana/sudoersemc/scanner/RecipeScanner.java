@@ -77,7 +77,7 @@ public final class RecipeScanner {
             Optional<? extends Recipe<?>> maybeRecipe;
             try {
                 maybeRecipe = manager.byKey(id);
-            } catch (RuntimeException e) {
+            } catch (RuntimeException | LinkageError e) {
                 failed++;
                 continue;
             }
@@ -97,7 +97,9 @@ public final class RecipeScanner {
                     continue;
                 }
                 snapshots.add(snapshot);
-            } catch (RuntimeException e) {
+            } catch (RuntimeException | LinkageError e) {
+                // 可选模组的配方类可能在加载/链接阶段失败（NoClassDefFoundError 等）；
+                // 只跳过该条配方，不能让整轮扫描失去全部数据。
                 failed++;
                 LOGGER.debug("Failed to describe recipe {}; skipping it", id, e);
             }

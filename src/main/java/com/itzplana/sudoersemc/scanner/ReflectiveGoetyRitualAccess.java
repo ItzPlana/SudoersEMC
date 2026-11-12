@@ -4,6 +4,7 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.item.ItemStack;
@@ -31,6 +32,16 @@ final class ReflectiveGoetyRitualAccess implements GoetyRitualAccess {
     private static final String GOETY_MODID = "goety";
     private static final String RITUAL_RECIPE_CLASS =
             "com.Polarice3.Goety.common.crafting.RitualRecipe";
+    private static final ClassResolver DEFAULT_CLASS_RESOLVER = Class::forName;
+
+    /**
+     * 类查找接缝；生产环境使用 {@link Class#forName(String)}，测试可注入自定义实现。
+     */
+    @FunctionalInterface
+    interface ClassResolver {
+
+        Class<?> resolve(String className) throws ClassNotFoundException;
+    }
 
     /**
      * 生产环境共享实例；解析结果在 JVM 生命周期内缓存。
@@ -165,7 +176,7 @@ final class ReflectiveGoetyRitualAccess implements GoetyRitualAccess {
     /**
      * 解析 Goety 类与四个访问器。只有全部成功时才标记为可用。
      */
-    private static Resolved resolveAccessors() {
+    private Resolved resolveAccessors() {
         boolean loaded;
         try {
             ModList modList = ModList.get();
@@ -180,25 +191,53 @@ final class ReflectiveGoetyRitualAccess implements GoetyRitualAccess {
                     "未检测到 Goety；仪式配方将计为不支持", null);
             return Resolved.unavailable();
         }
+        return resolveAccessors(DEFAULT_CLASS_RESOLVER);
+    }
 
+    /**
+     * 包级测试钩子：跳过 Forge 模块探测，用指定类查找器解析 Goety 配方类与访问器。
+     *
+     * <p>生产环境由 {@link #resolveAccessors()} 先确认 Goety 已加载；该入口用于覆盖
+     * 类缺失、类初始化失败与方法签名漂移等边界。</p>
+     */
+    static Resolved resolveAccessors(ClassResolver classResolver) {
         Class<?> ritualClass;
         try {
-            ritualClass = Class.forName(RITUAL_RECIPE_CLASS);
-        } catch (Throwable failure) {
+            ritualClass = classResolver.resolve(RITUAL_RECIPE_CLASS);
+        } catch (ClassNotFoundException | RuntimeException | LinkageError failure) {
             LOG.warn("goety.class",
                     "Goety 已加载但缺少 " + RITUAL_RECIPE_CLASS + "；所有仪式配方将被跳过", failure);
             return Resolved.unavailable();
         }
+        return resolveAccessors(ritualClass);
+    }
 
-        Method ingredients = findAccessor(ritualClass, "getIngredients", "ingredients",
-                new Class<?>[0]);
-        Method activation = findAccessor(ritualClass, "getActivationItem", "activationItem",
-                new Class<?>[0]);
-        Method ritualType = findAccessor(ritualClass, "getRitualType", "ritualType",
-                new Class<?>[0]);
-        Method result = findAccessor(ritualClass, "getResultItem", "result",
-                new Class<?>[]{RegistryAccess.class});
-
+    /**
+     * 解析指定配方类的四个访问器；任一解析失败都整体降级为不可用。
+     *
+     * <p>{@link RuntimeException} 与 {@link LinkageError}（例如方法签名引用的可选类型缺失）
+     * 都只让 Goety 集成降级，不能穿透到整轮扫描。</p>
+     */
+    static Resolved resolveAccessors(Class<?> ritualClass) {
+        Objects.requireNonNull(ritualClass, "ritualClass");
+        Method ingredients;
+        Method activation;
+        Method ritualType;
+        Method result;
+        try {
+            ingredients = findAccessor(ritualClass, "getIngredients", "ingredients",
+                    new Class<?>[0]);
+            activation = findAccessor(ritualClass, "getActivationItem", "activationItem",
+                    new Class<?>[0]);
+            ritualType = findAccessor(ritualClass, "getRitualType", "ritualType",
+                    new Class<?>[0]);
+            result = findAccessor(ritualClass, "getResultItem", "result",
+                    new Class<?>[]{RegistryAccess.class});
+        } catch (RuntimeException | LinkageError failure) {
+            LOG.warn("goety.access.resolve",
+                    "Goety 仪式访问器解析失败；所有仪式配方将被跳过", failure);
+            return Resolved.unavailable();
+        }
         if (ingredients == null || activation == null || ritualType == null || result == null) {
             return Resolved.unavailable();
         }
@@ -297,11 +336,11 @@ final class ReflectiveGoetyRitualAccess implements GoetyRitualAccess {
     /**
      * 反射解析结果；不可用时四个方法均为 {@code null}。
      */
-    private record Resolved(boolean available,
-                            @Nullable Method ingredients,
-                            @Nullable Method activationItem,
-                            @Nullable Method ritualType,
-                            @Nullable Method result) {
+    record Resolved(boolean available,
+                    @Nullable Method ingredients,
+                    @Nullable Method activationItem,
+                    @Nullable Method ritualType,
+                    @Nullable Method result) {
 
         static Resolved unavailable() {
             return new Resolved(false, null, null, null, null);

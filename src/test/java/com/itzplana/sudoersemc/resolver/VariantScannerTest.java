@@ -133,9 +133,12 @@ class VariantScannerTest {
         CompoundTag tag = new CompoundTag();
         tag.putInt("Damage", 0);
 
-        List<ItemKey> keys = scanner.scan(BASE_STACK, List.of(tag), 10);
+        assertTrue(scanner.scan(DAMAGEABLE_STACK, List.of(tag), 10).isEmpty(),
+                "可损坏物品的默认伤害标签不是经济变体");
 
-        assertTrue(keys.isEmpty(), "默认伤害标签不是经济变体");
+        // 宽松策略：非可损坏物品不存在伤害语义，{Damage:0} 同样按无变体处理。
+        assertTrue(scanner.scan(BASE_STACK, List.of(tag), 10).isEmpty(),
+                "非可损坏物品的 {Damage:0} 也按无变体处理");
     }
 
     private static CompoundTag damageTag(int damage) {

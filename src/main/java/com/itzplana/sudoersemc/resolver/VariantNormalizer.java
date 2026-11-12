@@ -52,9 +52,11 @@ public final class VariantNormalizer {
      * <p>该方法不会修改传入的标签；返回的字符串可安全地长期保存。嵌套的复合标签与列表
      * 也会递归清洗，因此容器内容中物品的自定义名称不会影响容器变体的身份。</p>
      *
-     * <p>可损坏物品默认携带的 {@code {Damage:0}} 只表示「未受损」，不构成经济差异；
-     * 因此当清洗后的标签只剩 {@code Damage} 且值为 0 时同样返回 {@code null}。若还包含
-     * 其它经济字段，或伤害值非 0，则保留 {@code Damage}。</p>
+     * <p>{@code {Damage:0}} 只表示「未受损」，不构成经济差异；因此当清洗后的标签
+     * 只剩数值精确为 0 的 {@code Damage} 时同样返回 {@code null}。该方法不知道物品
+     * 类型，非可损坏物品若恰好只带 {@code {Damage:0}} 也会按宽松策略合并为普通物品。
+     * 可损坏物品请使用 {@link #keyFor(ResourceLocation, CompoundTag)}：它会剥离顶层
+     * {@code Damage}，由 ProjectE 的 {@code DamageProcessor} 在查询时按耐久折价。</p>
      *
      * @param tag 原始物品标签，允许为 {@code null}
      * @return 规范化的 SNBT；清洗后没有经济相关数据时返回 {@code null}
@@ -92,18 +94,25 @@ public final class VariantNormalizer {
     /**
      * 判断清洗后的标签是否只包含「未受损」这一默认伤害标记。
      *
-     * <p>只有唯一键 {@code Damage} 且数值为 0 时才算默认值。若还有其它键，说明
-     * 该标签携带额外经济数据，{@code Damage} 必须作为组合变体的一部分保留。</p>
+     * <p>只有唯一键 {@code Damage} 且数值精确为 0 时才算默认值。这里使用
+     * {@link NumericTag#getAsDouble()} 而不是 {@code getAsInt()}，避免
+     * {@code 4294967296L}、{@code 0.5d} 等非零值被整数截断成 0 后误归一。
+     * 若还有其它键，说明该标签携带额外经济数据，{@code Damage} 必须作为组合变体的
+     * 一部分保留。</p>
+     *
+     * <p>该方法不接收物品可损坏性上下文：对不存在伤害语义的非可损坏物品，恰好只带
+     * {@code {Damage:0}} 时也按宽松策略视为普通物品。生产路径中的可损坏物品由
+     * {@link #keyFor(ResourceLocation, CompoundTag)} 先行剥离顶层 {@code Damage}。</p>
      *
      * @param tag 已清洗的标签，不能为空
-     * @return 仅包含默认 {@code Damage:0} 时返回 {@code true}
+     * @return 仅包含数值精确为 0 的 {@code Damage} 时返回 {@code true}
      */
     private static boolean isDefaultDamageOnly(CompoundTag tag) {
         if (tag.size() != 1) {
             return false;
         }
         Tag damage = tag.get(DAMAGE);
-        return damage instanceof NumericTag numeric && numeric.getAsInt() == 0;
+        return damage instanceof NumericTag numeric && numeric.getAsDouble() == 0.0D;
     }
 
     private static CompoundTag sanitizeCompound(CompoundTag source, boolean stripTopLevelDamage) {

@@ -6,10 +6,12 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 
 import com.itzplana.sudoersemc.core.ItemKey;
 import java.util.UUID;
+import net.minecraft.SharedConstants;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.TagParser;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.Bootstrap;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -18,6 +20,12 @@ import org.junit.jupiter.api.Test;
  * <p>Forge 未启动，所有标签都直接构造；测试只验证 NBT 清洗与规范化行为。</p>
  */
 class VariantNormalizerTest {
+
+    static {
+        // keyFor 通过 BuiltInRegistries 查找物品，测试前必须先完成原版注册表引导。
+        SharedConstants.tryDetectVersion();
+        Bootstrap.bootStrap();
+    }
 
     private static final ResourceLocation SUDOERSEMC_TOKEN =
             new ResourceLocation("sudoersemc", "token");
@@ -274,5 +282,56 @@ class VariantNormalizerTest {
 
         assertEquals("{Damage:0,stored_emc:64L}", VariantNormalizer.normalize(tag),
                 "存在其它经济字段时 Damage 必须作为组合变体的一部分保留");
+    }
+
+    @Test
+    void longDamageAboveIntRangeIsNotTruncatedToZero() {
+        CompoundTag tag = new CompoundTag();
+        tag.putLong("Damage", 4294967296L);
+
+        assertEquals("{Damage:4294967296L}", VariantNormalizer.normalize(tag),
+                "LongTag 2^32 不能被 getAsInt() 截断为 0");
+    }
+
+    @Test
+    void fractionalDamageIsNotTruncatedToZero() {
+        CompoundTag tag = new CompoundTag();
+        tag.putDouble("Damage", 0.5D);
+
+        assertEquals("{Damage:0.5d}", VariantNormalizer.normalize(tag),
+                "0.5 不能因整数转换被误判为默认伤害");
+    }
+
+    @Test
+    void zeroDamageOfEveryNumericTypeIsStillDropped() {
+        CompoundTag byteDamage = new CompoundTag();
+        byteDamage.putByte("Damage", (byte) 0);
+        CompoundTag shortDamage = new CompoundTag();
+        shortDamage.putShort("Damage", (short) 0);
+        CompoundTag intDamage = new CompoundTag();
+        intDamage.putInt("Damage", 0);
+        CompoundTag longDamage = new CompoundTag();
+        longDamage.putLong("Damage", 0L);
+        CompoundTag floatDamage = new CompoundTag();
+        floatDamage.putFloat("Damage", 0.0F);
+        CompoundTag doubleDamage = new CompoundTag();
+        doubleDamage.putDouble("Damage", 0.0D);
+
+        assertNull(VariantNormalizer.normalize(byteDamage));
+        assertNull(VariantNormalizer.normalize(shortDamage));
+        assertNull(VariantNormalizer.normalize(intDamage));
+        assertNull(VariantNormalizer.normalize(longDamage));
+        assertNull(VariantNormalizer.normalize(floatDamage));
+        assertNull(VariantNormalizer.normalize(doubleDamage));
+    }
+
+    @Test
+    void keyForKeepsNonZeroFractionalDamageVariant() {
+        CompoundTag tag = new CompoundTag();
+        tag.putDouble("Damage", 0.5D);
+
+        assertEquals(ItemKey.of(SUDOERSEMC_TOKEN, "{Damage:0.5d}"),
+                VariantNormalizer.keyFor(SUDOERSEMC_TOKEN, tag),
+                "非零小数伤害必须保留为独立变体键");
     }
 }
