@@ -355,6 +355,27 @@ class ConfigValidatorTest {
         assertEquals(List.of("当前配置快照为空"), result.errors());
     }
 
+    @Test
+    void unknownRecipeSelectionStrategyProducesWarning() {
+        ConfigValidationResult result = ConfigValidator.validate(
+                base().recipeSelectionStrategy("nonsense").build());
+
+        assertTrue(result.valid());
+        assertTrue(result.warnings().stream()
+                        .anyMatch(warning -> warning.contains("recipe.selectionStrategy")),
+                "非法策略应回退默认并给出警告");
+    }
+
+    @Test
+    void validRecipeSelectionStrategiesProduceNoWarning() {
+        ConfigValidationResult result = ConfigValidator.validate(
+                base().recipeSelectionStrategy("prefer_simple").build());
+
+        assertTrue(result.valid());
+        assertFalse(result.warnings().stream()
+                .anyMatch(warning -> warning.contains("recipe.selectionStrategy")));
+    }
+
     private static final class ValuesBuilder {
 
         private int itemsPerTick = 100;
@@ -373,6 +394,7 @@ class ConfigValidatorTest {
         private List<String> creativeItemExclusions = List.of();
         private List<String> creativeItemSpecialValues = List.of();
         private List<String> creativeNamespaces = List.of();
+        private String recipeSelectionStrategy = "lowest_cost";
 
         ValuesBuilder itemsPerTick(int value) {
             this.itemsPerTick = value;
@@ -454,6 +476,11 @@ class ConfigValidatorTest {
             return this;
         }
 
+        ValuesBuilder recipeSelectionStrategy(String value) {
+            this.recipeSelectionStrategy = value;
+            return this;
+        }
+
         ConfigValidator.Values build() {
             return new ConfigValidator.Values(
                     itemsPerTick,
@@ -471,7 +498,8 @@ class ConfigValidatorTest {
                     maxAllowedDropRatio,
                     creativeItemExclusions,
                     creativeItemSpecialValues,
-                    creativeNamespaces);
+                    creativeNamespaces,
+                    recipeSelectionStrategy);
         }
     }
 }

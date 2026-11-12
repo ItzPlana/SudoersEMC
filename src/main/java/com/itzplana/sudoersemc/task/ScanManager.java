@@ -16,8 +16,9 @@ import org.slf4j.LoggerFactory;
  * （{@link ResultApplier}）必须在服务器线程执行，因为真实实现会读取 Minecraft 注册表、
  * 配方管理器或写入 EMC 后端。只有不接触游戏状态的纯计算才可以移到工作线程。{@link #tick()}
  * 同样由服务器线程调用。{@link #progress()} 通过 {@code volatile} 字段发布，其他线程可以
- * 安全读取最近一次完整进度；{@link #cancel()} 也可以从其他线程调用，实际取消会在下一次
- * tick 被观察到。</p>
+ * 安全读取最近一次完整进度；{@link #cancel()} 也可以从其他线程调用。状态机仍在下一次
+ * tick 转入 {@link ScanPhase#CANCELLED}，但共享 {@link ScanCancellation} 令牌允许管线在
+ * 物品采集、配方扫描、NBT 变体、求解与应用循环内部提前停止重活。</p>
  *
  * <p>任何回调抛出的运行时异常都会被捕获并转换为 {@link ScanPhase#FAILED}，异常消息写入
  * 进度细节，绝不允许异常穿透 tick 循环破坏服务器主循环。</p>
@@ -105,7 +106,7 @@ public final class ScanManager {
     private final AbortListener abortListener;
 
     private volatile ScanProgress progress = ScanProgress.idle();
-    private volatile boolean cancelRequested;
+    private final ScanCancellation cancellation;
 
     private SnapshotData snapshot;
     private long lastBatchNanos;
@@ -141,6 +142,32 @@ public final class ScanManager {
                        long tickBudgetNanos,
                        @Nullable ScanDiagnostics diagnostics,
                        @Nullable AbortListener abortListener) {
+        this(batchProcessor, collector, applier, tickBudgetNanos, diagnostics, abortListener,
+                new ScanCancellation());
+    }
+
+    /**
+     * 使用共享取消令牌创建调度器。
+     *
+     * <p>真实管线可以持有同一个 {@link ScanCancellation}，在物品采集、配方扫描、NBT 变体、
+     * 求解与应用循环中主动检查取消信号，从而不必等到下一次 {@link #tick()}。传入
+     * {@code null} 时新建令牌，行为与旧构造器一致。</p>
+     *
+     * @param batchProcessor 批量决策器，不能为 {@code null}
+     * @param collector      快照采集回调，不能为 {@code null}
+     * @param applier        结果应用回调，不能为 {@code null}
+     * @param tickBudgetNanos 每 tick 允许用于扫描的时间预算（纳秒），不得为负
+     * @param diagnostics    耗时与内存采样器；{@code null} 时新建一个
+     * @param abortListener  取消/失败终止回调，可为 {@code null}
+     * @param cancellation   共享取消令牌，可为 {@code null}
+     */
+    public ScanManager(BatchProcessor batchProcessor,
+                       SnapshotCollector collector,
+                       ResultApplier applier,
+                       long tickBudgetNanos,
+                       @Nullable ScanDiagnostics diagnostics,
+                       @Nullable AbortListener abortListener,
+                       @Nullable ScanCancellation cancellation) {
         this.batchProcessor = Objects.requireNonNull(batchProcessor, "batchProcessor");
         this.collector = Objects.requireNonNull(collector, "collector");
         this.applier = Objects.requireNonNull(applier, "applier");
@@ -150,6 +177,14 @@ public final class ScanManager {
         this.tickBudgetNanos = tickBudgetNanos;
         this.diagnostics = diagnostics == null ? new ScanDiagnostics() : diagnostics;
         this.abortListener = abortListener;
+        this.cancellation = cancellation == null ? new ScanCancellation() : cancellation;
+    }
+
+    /**
+     * @return 本次调度器使用的共享取消令牌；管线可以持有同一实例并做协作式检查
+     */
+    public ScanCancellation cancellation() {
+        return cancellation;
     }
 
     /**
@@ -172,7 +207,7 @@ public final class ScanManager {
         if (isRunning()) {
             return false;
         }
-        cancelRequested = false;
+        cancellation.clear();
         snapshot = null;
         lastBatchNanos = 0L;
         diagnostics.reset();
@@ -190,7 +225,7 @@ public final class ScanManager {
      * {@link #requestScan()} 会将其清除。</p>
      */
     public void cancel() {
-        cancelRequested = true;
+        cancellation.request();
     }
 
     /**
@@ -211,7 +246,7 @@ public final class ScanManager {
      * @return 是否已经请求取消但尚未被 tick 观察
      */
     public boolean isCancelRequested() {
-        return cancelRequested;
+        return cancellation.isRequested();
     }
 
     /**
@@ -237,8 +272,8 @@ public final class ScanManager {
         boolean batchRecorded = false;
         ScanPhase abortedPhase = null;
         try {
-            if (cancelRequested) {
-                cancelRequested = false;
+            if (cancellation.isRequested()) {
+                cancellation.clear();
                 progress = current.advance(ScanPhase.CANCELLED, current.processed(),
                         current.total(), "扫描已取消");
                 abortedPhase = ScanPhase.CANCELLED;
@@ -295,7 +330,7 @@ public final class ScanManager {
      * 不会被重置，以便下一次扫描沿用已经学到的批量。</p>
      */
     public synchronized void reset() {
-        cancelRequested = false;
+        cancellation.clear();
         snapshot = null;
         lastBatchNanos = 0L;
         diagnostics.reset();

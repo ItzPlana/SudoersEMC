@@ -170,4 +170,31 @@ class ScanStateStoreTest {
         assertFalse(store.isDirty());
         assertTrue(Files.isRegularFile(file));
     }
+
+    @Test
+    void compareReportsChangedChannels() {
+        Path file = tempDir.resolve(ScanStateStore.FILE_NAME);
+        ScanStateStore store = new ScanStateStore(file);
+        ScanFingerprint stored = fingerprint();
+
+        ScanStateStore.FingerprintComparison empty = store.compare(stored);
+        assertFalse(empty.stored(), "没有保存过指纹时 stored=false");
+        assertFalse(empty.matches());
+
+        store.update(stored, 1L, 1, 0);
+
+        assertTrue(store.compare(stored).matches());
+        assertEquals(List.of(), store.compare(stored).changedChannels());
+
+        ScanFingerprint changed = ScanFingerprint.of(
+                List.of("item-input"),
+                List.of("recipe-input"),
+                List.of("tag-input"),
+                List.of("config-input", "changed"),
+                List.of("baseline-input"));
+        ScanStateStore.FingerprintComparison comparison = store.compare(changed);
+        assertTrue(comparison.stored());
+        assertFalse(comparison.matches());
+        assertEquals(List.of("config"), comparison.changedChannels());
+    }
 }

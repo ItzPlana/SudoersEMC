@@ -22,6 +22,7 @@ import com.itzplana.sudoersemc.safety.OverflowPipeline;
 import com.itzplana.sudoersemc.safety.OverflowProtection;
 import com.itzplana.sudoersemc.safety.OverflowReset;
 import com.itzplana.sudoersemc.scanner.IngredientOption;
+import com.itzplana.sudoersemc.scanner.ItemScanner;
 import com.itzplana.sudoersemc.scanner.ItemSnapshot;
 import com.itzplana.sudoersemc.scanner.RecipeInput;
 import com.itzplana.sudoersemc.scanner.RecipeKind;
@@ -386,10 +387,8 @@ class ScanPipelineTest {
 
         PipelineResult result = pipeline.solveAndApply(snapshot);
 
-        ScanFingerprint expected = ScanFingerprint.of(
-                List.of(INGOT_ID.toString(), RESULT_ID.toString()),
-                List.of(RECIPE_ID.toString()),
-                List.of(), List.of(), List.of());
+        ScanFingerprint expected = ScanPipeline.fingerprintFor(
+                snapshot.items(), snapshot.recipes(), List.of(), List.of());
         assertTrue(stateStore.matches(expected));
         assertEquals(result.applied(), stateStore.lastSolvedCount());
         assertEquals(0, stateStore.lastUnresolvedCount());
@@ -1121,6 +1120,107 @@ class ScanPipelineTest {
         assertTrue(failed.contains("部分报告（扫描失败）"));
         assertTrue(failed.lines().anyMatch(line -> line.contains("scanFailed: 1")));
         assertTrue(failed.lines().anyMatch(line -> line.contains("scanAborts: 1")));
+    }
+
+    @Test
+    void fingerprintIncludesAllFiveChannels() {
+        ItemSnapshot item = ItemSnapshot.of(INGOT, false, 0L,
+                List.of("forge:ingots"), Rarity.COMMON);
+        RecipeSnapshot recipe = recipe(INGOT, RESULT);
+
+        ScanFingerprint base = ScanPipeline.fingerprintFor(
+                List.of(item), List.of(recipe), List.of("cfg=1"), List.of("base=1"));
+        ScanFingerprint configChanged = ScanPipeline.fingerprintFor(
+                List.of(item), List.of(recipe), List.of("cfg=2"), List.of("base=1"));
+        ScanFingerprint baselineChanged = ScanPipeline.fingerprintFor(
+                List.of(item), List.of(recipe), List.of("cfg=1"), List.of("base=2"));
+        ScanFingerprint tagChanged = ScanPipeline.fingerprintFor(
+                List.of(ItemSnapshot.of(INGOT, false, 0L, List.of("forge:blocks"), Rarity.COMMON)),
+                List.of(recipe), List.of("cfg=1"), List.of("base=1"));
+
+        assertFalse(base.equalsFingerprint(configChanged));
+        assertFalse(base.equalsFingerprint(baselineChanged));
+        assertFalse(base.equalsFingerprint(tagChanged));
+        assertEquals(List.of("config"), base.changedChannels(configChanged));
+        assertEquals(List.of("baseline"), base.changedChannels(baselineChanged));
+        assertEquals(List.of("tag"), base.changedChannels(tagChanged));
+    }
+
+    @Test
+    void cancelledSolveDoesNotUpdateStateAndWritesPartialReport() throws IOException {
+        ReportManager reportManager = new ReportManager(tempDir.resolve("cancel_reports"));
+        ScanStateStore stateStore = new ScanStateStore(tempDir.resolve("cancel_state.json"));
+        GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("cancel_generated.json"));
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 5L), item(RESULT, 0L)),
+                List.of(recipe(INGOT, RESULT)),
+                Map.of(INGOT, 5L));
+        ScanPipeline pipeline = pipeline(
+                store, stateStore, reportManager, null, null, null, disabledFallback());
+        pipeline.setCancellationCheck(() -> true);
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(0, result.applied());
+        assertEquals(0, store.size(), "取消时不得写入任何条目");
+        assertFalse(stateStore.isDirty(), "取消时不得把未完成结果写成扫描指纹");
+        String report = Files.readString(reportManager.reportFile());
+        assertTrue(report.contains("部分报告（扫描已取消）"));
+        assertTrue(report.lines().anyMatch(line -> line.contains("scanCancelled: 1")));
+    }
+
+    @Test
+    void itemScannerHonorsCancellationCheckpoint() {
+        ItemScanner scanner = new ItemScanner(new ItemScanner.EmcQuery() {
+            @Override
+            public boolean hasValue(net.minecraft.world.item.ItemStack stack) {
+                return false;
+            }
+
+            @Override
+            public long getValue(net.minecraft.world.item.ItemStack stack) {
+                return 0L;
+            }
+        }, Set.of(), Set.of());
+
+        assertTrue(scanner.scan(() -> true).isEmpty(),
+                "取消信号在首个检查点生效，不应继续遍历物品注册表");
+    }
+
+    @Test
+    void collectFingerprintReturnsNullWithoutServer() {
+        ScanPipeline pipeline = pipeline(null, null, null, null, null, null, disabledFallback());
+
+        assertNull(pipeline.collectFingerprint(null));
+    }
+
+    @Test
+    void cancelledVariantCollectionStopsAtCheckpoint() {
+        ItemSnapshot base = ItemSnapshot.of(STONE, false, 0L,
+                List.of("minecraft:stone"), Rarity.COMMON);
+        List<ItemSnapshot> variants = ScanPipeline.collectVariantSnapshots(
+                List.of(base), List.of(recipeWithNbt(STONE, "{Display:{Name:'x'}}")),
+                true, 100, () -> true);
+
+        assertTrue(variants.isEmpty(), "取消后不应继续生成 NBT 变体");
+    }
+
+    @Test
+    void solverCacheCountersAreExposedInResult() {
+        GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("cache_generated.json"));
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 5L), item(RESULT, 0L)),
+                List.of(recipe(INGOT, RESULT)),
+                Map.of(INGOT, 5L));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null, disabledFallback());
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertTrue(result.extraCounters().containsKey("solverCacheHits"));
+        assertTrue(result.extraCounters().containsKey("solverCacheMisses"));
+        assertTrue(result.extraCounters().get("solverCacheMisses") > 0L,
+                "首次扫描至少应有一次真实评估");
     }
 
     /**

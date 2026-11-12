@@ -1,6 +1,7 @@
 package com.itzplana.sudoersemc.config;
 
 import com.itzplana.sudoersemc.core.OverflowScope;
+import com.itzplana.sudoersemc.solver.RecipeSelectionStrategy;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -44,10 +45,10 @@ public final class ConfigValidator {
      * @param overwriteScope           改写范围字符串
      * @param allowProjectEFileRewrite 是否允许改写 ProjectE 的 custom_emc.json
      * @param maxNbtVariantsPerItem    每个物品最多扫描的 NBT 变体数
-     * @param maxAllowedDropRatio      单次生成值允许的最大相对跌幅
      * @param creativeItemExclusions   禁止自动定价的完整物品 id 原始列表
      * @param creativeItemSpecialValues 固定 EMC 值原始列表，格式为 {@code namespace:path=正整数}
      * @param creativeNamespaces       整体视为创造专属的命名空间原始列表
+     * @param recipeSelectionStrategy  同一物品多条同成本配方时的取舍策略原始字符串
      */
     public record Values(
             int itemsPerTick,
@@ -65,13 +66,42 @@ public final class ConfigValidator {
             double maxAllowedDropRatio,
             List<String> creativeItemExclusions,
             List<String> creativeItemSpecialValues,
-            List<String> creativeNamespaces
+            List<String> creativeNamespaces,
+            String recipeSelectionStrategy
     ) {
 
         public Values {
             creativeItemExclusions = copyList(creativeItemExclusions);
             creativeItemSpecialValues = copyList(creativeItemSpecialValues);
             creativeNamespaces = copyList(creativeNamespaces);
+            recipeSelectionStrategy = recipeSelectionStrategy == null
+                    ? "lowest_cost" : recipeSelectionStrategy;
+        }
+
+        /**
+         * 兼容 Phase 22 及更早测试/调用点的构造器：默认选择策略为 {@code lowest_cost}。
+         */
+        public Values(int itemsPerTick,
+                      int maxRecipePasses,
+                      long minEmc,
+                      boolean overflowEnabled,
+                      long overflowThreshold,
+                      long resetMin,
+                      long resetMax,
+                      int bucketCount,
+                      int weightCap,
+                      String overwriteScope,
+                      boolean allowProjectEFileRewrite,
+                      int maxNbtVariantsPerItem,
+                      double maxAllowedDropRatio,
+                      List<String> creativeItemExclusions,
+                      List<String> creativeItemSpecialValues,
+                      List<String> creativeNamespaces) {
+            this(itemsPerTick, maxRecipePasses, minEmc, overflowEnabled, overflowThreshold,
+                    resetMin, resetMax, bucketCount, weightCap, overwriteScope,
+                    allowProjectEFileRewrite, maxNbtVariantsPerItem, maxAllowedDropRatio,
+                    creativeItemExclusions, creativeItemSpecialValues, creativeNamespaces,
+                    "lowest_cost");
         }
 
         private static List<String> copyList(List<String> source) {
@@ -117,6 +147,10 @@ public final class ConfigValidator {
         if (!(values.maxAllowedDropRatio() > 0.0D && values.maxAllowedDropRatio() <= 1.0D)) {
             errors.add("maxAllowedDropRatio 必须在 (0.0, 1.0] 内，当前为 "
                     + values.maxAllowedDropRatio());
+        }
+        if (!RecipeSelectionStrategy.isValid(values.recipeSelectionStrategy())) {
+            warnings.add("recipe.selectionStrategy='" + values.recipeSelectionStrategy()
+                    + "' 不是可识别值，将回退 lowest_cost");
         }
 
         appendScopeWarning(values, warnings);

@@ -1,7 +1,9 @@
 package com.itzplana.sudoersemc.solver;
 
+import java.util.Objects;
+
 /**
- * 一次配方求解的收敛与诊断参数。
+ * 一次配方求解的收敛、诊断与配方选择参数。
  *
  * <p>这些参数只影响求解过程，不改变任何现有 EMC 值：已有值永远优先，生成的候选值只在缺口处发布。</p>
  *
@@ -9,12 +11,15 @@ package com.itzplana.sudoersemc.solver;
  * @param allowValueIncrease       是否允许后续轮次抬高本轮已经生成的值；默认 {@code false}
  * @param minimumEmc               交给评估器的最小 EMC，必须 {@code >= 0}；默认 1
  * @param maxAlternativeCostsPerItem 每个物品最多保留多少条备选成本，必须 {@code >= 0}；默认 8
+ * @param selectionStrategy        同一物品多条同成本配方时的取舍策略；默认
+ *                                 {@link RecipeSelectionStrategy#LOWEST_COST}
  */
 public record SolveSettings(
         int maxPasses,
         boolean allowValueIncrease,
         long minimumEmc,
-        int maxAlternativeCostsPerItem
+        int maxAlternativeCostsPerItem,
+        RecipeSelectionStrategy selectionStrategy
 ) {
 
     /** 默认最大迭代轮数。 */
@@ -37,10 +42,21 @@ public record SolveSettings(
             throw new IllegalArgumentException(
                     "maxAlternativeCostsPerItem 必须 >= 0，实际为 " + maxAlternativeCostsPerItem);
         }
+        selectionStrategy = Objects.requireNonNull(selectionStrategy, "selectionStrategy");
     }
 
     /**
-     * @return 生产环境默认参数：最多 20 轮、禁止抬价、最小 EMC 为 1、每个物品保留 8 条备选成本
+     * 兼容 Phase 22 及更早调用点的构造器：使用默认配方选择策略。
+     */
+    public SolveSettings(int maxPasses, boolean allowValueIncrease, long minimumEmc,
+                         int maxAlternativeCostsPerItem) {
+        this(maxPasses, allowValueIncrease, minimumEmc, maxAlternativeCostsPerItem,
+                RecipeSelectionStrategy.DEFAULT);
+    }
+
+    /**
+     * @return 生产环境默认参数：最多 20 轮、禁止抬价、最小 EMC 为 1、每个物品保留 8 条备选成本、
+     *         成本相同时按配方 id 选择
      */
     public static SolveSettings defaults() {
         return new SolveSettings(DEFAULT_MAX_PASSES, false, DEFAULT_MINIMUM_EMC,

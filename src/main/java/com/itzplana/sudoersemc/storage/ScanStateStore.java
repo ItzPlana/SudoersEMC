@@ -3,6 +3,7 @@ package com.itzplana.sudoersemc.storage;
 import com.itzplana.sudoersemc.task.ScanFingerprint;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.Logger;
@@ -237,6 +238,44 @@ public final class ScanStateStore {
         }
         synchronized (lock) {
             return storedFingerprint != null && storedFingerprint.equalsFingerprint(candidate);
+        }
+    }
+
+    /**
+     * 比较候选指纹与已保存指纹，并返回发生变化的通道名称。
+     *
+     * <p>该 API 用于启动时的可观测诊断：调用方可以据此记录“为什么没有跳过扫描”。
+     * 没有保存过指纹时 {@code stored=false}，且 {@code changedChannels} 为五个通道名称。</p>
+     *
+     * @param candidate 候选指纹，可为 {@code null}
+     * @return 不可变比较结果
+     */
+    public FingerprintComparison compare(ScanFingerprint candidate) {
+        synchronized (lock) {
+            if (storedFingerprint == null) {
+                return new FingerprintComparison(false, false,
+                        List.of("item", "recipe", "tag", "config", "baseline"));
+            }
+            if (candidate == null) {
+                return new FingerprintComparison(true, false,
+                        List.of("item", "recipe", "tag", "config", "baseline"));
+            }
+            List<String> changed = storedFingerprint.changedChannels(candidate);
+            return new FingerprintComparison(true, changed.isEmpty(), changed);
+        }
+    }
+
+    /**
+     * 指纹比较结果。
+     *
+     * @param stored         是否已经保存过指纹
+     * @param matches        五个通道是否全部一致
+     * @param changedChannels 发生变化的通道名称；完全一致时为空
+     */
+    public record FingerprintComparison(boolean stored, boolean matches, List<String> changedChannels) {
+
+        public FingerprintComparison {
+            changedChannels = List.copyOf(changedChannels);
         }
     }
 

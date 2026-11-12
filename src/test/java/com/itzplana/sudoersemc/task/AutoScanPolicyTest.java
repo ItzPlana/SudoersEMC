@@ -44,4 +44,22 @@ class AutoScanPolicyTest {
         assertFalse(AutoScanPolicy.shouldScan(true, false, 123L, 456),
                 "已有扫描时刻与生成条目时默认复用缓存");
     }
+
+    @Test
+    void matchingFingerprintSkipsScan() {
+        assertFalse(AutoScanPolicy.shouldScan(true, false, 123L, 456, true),
+                "输入指纹完全一致时应跳过重复扫描");
+    }
+
+    @Test
+    void changedFingerprintForcesScan() {
+        assertTrue(AutoScanPolicy.shouldScan(true, false, 123L, 456, false),
+                "任一输入通道变化都必须重新扫描");
+    }
+
+    @Test
+    void alwaysRescanIgnoresMatchingFingerprint() {
+        assertTrue(AutoScanPolicy.shouldScan(true, true, 123L, 456, true),
+                "alwaysRescan=true 时即使指纹一致也要重扫");
+    }
 }
