@@ -275,6 +275,19 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
     }
 
     /**
+     * Looks up a single entry without copying the whole map.
+     *
+     * <p>Used by the {@code /sudoemc explain} command so a large generated-entry table is not
+     * snapshotted merely to read one item.</p>
+     *
+     * @param key item identity; {@code null} returns {@code null}
+     * @return the current entry, or {@code null} when absent
+     */
+    public GeneratedEmcEntry get(ItemKey key) {
+        return key == null ? null : entries.get(key);
+    }
+
+    /**
      * @return number of entries currently held in memory
      */
     public int size() {

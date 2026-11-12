@@ -2,7 +2,10 @@ package com.itzplana.sudoersemc;
 
 import com.itzplana.sudoersemc.command.CommandService;
 import com.itzplana.sudoersemc.command.SudoemcCommands;
+import com.itzplana.sudoersemc.config.ConfigValidationResult;
+import com.itzplana.sudoersemc.config.ReloadDecision;
 import com.itzplana.sudoersemc.config.SudoersemcConfig;
+import com.itzplana.sudoersemc.diagnostic.ReportManager;
 import com.itzplana.sudoersemc.diagnostic.SmokeTestHook;
 import com.itzplana.sudoersemc.integration.GeneratedEmcMapper;
 import com.itzplana.sudoersemc.integration.OptionalIntegrationManager;
@@ -40,6 +43,9 @@ public final class Sudoersemc {
     private static volatile GeneratedEntryStore entryStore;
     private static volatile ScanStateStore scanStateStore;
     private static volatile ScanManager scanManager;
+    private static volatile ReportManager reportManager;
+    private static volatile CommandService commandService;
+    private static volatile boolean pendingReload;
 
     public Sudoersemc() {
         IEventBus modEventBus = FMLJavaModLoadingContext.get().getModEventBus();
@@ -79,12 +85,16 @@ public final class Sudoersemc {
                 LOGGER.info("SudoersEMC wired its generated-value mapper into ProjectE");
             }
 
-            scanManager = createScanManager();
-            SudoemcCommands.setService(new CommandService(
-                    scanManager,
-                    new com.itzplana.sudoersemc.diagnostic.ReportManager(),
+            reportManager = new ReportManager();
+            ScanManager manager = createScanManager();
+            scanManager = manager;
+            commandService = new CommandService(
+                    manager,
+                    reportManager,
                     store,
-                    stateStore));
+                    stateStore,
+                    Sudoersemc::reloadConfig);
+            SudoemcCommands.setService(commandService);
 
             LOGGER.info("SudoersEMC common setup complete ({} generated entries loaded)", store.size());
         });
@@ -116,6 +126,64 @@ public final class Sudoersemc {
                 TICK_BUDGET_NANOS);
     }
 
+    /**
+     * 处理 {@code /sudoemc reload}：重读配置文件并重建受配置影响的运行时组件。
+     *
+     * <p>扫描进行中时不读取文件，只登记延迟重载；扫描结束后由服务器 tick 调用
+     * {@link #applyConfigReload()}。这样可以避免在扫描中途替换 {@link ScanManager}
+     * 导致进度或取消标志丢失。</p>
+     *
+     * @return 命令层用于生成回执的处理决策
+     */
+    private static ReloadDecision reloadConfig() {
+        ScanManager manager = scanManager;
+        if (manager != null && manager.isRunning()) {
+            pendingReload = true;
+            LOGGER.info("SudoersEMC 扫描进行中，配置重载已延后到扫描结束");
+            return ReloadDecision.DEFER;
+        }
+        return applyConfigReload();
+    }
+
+    /**
+     * 从磁盘重读配置，校验通过后重建扫描调度器与命令服务。
+     *
+     * <p>配置读取或跨字段校验失败时不会替换任何运行时组件，返回
+     * {@link ReloadDecision#REJECT}；成功时使用新配置重建 {@link ScanManager} 并重新注入
+     * {@link CommandService}，同时清理旧调度器，避免残留取消标志。</p>
+     */
+    private static synchronized ReloadDecision applyConfigReload() {
+        pendingReload = false;
+        ConfigValidationResult validation = SudoersemcConfig.reloadFromDisk();
+        if (!validation.valid()) {
+            LOGGER.warn("SudoersEMC 配置重载被拒绝，保留上一份有效配置：\n{}", validation.format());
+            return ReloadDecision.REJECT;
+        }
+
+        try {
+            ScanManager rebuilt = createScanManager();
+            CommandService rebuiltService = new CommandService(
+                    rebuilt,
+                    reportManager,
+                    entryStore,
+                    scanStateStore,
+                    Sudoersemc::reloadConfig);
+            ScanManager previous = scanManager;
+            scanManager = rebuilt;
+            commandService = rebuiltService;
+            SudoemcCommands.setService(rebuiltService);
+            if (previous != null) {
+                previous.cancel();
+                previous.reset();
+            }
+            LOGGER.info("SudoersEMC 配置已重新加载并生效");
+            return ReloadDecision.APPLY_NOW;
+        } catch (RuntimeException failure) {
+            LOGGER.warn("SudoersEMC 应用新配置失败，保留旧运行时组件", failure);
+            return ReloadDecision.REJECT;
+        }
+    }
+
     private void onRegisterCommands(RegisterCommandsEvent event) {
         event.getDispatcher().register(SudoemcCommands.register());
         LOGGER.debug("SudoersEMC registered /sudoemc command tree");
@@ -129,9 +197,22 @@ public final class Sudoersemc {
         if (manager != null && manager.isRunning()) {
             manager.tick();
         }
+        if (pendingReload) {
+            ScanManager current = scanManager;
+            if (current == null || !current.isRunning()) {
+                applyConfigReload();
+            }
+        }
     }
 
     private void onServerStarted(ServerStartedEvent event) {
+        ScanManager manager = scanManager;
+        if (manager != null) {
+            manager.reset();
+        }
+        // 集成服务器停止后会清空命令服务；新世界启动时必须重新注入。
+        SudoemcCommands.setService(commandService);
+
         GeneratedEntryStore store = entryStore;
         if (store != null) {
             LOGGER.info("SudoersEMC active: {} generated entries, ProjectE {}",
@@ -150,6 +231,14 @@ public final class Sudoersemc {
         if (stateStore != null) {
             stateStore.saveIfDirty();
         }
+        ScanManager manager = scanManager;
+        if (manager != null) {
+            manager.cancel();
+            manager.reset();
+        }
+        pendingReload = false;
+        // 不保留指向旧世界的命令服务；下一次 ServerStartedEvent 会重新注入。
+        SudoemcCommands.setService(null);
     }
 
     /**
