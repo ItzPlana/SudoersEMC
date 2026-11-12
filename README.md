@@ -145,7 +145,7 @@ allowRecipeValueIncrease = false
 useFallbackForUnsolvable = true
 useTagPricing = true
 useRarityPricing = true
-useProjectEIntegrationBaselines = true
+useProjectEIntegrationBaselines = true   # Phase 25 接线；Phase 16 构建暂不读取
 
 [safety]
 largeDropProtection = true
@@ -168,7 +168,7 @@ scanNbtVariants = true
 maxNbtVariantsPerItem = 100
 
 [diagnostic]
-debugLogging = false
+debugLogging = false                     # Phase 25 接线；Phase 16 构建暂不读取
 generateReports = true
 ```
 

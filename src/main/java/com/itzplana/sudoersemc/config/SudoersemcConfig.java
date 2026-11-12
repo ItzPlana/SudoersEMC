@@ -119,7 +119,8 @@ public final class SudoersemcConfig {
         FALLBACK_USE_RARITY_PRICING = BUILDER.comment("Derive values from item rarity.")
                 .define("useRarityPricing", true);
         FALLBACK_USE_PROJECTE_INTEGRATION_BASELINES = BUILDER.comment(
-                        "Use ProjectE integration baselines when available.")
+                        "Use ProjectE integration baselines when available.",
+                        "Reserved for Phase 25; this Phase 16 build does not read this key yet.")
                 .define("useProjectEIntegrationBaselines", true);
         BUILDER.pop();
 
@@ -185,7 +186,8 @@ public final class SudoersemcConfig {
 
         // [diagnostic]
         BUILDER.comment("Diagnostic logging and reports.").push("diagnostic");
-        DIAGNOSTIC_DEBUG_LOGGING = BUILDER.comment("Enable verbose diagnostic logging.")
+        DIAGNOSTIC_DEBUG_LOGGING = BUILDER.comment("Enable verbose diagnostic logging.",
+                        "Reserved for Phase 25; this Phase 16 build does not read this key yet.")
                 .define("debugLogging", false);
         DIAGNOSTIC_GENERATE_REPORTS = BUILDER.comment("Write diagnostic reports after scans.")
                 .define("generateReports", true);

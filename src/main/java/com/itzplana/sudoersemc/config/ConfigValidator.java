@@ -95,14 +95,7 @@ public final class ConfigValidator {
                     + values.overwriteScope());
         }
         appendOverflowErrors(values, errors);
-        if (values.maxNbtVariantsPerItem() < 1 || values.maxNbtVariantsPerItem() > 1000) {
-            errors.add("maxNbtVariantsPerItem 必须在 [1, 1000] 内，当前为 "
-                    + values.maxNbtVariantsPerItem());
-        }
-        if (!(values.maxAllowedDropRatio() > 0.0D && values.maxAllowedDropRatio() <= 1.0D)) {
-            errors.add("maxAllowedDropRatio 必须在 (0.0, 1.0] 内，当前为 "
-                    + values.maxAllowedDropRatio());
-        }
+        appendNbtAndDropRatioErrors(values, errors);
 
         appendScopeWarning(values, warnings);
         if (values.itemsPerTick() > 5_000) {
@@ -123,10 +116,12 @@ public final class ConfigValidator {
     /**
      * 只执行运行时重建真正依赖的跨字段校验。
      *
-     * <p>单项数值范围由 {@code ForgeConfigSpec} 在加载配置时强制，本方法不重复检查；
-     * 它复用 {@link #validate(Values)} 中同一组溢出区间规则与改写范围冲突警告，
-     * 因此不会出现两套规则文本。适用于 {@code ModConfigEvent} 与命令触发的运行时
-     * 重载：只要这些跨字段不变量成立，现有组件就可以安全替换。</p>
+     * <p>Forge 的 spec 只负责裁剪越界值；某些“裁剪后仍在合法范围”的取值仍具有安全语义，
+     * 例如 {@code maxAllowedDropRatio=0.0} 会被安全层解释为隔离任何降价，而
+     * {@code maxNbtVariantsPerItem} 超过硬上限会被消费端静默截断。因此本方法除溢出区间外，
+     * 也复用 {@link #validate(Values)} 对 NBT 变体数与跌幅比例的校验。它与完整校验共享
+     * 同一组辅助方法与错误文本，因此不会出现两套规则。适用于 {@code ModConfigEvent} 与
+     * 命令触发的运行时重载：只要这些跨字段不变量成立，现有组件就可以安全替换。</p>
      *
      * @param values 待校验配置，不能为 {@code null}
      * @return 校验结果；存在跨字段错误时 {@link ConfigValidationResult#valid()} 为 {@code false}
@@ -138,6 +133,7 @@ public final class ConfigValidator {
         List<String> errors = new ArrayList<>();
         List<String> warnings = new ArrayList<>();
         appendOverflowErrors(values, errors);
+        appendNbtAndDropRatioErrors(values, errors);
         appendScopeWarning(values, warnings);
 
         return errors.isEmpty()
@@ -166,6 +162,25 @@ public final class ConfigValidator {
         }
         if (values.weightCap() < 1) {
             errors.add("overflow.weightCap 必须 >= 1，当前为 " + values.weightCap());
+        }
+    }
+
+    /**
+     * 收集 NBT 变体数与跌幅比例的范围错误。
+     *
+     * <p>这两项不仅参与 {@link #validate(Values)} 的完整校验，也必须在运行时跨字段校验中
+     * 重新检查：{@code maxAllowedDropRatio=0.0} 会被安全层解释为隔离任何降价，旧实现会在
+     * 组件构建失败时静默退回默认 0.5；{@code maxNbtVariantsPerItem} 超过硬上限则会被消费端
+     * 静默截断。复用同一辅助方法可保证完整校验与运行时校验使用同一组错误文本。</p>
+     */
+    private static void appendNbtAndDropRatioErrors(Values values, List<String> errors) {
+        if (values.maxNbtVariantsPerItem() < 1 || values.maxNbtVariantsPerItem() > 1000) {
+            errors.add("maxNbtVariantsPerItem 必须在 [1, 1000] 内，当前为 "
+                    + values.maxNbtVariantsPerItem());
+        }
+        if (!(values.maxAllowedDropRatio() > 0.0D && values.maxAllowedDropRatio() <= 1.0D)) {
+            errors.add("maxAllowedDropRatio 必须在 (0.0, 1.0] 内，当前为 "
+                    + values.maxAllowedDropRatio());
         }
     }
 

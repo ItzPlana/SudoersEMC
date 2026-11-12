@@ -7,6 +7,8 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.lang.reflect.Modifier;
+
 import com.itzplana.sudoersemc.task.BatchProcessor;
 import com.itzplana.sudoersemc.task.ScanManager;
 import com.itzplana.sudoersemc.task.ScanPhase;
@@ -80,5 +82,15 @@ class SudoersemcLifecycleTest {
     @Test
     void shutdownResetToleratesMissingManager() {
         assertDoesNotThrow(() -> Sudoersemc.resetScanManager(null));
+    }
+
+    @Test
+    void configReloadEntryPointsShareTheClassLock() throws Exception {
+        assertTrue(Modifier.isSynchronized(
+                Sudoersemc.class.getDeclaredMethod("reloadConfig").getModifiers()),
+                "命令触发的重载必须与 tick 重载序列化，避免 isRunning 检查与组件替换交错");
+        assertTrue(Modifier.isSynchronized(
+                Sudoersemc.class.getDeclaredMethod("applyConfigReload").getModifiers()),
+                "实际重建必须与命令/延迟重载共用同一把类锁");
     }
 }

@@ -408,7 +408,7 @@ public final class Sudoersemc {
      *
      * @return 命令层用于生成回执的处理决策
      */
-    private static ReloadDecision reloadConfig() {
+    private static synchronized ReloadDecision reloadConfig() {
         ScanManager manager = scanManager;
         if (manager != null && manager.isRunning()) {
             pendingReload = true;
