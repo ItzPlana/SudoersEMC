@@ -151,7 +151,8 @@ public final class Sudoersemc {
         try {
             dropSettings = new LargeDropProtection.Settings(
                     SudoersemcConfig.SAFETY_LARGE_DROP_PROTECTION.get(),
-                    SudoersemcConfig.SAFETY_MAX_ALLOWED_DROP_RATIO.get(),
+                    sanitizeMaxAllowedDropRatio(
+                            SudoersemcConfig.SAFETY_MAX_ALLOWED_DROP_RATIO.get()),
                     Set.of(),
                     Set.of());
         } catch (RuntimeException e) {
@@ -211,6 +212,23 @@ public final class Sudoersemc {
     }
 
     /**
+     * 把配置中的最大允许降幅夹到 {@link LargeDropProtection.Settings} 接受的 {@code (0.0, 1.0]} 区间。
+     *
+     * <p>配置边界已经拒绝 0.0，但旧配置文件、手工编辑或未来迁移仍可能绕过边界检查。这里再做一次
+     * 防御：任何非有限、非正或大于 1 的值都按 {@link Double#MIN_VALUE} 处理，语义是“任何正降幅
+     * 都隔离”。绝不静默退回默认的 0.5，避免管理员以为关闭了降价却被允许 50% 降价。</p>
+     *
+     * @param configured 配置读取到的最大允许降幅
+     * @return 位于 {@code (0.0, 1.0]} 的可用值
+     */
+    static double sanitizeMaxAllowedDropRatio(double configured) {
+        if (!Double.isFinite(configured) || configured <= 0.0D || configured > 1.0D) {
+            return Double.MIN_VALUE;
+        }
+        return configured;
+    }
+
+    /**
      * 创建扫描调度器并接入真实管线。
      *
      * <p>接线采用“采集暂存、应用取出”的方式：采集回调在服务器线程完成注册表与配方读取后把
@@ -243,18 +261,17 @@ public final class Sudoersemc {
     /**
      * 采集阶段回调：读取当前服务器并生成不可变快照。
      *
-     * <p>服务器尚未就绪时返回空快照，避免调度器因为空指针进入失败状态。</p>
+     * <p>服务器或管线尚未就绪时抛出 {@link IllegalStateException}，由 {@link ScanManager} 转为
+     * {@code FAILED}；绝不在失败时暂存空快照，避免调度器把失败扫描记录为成功的空扫描。</p>
      */
     private static ScanManager.SnapshotData collectSnapshot(ScanPipeline pipeline) {
         if (pipeline == null) {
-            return new ScanManager.SnapshotData("扫描管线未初始化", 0, 0);
+            throw new IllegalStateException("扫描采集失败：扫描管线未初始化");
         }
         MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
         if (server == null) {
-            LOGGER.warn("SudoersEMC 扫描请求到达时服务器尚未就绪，本轮采集空快照");
-            PipelineSnapshot empty = PipelineSnapshot.empty();
-            pipeline.stash(empty);
-            return new ScanManager.SnapshotData("服务器未就绪", 0, 0);
+            LOGGER.warn("SudoersEMC 扫描请求到达时服务器尚未就绪，本次扫描失败");
+            throw new IllegalStateException("扫描采集失败：服务器尚未就绪");
         }
 
         PipelineSnapshot snapshot = pipeline.collect(server);
