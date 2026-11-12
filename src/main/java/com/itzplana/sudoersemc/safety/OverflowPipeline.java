@@ -50,13 +50,14 @@ public final class OverflowPipeline {
      * 按需应用溢出保护并写入审计。
      *
      * <p>只有“严格超过阈值且策略确实改变了数值”的调用才会产生审计记录。物品或作用域为
-     * {@code null} 时仍然返回策略结果，但跳过审计写入，因为缺少归属信息或作用域的记录没有
-     * 审计价值。</p>
+     * {@code null} 时 fail-closed：直接返回原值，不修改数值也不写审计。请求作用域宽于
+     * {@link OverflowProtection.Settings#scope()}（配置为 {@code OWNED_ONLY} 却请求
+     * {@code ENTIRE_CUSTOM_EMC}）时同样返回原值，避免审计记录与实际策略不一致。</p>
      *
      * @param item  被处理的物品
      * @param value 待处理数值
-     * @param scope 本次处理适用的作用域
-     * @return 原值（未溢出或策略未改变数值）或回落后的值
+     * @param scope 本次处理适用的作用域；不得宽于配置作用域
+     * @return 原值（未溢出、策略未改变数值或输入无效）或回落后的值
      */
     public long applyAndAudit(ItemKey item, long value, OverflowScope scope) {
         boolean overflow;
@@ -70,6 +71,17 @@ public final class OverflowPipeline {
             return value;
         }
 
+        if (item == null || scope == null) {
+            LOGGER.warn("跳过溢出处理：缺少物品或作用域，保持原值 {}（item={} scope={}）", value, item, scope);
+            return value;
+        }
+        OverflowScope configuredScope = protection.settings().scope();
+        if (scope == OverflowScope.ENTIRE_CUSTOM_EMC && configuredScope == OverflowScope.OWNED_ONLY) {
+            LOGGER.warn("跳过溢出处理：请求作用域 {} 超出配置作用域 {}（物品 {}）",
+                    scope, configuredScope, item);
+            return value;
+        }
+
         long reset;
         try {
             reset = protection.applyIdempotent(value);
@@ -80,12 +92,6 @@ public final class OverflowPipeline {
         if (reset == value) {
             // 保护禁用或策略未改变数值：这不是一次实际重置，不写审计。
             return value;
-        }
-
-        if (item == null || scope == null) {
-            LOGGER.warn("跳过溢出审计记录：item={} scope={}", item, scope);
-            resetsApplied.incrementAndGet();
-            return reset;
         }
 
         try {

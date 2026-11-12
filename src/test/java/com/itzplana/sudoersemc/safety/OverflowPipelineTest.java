@@ -48,6 +48,11 @@ class OverflowPipelineTest {
         pipeline = new OverflowPipeline(protection, log);
     }
 
+    private static OverflowProtection protectionWithScope(OverflowScope scope) {
+        return new OverflowProtection(new OverflowProtection.Settings(
+                true, THRESHOLD, RESET_MIN, RESET_MAX, 100, 20, scope, false, 12345L));
+    }
+
     @Test
     void valueBelowThresholdIsUnchangedAndNotAudited() {
         long result = pipeline.applyAndAudit(ITEM, THRESHOLD - 1L, OverflowScope.OWNED_ONLY);
@@ -120,12 +125,46 @@ class OverflowPipelineTest {
     }
 
     @Test
-    void scopeIsPropagatedIntoTheAuditRecord() {
-        long result = pipeline.applyAndAudit(ITEM, 1_500_000L, OverflowScope.ENTIRE_CUSTOM_EMC);
+    void requestedScopeIsPropagatedIntoTheAuditRecord() {
+        OverflowPipeline entirePipeline = new OverflowPipeline(
+                protectionWithScope(OverflowScope.ENTIRE_CUSTOM_EMC), log);
+
+        long result = entirePipeline.applyAndAudit(
+                ITEM, 1_500_000L, OverflowScope.ENTIRE_CUSTOM_EMC);
 
         assertTrue(result >= RESET_MIN && result <= RESET_MAX);
         assertEquals(1, log.entries().size());
         assertEquals(OverflowScope.ENTIRE_CUSTOM_EMC, log.entries().get(0).scope());
+    }
+
+    @Test
+    void requestedScopeWiderThanConfiguredIsFailClosed() {
+        long result = pipeline.applyAndAudit(ITEM, 1_500_000L, OverflowScope.ENTIRE_CUSTOM_EMC);
+
+        assertEquals(1_500_000L, result, "宽于配置的作用域必须 fail-closed 返回原值");
+        assertEquals(0, pipeline.auditCount());
+        assertEquals(0, pipeline.resetsApplied());
+        assertTrue(log.entries().isEmpty());
+    }
+
+    @Test
+    void nullItemIsFailClosedWithoutAudit() {
+        long result = pipeline.applyAndAudit(null, 1_500_000L, OverflowScope.OWNED_ONLY);
+
+        assertEquals(1_500_000L, result);
+        assertEquals(0, pipeline.auditCount());
+        assertEquals(0, pipeline.resetsApplied());
+        assertTrue(log.entries().isEmpty());
+    }
+
+    @Test
+    void nullScopeIsFailClosedWithoutAudit() {
+        long result = pipeline.applyAndAudit(ITEM, 1_500_000L, null);
+
+        assertEquals(1_500_000L, result);
+        assertEquals(0, pipeline.auditCount());
+        assertEquals(0, pipeline.resetsApplied());
+        assertTrue(log.entries().isEmpty());
     }
 
     @Test
