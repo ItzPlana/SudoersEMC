@@ -41,7 +41,9 @@ import org.slf4j.LoggerFactory;
  * {@link #removeOwned(ItemKey)} never throw. Corrupt entries are skipped individually. A file
  * written by a newer schema version is preserved untouched: it is neither loaded nor overwritten.
  * Before the first rewrite of a file that was read from disk, a timestamped {@code .bak} copy is
- * made.</p>
+ * made. A failed write keeps the store dirty and leaves the one-time backup flag set, so a later
+ * {@link #saveIfDirty()} retries; an existing file is never overwritten without a successful
+ * backup.</p>
  */
 public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValueSource {
 
@@ -189,10 +191,18 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
                     dto.entries.add(EntryDto.from(entry));
                 }
 
-                if (backupPending) {
-                    JsonFileIO.backupIfExists(file);
+                if (backupPending && !JsonFileIO.backupIfExists(file)) {
+                    dirty.set(true);
+                    LOGGER.warn(
+                            "Failed to save generated entries to {}: could not create a backup; "
+                                    + "keeping the store dirty for a later retry",
+                            file);
+                    return;
                 }
-                JsonFileIO.writeAtomically(file, dto);
+                if (!JsonFileIO.writeAtomically(file, dto)) {
+                    dirty.set(true);
+                    return;
+                }
                 backupPending = false;
             } catch (RuntimeException e) {
                 dirty.set(true);
@@ -281,6 +291,19 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
         }
         GeneratedEmcEntry entry = entries.get(key);
         return entry != null && entry.owned();
+    }
+
+    /**
+     * Looks up a single entry without copying the whole map.
+     *
+     * <p>Used by the {@code /sudoemc explain} command so a large generated-entry table is not
+     * snapshotted merely to read one item.</p>
+     *
+     * @param key item identity; {@code null} returns {@code null}
+     * @return the current entry, or {@code null} when absent
+     */
+    public GeneratedEmcEntry get(ItemKey key) {
+        return key == null ? null : entries.get(key);
     }
 
     /**

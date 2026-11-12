@@ -156,10 +156,11 @@ class LargeDropProtectionTest {
         PriceDropDecision ironDecision = protection.evaluate(IRON, 1_000L, 100L);
         assertEquals(2, protection.quarantineCount());
 
-        protection.approve(DIAMOND);
+        List<PriceDropDecision> approved = protection.approve(DIAMOND);
 
         assertEquals(1, protection.quarantineCount());
         assertEquals(List.of(ironDecision), protection.quarantined());
+        assertEquals(List.of(diamondDecision), approved, "approve 必须返回被移除的具体决策");
         assertTrue(protection.isApproved(DIAMOND));
         assertFalse(protection.isApproved(IRON));
         assertEquals(Set.of(DIAMOND), protection.approvedItems());
@@ -179,6 +180,43 @@ class LargeDropProtectionTest {
         assertEquals(0, protection.quarantineCount());
         assertTrue(protection.quarantined().isEmpty());
         assertTrue(protection.isApproved(DIAMOND), "审批历史与待处理隔离列表相互独立");
+    }
+
+    @Test
+    void repeatedEvaluationsKeepOnlyTheLatestDecisionPerItem() {
+        LargeDropProtection protection = new LargeDropProtection(settings(true, 0.5));
+
+        PriceDropDecision first = protection.evaluate(DIAMOND, 1_000L, 100L);
+        PriceDropDecision second = protection.evaluate(DIAMOND, 1_000L, 200L);
+
+        assertFalse(first.allowed());
+        assertFalse(second.allowed());
+        assertEquals(1, protection.quarantineCount(), "重复判定同一物品不得增长隔离列表");
+        assertEquals(List.of(second), protection.quarantined());
+    }
+
+    @Test
+    void approveReturnsRemovedDecisionsAndDoesNotBypassFutureDrops() {
+        LargeDropProtection protection = new LargeDropProtection(settings(true, 0.5));
+        PriceDropDecision quarantined = protection.evaluate(DIAMOND, 1_000L, 100L);
+
+        assertEquals(List.of(quarantined), protection.approve(DIAMOND));
+        assertEquals(0, protection.quarantineCount());
+        assertTrue(protection.isApproved(DIAMOND), "审批历史仍可用于诊断");
+
+        PriceDropDecision future = protection.evaluate(DIAMOND, 1_000L, 50L);
+
+        assertFalse(future.allowed(), "批准历史绝不能放行未来的新降价");
+        assertEquals(1, protection.quarantineCount());
+        assertEquals(List.of(future), protection.quarantined());
+    }
+
+    @Test
+    void approveWithoutPendingDecisionReturnsEmptyList() {
+        LargeDropProtection protection = new LargeDropProtection(settings(true, 0.5));
+
+        assertTrue(protection.approve(IRON).isEmpty());
+        assertEquals(0, protection.quarantineCount());
     }
 
     @Test

@@ -77,6 +77,7 @@ public final class ConfigWatcher {
             return;
         }
 
+        logConflictWarnings(result);
         for (RebuildListener listener : listeners) {
             try {
                 listener.onReload(result);

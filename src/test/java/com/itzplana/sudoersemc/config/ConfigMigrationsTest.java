@@ -68,6 +68,37 @@ class ConfigMigrationsTest {
     }
 
     @Test
+    void versionOneKeepsNestedOverflowShape() {
+        Map<String, Object> overflow = new LinkedHashMap<>();
+        overflow.put("threshold", 123L);
+        Map<String, Object> raw = new LinkedHashMap<>();
+        raw.put("overflow", overflow);
+
+        ConfigMigrations.MigrationResult result = ConfigMigrations.migrate(1, raw);
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> migratedOverflow = (Map<String, Object>) result.values().get("overflow");
+        assertEquals(123L, migratedOverflow.get("threshold"));
+        assertEquals("owned_only", migratedOverflow.get("overwriteScope"));
+        assertFalse(result.values().containsKey("threshold"));
+        assertFalse(result.values().containsKey("overwriteScope"));
+        assertFalse(overflow.containsKey("overwriteScope"), "input nested map must not be mutated");
+    }
+
+    @Test
+    void versionOneKeepsDottedKeyShape() {
+        Map<String, Object> raw = new LinkedHashMap<>();
+        raw.put("overflow.threshold", 123L);
+
+        ConfigMigrations.MigrationResult result = ConfigMigrations.migrate(1, raw);
+
+        assertEquals(123L, result.values().get("overflow.threshold"));
+        assertEquals("owned_only", result.values().get("overflow.overwriteScope"));
+        assertFalse(result.values().containsKey("threshold"));
+        assertFalse(result.values().containsKey("overwriteScope"));
+    }
+
+    @Test
     void currentVersionIsNoOp() {
         Map<String, Object> raw = Map.of("a", 1, "b", "two");
 

@@ -100,7 +100,7 @@ public final class ScanStateStore {
                     LOGGER.warn("无法解析 {}，按空扫描状态处理", file);
                     return;
                 }
-                if (dto.schemaVersion != SCHEMA_VERSION) {
+                if (dto.schemaVersion > SCHEMA_VERSION) {
                     unsupportedSchemaVersion = true;
                     loadedSchemaVersion = dto.schemaVersion;
                     backupPending = false;
@@ -143,7 +143,8 @@ public final class ScanStateStore {
      * 以原子替换方式写入当前扫描状态。
      *
      * <p>加载时发现的不支持版本会阻止本次写入，文件内容保持原样。写入前若文件是本次进程首次
-     * 重写的对象，会先生成一份带时间戳的 {@code .bak} 备份。</p>
+     * 重写的对象，会先生成一份带时间戳的 {@code .bak} 备份。写入或备份失败时保留脏标记与
+     * 首次备份标记，下一次 {@link #saveIfDirty()} 会重试。</p>
      */
     public void save() {
         synchronized (lock) {
@@ -172,10 +173,15 @@ public final class ScanStateStore {
                 dto.lastSolvedCount = lastSolvedCount;
                 dto.lastUnresolvedCount = lastUnresolvedCount;
 
-                if (backupPending) {
-                    JsonFileIO.backupIfExists(file);
+                if (backupPending && !JsonFileIO.backupIfExists(file)) {
+                    dirty.set(true);
+                    LOGGER.warn("保存扫描状态到 {} 失败：无法创建备份，保留待保存状态等待重试", file);
+                    return;
                 }
-                JsonFileIO.writeAtomically(file, dto);
+                if (!JsonFileIO.writeAtomically(file, dto)) {
+                    dirty.set(true);
+                    return;
+                }
                 backupPending = false;
             } catch (RuntimeException e) {
                 dirty.set(true);

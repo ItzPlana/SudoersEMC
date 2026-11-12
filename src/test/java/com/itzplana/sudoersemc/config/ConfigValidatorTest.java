@@ -219,14 +219,30 @@ class ConfigValidatorTest {
     }
 
     @Test
-    void disabledOverflowSkipsRangeErrorsButStillWarns() {
+    void disabledOverflowStillRejectsInvalidRanges() {
         ConfigValidationResult result = ConfigValidator.validate(base()
                 .overflowEnabled(false)
-                .overflowThreshold(0L)
+                .overflowThreshold(-10L)
                 .resetMin(0L)
                 .resetMax(-5L)
                 .bucketCount(0)
                 .weightCap(0)
+                .build());
+
+        assertFalse(result.valid());
+        assertEquals(List.of(
+                "overflow.resetMin 必须 >= 1，当前为 0",
+                "overflow.resetMin 不能大于 resetMax",
+                "overflow.threshold 必须大于 resetMax",
+                "overflow.bucketCount 必须 >= 1，当前为 0",
+                "overflow.weightCap 必须 >= 1，当前为 0"), result.errors());
+        assertEquals(List.of("溢出保护已关闭，超大 EMC 值不会被重置"), result.warnings());
+    }
+
+    @Test
+    void disabledOverflowWithValidRangesIsValidAndWarns() {
+        ConfigValidationResult result = ConfigValidator.validate(base()
+                .overflowEnabled(false)
                 .build());
 
         assertTrue(result.valid());
