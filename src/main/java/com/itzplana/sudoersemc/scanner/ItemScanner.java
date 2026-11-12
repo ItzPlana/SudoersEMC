@@ -125,11 +125,28 @@ public final class ItemScanner {
          * @return 本次实际检查的条目数；注册表已经遍历完时返回 0
          */
         public int step(int maxItems) {
+            return step(maxItems, Long.MAX_VALUE);
+        }
+
+        /**
+         * 检查最多 {@code maxItems} 个注册表条目，并在每个条目之间检查截止时间。
+         *
+         * <p>单个物品的 EMC 后端查询无法被抢占，因此截止时间是最佳努力：本方法会在当前
+         * 条目处理完后立即返回，而不会在校验预算时中断正在执行的查询。</p>
+         *
+         * @param maxItems      本次允许检查的最大条目数，必须大于等于 1
+         * @param deadlineNanos {@link System#nanoTime()} 截止时间；{@link Long#MAX_VALUE} 表示不限
+         * @return 本次实际检查的条目数；注册表已经遍历完时返回 0
+         */
+        public int step(int maxItems, long deadlineNanos) {
             if (maxItems < 1) {
                 throw new IllegalArgumentException("maxItems 必须 >= 1，实际为 " + maxItems);
             }
             int work = 0;
             while (work < maxItems && iterator.hasNext()) {
+                if (deadlineReached(deadlineNanos)) {
+                    break;
+                }
                 Item item = iterator.next();
                 work++;
                 processed++;
@@ -139,6 +156,10 @@ public final class ItemScanner {
                 logSkipSummary();
             }
             return work;
+        }
+
+        private static boolean deadlineReached(long deadlineNanos) {
+            return deadlineNanos != Long.MAX_VALUE && System.nanoTime() >= deadlineNanos;
         }
 
         /**

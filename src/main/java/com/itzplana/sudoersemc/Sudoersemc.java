@@ -31,10 +31,11 @@ import org.slf4j.Logger;
  * <p><strong>Phase 7 wiring:</strong> the scan state machine is constructed and ticked here. On
  * {@link ServerStartedEvent} this class builds a {@link ScanCollectionPipeline}, injects its
  * sharded {@code ItemScanner}/{@code RecipeScanner} sessions, production fingerprint supplier,
- * result applier and persistence callback into {@link ScanManager}, then requests an initial scan
- * when the input fingerprint changed (or {@code general.alwaysRescan} is enabled). The
- * {@link TickEvent.ServerTickEvent} listener drives {@link ScanManager#tick()} on the server
- * thread.</p>
+ * cross-tick staged result applier and asynchronous persistence handler into {@link ScanManager},
+ * then requests an initial scan when the input fingerprint changed (or
+ * {@code general.alwaysRescan} is enabled). The {@link TickEvent.ServerTickEvent} listener drives
+ * {@link ScanManager#tick()} on the server thread; pure solving and file writes run on the
+ * pipeline's daemon worker.</p>
  */
 @Mod(Sudoersemc.MODID)
 public final class Sudoersemc {
@@ -160,14 +161,15 @@ public final class Sudoersemc {
         boolean adaptive = readBoolean(SudoersemcConfig.PERFORMANCE_ADAPTIVE_BATCH_SIZING, true);
         boolean alwaysRescan = readBoolean(SudoersemcConfig.GENERAL_ALWAYS_RESCAN, false);
 
-        ScanCollectionPipeline pipeline = new ScanCollectionPipeline(store);
-        ScanManager manager = new ScanManager(
+        ScanCollectionPipeline pipeline = new ScanCollectionPipeline(
+                store, () -> requestProjectERemap(server));
+        ScanManager manager = ScanManager.staged(
                 new BatchProcessor(Math.max(1, itemsPerTick), adaptive),
                 pipeline.collector(server),
-                data -> applyScanResult(pipeline, server, data),
+                pipeline.stagedApplier(),
                 TICK_BUDGET_NANOS,
                 pipeline.fingerprintSupplier(server),
-                pipeline::persist);
+                pipeline.stagedSaveHandler());
 
         scanPipeline = pipeline;
         scanManager = manager;
@@ -187,15 +189,13 @@ public final class Sudoersemc {
     }
 
     /**
-     * 应用扫描结果并请求 EMC 后端重映射。
+     * 在全部生成值 staging 完成后请求 EMC 后端重映射。
      *
-     * <p>生成值先写入 {@link GeneratedEntryStore}，随后请求 ProjectE 重新计算 EMC；重映射
-     * 失败只记录警告，已经暂存的值仍会在下一次 remap 或重启后生效。</p>
+     * <p>生成值此时已经写入 {@link GeneratedEntryStore}；重映射失败只记录警告，已经暂存的
+     * 值仍会在下一次 remap 或重启后生效。该回调由扫描管线在服务器线程的 APPLYING 阶段末尾
+     * 调用，不在文件写入或求解工作线程上执行。</p>
      */
-    private static void applyScanResult(ScanCollectionPipeline pipeline,
-                                        MinecraftServer server,
-                                        ScanManager.SnapshotData data) {
-        pipeline.apply(data);
+    private static void requestProjectERemap(MinecraftServer server) {
         try {
             OptionalIntegrationManager.provider()
                     .ifPresent(provider -> provider.requestRemap(server));

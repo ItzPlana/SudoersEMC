@@ -451,7 +451,7 @@ class ScanManagerTest {
     }
 
     @Test
-    void adaptiveSamplesAreOnlyRecordedForCollectingAndSolving() {
+    void adaptiveSamplesAreOnlyRecordedForCollection() {
         BatchProcessor processor = new BatchProcessor(10, true);
         ScanManager manager = manager(processor, collector(data(1, 1)), snapshot -> { });
 
@@ -463,8 +463,8 @@ class ScanManagerTest {
         }
         assertEquals(ScanPhase.APPLYING, manager.progress().phase());
         long batchesBeforeApply = processor.batchesProcessed();
-        assertEquals(3L, batchesBeforeApply,
-                "2 个采集批次（物品 + 配方）和 1 个求解批次应计入自适应样本");
+        assertEquals(2L, batchesBeforeApply,
+                "只有 2 个真实采集批次（物品 + 配方）应计入自适应样本；求解空转不得记账");
 
         while (manager.isRunning() && ticks++ < TICK_GUARD) {
             manager.tick();
@@ -683,5 +683,207 @@ class ScanManagerTest {
 
         assertEquals(ScanPhase.FAILED, manager.progress().phase());
         assertTrue(manager.progress().detail().contains("disk full"));
+    }
+
+    @Test
+    void solveIdleDoesNotGrowAdaptiveBatch() {
+        BatchProcessor processor = new BatchProcessor(10, true);
+        ScanManager.ApplyTask neverSolved = new ScanManager.ApplyTask() {
+            @Override
+            public boolean isSolveComplete() {
+                return false;
+            }
+
+            @Override
+            public void advanceSolve(long deadlineNanos) {
+            }
+
+            @Override
+            public int stage(int maxItems, long deadlineNanos) {
+                return 0;
+            }
+
+            @Override
+            public boolean isDone() {
+                return false;
+            }
+
+            @Override
+            public int solvedCount() {
+                return 0;
+            }
+
+            @Override
+            public int unresolvedCount() {
+                return 0;
+            }
+        };
+        ScanManager manager = ScanManager.staged(processor, collector(data(0, 0)),
+                snapshot -> neverSolved, TICK_BUDGET_NANOS, null, null);
+
+        manager.requestScan();
+        manager.tick();
+        assertEquals(ScanPhase.SOLVING, manager.progress().phase());
+        long samplesBefore = processor.batchesProcessed();
+        int batchBefore = processor.currentBatchSize();
+
+        for (int tick = 0; tick < 50 && manager.progress().phase() == ScanPhase.SOLVING; tick++) {
+            manager.tick();
+        }
+
+        assertEquals(ScanPhase.SOLVING, manager.progress().phase());
+        assertEquals(samplesBefore, processor.batchesProcessed(),
+                "求解空转 tick 不得写入自适应样本");
+        assertEquals(batchBefore, processor.currentBatchSize(),
+                "求解空转不得把自适应批量推到上限");
+
+        manager.cancel();
+        manager.tick();
+        assertEquals(ScanPhase.CANCELLED, manager.progress().phase());
+    }
+
+    @Test
+    void stagedApplyIsShardedAcrossTicks() {
+        AtomicInteger stagedTotal = new AtomicInteger();
+        AtomicInteger maxStep = new AtomicInteger();
+        ScanManager.ApplyTask task = new ScanManager.ApplyTask() {
+            private boolean done;
+
+            @Override
+            public boolean isSolveComplete() {
+                return true;
+            }
+
+            @Override
+            public void advanceSolve(long deadlineNanos) {
+            }
+
+            @Override
+            public int stage(int maxItems, long deadlineNanos) {
+                int take = Math.min(maxItems, 10 - stagedTotal.get());
+                maxStep.accumulateAndGet(take, Math::max);
+                stagedTotal.addAndGet(take);
+                if (stagedTotal.get() >= 10) {
+                    done = true;
+                }
+                return take;
+            }
+
+            @Override
+            public boolean isDone() {
+                return done;
+            }
+
+            @Override
+            public int solvedCount() {
+                return 10;
+            }
+
+            @Override
+            public int unresolvedCount() {
+                return 0;
+            }
+        };
+        ScanManager manager = ScanManager.staged(new BatchProcessor(3, false),
+                collector(data(0, 0)), snapshot -> task, TICK_BUDGET_NANOS, null, null);
+
+        manager.requestScan();
+        manager.tick();
+        assertEquals(ScanPhase.SOLVING, manager.progress().phase());
+        manager.tick();
+        assertEquals(ScanPhase.APPLYING, manager.progress().phase());
+
+        manager.tick();
+        assertEquals(3, stagedTotal.get(), "单 tick 只能写入一个批次");
+        assertEquals(ScanPhase.APPLYING, manager.progress().phase());
+
+        int ticks = 0;
+        while (manager.isRunning() && ticks++ < TICK_GUARD) {
+            manager.tick();
+        }
+
+        assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
+        assertEquals(10, stagedTotal.get());
+        assertTrue(maxStep.get() <= 3, "每个 tick 的 staging 不得超过批量上限");
+    }
+
+    @Test
+    void stagedSaveIsPolledAcrossTicks() {
+        AtomicInteger advances = new AtomicInteger();
+        ScanManager.SaveTask save = deadlineNanos -> advances.incrementAndGet() >= 3;
+        ScanManager manager = ScanManager.staged(new BatchProcessor(10, false),
+                collector(data(0, 0)),
+                snapshot -> ScanManager.ApplyTask.completed(0, 0),
+                TICK_BUDGET_NANOS, null, () -> save);
+
+        manager.requestScan();
+        int ticks = 0;
+        while (manager.isRunning() && ticks++ < TICK_GUARD) {
+            manager.tick();
+        }
+
+        assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
+        assertEquals(3, advances.get(), "SAVING 阶段每 tick 只轮询一次，完成前保持 SAVING");
+    }
+
+    @Test
+    void collectionStepReceivesDeadline() {
+        AtomicReference<Long> seenDeadline = new AtomicReference<>();
+        ScanManager.CollectSession session = new ScanManager.CollectSession() {
+            private int processed;
+
+            @Override
+            public int itemCount() {
+                return 10;
+            }
+
+            @Override
+            public int recipeCount() {
+                return 0;
+            }
+
+            @Override
+            public int processedItems() {
+                return processed;
+            }
+
+            @Override
+            public int processedRecipes() {
+                return 0;
+            }
+
+            @Override
+            public boolean isDone() {
+                return false;
+            }
+
+            @Override
+            public ScanManager.StepResult step(int maxItems) {
+                return step(maxItems, Long.MAX_VALUE);
+            }
+
+            @Override
+            public ScanManager.StepResult step(int maxItems, long deadlineNanos) {
+                seenDeadline.set(deadlineNanos);
+                processed++;
+                return new ScanManager.StepResult(1, false);
+            }
+
+            @Override
+            public ScanManager.SnapshotData finish() {
+                return data(10, 0);
+            }
+        };
+        long before = System.nanoTime();
+        ScanManager manager = manager(new BatchProcessor(5, false),
+                () -> session, snapshot -> { });
+
+        manager.requestScan();
+        manager.tick();
+
+        Long deadline = seenDeadline.get();
+        assertTrue(deadline != null && deadline > before,
+                "采集会话必须收到本 tick 的绝对截止时间");
+        assertEquals(1, manager.progress().processed());
     }
 }
