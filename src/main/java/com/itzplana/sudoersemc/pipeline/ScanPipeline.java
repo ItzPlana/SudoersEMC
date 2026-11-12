@@ -9,6 +9,7 @@ import com.itzplana.sudoersemc.diagnostic.ReportManager;
 import com.itzplana.sudoersemc.integration.EmcProvider;
 import com.itzplana.sudoersemc.integration.ProjectECustomEmcFile;
 import com.itzplana.sudoersemc.pricing.FallbackPricing;
+import com.itzplana.sudoersemc.pricing.TierPricing;
 import com.itzplana.sudoersemc.resolver.VariantScanner;
 import com.itzplana.sudoersemc.safety.CreativeItemProtection;
 import com.itzplana.sudoersemc.safety.LargeDropProtection;
@@ -99,6 +100,7 @@ public final class ScanPipeline {
     private final CreativeItemProtection creativeProtection;
     private final OverflowPipeline overflowPipeline;
     private final FallbackPricing fallbackPricing;
+    private final TierPricing tierPricing;
     private final SolveSettings solveSettings;
     private volatile boolean solveRecipesEnabled = true;
     private volatile boolean generateReportsEnabled = true;
@@ -150,6 +152,7 @@ public final class ScanPipeline {
                 : creativeProtection;
         this.overflowPipeline = overflowPipeline;
         this.fallbackPricing = fallbackPricing;
+        this.tierPricing = fallbackPricing == null ? TierPricing.defaults() : fallbackPricing.tierPricing();
         this.solveSettings = solveSettings == null ? SolveSettings.defaults() : solveSettings;
     }
 
@@ -648,6 +651,12 @@ public final class ScanPipeline {
                 sourceCounts.merge(candidate.source().name(), 1L, Long::sum);
             }
 
+            Set<ItemKey> candidateKeys = new HashSet<>(candidates.size());
+            for (Candidate candidate : candidates) {
+                candidateKeys.add(candidate.item());
+            }
+            int retiredEntries = retireStaleOwnedEntries(data, candidateKeys, data.existingValues());
+
             rewriteProjectECustomEmcIfEnabled();
 
             int overflowResets = overflowPipeline == null
@@ -663,7 +672,7 @@ public final class ScanPipeline {
             boolean appliedToStore = store != null;
             updateScanState(data, durationMillis, applied, unresolved);
             writeDiagnosticReport(data, lastSolveResult, unresolved, applied, quarantined,
-                    overflowResets, durationMillis, appliedToStore, sourceCounts);
+                    overflowResets, durationMillis, appliedToStore, sourceCounts, retiredEntries);
 
             return new PipelineResult(
                     solvedByRecipe,
@@ -684,6 +693,53 @@ public final class ScanPipeline {
             LOGGER.error("SudoersEMC 扫描管线求解与应用失败，本轮返回全零结果", failure);
             return PipelineResult.zeroed(durationMillis);
         }
+    }
+
+    /**
+     * 清理本轮完全没有参与定价的自有条目。
+     *
+     * <p>物品被新配置排除、配方被移除或物品从注册表消失后，旧的自有值不应继续生效。判定口径：
+     * 条目 {@code owned=true}，且既不在本轮最终候选中，也不在本轮 {@code existingValues} 中，
+     * 即视为完全没有参与定价。非自有条目（手动配置或外部后端写入）永远不会删除。干跑模式
+     * （{@code store == null}）或空快照（例如服务器尚未就绪）直接跳过，避免误删全部条目。</p>
+     *
+     * @param snapshot       本轮采集结果
+     * @param pricedKeys     本轮选出的候选物品集合
+     * @param existingValues 本轮受保护的既有值映射
+     * @return 实际删除的自有条目数量
+     */
+    private int retireStaleOwnedEntries(PipelineSnapshot snapshot, Set<ItemKey> pricedKeys,
+                                        Map<ItemKey, Long> existingValues) {
+        if (store == null) {
+            return 0;
+        }
+        if (snapshot.items().isEmpty()) {
+            LOGGER.debug("本轮快照没有任何物品，跳过陈旧自有条目清理");
+            return 0;
+        }
+        int retired = 0;
+        try {
+            for (Map.Entry<ItemKey, GeneratedEmcEntry> entry : store.snapshotAll().entrySet()) {
+                GeneratedEmcEntry value = entry.getValue();
+                if (value == null || !value.owned()) {
+                    continue;
+                }
+                ItemKey key = entry.getKey();
+                if (pricedKeys.contains(key) || existingValues.containsKey(key)) {
+                    continue;
+                }
+                if (store.removeOwned(key)) {
+                    retired++;
+                }
+            }
+        } catch (RuntimeException failure) {
+            LOGGER.warn("清理陈旧自有条目失败，本轮扫描结果仍然有效", failure);
+        }
+        LOGGER.debug("本轮扫描清理检查完成：retired={}", retired);
+        if (retired > 0) {
+            LOGGER.info("SudoersEMC 清理了 {} 个不再参与定价的自有 EMC 条目", retired);
+        }
+        return retired;
     }
 
     /**
@@ -763,6 +819,10 @@ public final class ScanPipeline {
         boolean allowIncrease = solveSettings.allowValueIncrease();
         for (Map.Entry<ItemKey, Long> entry : solveResult.values().entrySet()) {
             ItemKey item = entry.getKey();
+            if (isExcludedFromPricing(item)) {
+                LOGGER.debug("物品 {} 被排除规则命中，跳过配方候选", item);
+                continue;
+            }
             long solvedValue = entry.getValue();
             if (solvedValue <= 0L) {
                 continue;
@@ -791,6 +851,37 @@ public final class ScanPipeline {
             }
         }
         return changed;
+    }
+
+    /**
+     * 判断物品是否被排除规则明确拒绝自动定价。
+     *
+     * <p>配方路径与兜底路径共用本方法，避免两处逻辑漂移：</p>
+     * <ul>
+     *   <li>{@link TierPricing#price} 返回 {@code Optional.of(0L)} 表示层级规则明确排除；</li>
+     *   <li>{@link CreativeItemProtection#decide} 返回 {@code priceable=false} 表示创造物品保护排除。</li>
+     * </ul>
+     *
+     * <p>变体的 {@link ItemKey} 与基础物品共享物品 id，因此排除规则天然覆盖全部 NBT 变体。</p>
+     *
+     * @param item 待判定物品身份
+     * @return {@code true} 表示该物品不得进入候选或写入存储
+     */
+    private boolean isExcludedFromPricing(ItemKey item) {
+        if (item == null) {
+            return false;
+        }
+        try {
+            Optional<Long> tierValue = tierPricing.price(item);
+            if (tierValue.isPresent() && tierValue.get() <= 0L) {
+                return true;
+            }
+            CreativeItemProtection.Decision decision = creativeProtection.decide(item, true, true);
+            return !decision.priceable();
+        } catch (RuntimeException failure) {
+            LOGGER.warn("排除规则判定失败，按排除处理：{}", item, failure);
+            return true;
+        }
     }
 
     /**
@@ -860,6 +951,10 @@ public final class ScanPipeline {
         for (ItemSnapshot itemSnapshot : snapshot.items()) {
             ItemKey item = itemSnapshot.key();
             if (seeds.containsKey(item) || snapshot.existingValues().containsKey(item)) {
+                continue;
+            }
+            if (isExcludedFromPricing(item)) {
+                LOGGER.debug("物品 {} 被排除规则命中，跳过兜底定价", item);
                 continue;
             }
 
@@ -1009,13 +1104,15 @@ public final class ScanPipeline {
     private void writeDiagnosticReport(PipelineSnapshot snapshot, SolveResult solveResult,
                                        int unresolvedCount, int applied, int quarantined,
                                        int overflowResets, long durationMillis,
-                                       boolean appliedToStore, Map<String, Long> sourceCounts) {
+                                       boolean appliedToStore, Map<String, Long> sourceCounts,
+                                       int retiredEntries) {
         if (!generateReportsEnabled || reportManager == null) {
             return;
         }
         try {
             reportManager.writeReport(buildReport(snapshot, solveResult, unresolvedCount,
-                    quarantined, overflowResets, durationMillis, appliedToStore, sourceCounts));
+                    quarantined, overflowResets, durationMillis, appliedToStore, sourceCounts,
+                    retiredEntries));
         } catch (RuntimeException failure) {
             LOGGER.warn("写入诊断报告失败，本轮结果仍然有效", failure);
         }
@@ -1032,7 +1129,8 @@ public final class ScanPipeline {
                                                 int unresolvedCount, int quarantined,
                                                 int overflowResets, long durationMillis,
                                                 boolean appliedToStore,
-                                                Map<String, Long> sourceCounts) {
+                                                Map<String, Long> sourceCounts,
+                                                int retiredEntries) {
         Map<String, Long> extraCounters = new LinkedHashMap<>();
         extraCounters.put("unsupportedRecipes", (long) snapshot.unsupportedRecipes());
         extraCounters.put("invalidRecipes", (long) snapshot.invalidRecipes());
@@ -1042,6 +1140,7 @@ public final class ScanPipeline {
         extraCounters.put("solverConverged", solveResult.converged() ? 1L : 0L);
         extraCounters.put("overflowResets", (long) overflowResets);
         extraCounters.put("dryRun", appliedToStore ? 0L : 1L);
+        extraCounters.put("retiredEntries", (long) retiredEntries);
 
         return new DiagnosticReport(
                 snapshot.itemCount(),

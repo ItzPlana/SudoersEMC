@@ -255,7 +255,13 @@ public final class RecipeScanner {
                 return null;
             }
             String snbt = tag.toString();
-            return snbt.isBlank() ? null : snbt;
+            if (snbt == null) {
+                return null;
+            }
+            // 某些实现可能把空 CompoundTag 序列化成 "{}" 或带空白的等价形式；
+            // 去除全部空白后仍为 "{}" 时按无 NBT 处理，避免下游生成伪变体。
+            String compact = snbt.replaceAll("\\s+", "");
+            return compact.isEmpty() || "{}".equals(compact) ? null : snbt;
         } catch (RuntimeException failure) {
             LOGGER.debug("序列化配方输出 NBT 失败，按无 NBT 处理", failure);
             return null;

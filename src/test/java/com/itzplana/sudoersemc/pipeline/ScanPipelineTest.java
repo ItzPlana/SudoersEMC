@@ -69,6 +69,8 @@ class ScanPipelineTest {
             new ResourceLocation("minecraft", "stone");
     private static final ResourceLocation SPAWN_EGG_ID =
             new ResourceLocation("minecraft", "bedrock_spawn_egg");
+    private static final ResourceLocation BEDROCK_ID =
+            new ResourceLocation("minecraft", "bedrock");
     private static final ResourceLocation ORE_ID =
             new ResourceLocation("sudoersemc", "test_ore");
     private static final ResourceLocation GEAR_ID =
@@ -82,6 +84,7 @@ class ScanPipelineTest {
     private static final ItemKey RESULT = ItemKey.of(RESULT_ID);
     private static final ItemKey DUST = ItemKey.of(DUST_ID);
     private static final ItemKey STONE = ItemKey.of(STONE_ID);
+    private static final ItemKey BEDROCK = ItemKey.of(BEDROCK_ID);
     private static final ItemKey ORE = ItemKey.of(ORE_ID);
     private static final ItemKey GEAR = ItemKey.of(GEAR_ID);
 
@@ -888,6 +891,103 @@ class ScanPipelineTest {
 
         assertTrue(result.applied() >= 2, "干跑模式仍需统计基础物品与变体");
         assertFalse(result.appliedToStore());
+    }
+
+    @Test
+    void emptyNbtRecipeOutputProducesNoVariantEntries() {
+        ItemSnapshot stoneBase = ItemSnapshot.of(STONE, false, 0L);
+        RecipeSnapshot emptyNbtRecipe = recipeWithNbt(STONE, "{}");
+
+        assertNull(emptyNbtRecipe.outputs().get(0).outputNbt(),
+                "空 SNBT 必须在 RecipeOutput 构造时归一为 null");
+        assertTrue(ScanPipeline.collectVariantSnapshots(
+                        List.of(stoneBase), List.of(emptyNbtRecipe), true, 100).isEmpty(),
+                "空 NBT 配方不得产生 variantHash 快照");
+
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_empty_nbt_recipe.json"));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null, genericFallback(7L));
+        PipelineResult result = pipeline.solveAndApply(
+                snapshot(List.of(stoneBase), List.of(), Map.of()));
+
+        assertEquals(1, result.applied());
+        assertTrue(store.snapshotAll().keySet().stream().noneMatch(ItemKey::hasVariant),
+                "空 NBT 配方不得写入带 variantHash 的条目");
+    }
+
+    @Test
+    void creativeExclusionPreventsRecipeCandidate() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_recipe_excluded.json"));
+        CreativeItemProtection protection = new CreativeItemProtection(
+                new CreativeItemProtection.Settings(true, Set.of(RESULT_ID), Map.of(), Set.of()));
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 5L), item(RESULT, 0L)),
+                List.of(recipe(INGOT, RESULT)),
+                Map.of(INGOT, 5L));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, protection, null, disabledFallback());
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(0, result.solvedByRecipe(), "被排除物品不得产生 RECIPE 候选");
+        assertEquals(0, result.applied());
+        assertNull(store.snapshotAll().get(RESULT), "被排除物品不得写入 store");
+    }
+
+    @Test
+    void tierDefaultExclusionPreventsRecipeCandidate() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_bedrock_recipe.json"));
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 5L), item(BEDROCK, 0L)),
+                List.of(recipe(INGOT, BEDROCK)),
+                Map.of(INGOT, 5L));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null, disabledFallback());
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(0, result.solvedByRecipe(), "TierPricing 默认排除项不得产生配方候选");
+        assertEquals(0, result.applied());
+        assertNull(store.snapshotAll().get(BEDROCK), "默认排除项不得写入 store");
+    }
+
+    @Test
+    void staleOwnedEntryIsRetiredWhenNoCandidateIsProduced() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_stale_owned.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 128L, PriceSource.RECIPE, null, true, 0L));
+
+        PipelineSnapshot snapshot = snapshot(List.of(item(RESULT, 0L)), List.of(), Map.of());
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null, disabledFallback());
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(0, result.applied());
+        assertNull(store.snapshotAll().get(RESULT), "不再参与定价的自有条目必须被清理");
+        assertEquals(0, store.size());
+    }
+
+    @Test
+    void manualEntryIsNotRetiredWhenNoCandidateIsProduced() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_manual_kept.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 128L, PriceSource.EXISTING, null, false, 0L));
+
+        PipelineSnapshot snapshot = snapshot(List.of(item(RESULT, 0L)), List.of(), Map.of());
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null, disabledFallback());
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(0, result.applied());
+        GeneratedEmcEntry kept = store.snapshotAll().get(RESULT);
+        assertNotNull(kept, "非自有条目绝不能被清理");
+        assertEquals(128L, kept.value());
+        assertFalse(kept.owned());
     }
 
     /**
