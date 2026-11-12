@@ -72,7 +72,7 @@ public final class ReportManager {
      *
      * @param report 待写入的诊断快照
      */
-    public void writeReport(DiagnosticReport report) {
+    public synchronized void writeReport(DiagnosticReport report) {
         if (report == null) {
             LOGGER.warn("拒绝写入 null 诊断报告");
             return;

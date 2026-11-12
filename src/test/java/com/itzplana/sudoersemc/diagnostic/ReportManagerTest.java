@@ -8,8 +8,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -93,5 +100,39 @@ class ReportManagerTest {
         Files.delete(manager.reportFile());
 
         assertEquals(Optional.of(report.formatText()), manager.readLastReport());
+    }
+
+    @Test
+    void concurrentWritesLeaveOneCompleteReport() throws Exception {
+        ReportManager manager = new ReportManager(tempDir);
+        int writers = 8;
+        int writesPerWriter = 20;
+        ExecutorService pool = Executors.newFixedThreadPool(writers);
+        CountDownLatch start = new CountDownLatch(1);
+        List<Future<?>> futures = new ArrayList<>();
+        try {
+            for (int writer = 0; writer < writers; writer++) {
+                long base = writer * 1000L;
+                futures.add(pool.submit(() -> {
+                    start.await();
+                    for (int i = 0; i < writesPerWriter; i++) {
+                        manager.writeReport(report(base + i));
+                    }
+                    return null;
+                }));
+            }
+            start.countDown();
+            for (Future<?> future : futures) {
+                future.get(20, TimeUnit.SECONDS);
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+
+        String text = manager.readLastReport().orElseThrow();
+        assertTrue(text.startsWith("===== SudoersEMC 诊断报告 ====="));
+        assertTrue(text.endsWith("================================"));
+        assertFalse(Files.exists(tempDir.resolve(ReportManager.FILE_NAME + ".tmp")),
+                "写入完成后不应残留共享临时文件");
     }
 }
