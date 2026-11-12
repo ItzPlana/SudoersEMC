@@ -22,8 +22,10 @@ import org.jetbrains.annotations.Nullable;
  *       单元 EMC 乘以 {@code Count}；容器里有多个非空堆叠时无法给出唯一价格，返回空。</li>
  *   <li>容器内可损坏物品的 {@code Damage} 会按与 ProjectE {@code DamageProcessor}
  *       相同的公式折价，避免把损坏物品按满耐久计价。</li>
- *   <li>ProjectE 的 {@code StoredEMC} 由 {@code StoredEMCProcessor} 在 EMC 查询阶段
- *       动态叠加，本解析器不再重复处理，否则会造成双重计价。</li>
+ *   <li>容器内物品自身的 {@code StoredEMC} 在折价后饱和叠加，顺序与 ProjectE 的
+ *       {@code DamageProcessor} → {@code StoredEMCProcessor} 一致。ProjectE 不会为容器
+ *       内容物执行该 processor，因此必须在这里处理，否则满 EMC 的 Klein Star 会被按
+ *       空星计价。容器根标签上的 {@code StoredEMC} 仍由 ProjectE 处理，这里不重复叠加。</li>
  * </ul>
  *
  * <p>查询函数必须返回非负 EMC，0 表示未知。解析结果始终大于 0，避免把无法定价的物品
@@ -36,6 +38,7 @@ public final class DefaultMaterialResolver implements NbtMaterialResolver {
     private static final String ID = "id";
     private static final String COUNT = "Count";
     private static final String ITEM_TAG = "tag";
+    private static final String STORED_EMC = "StoredEMC";
 
     private final ToLongFunction<ItemKey> emcLookup;
 
@@ -109,35 +112,42 @@ public final class DefaultMaterialResolver implements NbtMaterialResolver {
     }
 
     /**
-     * 计算容器内单个物品的 EMC。可损坏物品按剩余耐久折价，公式与 ProjectE 的
-     * {@code DamageProcessor} 一致。
+     * 计算容器内单个物品的 EMC。可损坏物品按剩余耐久折价（公式与 ProjectE 的
+     * {@code DamageProcessor} 一致），随后饱和叠加物品自身存储的 {@code StoredEMC}
+     * （与 {@code StoredEMCProcessor} 的顺序一致）。基础价值未知时返回 {@code 0}，
+     * 让容器整体保持无价，避免把存储 EMC 误当成完整价值或给出低价。
      */
     private long containedItemValue(ResourceLocation itemId, @Nullable CompoundTag itemTag) {
-        long value = emcLookup.applyAsLong(VariantNormalizer.keyFor(itemId, itemTag));
+        Item item = BuiltInRegistries.ITEM.getOptional(itemId).orElse(null);
+        long value = emcLookup.applyAsLong(VariantNormalizer.keyFor(itemId, itemTag, item));
         if (value <= 0L) {
             return value;
         }
 
-        Item item = BuiltInRegistries.ITEM.getOptional(itemId).orElse(null);
-        if (item == null || !item.canBeDepleted()) {
-            return value;
+        if (item != null && item.canBeDepleted()) {
+            ItemStack contained = new ItemStack(item);
+            if (itemTag != null) {
+                contained.setTag(itemTag);
+            }
+            int maxDamage = contained.getMaxDamage();
+            int damage = contained.getDamageValue();
+            // ProjectE 在 damage > maxDamage 时放弃折价，这里保持一致。
+            if (maxDamage > 0 && damage > 0 && damage <= maxDamage) {
+                long remaining = maxDamage - damage + 1L;
+                value = value > Long.MAX_VALUE / remaining
+                        ? Long.MAX_VALUE
+                        : value * remaining / maxDamage;
+            }
         }
 
-        ItemStack contained = new ItemStack(item);
-        if (itemTag != null) {
-            contained.setTag(itemTag);
-        }
-        int maxDamage = contained.getMaxDamage();
-        int damage = contained.getDamageValue();
-        if (maxDamage <= 0 || damage <= 0 || damage > maxDamage) {
-            // ProjectE 在 damage > maxDamage 时放弃折价，这里保持一致。
+        long storedEmc = itemTag == null ? 0L : Math.max(0L, itemTag.getLong(STORED_EMC));
+        if (storedEmc == 0L) {
             return value;
         }
-        long remaining = maxDamage - damage + 1L;
-        if (value > Long.MAX_VALUE / remaining) {
+        if (value > Long.MAX_VALUE - storedEmc) {
             return Long.MAX_VALUE;
         }
-        return value * remaining / maxDamage;
+        return value + storedEmc;
     }
 
     /**
