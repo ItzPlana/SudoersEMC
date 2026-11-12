@@ -178,6 +178,19 @@ class ApprovedDropApplierTest {
     }
 
     @Test
+    void nullExclusionDetectorFailsClosed() {
+        GeneratedEntryStore store = store();
+
+        ApprovedDropApplier.Result result = ApprovedDropApplier.apply(
+                drop(10L), store, true, 1L, NEVER_MANUAL, null);
+
+        assertEquals(ApprovedDropApplier.Status.REFUSED_EXCLUDED, result.status());
+        assertTrue(result.message().contains("排除规则服务不可用"));
+        assertTrue(store.snapshotAll().isEmpty());
+        assertFalse(store.isDirty());
+    }
+
+    @Test
     void nullStoreIsStorageUnavailable() {
         ApprovedDropApplier.Result result = ApprovedDropApplier.apply(
                 drop(10L), null, true, 1L, NEVER_MANUAL, NEVER_EXCLUDED);

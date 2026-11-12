@@ -22,7 +22,7 @@ import org.jetbrains.annotations.Nullable;
  *   <li>拟应用值必须为正；</li>
  *   <li>拟应用值不得低于最小 EMC；</li>
  *   <li>ProjectE 手动值（含判定器缺失/异常）一律 fail-closed；</li>
- *   <li>被排除规则命中的物品拒绝，因为下一次扫描会清理它；</li>
+ *   <li>排除规则服务缺失或判定异常同样 fail-closed，被排除的物品拒绝；</li>
  *   <li>最后才写入 {@link PriceSource#APPROVED} 条目。</li>
  * </ol>
  */
@@ -36,9 +36,9 @@ public final class ApprovedDropApplier {
         ALREADY_APPLIED,
         /** 物品存在 ProjectE 手动值，或无法确认是否为手动值。 */
         REFUSED_MANUAL,
-        /** 物品被定价排除规则命中。 */
+        /** 物品被定价排除规则命中，或排除规则服务不可用（fail-closed）。 */
         REFUSED_EXCLUDED,
-        /** 配置关闭了“批准后立即应用”。 */
+        /** 配置关闭了“批准后立即应用”；调用方应退化为仅标记审批状态。 */
         REFUSED_DISABLED,
         /** 拟应用值低于配置的最小 EMC。 */
         REFUSED_BELOW_MIN,
@@ -76,7 +76,7 @@ public final class ApprovedDropApplier {
      * @param applyEnabled      配置开关；{@code false} 时只允许标记审批，不写入数值
      * @param minimumEmc        允许写入的最低 EMC
      * @param manualDetector    ProjectE 手动值判定器；{@code null} 视为不可用并 fail-closed
-     * @param exclusionDetector 定价排除判定器；{@code null} 视为不排除
+     * @param exclusionDetector 定价排除判定器；{@code null} 表示服务不可用，同样 fail-closed 拒绝
      * @return 结果；永不抛出异常
      */
     public static Result apply(@Nullable QuarantinedDrop drop,
@@ -91,12 +91,13 @@ public final class ApprovedDropApplier {
         if (drop.approved()) {
             return refused(Status.ALREADY_APPLIED, "该隔离记录已批准过，未重复应用");
         }
-        if (store == null) {
-            return refused(Status.STORAGE_UNAVAILABLE, "生成条目存储不可用");
-        }
+        // 关闭立即应用时只允许审计式批准，调用方据此仅标记审批状态；此时不需要条目存储。
         if (!applyEnabled) {
             return refused(Status.REFUSED_DISABLED,
                     "已禁用批准后立即应用（safety.approveAppliesImmediately=false）");
+        }
+        if (store == null) {
+            return refused(Status.STORAGE_UNAVAILABLE, "生成条目存储不可用");
         }
 
         long proposedValue = drop.proposedValue();
@@ -126,18 +127,21 @@ public final class ApprovedDropApplier {
                     "该物品存在 ProjectE 手动值，SudoersEMC 不会覆盖");
         }
 
-        if (exclusionDetector != null) {
-            boolean excluded;
-            try {
-                excluded = exclusionDetector.test(key);
-            } catch (RuntimeException | LinkageError failure) {
-                // 排除规则不可判定时按排除处理，避免写入会被下一次扫描清理的数值。
-                excluded = true;
-            }
-            if (excluded) {
-                return refused(Status.REFUSED_EXCLUDED,
-                        "该物品被排除规则命中；批准后会被下次扫描清理，请先调整排除配置");
-            }
+        if (exclusionDetector == null) {
+            // 无法确认物品是否允许定价时 fail-closed：宁可拒绝，也不写入会被下次扫描清理的值。
+            return refused(Status.REFUSED_EXCLUDED,
+                    "排除规则服务不可用，无法确认该物品是否允许定价（fail-closed）");
+        }
+        boolean excluded;
+        try {
+            excluded = exclusionDetector.test(key);
+        } catch (RuntimeException | LinkageError failure) {
+            // 排除规则不可判定时按排除处理，避免写入会被下一次扫描清理的数值。
+            excluded = true;
+        }
+        if (excluded) {
+            return refused(Status.REFUSED_EXCLUDED,
+                    "该物品被排除规则命中；批准后会被下次扫描清理，请先调整排除配置");
         }
 
         GeneratedEmcEntry entry = new GeneratedEmcEntry(
