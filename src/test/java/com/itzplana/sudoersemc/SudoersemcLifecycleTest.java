@@ -7,11 +7,14 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 
 import com.itzplana.sudoersemc.core.GeneratedEmcEntry;
 import com.itzplana.sudoersemc.core.ItemKey;
+import com.itzplana.sudoersemc.core.OverflowScope;
 import com.itzplana.sudoersemc.core.PriceSource;
+import com.itzplana.sudoersemc.pipeline.ScanPipeline;
 import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
 import com.itzplana.sudoersemc.task.BatchProcessor;
 import com.itzplana.sudoersemc.task.ScanManager;
@@ -158,5 +161,28 @@ void configReloadEntryPointsShareTheClassLock() throws Exception {
         assertEquals(0.5D, Sudoersemc.sanitizeMaxAllowedDropRatio(0.5D));
         assertEquals(Double.MIN_VALUE,
                 Sudoersemc.sanitizeMaxAllowedDropRatio(Double.MIN_VALUE));
+    }
+
+    @Test
+    void runtimeConfigurationSwitchesAreAppliedToPipeline() throws Exception {
+        ScanPipeline pipeline = new ScanPipeline(null, null, null, null, null, null, null, null);
+
+        Sudoersemc.applyRuntimeSwitches(
+                pipeline, false, false, OverflowScope.ENTIRE_CUSTOM_EMC, true);
+
+        assertEquals(Boolean.FALSE, readField(pipeline, "solveRecipesEnabled"),
+                "recipe.solveRecipes=false 必须关闭管线配方求解");
+        assertEquals(Boolean.FALSE, readField(pipeline, "generateReportsEnabled"),
+                "diagnostic.generateReports=false 必须关闭诊断报告");
+        assertEquals(OverflowScope.ENTIRE_CUSTOM_EMC, readField(pipeline, "overflowScope"),
+                "overflow.overwriteScope 必须应用到管线");
+        assertEquals(Boolean.TRUE, readField(pipeline, "allowProjectEFileRewrite"),
+                "overflow.allowProjectEFileRewrite 必须应用到管线");
+    }
+
+    private static Object readField(Object target, String name) throws Exception {
+        Field field = target.getClass().getDeclaredField(name);
+        field.setAccessible(true);
+        return field.get(target);
     }
 }

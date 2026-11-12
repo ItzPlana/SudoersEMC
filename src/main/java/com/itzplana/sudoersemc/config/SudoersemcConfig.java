@@ -183,12 +183,15 @@ public final class SudoersemcConfig {
         // [nbt]
         BUILDER.comment("ItemStack NBT variant scanning.").push("nbt");
         NBT_SCAN_NBT_VARIANTS = BUILDER.comment(
-                        "Scan economically relevant NBT variants of items.")
+                        "Scan economically relevant NBT variants of items.",
+                        "Reserved for Phase 17; this Phase 16 build does not read this key yet.")
                 .define("scanNbtVariants", true);
         // Upper bound mirrors VariantScanner.HARD_VARIANT_CEILING; a larger spec value would be
         // silently clamped by the consumer, so reject it at the config boundary instead.
         NBT_MAX_NBT_VARIANTS_PER_ITEM = BUILDER.comment(
-                        "Maximum number of NBT variants scanned per item, in [1, 1000].")
+                        "Maximum number of NBT variants scanned per item, in [1, 1000].",
+                        "Reserved for Phase 17; this Phase 16 build only validates the value and",
+                        "does not scan NBT variants yet.")
                 .defineInRange("maxNbtVariantsPerItem", 100, 1, 1000);
         BUILDER.pop();
 

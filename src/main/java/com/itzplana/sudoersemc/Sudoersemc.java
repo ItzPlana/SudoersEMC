@@ -5,6 +5,7 @@ import com.itzplana.sudoersemc.command.SudoemcCommands;
 import com.itzplana.sudoersemc.config.ConfigValidationResult;
 import com.itzplana.sudoersemc.config.ReloadDecision;
 import com.itzplana.sudoersemc.config.SudoersemcConfig;
+import com.itzplana.sudoersemc.core.OverflowScope;
 import com.itzplana.sudoersemc.diagnostic.ReportManager;
 import com.itzplana.sudoersemc.diagnostic.SmokeTestHook;
 import com.itzplana.sudoersemc.integration.GeneratedEmcMapper;
@@ -29,6 +30,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.function.BooleanSupplier;
 import net.minecraft.server.MinecraftServer;
+import net.minecraftforge.common.ForgeConfigSpec;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.RegisterCommandsEvent;
 import net.minecraftforge.event.TickEvent;
@@ -214,7 +216,66 @@ public final class Sudoersemc {
                 fallbackPricing,
                 solveSettings);
         pipeline.setEmcProvider(OptionalIntegrationManager.provider().orElse(null));
+
+        OverflowScope overflowScope = OverflowScope.OWNED_ONLY;
+        boolean allowProjectEFileRewrite = false;
+        try {
+            overflowScope = SudoersemcConfig.parseOverflowScope(
+                    SudoersemcConfig.OVERFLOW_OVERWRITE_SCOPE.get());
+            allowProjectEFileRewrite = SudoersemcConfig.OVERFLOW_ALLOW_PROJECTE_FILE_REWRITE.get();
+        } catch (RuntimeException e) {
+            // 配置尚未加载或读取失败时回退到最保守的组合，绝不阻止模组启动。
+            LOGGER.warn("SudoersEMC 无法读取溢出作用域配置，回退 owned_only 并禁用 ProjectE 文件改写", e);
+        }
+        applyRuntimeSwitches(
+                pipeline,
+                readBoolean("recipe.solveRecipes", SudoersemcConfig.RECIPE_SOLVE_RECIPES, true),
+                readBoolean("diagnostic.generateReports", SudoersemcConfig.DIAGNOSTIC_GENERATE_REPORTS, true),
+                overflowScope,
+                allowProjectEFileRewrite);
         return pipeline;
+    }
+
+    /**
+     * 把配置开关应用到新构建的扫描管线。
+     *
+     * <p>抽成独立方法便于在没有 Forge 配置环境的单元测试中验证四个开关的映射，
+     * 避免 {@code recipe.solveRecipes}、{@code diagnostic.generateReports}、
+     * {@code overflow.overwriteScope} 与 {@code overflow.allowProjectEFileRewrite}
+     * 再次退化成“只定义不消费”的配置键。</p>
+     *
+     * @param pipeline                 目标管线，不能为 {@code null}
+     * @param solveRecipes             是否启用配方求解
+     * @param generateReports          是否写出诊断报告
+     * @param overflowScope            溢出作用域，不能为 {@code null}
+     * @param allowProjectEFileRewrite 是否允许改写 ProjectE 中归本模组所有的条目
+     */
+    static void applyRuntimeSwitches(ScanPipeline pipeline,
+                                     boolean solveRecipes,
+                                     boolean generateReports,
+                                     OverflowScope overflowScope,
+                                     boolean allowProjectEFileRewrite) {
+        pipeline.setOverflowScope(overflowScope);
+        pipeline.setProjectEFileRewriteEnabled(allowProjectEFileRewrite);
+        pipeline.setSolveRecipesEnabled(solveRecipes);
+        pipeline.setGenerateReportsEnabled(generateReports);
+    }
+
+    /**
+     * 读取一个布尔配置开关；读取失败时记录警告并返回给定默认值。
+     *
+     * @param key      配置键名，仅用于日志
+     * @param value    Forge 配置值
+     * @param fallback 读取失败时的默认值
+     * @return 配置值或默认值
+     */
+    private static boolean readBoolean(String key, ForgeConfigSpec.BooleanValue value, boolean fallback) {
+        try {
+            return value.get();
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法读取 {} 配置，使用默认值 {}", key, fallback, e);
+            return fallback;
+        }
     }
 
     /**
