@@ -22,7 +22,8 @@ import org.slf4j.LoggerFactory;
  *
  * <h2>保留策略</h2>
  * <p>同一物品只保留一条记录：再次记录时用新条目替换旧条目。总量上限为
- * {@link #DEFAULT_MAX_ENTRIES}，超出时按时间戳从最旧开始淘汰，避免长期运行后文件无限增长。</p>
+ * {@link #DEFAULT_MAX_ENTRIES}，超出时按时间戳从最旧开始淘汰，避免长期运行后文件无限增长。
+ * 加载后若超过上限，会先按时间戳排序再一次性裁剪，避免手工放大的异常文件造成平方级开销。</p>
  *
  * <h2>并发与失败行为</h2>
  * <p>所有公开方法都在私有锁内操作内存表，快照返回不可变副本。{@code load/save/record/approve/
@@ -151,7 +152,7 @@ public final class QuarantinedDropsStore {
                     LOGGER.warn("无法解析 {}，按空隔离列表处理", file);
                     return;
                 }
-                if (dto.schemaVersion != SCHEMA_VERSION) {
+                if (dto.schemaVersion > SCHEMA_VERSION) {
                     unsupportedSchemaVersion = true;
                     loadedSchemaVersion = dto.schemaVersion;
                     backupPending = false;
@@ -194,7 +195,8 @@ public final class QuarantinedDropsStore {
     /**
      * 按 {@link ItemKey#compareTo(ItemKey)} 升序写出全部隔离记录。
      *
-     * <p>不支持的更高版本会阻止写入。首次重写已存在的文件前会生成带时间戳的 {@code .bak}。</p>
+     * <p>不支持的更高版本会阻止写入。首次重写已存在的文件前会生成带时间戳的 {@code .bak}。
+     * 写入或备份失败时保留脏标记，调用方可在下一次 {@link #saveIfDirty()} 时重试。</p>
      */
     public void save() {
         synchronized (lock) {
@@ -216,10 +218,15 @@ public final class QuarantinedDropsStore {
                     dto.entries.add(DropDto.from(drop));
                 }
 
-                if (backupPending) {
-                    JsonFileIO.backupIfExists(file);
+                if (backupPending && !JsonFileIO.backupIfExists(file)) {
+                    dirty.set(true);
+                    LOGGER.warn("保存隔离记录到 {} 失败：无法创建备份，保留待保存状态等待重试", file);
+                    return;
                 }
-                JsonFileIO.writeAtomically(file, dto);
+                if (!JsonFileIO.writeAtomically(file, dto)) {
+                    dirty.set(true);
+                    return;
+                }
                 backupPending = false;
             } catch (RuntimeException e) {
                 dirty.set(true);
@@ -333,18 +340,34 @@ public final class QuarantinedDropsStore {
 
     /** 调用方必须持有 {@link #lock}。按时间戳从最旧开始淘汰，直到不超过上限。 */
     private void trimToCapacity() {
-        while (entries.size() > DEFAULT_MAX_ENTRIES) {
-            ItemKey oldestKey = null;
-            long oldestTimestamp = Long.MAX_VALUE;
-            for (QuarantinedDrop candidate : entries.values()) {
-                if (oldestKey == null || candidate.timestamp() < oldestTimestamp) {
-                    oldestKey = candidate.key();
-                    oldestTimestamp = candidate.timestamp();
-                }
+        int excess = entries.size() - DEFAULT_MAX_ENTRIES;
+        if (excess <= 0) {
+            return;
+        }
+        if (excess == 1) {
+            // 记录路径每次最多超出一条，单次扫描比排序更便宜。
+            removeOldestEntry();
+            return;
+        }
+        // 批量裁剪（例如加载手工放大的文件）只排序一次，避免最坏 O(n²)。
+        List<QuarantinedDrop> byTimestamp = new ArrayList<>(entries.values());
+        byTimestamp.sort((left, right) -> Long.compare(left.timestamp(), right.timestamp()));
+        for (int i = 0; i < excess; i++) {
+            entries.remove(byTimestamp.get(i).key());
+        }
+    }
+
+    /** 调用方必须持有 {@link #lock}。 */
+    private void removeOldestEntry() {
+        ItemKey oldestKey = null;
+        long oldestTimestamp = Long.MAX_VALUE;
+        for (QuarantinedDrop candidate : entries.values()) {
+            if (oldestKey == null || candidate.timestamp() < oldestTimestamp) {
+                oldestKey = candidate.key();
+                oldestTimestamp = candidate.timestamp();
             }
-            if (oldestKey == null) {
-                return;
-            }
+        }
+        if (oldestKey != null) {
             entries.remove(oldestKey);
         }
     }

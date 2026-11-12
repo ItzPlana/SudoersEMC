@@ -84,6 +84,25 @@ class ResolverRegistryTest {
     }
 
     @Test
+    void errorIsNotSwallowed() {
+        NbtMaterialResolver fatal = new NbtMaterialResolver() {
+            @Override
+            public boolean supports(ItemStack stack) {
+                return true;
+            }
+
+            @Override
+            public OptionalLong resolve(ItemStack stack) {
+                throw new AssertionError("模拟 JVM 错误");
+            }
+        };
+        ResolverRegistry registry = ResolverRegistry.defaults();
+        registry.register(fatal);
+
+        assertThrows(AssertionError.class, () -> registry.resolve(STACK));
+    }
+
+    @Test
     void emptyRegistryReturnsEmpty() {
         assertTrue(ResolverRegistry.defaults().resolve(STACK).isEmpty());
     }

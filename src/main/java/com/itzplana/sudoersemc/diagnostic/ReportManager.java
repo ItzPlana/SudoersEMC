@@ -36,6 +36,9 @@ public final class ReportManager {
 
     private final Path dataDir;
 
+    /** 最近一次成功写入（或读取）的报告文本，避免命令在服务器线程重复读盘。 */
+    private volatile String cachedReport;
+
     /**
      * 生产环境构造函数，使用 {@link SudoersemcPaths#dataDir()}。
      *
@@ -69,18 +72,19 @@ public final class ReportManager {
      *
      * @param report 待写入的诊断快照
      */
-    public void writeReport(DiagnosticReport report) {
+    public synchronized void writeReport(DiagnosticReport report) {
         if (report == null) {
             LOGGER.warn("拒绝写入 null 诊断报告");
             return;
         }
         Path target = reportFile();
         Path temp = dataDir.resolve(FILE_NAME + TEMP_SUFFIX);
+        String text = report.formatText();
         try {
             Files.createDirectories(dataDir);
             Files.writeString(
                     temp,
-                    report.formatText(),
+                    text,
                     StandardCharsets.UTF_8,
                     StandardOpenOption.CREATE,
                     StandardOpenOption.TRUNCATE_EXISTING,
@@ -91,6 +95,7 @@ public final class ReportManager {
                 LOGGER.debug("文件系统不支持原子替换 {}，改用普通替换", target);
                 Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING);
             }
+            cachedReport = text;
         } catch (IOException | RuntimeException e) {
             LOGGER.warn("写入诊断报告 {} 失败", target, e);
             try {
@@ -107,12 +112,18 @@ public final class ReportManager {
      * @return 报告内容；文件不存在、不可读或不是普通文件时返回空 {@link Optional}
      */
     public Optional<String> readLastReport() {
+        String cached = cachedReport;
+        if (cached != null) {
+            return Optional.of(cached);
+        }
         Path target = reportFile();
         try {
             if (!Files.isRegularFile(target)) {
                 return Optional.empty();
             }
-            return Optional.of(Files.readString(target, StandardCharsets.UTF_8));
+            String text = Files.readString(target, StandardCharsets.UTF_8);
+            cachedReport = text;
+            return Optional.of(text);
         } catch (IOException | RuntimeException e) {
             LOGGER.warn("读取诊断报告 {} 失败", target, e);
             return Optional.empty();
