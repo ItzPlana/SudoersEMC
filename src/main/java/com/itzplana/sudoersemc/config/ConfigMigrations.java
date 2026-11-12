@@ -24,6 +24,8 @@ public final class ConfigMigrations {
     /** 引入 schema 版本字段之前的旧版本号。 */
     public static final int LEGACY_SCHEMA_VERSION = 1;
 
+    private static final String OVERFLOW_SECTION = "overflow";
+    private static final String OVERFLOW_PREFIX = OVERFLOW_SECTION + ".";
     private static final String KEY_THRESHOLD = "threshold";
     private static final String KEY_OVERWRITE_SCOPE = "overwriteScope";
     private static final long DEFAULT_OVERFLOW_THRESHOLD = 999_999L;
@@ -66,6 +68,11 @@ public final class ConfigMigrations {
      *   <li>当前版本：不做修改，也不产生提示。</li>
      * </ul>
      *
+     * <p><strong>键形状契约：</strong>{@code rawValues} 支持三种键形状，迁移会沿用输入已有的
+     * 形状：扁平逻辑键（{@code threshold}）、点分键（{@code overflow.threshold}）或嵌套
+     * {@code overflow} map。若输入没有任何可识别的形状，补充的默认值使用扁平逻辑键。
+     * Forge 的 TOML 路径映射由 {@code ConfigFileMigration} 负责，本方法从不直接读写文件。</p>
+     *
      * @param fromVersion 原始配置声明的 schema 版本
      * @param rawValues   原始键值映射，允许为 {@code null}（按空映射处理）
      * @return 迁移结果；{@code values} 始终是新的独立映射
@@ -90,18 +97,74 @@ public final class ConfigMigrations {
 
         if (fromVersion == LEGACY_SCHEMA_VERSION) {
             Map<String, Object> migrated = new LinkedHashMap<>(source);
+            KeyStyle style = detectStyle(source);
             List<String> notes = new ArrayList<>(2);
-            if (!migrated.containsKey(KEY_THRESHOLD)) {
-                migrated.put(KEY_THRESHOLD, DEFAULT_OVERFLOW_THRESHOLD);
+            if (!containsLogicalKey(migrated, KEY_THRESHOLD)) {
+                putLogicalKey(migrated, style, KEY_THRESHOLD, DEFAULT_OVERFLOW_THRESHOLD);
                 notes.add("v1→v2：补充 overflow.threshold 默认值 999999");
             }
-            if (!migrated.containsKey(KEY_OVERWRITE_SCOPE)) {
-                migrated.put(KEY_OVERWRITE_SCOPE, DEFAULT_OVERWRITE_SCOPE);
+            if (!containsLogicalKey(migrated, KEY_OVERWRITE_SCOPE)) {
+                putLogicalKey(migrated, style, KEY_OVERWRITE_SCOPE, DEFAULT_OVERWRITE_SCOPE);
                 notes.add("v1→v2：补充 overwriteScope 默认值 owned_only");
             }
             return new MigrationResult(migrated, SCHEMA_VERSION, notes);
         }
 
         return new MigrationResult(source, SCHEMA_VERSION, List.of());
+    }
+
+    /**
+     * 检测输入映射使用的键形状，用于让补充的默认值与现有条目保持同一层级。
+     * 点分键优先于嵌套 map，避免混合输入时把默认值写到错误层级。
+     */
+    private static KeyStyle detectStyle(Map<String, Object> values) {
+        for (String key : values.keySet()) {
+            if (key != null && key.startsWith(OVERFLOW_PREFIX)) {
+                return KeyStyle.DOTTED;
+            }
+        }
+        if (values.get(OVERFLOW_SECTION) instanceof Map<?, ?>) {
+            return KeyStyle.NESTED;
+        }
+        return KeyStyle.FLAT;
+    }
+
+    /**
+     * 判断逻辑键是否已以任意受支持的形状存在。
+     */
+    private static boolean containsLogicalKey(Map<String, Object> values, String key) {
+        if (values.containsKey(key) || values.containsKey(OVERFLOW_PREFIX + key)) {
+            return true;
+        }
+        Object nested = values.get(OVERFLOW_SECTION);
+        return nested instanceof Map<?, ?> map && map.containsKey(key);
+    }
+
+    /**
+     * 按指定形状写入逻辑键。嵌套 map 会被复制为不可变视图，避免修改调用方传入的对象。
+     */
+    private static void putLogicalKey(Map<String, Object> values, KeyStyle style,
+                                      String key, Object value) {
+        switch (style) {
+            case DOTTED -> values.put(OVERFLOW_PREFIX + key, value);
+            case NESTED -> {
+                Object nested = values.get(OVERFLOW_SECTION);
+                Map<String, Object> copied = new LinkedHashMap<>();
+                if (nested instanceof Map<?, ?> map) {
+                    for (Map.Entry<?, ?> entry : map.entrySet()) {
+                        copied.put(String.valueOf(entry.getKey()), entry.getValue());
+                    }
+                }
+                copied.put(key, value);
+                values.put(OVERFLOW_SECTION, Collections.unmodifiableMap(copied));
+            }
+            default -> values.put(key, value);
+        }
+    }
+
+    private enum KeyStyle {
+        FLAT,
+        DOTTED,
+        NESTED
     }
 }

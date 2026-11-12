@@ -14,6 +14,7 @@ import net.minecraft.world.item.Rarity;
  * <p>优先级从高到低（必须与此顺序完全一致）：</p>
  * <ol>
  *   <li>{@link PriceSource#EXISTING}：物品已有 EMC，且大于 0；</li>
+ *   <li>排除检查：层级规则明确排除的物品直接终止，不参与后续任何定价；</li>
  *   <li>{@link PriceSource#EXTERNAL_BASELINE}：外部基线值大于 0；</li>
  *   <li>排除检查：层级规则明确排除的物品直接终止，不参与后续任何定价；</li>
  *   <li>{@link PriceSource#TAG}：命中材料标签基准值（受 {@link PricingSettings#useTagPricing()} 控制）；</li>
@@ -26,8 +27,14 @@ import net.minecraft.world.item.Rarity;
  * <p>层级规则返回 {@code Optional.of(0L)} 表示“明确排除”。此时本类直接返回
  * {@link Optional#empty()}，绝不把被排除的物品当成免费物品。任何情况下都不会返回负值。</p>
  *
- * <p>层级规则的纯倍率规则不会单独产生价格：{@link TierPricing#price} 对它返回空，定价链会
- * 继续尝试稀有度与通用兜底值。需要缩放的调用方应自行使用 {@link TierPricing#multiplierFor}。</p>
+ * <p>排除语义与价格优先级是两件事：排除表示“拒绝定价”，不是“价格来源”。稀有度定价对任何输入
+ * 都会返回值，若把排除检查放在它之后，层级排除规则将永远不可达，因此排除检查先于所有定价步骤。</p>
+ *
+ * <p>层级规则的纯倍率规则不会单独产生价格：{@link TierPricing#price} 对它返回空，定价链会继续
+ * 尝试稀有度与通用兜底值。需要缩放的调用方应自行使用 {@link TierPricing#multiplierFor}。</p>
+ *
+ * <p>{@link PricedValue#value()} 为 {@code 0} 表示“免费价格”（配置显式给出 0），而不是未定价；
+ * 未定价一律用 {@link Optional#empty()} 表达。</p>
  */
 public final class FallbackPricing {
 
@@ -131,12 +138,12 @@ public final class FallbackPricing {
     }
 
     /**
-     * 按 {@code EXISTING → EXTERNAL_BASELINE → 排除检查 → TAG → TIER → RARITY → FALLBACK}
+     * 按 {@code EXISTING → 排除检查 → EXTERNAL_BASELINE → TAG → TIER → RARITY → FALLBACK}
      * 的顺序定价。
      *
      * <p>只有“启用且命中”的步骤才会产生结果；层级规则的排除标记（{@code 0L}）会立即终止
      * 整个定价链并返回 {@link Optional#empty()}，而不是继续尝试通用兜底值。纯倍率层级规则
-     * 返回空，因此不会阻断后续的稀有度定价。</p>
+     * 返回空，因此不会阻断后续的稀有度与通用兜底值。</p>
      *
      * @param request 定价请求
      * @return 命中的价格与来源，未定价时为空
@@ -150,18 +157,19 @@ public final class FallbackPricing {
             return Optional.of(new PricedValue(item, existingValue, PriceSource.EXISTING, "existing-value"));
         }
 
+        // 排除语义与价格优先级是两件事：排除表示“拒绝定价”，不是“价格来源”。
+        // 稀有度定价对任何输入都会返回值，若把排除检查放在它之后，层级排除规则将永远不可达，
+        // 导致刷怪蛋、命令方块等物品被误定价。因此排除检查必须先于所有定价步骤。
+        if (settings.useTierPricing() && isExcluded(item)) {
+            return Optional.empty();
+        }
+
         long externalBaseline = request.externalBaseline();
         if (externalBaseline > 0L) {
             return Optional.of(new PricedValue(
                     item, externalBaseline, PriceSource.EXTERNAL_BASELINE, "external-baseline"));
         }
 
-        // 排除语义与价格优先级是两件事：排除表示「拒绝定价」，不是「价格来源」。
-        // 稀有度定价对任何输入都会返回值，若把排除检查放在它之后，层级排除规则将永远不可达，
-        // 导致 spawn egg、命令方块等物品被误定价。因此排除检查必须先于所有定价步骤。
-        if (settings.useTierPricing() && isExcluded(item)) {
-            return Optional.empty();
-        }
 
         if (settings.useTagPricing()) {
             Optional<Long> tagValue = tagPricing.price(item, request.tagPaths());

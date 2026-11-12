@@ -23,7 +23,7 @@ public enum ReloadDecision {
      *
      * <p>校验失败永远优先于扫描状态：即使扫描正在进行，也不应把非法配置挂起等待。</p>
      *
-     * @param scanRunning     是否有扫描正在进行
+     * @param scanRunning      是否有扫描正在进行
      * @param validationPassed 配置是否通过校验
      * @return 对应的处理决策，永不为 {@code null}
      */
