@@ -98,4 +98,15 @@ class RarityPricingTest {
         assertThrows(IllegalArgumentException.class,
                 () -> new RarityPricing(Map.of(), Map.of(Rarity.COMMON, Double.POSITIVE_INFINITY), 0L));
     }
+
+    @Test
+    void hugeValuesSaturateInsteadOfWrapping() {
+        RarityPricing pricing = new RarityPricing(
+                Map.of(Rarity.COMMON, Long.MAX_VALUE),
+                Map.of(Rarity.COMMON, 2.0D),
+                0L);
+
+        assertEquals(Long.MAX_VALUE, pricing.price(Rarity.COMMON),
+                "超大值应饱和到 Long.MAX_VALUE，而不是回绕成负数");
+    }
 }
