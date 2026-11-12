@@ -14,9 +14,11 @@ import com.itzplana.sudoersemc.scanner.RecipeInput;
 import com.itzplana.sudoersemc.scanner.RecipeKind;
 import com.itzplana.sudoersemc.scanner.RecipeOutput;
 import com.itzplana.sudoersemc.scanner.RecipeSnapshot;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 import net.minecraft.resources.ResourceLocation;
 import org.junit.jupiter.api.Test;
 
@@ -492,5 +494,124 @@ class RecipeSolverTest {
                 SolveSettings.defaults());
 
         assertEquals(Set.of(), result.unresolvedItems(), "第 1 轮暂时未解析的 plank 最终已定价，不应报告");
+    }
+
+    @Test
+    void preferSimpleBreaksCostTiesByFewerInputs() {
+        ItemKey a = item("tie_a");
+        ItemKey b = item("tie_b");
+        ItemKey product = item("tie_product");
+        List<RecipeSnapshot> recipes = List.of(
+                recipe("a_complex", RecipeKind.SHAPED, List.of(in(a), in(b)),
+                        List.of(out(product, 1))),
+                recipe("b_simple", RecipeKind.SHAPED, List.of(in(a, 2)),
+                        List.of(out(product, 1))));
+        SolveContext context = new SolveContext(Map.of(a, 5L, b, 5L));
+
+        SolveResult defaultResult = SOLVER.solve(recipes, context, REGISTRY,
+                SolveSettings.defaults());
+        assertEquals(new ResourceLocation("sudoersemc", "a_complex"),
+                defaultResult.traces().get(product).recipeId(),
+                "默认策略在成本相同时按配方 id 选择");
+
+        RecipeSolver solver = new RecipeSolver();
+        SolveResult simple = solver.solve(recipes, new SolveContext(Map.of(a, 5L, b, 5L)), REGISTRY,
+                new SolveSettings(20, false, 1L, 8, RecipeSelectionStrategy.PREFER_SIMPLE));
+        assertEquals(new ResourceLocation("sudoersemc", "b_simple"),
+                simple.traces().get(product).recipeId(),
+                "prefer_simple 应优先输入槽更少的配方");
+        assertEquals(10L, simple.values().get(product), "选择策略不得改变最低成本语义");
+    }
+
+    @Test
+    void stableIdBreaksCostTiesByRecipeId() {
+        ItemKey input = item("stable_in");
+        ItemKey product = item("stable_out");
+        List<RecipeSnapshot> recipes = List.of(
+                recipe("z_route", RecipeKind.SHAPED, List.of(in(input)),
+                        List.of(out(product, 1))),
+                recipe("a_route", RecipeKind.SHAPED, List.of(in(input)),
+                        List.of(out(product, 1))));
+        RecipeSolver solver = new RecipeSolver();
+
+        SolveResult result = solver.solve(recipes, new SolveContext(Map.of(input, 10L)), REGISTRY,
+                new SolveSettings(20, false, 1L, 8, RecipeSelectionStrategy.STABLE_ID));
+
+        assertEquals(new ResourceLocation("sudoersemc", "a_route"),
+                result.traces().get(product).recipeId());
+    }
+
+    @Test
+    void evaluationCacheHitsUnchangedRecipeAndInvalidatesOnInputChange() {
+        RecipeSolver solver = new RecipeSolver(EvaluationPolicy.defaults(), 32);
+        ItemKey input = item("cache_in");
+        ItemKey product = item("cache_out");
+        List<RecipeSnapshot> recipes = List.of(
+                recipe("cache_recipe", RecipeKind.FURNACE, List.of(in(input)),
+                        List.of(out(product, 1))));
+
+        SolveResult first = solver.solve(recipes, new SolveContext(Map.of(input, 10L)), REGISTRY,
+                SolveSettings.defaults());
+        assertEquals(10L, first.values().get(product));
+        assertTrue(solver.cacheMisses() > 0L, "首次求解必须产生未命中");
+
+        long hitsBefore = solver.cacheHits();
+        SolveResult second = solver.solve(recipes, new SolveContext(Map.of(input, 10L)), REGISTRY,
+                SolveSettings.defaults());
+        assertEquals(10L, second.values().get(product));
+        assertTrue(solver.cacheHits() > hitsBefore, "未变化配方与输入值应命中缓存");
+
+        long missesBefore = solver.cacheMisses();
+        SolveResult changed = solver.solve(recipes, new SolveContext(Map.of(input, 20L)), REGISTRY,
+                SolveSettings.defaults());
+        assertEquals(20L, changed.values().get(product));
+        assertTrue(solver.cacheMisses() > missesBefore, "输入值变化必须使缓存失效");
+    }
+
+    @Test
+    void evaluationCacheIsBounded() {
+        RecipeSolver solver = new RecipeSolver(EvaluationPolicy.defaults(), 2);
+        for (int index = 0; index < 8; index++) {
+            ItemKey input = item("bounded_in_" + index);
+            ItemKey product = item("bounded_out_" + index);
+            List<RecipeSnapshot> recipes = List.of(
+                    recipe("bounded_recipe_" + index, RecipeKind.FURNACE, List.of(in(input)),
+                            List.of(out(product, 1))));
+            solver.solve(recipes, new SolveContext(Map.of(input, 1L + index)), REGISTRY,
+                    SolveSettings.defaults());
+        }
+
+        assertTrue(solver.cacheSize() <= 2, "有界 LRU 不得突破容量");
+    }
+
+    @Test
+    void cancellationStopsWithinAPass() {
+        RecipeSolver solver = new RecipeSolver();
+        ItemKey seed = item("cancel_seed");
+        List<RecipeSnapshot> recipes = new ArrayList<>();
+        int total = RecipeSolver.CANCEL_CHECK_INTERVAL + 10;
+        for (int index = 0; index < total; index++) {
+            recipes.add(recipe(String.format("cancel_%03d", index), RecipeKind.SHAPED,
+                    List.of(in(seed)), List.of(out(item("cancel_out_" + index), 1))));
+        }
+        AtomicInteger checks = new AtomicInteger();
+
+        SolveResult result = solver.solve(recipes, new SolveContext(Map.of(seed, 1L)), REGISTRY,
+                SolveSettings.defaults(), () -> checks.incrementAndGet() > 2);
+
+        assertFalse(result.converged(), "取消时不得声称收敛");
+        assertEquals(RecipeSolver.CANCEL_CHECK_INTERVAL, result.recipesEvaluated(),
+                "应在下一个检查点停止，而不是处理完全部配方");
+    }
+
+    @Test
+    void selectionStrategyParsingIsCaseInsensitiveAndRejectsUnknown() {
+        assertEquals(RecipeSelectionStrategy.PREFER_SIMPLE,
+                RecipeSelectionStrategy.parse("  PREFER_SIMPLE "));
+        assertEquals(RecipeSelectionStrategy.STABLE_ID,
+                RecipeSelectionStrategy.parse("stable_id"));
+        assertNull(RecipeSelectionStrategy.parse("unknown"));
+        assertTrue(RecipeSelectionStrategy.isValid("lowest_cost"));
+        assertFalse(RecipeSelectionStrategy.isValid("nope"));
     }
 }

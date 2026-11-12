@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.BooleanSupplier;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.item.Item;
@@ -39,18 +40,40 @@ public final class ItemScanner {
         this.ignoredItems = Set.copyOf(ignoredItems == null ? Set.of() : ignoredItems);
     }
 
+    /** 每扫描多少个注册项检查一次取消信号。 */
+    public static final int CANCELLATION_CHECK_INTERVAL = 256;
+
     /**
      * Scans every registered item.
      *
      * @return one snapshot per non-air, non-ignored item, in registry order
      */
     public List<ItemSnapshot> scan() {
+        return scan(() -> false);
+    }
+
+    /**
+     * Scans registered items with a cooperative cancellation checkpoint.
+     *
+     * <p>每 {@value #CANCELLATION_CHECK_INTERVAL} 个注册项检查一次取消信号。取消时返回已经产生的
+     * 部分快照；列表本身仍然不可变且顺序与注册表一致，调用方可以安全地用于部分诊断报告。</p>
+     *
+     * @param cancellation 取消检查；返回 {@code true} 时停止继续扫描
+     * @return one snapshot per processed non-air, non-ignored item, in registry order
+     */
+    public List<ItemSnapshot> scan(BooleanSupplier cancellation) {
+        Objects.requireNonNull(cancellation, "cancellation");
         List<ItemSnapshot> snapshots = new ArrayList<>();
         int skippedEmpty = 0;
         int skippedIgnored = 0;
         int skippedUnregistered = 0;
+        int processed = 0;
 
         for (Item item : BuiltInRegistries.ITEM) {
+            if (processed % CANCELLATION_CHECK_INTERVAL == 0 && cancellation.getAsBoolean()) {
+                break;
+            }
+            processed++;
             if (item == Items.AIR) {
                 continue;
             }

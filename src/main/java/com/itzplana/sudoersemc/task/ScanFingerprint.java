@@ -136,6 +136,38 @@ public record ScanFingerprint(
     }
 
     /**
+     * 返回与另一个指纹相比发生变化的通道名称。
+     *
+     * <p>名称固定为 {@code item}、{@code recipe}、{@code tag}、{@code config}、{@code baseline}，
+     * 便于日志与诊断稳定解析。{@code other} 为 {@code null} 时五个通道都视为变化。</p>
+     *
+     * @param other 待比较指纹，可为 {@code null}
+     * @return 发生变化的通道名称列表；完全相同时为空列表
+     */
+    public List<String> changedChannels(ScanFingerprint other) {
+        if (other == null) {
+            return List.of("item", "recipe", "tag", "config", "baseline");
+        }
+        List<String> changed = new ArrayList<>(5);
+        if (!Objects.equals(itemFingerprint, other.itemFingerprint)) {
+            changed.add("item");
+        }
+        if (!Objects.equals(recipeFingerprint, other.recipeFingerprint)) {
+            changed.add("recipe");
+        }
+        if (!Objects.equals(tagFingerprint, other.tagFingerprint)) {
+            changed.add("tag");
+        }
+        if (!Objects.equals(configFingerprint, other.configFingerprint)) {
+            changed.add("config");
+        }
+        if (!Objects.equals(baselineFingerprint, other.baselineFingerprint)) {
+            changed.add("baseline");
+        }
+        return List.copyOf(changed);
+    }
+
+    /**
      * @return 五个通道都等于 {@link #EMPTY} 时返回 {@code true}
      */
     public boolean isEmpty() {

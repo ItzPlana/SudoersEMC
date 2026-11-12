@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.BooleanSupplier;
 import net.minecraft.core.NonNullList;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
@@ -54,12 +55,30 @@ public final class RecipeScanner {
         this.goetyReader = Objects.requireNonNull(goetyReader, "goetyReader");
     }
 
+    /** 每扫描多少条配方检查一次取消信号。 */
+    public static final int CANCELLATION_CHECK_INTERVAL = 256;
+
     /**
      * @param manager the active recipe manager
      * @return every recipe this build can describe, plus counters for what it skipped
      */
     public ScanResult scan(RecipeManager manager) {
+        return scan(manager, () -> false);
+    }
+
+    /**
+     * Scans recipes with a cooperative cancellation checkpoint.
+     *
+     * <p>每 {@value #CANCELLATION_CHECK_INTERVAL} 条配方检查一次取消信号。取消时返回已经描述的
+     * 部分配方与对应计数器；列表不可变，可用于部分诊断报告。</p>
+     *
+     * @param manager      the active recipe manager
+     * @param cancellation 取消检查；返回 {@code true} 时停止继续扫描
+     * @return every processed recipe this build can describe, plus counters for what it skipped
+     */
+    public ScanResult scan(RecipeManager manager, BooleanSupplier cancellation) {
         Objects.requireNonNull(manager, "manager");
+        Objects.requireNonNull(cancellation, "cancellation");
         List<RecipeSnapshot> snapshots = new ArrayList<>();
         List<String> failedDetails = new ArrayList<>();
         int unsupported = 0;
@@ -77,7 +96,12 @@ public final class RecipeScanner {
                     List.of("recipe-manager: " + failureText(e)));
         }
 
+        int processed = 0;
         for (ResourceLocation id : ids) {
+            if (processed % CANCELLATION_CHECK_INTERVAL == 0 && cancellation.getAsBoolean()) {
+                break;
+            }
+            processed++;
             Optional<? extends Recipe<?>> maybeRecipe;
             try {
                 maybeRecipe = manager.byKey(id);

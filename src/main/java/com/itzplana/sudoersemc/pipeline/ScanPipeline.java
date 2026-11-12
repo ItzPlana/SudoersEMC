@@ -17,6 +17,7 @@ import com.itzplana.sudoersemc.safety.OverflowPipeline;
 import com.itzplana.sudoersemc.safety.PriceDropDecision;
 import com.itzplana.sudoersemc.scanner.ItemScanner;
 import com.itzplana.sudoersemc.scanner.ItemSnapshot;
+import com.itzplana.sudoersemc.scanner.RecipeInput;
 import com.itzplana.sudoersemc.scanner.RecipeOutput;
 import com.itzplana.sudoersemc.scanner.RecipeScanner;
 import com.itzplana.sudoersemc.scanner.RecipeSnapshot;
@@ -42,8 +43,11 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.TagParser;
@@ -95,6 +99,15 @@ public final class ScanPipeline {
      */
     static final int MAX_SOLVE_ROUNDS = 4;
 
+    /** NBT 变体生成时每处理多少个观测条目检查一次取消信号。 */
+    static final int NBT_VARIANT_CANCEL_CHECK_INTERVAL = 64;
+
+    /** 应用循环每处理多少个候选检查一次取消信号。 */
+    static final int APPLY_CANCEL_CHECK_INTERVAL = 64;
+
+    /** 既有值收集每处理多少个物品检查一次取消信号。 */
+    static final int EXISTING_VALUE_CANCEL_CHECK_INTERVAL = 256;
+
     private final GeneratedEntryStore store;
     private volatile QuarantinedDropsStore quarantinedDropsStore;
     private final ScanStateStore stateStore;
@@ -111,6 +124,18 @@ public final class ScanPipeline {
     private volatile int maxNbtVariantsPerItem = 100;
 
     private final AtomicReference<PipelineSnapshot> stashedSnapshot = new AtomicReference<>();
+    private final RecipeSolver recipeSolver = new RecipeSolver();
+    private final EvaluatorRegistry evaluatorRegistry = EvaluatorRegistry.defaults();
+
+    /** 协作式取消检查；默认永不取消，由调度器注入共享令牌。 */
+    private volatile BooleanSupplier cancellationCheck = () -> false;
+    /** 配置与外部基线的指纹来源；默认空表示测试/嵌入式环境没有额外输入。 */
+    private volatile Supplier<List<String>> configFingerprintSupplier = List::of;
+    private volatile Supplier<List<String>> baselineFingerprintSupplier = List::of;
+    /** 取消或失败时写部分报告所需的最近一次快照。 */
+    private volatile PipelineSnapshot lastSnapshotForReport;
+    private volatile int lastSolverCacheHits;
+    private volatile int lastSolverCacheMisses;
 
     private volatile EmcProvider emcProvider;
     private volatile OverflowScope overflowScope = OverflowScope.OWNED_ONLY;
@@ -243,6 +268,191 @@ public final class ScanPipeline {
     }
 
     /**
+     * 注入协作式取消检查。
+     *
+     * <p>检查会在物品采集、配方扫描、NBT 变体生成、求解轮次与应用循环中被调用。传入
+     * {@code null} 恢复“永不取消”。</p>
+     *
+     * @param check 取消检查，可为 {@code null}
+     */
+    public void setCancellationCheck(@Nullable BooleanSupplier check) {
+        this.cancellationCheck = check == null ? () -> false : check;
+    }
+
+    /**
+     * 注入配置指纹来源。来源返回的字符串应稳定、可排序；读取失败时管线会退化为一个固定的
+     * 错误标记，不会阻止扫描。
+     *
+     * @param supplier 配置条目来源，可为 {@code null}
+     */
+    public void setConfigFingerprintSupplier(@Nullable Supplier<List<String>> supplier) {
+        this.configFingerprintSupplier = supplier == null ? List::of : supplier;
+    }
+
+    /**
+     * 注入外部基线指纹来源（例如 ProjectE 手动 EMC 文件）。
+     *
+     * @param supplier 基线条目来源，可为 {@code null}
+     */
+    public void setBaselineFingerprintSupplier(@Nullable Supplier<List<String>> supplier) {
+        this.baselineFingerprintSupplier = supplier == null ? List::of : supplier;
+    }
+
+    /**
+     * @return 是否已经请求协作式取消
+     */
+    public boolean isCancelled() {
+        BooleanSupplier check = cancellationCheck;
+        try {
+            return check.getAsBoolean();
+        } catch (RuntimeException failure) {
+            LOGGER.warn("SudoersEMC 取消检查抛出异常，按未取消继续", failure);
+            return false;
+        }
+    }
+
+    /**
+     * 采集当前输入指纹，供服务器启动时与持久化状态比较。
+     *
+     * <p>该方法只读取物品注册表、物品标签与配方管理器，不查询 EMC 后端、不求解、不写存储。
+     * 物品条目按键去重并包含稀有度，配方条目包含完整内容摘要；配置与外部基线通过注入的
+     * 来源读取。任何异常都会返回 {@code null}，调用方应退化为“需要扫描”。</p>
+     *
+     * @param server 当前服务器，可为 {@code null}
+     * @return 当前输入指纹；无法计算时返回 {@code null}
+     */
+    @Nullable
+    public ScanFingerprint collectFingerprint(@Nullable MinecraftServer server) {
+        if (server == null) {
+            return null;
+        }
+        try {
+            ItemScanner identityScanner = new ItemScanner(new ItemScanner.EmcQuery() {
+                @Override
+                public boolean hasValue(ItemStack stack) {
+                    return false;
+                }
+
+                @Override
+                public long getValue(ItemStack stack) {
+                    return 0L;
+                }
+            }, Set.of(), Set.of());
+            List<ItemSnapshot> items = identityScanner.scan(this::isCancelled);
+            RecipeScanner recipeScanner = RecipeScanner.withGoety().orElseGet(RecipeScanner::new);
+            List<RecipeSnapshot> recipes =
+                    recipeScanner.scan(server.getRecipeManager(), this::isCancelled).recipes();
+            return fingerprintFor(items, recipes,
+                    safeFingerprintEntries(configFingerprintSupplier, "config"),
+                    safeFingerprintEntries(baselineFingerprintSupplier, "baseline"));
+        } catch (Throwable failure) {
+            LOGGER.warn("SudoersEMC 无法计算当前扫描指纹，退化为需要扫描", failure);
+            return null;
+        }
+    }
+
+    /**
+     * 根据物品、配方、配置与基线输入构造五通道指纹。
+     *
+     * <p>所有集合都先落入 {@link TreeSet} 再交给 {@link ScanFingerprint} 排序哈希，因此结果不受
+     * HashMap 遍历顺序影响。物品通道包含注册表 id 与稀有度，配方通道包含配方完整内容摘要。</p>
+     *
+     * @param items           物品快照，允许为空
+     * @param recipes         配方快照，允许为空
+     * @param configEntries   配置条目，允许为 {@code null}
+     * @param baselineEntries 外部基线条目，允许为 {@code null}
+     * @return 五通道指纹
+     */
+    static ScanFingerprint fingerprintFor(List<ItemSnapshot> items,
+                                          List<RecipeSnapshot> recipes,
+                                          Iterable<String> configEntries,
+                                          Iterable<String> baselineEntries) {
+        Set<String> itemEntries = new TreeSet<>();
+        Set<String> tagEntries = new TreeSet<>();
+        if (items != null) {
+            for (ItemSnapshot item : items) {
+                if (item == null) {
+                    continue;
+                }
+                itemEntries.add(item.registryId() + "|" + item.rarity().name());
+                tagEntries.addAll(item.tagPaths());
+            }
+        }
+
+        Set<String> recipeEntries = new TreeSet<>();
+        if (recipes != null) {
+            for (RecipeSnapshot recipe : recipes) {
+                if (recipe != null) {
+                    recipeEntries.add(recipeFingerprintEntry(recipe));
+                }
+            }
+        }
+
+        return ScanFingerprint.of(itemEntries, recipeEntries, tagEntries,
+                sortedEntries(configEntries), sortedEntries(baselineEntries));
+    }
+
+    /**
+     * 生成一条配方的稳定内容摘要。字段顺序固定，属性按 key 排序。
+     */
+    private static String recipeFingerprintEntry(RecipeSnapshot recipe) {
+        StringBuilder builder = new StringBuilder(128);
+        builder.append(recipe.id()).append('|').append(recipe.kind().name());
+        builder.append("|in:");
+        for (RecipeInput input : recipe.inputs()) {
+            builder.append('[');
+            List<String> candidates = new ArrayList<>(input.option().candidates().size());
+            for (ItemKey candidate : input.option().candidates()) {
+                candidates.add(candidate.toString());
+            }
+            Collections.sort(candidates);
+            builder.append(String.join(",", candidates));
+            builder.append('x').append(input.count()).append(']');
+        }
+        builder.append("|out:");
+        appendOutputs(builder, recipe.outputs());
+        builder.append("|rem:");
+        appendOutputs(builder, recipe.containerRemainders());
+        builder.append("|catalyst:").append(recipe.catalyst());
+        builder.append("|attrs:");
+        Map<String, String> attributes = recipe.attributes();
+        for (Map.Entry<String, String> entry : new TreeMap<>(attributes).entrySet()) {
+            builder.append(entry.getKey()).append('=').append(entry.getValue()).append(';');
+        }
+        return builder.toString();
+    }
+
+    private static void appendOutputs(StringBuilder builder, List<RecipeOutput> outputs) {
+        for (RecipeOutput output : outputs) {
+            builder.append('[').append(output.item())
+                    .append('x').append(output.count())
+                    .append(':').append(output.outputNbt())
+                    .append(']');
+        }
+    }
+
+    private static List<String> sortedEntries(Iterable<String> entries) {
+        Set<String> sorted = new TreeSet<>();
+        if (entries != null) {
+            for (String entry : entries) {
+                if (entry != null) {
+                    sorted.add(entry);
+                }
+            }
+        }
+        return List.copyOf(sorted);
+    }
+
+    private List<String> safeFingerprintEntries(Supplier<List<String>> supplier, String channel) {
+        try {
+            return sortedEntries(supplier.get());
+        } catch (RuntimeException failure) {
+            LOGGER.warn("SudoersEMC 读取 {} 指纹输入失败，使用固定错误标记", channel, failure);
+            return List.of("fingerprint-error:" + channel);
+        }
+    }
+
+    /**
      * 设置是否写出诊断报告。
      *
      * <p>关闭后 {@code last_report.txt} 不再更新，但本轮扫描的计数、状态存储与持久化
@@ -340,13 +550,21 @@ public final class ScanPipeline {
                 }
             };
 
-            List<ItemSnapshot> items = new ItemScanner(query, Set.of(), Set.of()).scan();
+            List<ItemSnapshot> items = new ItemScanner(query, Set.of(), Set.of()).scan(this::isCancelled);
+            if (isCancelled()) {
+                return partialSnapshot(items, List.of());
+            }
 
             RecipeScanner recipeScanner = RecipeScanner.withGoety().orElseGet(RecipeScanner::new);
-            RecipeScanner.ScanResult scanResult = recipeScanner.scan(server.getRecipeManager());
+            RecipeScanner.ScanResult scanResult =
+                    recipeScanner.scan(server.getRecipeManager(), this::isCancelled);
+            if (isCancelled()) {
+                return partialSnapshot(items, scanResult.recipes());
+            }
 
             List<ItemSnapshot> variantItems = collectVariantSnapshots(
-                    items, scanResult.recipes(), nbtVariantsEnabled, maxNbtVariantsPerItem);
+                    items, scanResult.recipes(), nbtVariantsEnabled, maxNbtVariantsPerItem,
+                    this::isCancelled);
             List<ItemSnapshot> allItems = items;
             if (!variantItems.isEmpty()) {
                 List<ItemSnapshot> combined = new ArrayList<>(items.size() + variantItems.size());
@@ -356,7 +574,11 @@ public final class ScanPipeline {
             }
 
             Map<ItemKey, Long> existingValues = new TreeMap<>();
+            int inspected = 0;
             for (ItemSnapshot item : allItems) {
+                if (inspected++ % EXISTING_VALUE_CANCEL_CHECK_INTERVAL == 0 && isCancelled()) {
+                    return partialSnapshot(allItems, scanResult.recipes());
+                }
                 if (item.hasExistingEmc()) {
                     existingValues.put(item.key(), item.existingValue());
                 }
@@ -374,6 +596,20 @@ public final class ScanPipeline {
             LOGGER.error("SudoersEMC 扫描采集失败，本轮按空快照处理", failure);
             return PipelineSnapshot.empty();
         }
+    }
+
+    /**
+     * 构造取消时的部分快照：物品/配方保持已采集部分，既有值只从当前物品列表重新推导。
+     */
+    private static PipelineSnapshot partialSnapshot(List<ItemSnapshot> items,
+                                                    List<RecipeSnapshot> recipes) {
+        Map<ItemKey, Long> existingValues = new TreeMap<>();
+        for (ItemSnapshot item : items) {
+            if (item.hasExistingEmc()) {
+                existingValues.put(item.key(), item.existingValue());
+            }
+        }
+        return new PipelineSnapshot(items, recipes, existingValues, 0, 0, 0, List.of());
     }
 
     /**
@@ -398,6 +634,21 @@ public final class ScanPipeline {
                                                       List<RecipeSnapshot> recipes,
                                                       boolean enabled,
                                                       int maxNbtVariantsPerItem) {
+        return collectVariantSnapshots(baseItems, recipes, enabled, maxNbtVariantsPerItem,
+                () -> false);
+    }
+
+    /**
+     * 带协作式取消检查的 NBT 变体生成。
+     *
+     * <p>每处理 {@value #NBT_VARIANT_CANCEL_CHECK_INTERVAL} 个观测条目检查一次取消信号。取消时
+     * 返回已经生成并排序的变体子集，序列不可变且与完整结果保持相同排序规则。</p>
+     */
+    static List<ItemSnapshot> collectVariantSnapshots(List<ItemSnapshot> baseItems,
+                                                      List<RecipeSnapshot> recipes,
+                                                      boolean enabled,
+                                                      int maxNbtVariantsPerItem,
+                                                      BooleanSupplier cancellation) {
         if (!enabled || baseItems == null || baseItems.isEmpty()
                 || recipes == null || recipes.isEmpty()) {
             return List.of();
@@ -405,7 +656,12 @@ public final class ScanPipeline {
         int limit = Math.max(1, Math.min(maxNbtVariantsPerItem, VariantScanner.HARD_VARIANT_CEILING));
 
         Map<ResourceLocation, List<String>> observedByItem = new TreeMap<>();
+        int scannedRecipes = 0;
         for (RecipeSnapshot recipe : recipes) {
+            if (scannedRecipes++ % NBT_VARIANT_CANCEL_CHECK_INTERVAL == 0
+                    && cancellation.getAsBoolean()) {
+                return List.of();
+            }
             for (RecipeOutput output : recipe.outputs()) {
                 String outputNbt = output.outputNbt();
                 if (outputNbt == null || outputNbt.isBlank()) {
@@ -430,7 +686,12 @@ public final class ScanPipeline {
         VariantScanner variantScanner = new VariantScanner();
         Set<ItemKey> seen = new HashSet<>();
         List<ItemSnapshot> variants = new ArrayList<>();
+        int processedEntries = 0;
         for (Map.Entry<ResourceLocation, List<String>> entry : observedByItem.entrySet()) {
+            if (processedEntries++ % NBT_VARIANT_CANCEL_CHECK_INTERVAL == 0
+                    && cancellation.getAsBoolean()) {
+                break;
+            }
             ItemSnapshot base = baseByItem.get(entry.getKey());
             if (base == null) {
                 // 基础物品未被扫描（被忽略或未注册）时不生成变体，避免绕过排除规则。
@@ -605,16 +866,23 @@ public final class ScanPipeline {
      *
      * <p>存储为 {@code null} 时进入干跑模式：计数与报告照常生成，但不会产生任何持久化写入。</p>
      *
+     * <p><strong>取消语义：</strong>求解或应用循环观察到取消时立即停止，已写入的条目各自保持
+     * 原子一致；本轮不会更新扫描指纹，并写出部分诊断报告，交由调度器发布 CANCELLED 状态。</p>
+     *
      * @param snapshot 采集结果，允许为 {@code null}
      * @return 汇总结果；任何未预期异常都会转为全零结果
      */
     public PipelineResult solveAndApply(@Nullable PipelineSnapshot snapshot) {
         PipelineSnapshot data = snapshot == null ? PipelineSnapshot.empty() : snapshot;
         fullReportWritten = false;
+        lastSnapshotForReport = data;
+        long cacheHitsBefore = recipeSolver.cacheHits();
+        long cacheMissesBefore = recipeSolver.cacheMisses();
         long startedAtNanos = System.nanoTime();
 
         try {
             data = applyOwnershipSeparation(data);
+            lastSnapshotForReport = data;
             long minimumEmc = solveSettings.minimumEmc();
 
             Map<ItemKey, Candidate> recipeCandidates = new TreeMap<>();
@@ -623,7 +891,12 @@ public final class ScanPipeline {
 
             SolveResult lastSolveResult = skippedSolveResult();
             int roundsUsed = 0;
+            boolean cancelledDuringSolve = false;
             for (int round = 1; round <= MAX_SOLVE_ROUNDS; round++) {
+                if (isCancelled()) {
+                    cancelledDuringSolve = true;
+                    break;
+                }
                 roundsUsed = round;
                 SolveResult roundResult = solveRound(data, seeds);
                 lastSolveResult = roundResult;
@@ -635,6 +908,14 @@ public final class ScanPipeline {
                 }
             }
             lastSolverRoundCount = roundsUsed;
+            lastSolverCacheHits = (int) Math.min(Integer.MAX_VALUE,
+                    recipeSolver.cacheHits() - cacheHitsBefore);
+            lastSolverCacheMisses = (int) Math.min(Integer.MAX_VALUE,
+                    recipeSolver.cacheMisses() - cacheMissesBefore);
+
+            if (cancelledDuringSolve || isCancelled()) {
+                return cancelledResult(data, startedAtNanos);
+            }
 
             List<Candidate> candidates =
                     selectFinalCandidates(recipeCandidates, fallbackCandidates, minimumEmc);
@@ -655,8 +936,14 @@ public final class ScanPipeline {
             int applied = 0;
             int quarantined = 0;
             Map<String, Long> sourceCounts = new LinkedHashMap<>();
+            boolean cancelledDuringApply = false;
+            int applyIndex = 0;
 
             for (Candidate candidate : candidates) {
+                if (applyIndex++ % APPLY_CANCEL_CHECK_INTERVAL == 0 && isCancelled()) {
+                    cancelledDuringApply = true;
+                    break;
+                }
                 GeneratedEmcEntry previous = previousEntries.get(candidate.item());
                 long previousValue = previous == null ? 0L : previous.value();
 
@@ -699,14 +986,17 @@ public final class ScanPipeline {
             for (Candidate candidate : candidates) {
                 candidateKeys.add(candidate.item());
             }
-            int retiredEntries = retireStaleOwnedEntries(data, candidateKeys, data.existingValues());
-
-            rewriteProjectECustomEmcIfEnabled();
+            int retiredEntries = 0;
+            if (!cancelledDuringApply) {
+                retiredEntries = retireStaleOwnedEntries(
+                        data, candidateKeys, data.existingValues());
+                rewriteProjectECustomEmcIfEnabled();
+            }
 
             int overflowResets = overflowPipeline == null
                     ? 0
                     : Math.max(0, overflowPipeline.resetsApplied() - overflowBefore);
-            int unresolved = countUnresolved(lastSolveResult, seeds);
+            int unresolved = cancelledDuringApply ? 0 : countUnresolved(lastSolveResult, seeds);
             long durationMillis = elapsedMillis(startedAtNanos);
 
             lastSolvedCount = applied;
@@ -714,11 +1004,20 @@ public final class ScanPipeline {
             lastDurationMillis = durationMillis;
 
             boolean appliedToStore = store != null;
-            updateScanState(data, durationMillis, applied, unresolved);
+            if (!cancelledDuringApply) {
+                // 取消时不能把未完成的候选集合写成新的扫描指纹，否则下一次启动会误判为未变化。
+                updateScanState(data, durationMillis, applied, unresolved);
+            }
 
             Map<String, Long> extraCounters = buildExtraCounters(data, lastSolveResult,
                     quarantined, overflowResets, durationMillis, appliedToStore,
                     retiredEntries, roundsUsed, diagnostics);
+            extraCounters.put("solverCacheHits", (long) lastSolverCacheHits);
+            extraCounters.put("solverCacheMisses", (long) lastSolverCacheMisses);
+            if (cancelledDuringApply) {
+                extraCounters.put("scanCancelled", 1L);
+                extraCounters.put("partialReport", 1L);
+            }
             PipelineResult result = new PipelineResult(
                     solvedByRecipe,
                     solvedByFallback,
@@ -730,7 +1029,13 @@ public final class ScanPipeline {
                     appliedToStore,
                     sourceCounts,
                     extraCounters);
-            writeDiagnosticReport(data, result);
+            if (cancelledDuringApply) {
+                // 已写入的条目各自原子且一致；这里只写部分报告，交由调度器终止扫描。
+                writePartialReport(data, diagnostics, true, "扫描已取消");
+                fullReportWritten = true;
+            } else {
+                writeDiagnosticReport(data, result);
+            }
             return result;
         } catch (Throwable failure) {
             long durationMillis = elapsedMillis(startedAtNanos);
@@ -744,6 +1049,22 @@ public final class ScanPipeline {
             writePartialReport(data, diagnostics, false, "扫描失败");
             return PipelineResult.zeroed(durationMillis);
         }
+    }
+
+    /**
+     * 求解阶段被取消时的终止路径。
+     *
+     * <p>此时尚未进入应用循环，不产生任何写入；写出部分报告并把
+     * {@code fullReportWritten} 置位，避免调度器终止回调重复写同一份报告。</p>
+     */
+    private PipelineResult cancelledResult(PipelineSnapshot data, long startedAtNanos) {
+        long durationMillis = elapsedMillis(startedAtNanos);
+        lastSolvedCount = 0;
+        lastUnresolvedCount = 0;
+        lastDurationMillis = durationMillis;
+        writePartialReport(data, diagnostics, true, "扫描已取消");
+        fullReportWritten = true;
+        return PipelineResult.zeroed(durationMillis);
     }
 
     /**
@@ -851,8 +1172,9 @@ public final class ScanPipeline {
             return skippedSolveResult();
         }
         SolveContext context = new SolveContext(seeds);
-        return new RecipeSolver().solve(
-                data.recipes(), context, EvaluatorRegistry.defaults(), solveSettings);
+        // 复用同一个求解器实例，让未变化配方的评估缓存跨轮次与跨扫描生效。
+        return recipeSolver.solve(
+                data.recipes(), context, evaluatorRegistry, solveSettings, this::isCancelled);
     }
 
     /**
@@ -1203,6 +1525,10 @@ public final class ScanPipeline {
      */
     public void writeCancelledReport(@Nullable ScanDiagnostics telemetry) {
         PipelineSnapshot snapshot = stashedSnapshot.getAndSet(null);
+        if (snapshot == null) {
+            // applyStashed 已经消费掉暂存快照时，仍用最近一次快照保留物品/配方统计。
+            snapshot = lastSnapshotForReport;
+        }
         writePartialReport(snapshot, telemetry, true, "扫描已取消");
     }
 
@@ -1219,6 +1545,9 @@ public final class ScanPipeline {
             LOGGER.warn("SudoersEMC 扫描未完成，生成部分诊断报告：{}", detail);
         }
         PipelineSnapshot snapshot = stashedSnapshot.getAndSet(null);
+        if (snapshot == null) {
+            snapshot = lastSnapshotForReport;
+        }
         writePartialReport(snapshot, telemetry, false, "扫描失败");
     }
 
@@ -1345,18 +1674,16 @@ public final class ScanPipeline {
     }
 
     /**
-     * 计算扫描指纹：物品 id、配方 id 升序摘要；标签、配置与基线通道本轮为空。
+     * 计算扫描指纹：物品/配方内容、标签、配置与外部基线五个通道全部参与。
+     *
+     * <p>配置与基线来源在读取失败时退化为固定错误标记，不会阻止扫描完成。</p>
      */
-    private static ScanFingerprint fingerprint(PipelineSnapshot snapshot) {
-        List<String> itemIds = new ArrayList<>(snapshot.items().size());
-        for (ItemSnapshot item : snapshot.items()) {
-            itemIds.add(item.registryId().toString());
-        }
-        List<String> recipeIds = new ArrayList<>(snapshot.recipes().size());
-        for (RecipeSnapshot recipe : snapshot.recipes()) {
-            recipeIds.add(recipe.id().toString());
-        }
-        return ScanFingerprint.of(itemIds, recipeIds, List.of(), List.of(), List.of());
+    private ScanFingerprint fingerprint(PipelineSnapshot snapshot) {
+        return fingerprintFor(
+                snapshot.items(),
+                snapshot.recipes(),
+                safeFingerprintEntries(configFingerprintSupplier, "config"),
+                safeFingerprintEntries(baselineFingerprintSupplier, "baseline"));
     }
 
 

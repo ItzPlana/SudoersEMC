@@ -112,4 +112,17 @@ class ScanFingerprintTest {
         assertEquals(ScanFingerprint.hash(List.of("config=1")), fingerprint.configFingerprint());
         assertEquals(ScanFingerprint.hash(List.of("baseline=2")), fingerprint.baselineFingerprint());
     }
+
+    @Test
+    void changedChannelsReportsOnlyDifferentFields() {
+        ScanFingerprint base = new ScanFingerprint(
+                "items-1", "recipes-1", "tags-1", "config-1", "baseline-1");
+
+        assertEquals(List.of(), base.changedChannels(
+                new ScanFingerprint("items-1", "recipes-1", "tags-1", "config-1", "baseline-1")));
+        assertEquals(List.of("item", "config"), base.changedChannels(
+                new ScanFingerprint("items-2", "recipes-1", "tags-1", "config-2", "baseline-1")));
+        assertEquals(List.of("item", "recipe", "tag", "config", "baseline"),
+                base.changedChannels(null), "null 指纹视为五通道全部变化");
+    }
 }

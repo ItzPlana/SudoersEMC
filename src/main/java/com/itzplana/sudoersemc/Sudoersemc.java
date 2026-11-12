@@ -27,10 +27,13 @@ import com.itzplana.sudoersemc.storage.QuarantinedDropsStore;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
 import com.itzplana.sudoersemc.task.AutoScanPolicy;
 import com.itzplana.sudoersemc.task.BatchProcessor;
+import com.itzplana.sudoersemc.task.ScanCancellation;
 import com.itzplana.sudoersemc.task.ScanDiagnostics;
+import com.itzplana.sudoersemc.task.ScanFingerprint;
 import com.itzplana.sudoersemc.task.ScanManager;
 import com.itzplana.sudoersemc.task.ScanPhase;
 import com.mojang.logging.LogUtils;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -400,7 +403,9 @@ public final class Sudoersemc {
                     Math.max(1, SudoersemcConfig.RECIPE_MAX_RECIPE_PASSES.get()),
                     SudoersemcConfig.RECIPE_ALLOW_RECIPE_VALUE_INCREASE.get(),
                     Math.max(0L, SudoersemcConfig.FALLBACK_MIN_EMC.get()),
-                    SolveSettings.DEFAULT_MAX_ALTERNATIVE_COSTS);
+                    SolveSettings.DEFAULT_MAX_ALTERNATIVE_COSTS,
+                    SudoersemcConfig.parseRecipeSelectionStrategy(
+                            SudoersemcConfig.RECIPE_SELECTION_STRATEGY.get()));
         } catch (RuntimeException e) {
             LOGGER.warn("SudoersEMC 无法读取配方求解配置，使用默认值", e);
             return SolveSettings.defaults();
@@ -433,6 +438,8 @@ public final class Sudoersemc {
                 newSolveSettings);
         pipeline.setEmcProvider(OptionalIntegrationManager.provider().orElse(null));
         pipeline.setQuarantinedDropsStore(quarantineStore);
+        pipeline.setConfigFingerprintSupplier(SudoersemcConfig::scanFingerprintEntries);
+        pipeline.setBaselineFingerprintSupplier(Sudoersemc::baselineFingerprintEntries);
 
         OverflowScope overflowScope = OverflowScope.OWNED_ONLY;
         boolean allowProjectEFileRewrite = false;
@@ -506,6 +513,9 @@ public final class Sudoersemc {
         BatchProcessor processor = new BatchProcessor(Math.max(1, itemsPerTick), adaptive);
         ScanDiagnostics diagnostics = new ScanDiagnostics();
         pipeline.setDiagnostics(diagnostics);
+        // 调度器与管线共享同一个取消令牌：cancel() 后采集/求解/应用循环都能在检查点提前退出。
+        ScanCancellation cancellation = new ScanCancellation();
+        pipeline.setCancellationCheck(cancellation::isRequested);
         return new ScanManager(
                 processor,
                 () -> collectSnapshot(pipeline),
@@ -518,7 +528,32 @@ public final class Sudoersemc {
                     } else if (phase == ScanPhase.FAILED) {
                         pipeline.writeFailedReport(progress.detail(), telemetry);
                     }
-                });
+                },
+                cancellation);
+    }
+
+    /**
+     * 构造外部基线的指纹条目：ProjectE 手动 EMC 物品值与手动标签。
+     *
+     * <p>文件缺失或未安装 ProjectE 时返回空列表；读取失败按空处理，绝不影响启动。</p>
+     */
+    private static List<String> baselineFingerprintEntries() {
+        try {
+            List<String> entries = new ArrayList<>();
+            var manualValues = OptionalIntegrationManager.manualValues();
+            for (Map.Entry<com.itzplana.sudoersemc.core.ItemKey, Long> entry
+                    : manualValues.manualValues().entrySet()) {
+                entries.add("item:" + entry.getKey() + "=" + entry.getValue());
+            }
+            for (var tagId : manualValues.manualTagIds()) {
+                entries.add("tag:#" + tagId);
+            }
+            entries.add("projecte=" + OptionalIntegrationManager.isProjectEAvailable());
+            return entries;
+        } catch (RuntimeException failure) {
+            LOGGER.warn("SudoersEMC 读取外部基线指纹失败，按空基线处理", failure);
+            return List.of();
+        }
     }
 
     /**
@@ -630,21 +665,41 @@ public final class Sudoersemc {
         long lastScanEpochMillis = stateStore == null ? 0L : stateStore.lastScanEpochMillis();
         int generatedEntryCount = store == null ? 0 : store.size();
 
+        boolean fingerprintsMatch = false;
+        if (enabled && !alwaysRescan && lastScanEpochMillis > 0L && generatedEntryCount > 0
+                && stateStore != null && scanPipeline != null) {
+            ScanFingerprint current = null;
+            try {
+                current = scanPipeline.collectFingerprint(event.getServer());
+            } catch (RuntimeException failure) {
+                // 指纹计算失败一律退化为“需要扫描”，绝不阻止服务器启动。
+                LOGGER.warn("SudoersEMC 启动指纹计算异常，退化为需要扫描", failure);
+            }
+            if (current != null) {
+                ScanStateStore.FingerprintComparison comparison = stateStore.compare(current);
+                fingerprintsMatch = comparison.matches();
+                if (!fingerprintsMatch) {
+                    LOGGER.info("SudoersEMC 扫描输入已变化，通道={}",
+                            comparison.changedChannels());
+                }
+            }
+        }
+
         if (!enabled) {
             LOGGER.info("SudoersEMC 自动扫描已禁用（general.enabled=false）");
         } else if (AutoScanPolicy.shouldScan(
-                enabled, alwaysRescan, lastScanEpochMillis, generatedEntryCount)) {
+                enabled, alwaysRescan, lastScanEpochMillis, generatedEntryCount, fingerprintsMatch)) {
             ScanManager manager = scanManager;
             if (manager == null) {
                 LOGGER.warn("SudoersEMC 自动扫描已请求，但扫描调度器尚未就绪（common setup 未完成）");
             } else if (manager.requestScan()) {
-                LOGGER.info("SudoersEMC 自动扫描已请求（alwaysRescan={}，上次扫描={}，已生成条目={}）",
-                        alwaysRescan, lastScanEpochMillis, generatedEntryCount);
+                LOGGER.info("SudoersEMC 自动扫描已请求（alwaysRescan={}，上次扫描={}，已生成条目={}，指纹一致={}）",
+                        alwaysRescan, lastScanEpochMillis, generatedEntryCount, fingerprintsMatch);
             } else {
                 LOGGER.info("SudoersEMC 自动扫描被拒绝：已有扫描正在运行");
             }
         } else {
-            LOGGER.info("SudoersEMC 自动扫描被拒绝（已有缓存状态：上次扫描={}，已生成条目={}）",
+            LOGGER.info("SudoersEMC 自动扫描被拒绝（输入指纹未变化且已有缓存：上次扫描={}，已生成条目={}）",
                     lastScanEpochMillis, generatedEntryCount);
         }
 

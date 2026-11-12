@@ -301,4 +301,51 @@ class ScanManagerTest {
         assertDoesNotThrow(manager::tick);
         assertEquals(ScanPhase.FAILED, manager.progress().phase());
     }
+
+    @Test
+    void sharedCancellationTokenIsVisibleToPipelineAndClearedAfterObservation() {
+        ScanCancellation cancellation = new ScanCancellation();
+        AtomicInteger collectorSawCancellation = new AtomicInteger();
+        ScanManager manager = new ScanManager(new BatchProcessor(1, false),
+                () -> {
+                    if (cancellation.isRequested()) {
+                        collectorSawCancellation.incrementAndGet();
+                    }
+                    return data(2, 2);
+                },
+                snapshot -> { }, TICK_BUDGET_NANOS, new ScanDiagnostics(), null, cancellation);
+
+        manager.requestScan();
+        cancellation.request();
+        assertTrue(manager.isCancelRequested());
+
+        manager.tick();
+
+        assertEquals(ScanPhase.CANCELLED, manager.progress().phase());
+        assertEquals(0, collectorSawCancellation.get(), "tick 开头的取消检查必须优先于采集");
+        assertFalse(manager.isCancelRequested(), "令牌在终止后清除，下一次扫描可复用");
+
+        manager.requestScan();
+        manager.tick();
+        assertEquals(0, collectorSawCancellation.get(), "新扫描开始后取消信号不应残留");
+    }
+
+    @Test
+    void cancellationRequestedInsideCollectorIsObservedOnNextTick() {
+        ScanCancellation cancellation = new ScanCancellation();
+        ScanManager manager = new ScanManager(new BatchProcessor(1, false),
+                () -> {
+                    cancellation.request();
+                    return data(5, 5);
+                },
+                snapshot -> { }, TICK_BUDGET_NANOS, new ScanDiagnostics(), null, cancellation);
+
+        manager.requestScan();
+        manager.tick();
+        assertTrue(manager.isRunning(), "采集回调本身完成，进度仍在采集阶段");
+
+        manager.tick();
+        assertEquals(ScanPhase.CANCELLED, manager.progress().phase(),
+                "管线内部请求的取消信号应在下一次 tick 被调度器观察");
+    }
 }
