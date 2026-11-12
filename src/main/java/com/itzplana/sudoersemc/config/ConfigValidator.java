@@ -15,8 +15,8 @@ import java.util.function.Supplier;
  * {@link ConfigValidationResult#errors()} 表示必须拒绝的配置，调用方应保留旧组件；
  * {@link ConfigValidationResult#warnings()} 表示配置可用但存在风险或行为冲突。</p>
  *
- * <p>溢出保护关闭时，只跳过与重置区间、阈值、桶数量相关的范围校验；
- * {@code maxNbtVariantsPerItem} 与 {@code maxAllowedDropRatio} 仍然始终校验。</p>
+ * <p>溢出保护关闭时，仍会校验重置区间、阈值、桶数量与权重上限等不变量。关闭只影响
+ * 运行时是否执行重置，并额外产生一条警告；它绝不会放宽配置本身的合法性要求。</p>
  */
 public final class ConfigValidator {
 
@@ -34,7 +34,8 @@ public final class ConfigValidator {
      *
      * @param itemsPerTick             服务端线程每 tick 最多处理的物品数
      * @param maxRecipePasses          单次扫描的配方求解遍数上限
-     * @param minEmc                   生成 EMC 值的下限，允许为 0
+     * @param minEmc                   生成 EMC 值的下限，允许为 0；当前阶段来自
+     *                                 {@code SolveSettings.DEFAULT_MINIMUM_EMC}，不是配置键
      * @param overflowEnabled          是否启用溢出保护
      * @param overflowThreshold        严格大于该值的 EMC 会被重置
      * @param resetMin                 重置区间下界（含）
@@ -145,12 +146,12 @@ public final class ConfigValidator {
     }
 
     /**
-     * 收集溢出区间相关的跨字段错误；溢出保护关闭时跳过全部范围检查。
+     * 收集溢出区间相关的跨字段错误。
+     *
+     * <p>{@code OverflowProtection.Settings} 即使 {@code enabled=false} 也会构造采样器并强制
+     * 这些不变量，因此校验器不能因开关关闭而放行非法区间，否则非法配置会在组件重建时抛异常。</p>
      */
     private static void appendOverflowErrors(Values values, List<String> errors) {
-        if (!values.overflowEnabled()) {
-            return;
-        }
         if (values.resetMin() < 1L) {
             errors.add("overflow.resetMin 必须 >= 1，当前为 " + values.resetMin());
         }

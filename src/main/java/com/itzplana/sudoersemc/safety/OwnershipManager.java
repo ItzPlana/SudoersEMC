@@ -94,7 +94,8 @@ public final class OwnershipManager {
      * 找出所有“记录为 owned 且当前值与记录值不同”的物品。
      *
      * <p>结果按 {@link ItemKey} 的自然顺序升序排列。只比较 {@code owned=true} 的记录；
-     * 读取器不可用或存储异常时返回空列表，绝不抛出异常。</p>
+     * 读取器不可用、存储异常或当前值未知（{@link EmcValueReader#currentValue(ItemKey)}
+     * 按契约返回 {@code 0}）时都不会把物品判为漂移，绝不抛出异常。</p>
      */
     public List<ItemKey> detectExternalModifications() {
         if (!isReaderAvailable()) {
@@ -104,23 +105,7 @@ public final class OwnershipManager {
         if (snapshot == null) {
             return List.of();
         }
-        List<ItemKey> drifted = new ArrayList<>();
-        for (Map.Entry<ItemKey, GeneratedEmcEntry> mapEntry : snapshot.entrySet()) {
-            GeneratedEmcEntry entry = mapEntry.getValue();
-            if (entry == null || !entry.owned()) {
-                continue;
-            }
-            ItemKey item = entry.item() == null ? mapEntry.getKey() : entry.item();
-            if (item == null) {
-                continue;
-            }
-            Long current = readCurrentValue(item);
-            if (current != null && current.longValue() != entry.value()) {
-                drifted.add(item);
-            }
-        }
-        drifted.sort(null);
-        return List.copyOf(drifted);
+        return List.copyOf(collectExternalModifications(snapshot).keySet());
     }
 
     /**
@@ -154,8 +139,9 @@ public final class OwnershipManager {
     /**
      * 把所有被外部改动过的条目迁移出所有权。
      *
-     * <p>读取器不可用时是安全的空操作：返回 {@code 0} 且不修改任何记录。每个条目独立处理，
-     * 单个写入失败只影响该条目，异常不会向外传播。</p>
+     * <p>读取器不可用时是安全的空操作：返回 {@code 0} 且不修改任何记录。整个迁移只读取一次
+     * 存储快照，再逐个条目写入；单个写入失败只影响该条目，异常不会向外传播。当前值未知的
+     * 条目不会被释放。</p>
      *
      * @return 成功释放所有权的条目数量
      */
@@ -163,10 +149,18 @@ public final class OwnershipManager {
         if (!isReaderAvailable()) {
             return 0;
         }
+        Map<ItemKey, GeneratedEmcEntry> snapshot = safeSnapshot();
+        if (snapshot == null) {
+            return 0;
+        }
         int released = 0;
-        for (ItemKey item : detectExternalModifications()) {
-            if (releaseOwnership(item)) {
-                released++;
+        for (GeneratedEmcEntry entry : collectExternalModifications(snapshot).values()) {
+            try {
+                if (sink.stage(entry.withOwned(false))) {
+                    released++;
+                }
+            } catch (RuntimeException e) {
+                // 单个条目的写入失败不能阻止其它条目迁移。
             }
         }
         return released;
@@ -202,12 +196,38 @@ public final class OwnershipManager {
             return OwnershipState.NOT_OWNED;
         }
         Long current = readCurrentValue(item);
-        if (current == null) {
+        if (current == null || current.longValue() <= 0L) {
             return OwnershipState.UNKNOWN;
         }
         return current.longValue() == entry.value()
                 ? OwnershipState.OWNED_BY_US
                 : OwnershipState.EXTERNALLY_MODIFIED;
+    }
+
+    /**
+     * 收集当前值与记录值不同的已拥有条目，按 {@link ItemKey} 升序排列。
+     *
+     * <p>读取器以 {@code 0} 表示“无法确定”，因此 {@code <= 0} 的当前值一律视为未知，
+     * 绝不能据此判定外部修改。</p>
+     */
+    private Map<ItemKey, GeneratedEmcEntry> collectExternalModifications(
+            Map<ItemKey, GeneratedEmcEntry> snapshot) {
+        Map<ItemKey, GeneratedEmcEntry> drifted = new TreeMap<>();
+        for (Map.Entry<ItemKey, GeneratedEmcEntry> mapEntry : snapshot.entrySet()) {
+            GeneratedEmcEntry entry = mapEntry.getValue();
+            if (entry == null || !entry.owned()) {
+                continue;
+            }
+            ItemKey item = entry.item() == null ? mapEntry.getKey() : entry.item();
+            if (item == null) {
+                continue;
+            }
+            Long current = readCurrentValue(item);
+            if (current != null && current.longValue() > 0L && current.longValue() != entry.value()) {
+                drifted.put(item, entry);
+            }
+        }
+        return drifted;
     }
 
     /**

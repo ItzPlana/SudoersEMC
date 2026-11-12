@@ -11,7 +11,9 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.List;
+import java.util.stream.Stream;
 import net.minecraft.resources.ResourceLocation;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -158,5 +160,209 @@ class QuarantinedDropsStoreTest {
         assertDoesNotThrow(() -> store.record(null));
         assertEquals(0, store.size());
         assertFalse(store.isDirty());
+    }
+
+    @Test
+    void emptyFileIsBackedUpAndRewritten() throws IOException {
+        Path file = tempDir.resolve(QuarantinedDropsStore.FILE_NAME);
+        Files.writeString(file, "", StandardCharsets.UTF_8);
+
+        QuarantinedDropsStore store = new QuarantinedDropsStore(file);
+        assertDoesNotThrow(store::load);
+        assertEquals(0, store.size());
+        assertFalse(store.isDirty());
+
+        store.record(drop(STONE, 1000L, 10L, 1L));
+        store.save();
+
+        assertFalse(store.isDirty());
+        assertTrue(Files.readString(file, StandardCharsets.UTF_8).contains("\"schemaVersion\": 1"));
+        assertEquals(1L, backupCount(), "首次重写空文件前也应生成 .bak");
+    }
+
+    @Test
+    void lowerSchemaVersionIsLoadedAndRewritten() throws IOException {
+        Path file = tempDir.resolve(QuarantinedDropsStore.FILE_NAME);
+        Files.writeString(file, """
+                {
+                  "schemaVersion": 0,
+                  "entries": [
+                    {
+                      "item": "minecraft:stone",
+                      "variant": null,
+                      "previousValue": 1000,
+                      "proposedValue": 10,
+                      "dropRatio": 0.99,
+                      "reason": "test",
+                      "timestamp": 123,
+                      "approved": false
+                    }
+                  ]
+                }
+                """, StandardCharsets.UTF_8);
+
+        QuarantinedDropsStore store = new QuarantinedDropsStore(file);
+        store.load();
+
+        assertEquals(1, store.size());
+        assertEquals(123L, store.entries().get(0).timestamp());
+
+        store.save();
+
+        String json = Files.readString(file, StandardCharsets.UTF_8);
+        assertTrue(json.contains("\"schemaVersion\": 1"), "保存时应升级到当前 schemaVersion");
+        assertEquals(1L, backupCount());
+    }
+
+    @Test
+    void missingSchemaVersionIsTreatedAsLegacy() throws IOException {
+        Path file = tempDir.resolve(QuarantinedDropsStore.FILE_NAME);
+        Files.writeString(file, """
+                {
+                  "entries": [
+                    {
+                      "item": "minecraft:dirt",
+                      "variant": null,
+                      "previousValue": 500,
+                      "proposedValue": 5,
+                      "dropRatio": 0.99,
+                      "reason": "test",
+                      "timestamp": 456,
+                      "approved": true
+                    }
+                  ]
+                }
+                """, StandardCharsets.UTF_8);
+
+        QuarantinedDropsStore store = new QuarantinedDropsStore(file);
+        store.load();
+
+        assertEquals(1, store.size());
+        assertTrue(store.entries().get(0).approved());
+
+        store.save();
+
+        assertTrue(Files.readString(file, StandardCharsets.UTF_8).contains("\"schemaVersion\": 1"));
+        assertEquals(1L, backupCount());
+    }
+
+    @Test
+    void unknownHigherSchemaVersionIsNeverDestroyed() throws IOException {
+        Path file = tempDir.resolve(QuarantinedDropsStore.FILE_NAME);
+        String content = """
+                {
+                  "schemaVersion": 99,
+                  "entries": [
+                    {
+                      "item": "minecraft:stone",
+                      "variant": null,
+                      "previousValue": 1000,
+                      "proposedValue": 10,
+                      "dropRatio": 0.99,
+                      "reason": "test",
+                      "timestamp": 1,
+                      "approved": false
+                    }
+                  ]
+                }
+                """;
+        Files.writeString(file, content, StandardCharsets.UTF_8);
+
+        QuarantinedDropsStore store = new QuarantinedDropsStore(file);
+        assertDoesNotThrow(store::load);
+        assertEquals(0, store.size());
+
+        store.record(drop(STONE, 1000L, 10L, 2L));
+        assertDoesNotThrow(store::save);
+
+        assertEquals(content, Files.readString(file, StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void failedWriteKeepsDirtyAndRetriesWithBackup() throws IOException {
+        Path file = tempDir.resolve(QuarantinedDropsStore.FILE_NAME);
+        QuarantinedDropsStore store = new QuarantinedDropsStore(file);
+        store.record(drop(STONE, 100_000L, 100L, 1L));
+        store.save();
+        assertFalse(store.isDirty());
+
+        store.load(); // 文件已存在：下一次重写前必须生成 .bak
+        store.record(drop(DIRT, 50_000L, 50L, 2L));
+
+        blockTempFile(file);
+        store.save();
+        assertTrue(store.isDirty(), "写入失败后必须保留脏标记，saveIfDirty() 才能重试");
+
+        unblockTempFile(file);
+        Files.writeString(file, "\n/* external-change-marker */", StandardCharsets.UTF_8,
+                StandardOpenOption.APPEND);
+
+        store.saveIfDirty();
+
+        assertFalse(store.isDirty());
+        QuarantinedDropsStore reloaded = new QuarantinedDropsStore(file);
+        reloaded.load();
+        assertEquals(2, reloaded.size());
+        assertTrue(anyBackupContains("external-change-marker"),
+                "首次写入失败后，下一次成功写入仍必须重新生成 .bak");
+    }
+
+    @Test
+    void oversizedFileIsTrimmedOnLoad() throws IOException {
+        Path file = tempDir.resolve(QuarantinedDropsStore.FILE_NAME);
+        int total = QuarantinedDropsStore.DEFAULT_MAX_ENTRIES + 10;
+        StringBuilder json = new StringBuilder("{\"schemaVersion\":1,\"entries\":[");
+        for (int i = 0; i < total; i++) {
+            if (i > 0) {
+                json.append(',');
+            }
+            json.append("{\"item\":\"minecraft:item_").append(i)
+                    .append("\",\"variant\":null,\"previousValue\":1000,\"proposedValue\":10,")
+                    .append("\"dropRatio\":0.99,\"reason\":\"test\",\"timestamp\":").append(i)
+                    .append(",\"approved\":false}");
+        }
+        json.append("]}");
+        Files.writeString(file, json.toString(), StandardCharsets.UTF_8);
+
+        QuarantinedDropsStore store = new QuarantinedDropsStore(file);
+        store.load();
+
+        assertEquals(QuarantinedDropsStore.DEFAULT_MAX_ENTRIES, store.size());
+        List<QuarantinedDropsStore.QuarantinedDrop> entries = store.entries();
+        assertEquals(10L, entries.stream()
+                .mapToLong(QuarantinedDropsStore.QuarantinedDrop::timestamp)
+                .min()
+                .orElseThrow(), "应按时间戳淘汰最旧的 10 条记录");
+    }
+
+    private long backupCount() throws IOException {
+        try (Stream<Path> files = Files.list(tempDir)) {
+            return files.filter(path -> path.getFileName().toString().endsWith(".bak")).count();
+        }
+    }
+
+    private boolean anyBackupContains(String marker) throws IOException {
+        List<Path> backups;
+        try (Stream<Path> files = Files.list(tempDir)) {
+            backups = files.filter(path -> path.getFileName().toString().endsWith(".bak")).toList();
+        }
+        for (Path backup : backups) {
+            if (Files.readString(backup, StandardCharsets.UTF_8).contains(marker)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void blockTempFile(Path file) throws IOException {
+        Path temp = file.resolveSibling(file.getFileName() + ".tmp");
+        Files.createDirectories(temp);
+        Files.writeString(temp.resolve("blocker"), "x", StandardCharsets.UTF_8);
+    }
+
+    private static void unblockTempFile(Path file) throws IOException {
+        Path temp = file.resolveSibling(file.getFileName() + ".tmp");
+        Files.deleteIfExists(temp.resolve("blocker"));
+        Files.deleteIfExists(temp);
     }
 }
