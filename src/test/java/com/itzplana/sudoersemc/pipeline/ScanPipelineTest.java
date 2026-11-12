@@ -1897,7 +1897,7 @@ class ScanPipelineTest {
         ScanFingerprint previous = ScanFingerprint.of(
                 List.of("item-before"), List.of("recipe-before"), List.of("tag-before"),
                 List.of("config-before"), List.of("baseline-before"));
-        stateStore.update(previous, 123L, 2, 1);
+        stateStore.update(previous, 123L, 2, 1, 2);
         stateStore.save();
         assertFalse(stateStore.isDirty());
 
@@ -1912,6 +1912,7 @@ class ScanPipelineTest {
         assertTrue(stateStore.fingerprint().isEmpty(), "取消后不得保留可匹配的旧指纹");
         assertEquals(0, stateStore.lastSolvedCount());
         assertEquals(0, stateStore.lastUnresolvedCount());
+        assertEquals(0, stateStore.lastSolverRounds(), "取消后求解轮数也必须归零");
         String report = Files.readString(reportManager.reportFile());
         assertTrue(report.contains("部分报告（扫描已取消）"));
         assertTrue(report.lines().anyMatch(line -> line.contains("scanCancelled: 1")));

@@ -37,7 +37,7 @@ SudoersEMC 是一个**独立实现**的 Minecraft Forge 1.20.1 模组。它扫�
 
 ## 当前状态
 
-项目按阶段推进。当前代码基线为 Phase 23 实现提交 `dfe2dd3`（分支 `phase-23-scan-lifecycle`），**545 个单元测试通过**（0 failures / 0 errors / 0 skipped）；Phase 18–23 已完成，Goety 与 NBT 变体的真实环境验证、以及 Phase 23 取消路径的实机触发仍待进行。
+项目按阶段推进。当前代码基线为 Phase 23 实现提交 `dfe2dd3`（分支 `phase-23-scan-lifecycle`），**737 个单元测试通过**（0 failures / 0 errors / 0 skipped）；Phase 18–23 已完成，Goety 与 NBT 变体的真实环境验证、以及 Phase 23 取消路径的实机触发仍待进行。
 
 | 阶段       | 内容                                                                                                                                  | 状态                                        |
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
@@ -244,15 +244,15 @@ ProjectE 原生值与 `custom_emc.json` 中的手动值不会进入这条候选�
 
 所有子命令都注册在 `/sudoemc` 下，并要求权限等级 2（管理员）。
 
-| 命令                      | 作用                                           | 说明                                                                                 |
-| ------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------------ |
-| `/sudoemc status`         | 查看扫描阶段、进度、上次耗时与上次结果         | 只读内存进度与扫描状态文件                                                           |
-| `/sudoemc rescan-all`     | 请求一次全量重新扫描                           | 已有扫描进行中时返回失败提示；不受启动指纹跳过影响                                   |
-| `/sudoemc cancel`         | 请求取消当前扫描                               | 采集、求解与应用循环在检查点响应；取消时不更新扫描指纹，报告标记为部分报告           |
-| `/sudoemc reload`         | 按当前已加载的配置重建运行时组件               | 扫描中延后到扫描结束；校验失败时保留上一份有效配置                                   |
-| `/sudoemc report`         | 读取 `config/sudoersemc/last_report.txt`       | 尚无报告时提示先执行一次扫描                                                         |
-| `/sudoemc explain <item>` | 解释某个已生成条目的来源、配方、归属与备选成本 | 只支持无 NBT 变体的普通条目；最多显示 5 条备选成本；ProjectE 原生值/手动值会单独提示 |
-| `/sudoemc approve <item>` | 批准该物品当前的隔离降价记录                   | 只标记并落盘，不修改 EMC、不触发重扫；仅支持普通物品 id（不支持 NBT 变体）           |
+| 命令                      | 作用                                           | 说明                                                                                           |
+| ------------------------- | ---------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `/sudoemc status`         | 查看扫描阶段、进度、上次耗时与上次结果         | 只读内存进度与扫描状态文件                                                                     |
+| `/sudoemc rescan-all`     | 请求一次全量重新扫描                           | 已有扫描进行中时返回失败提示；不受启动指纹跳过影响                                             |
+| `/sudoemc cancel`         | 请求取消当前扫描                               | 采集、求解与应用循环在检查点响应；取消时使扫描指纹失效（下次启动必然重扫），报告标记为部分报告 |
+| `/sudoemc reload`         | 按当前已加载的配置重建运行时组件               | 扫描中延后到扫描结束；校验失败时保留上一份有效配置                                             |
+| `/sudoemc report`         | 读取 `config/sudoersemc/last_report.txt`       | 尚无报告时提示先执行一次扫描                                                                   |
+| `/sudoemc explain <item>` | 解释某个已生成条目的来源、配方、归属与备选成本 | 只支持无 NBT 变体的普通条目；最多显示 5 条备选成本；ProjectE 原生值/手动值会单独提示           |
+| `/sudoemc approve <item>` | 批准该物品当前的隔离降价记录                   | 只标记并落盘，不修改 EMC、不触发重扫；仅支持普通物品 id（不支持 NBT 变体）                     |
 
 ---
 
@@ -342,7 +342,7 @@ ProjectE 原生值与 `custom_emc.json` 中的手动值不会进入这条候选�
 | `config/sudoersemc/last_report.txt`        | 每轮扫描后写出的诊断报告；Phase 22 起包含配方扫描统计与失败明细、tick 耗时（最大/平均/P95）、峰值堆与报告时堆内存；Phase 23 起另含求解轮次与 `solverCacheHits` / `solverCacheMisses`；取消/失败时写出标记为部分报告的版本 |
 | `config/ProjectE/custom_emc.json`          | ProjectE 手动配置；**默认只读**；`entire_custom_emc` + `allowProjectEFileRewrite` 双开关开启时会被受控改写并备份为 `custom_emc.json.<时间戳>.bak`                                                                         |
 
-本模组自有 JSON 与 `last_report.txt` 的写入采用「临时文件 + 原子替换」；ProjectE 文件改写同样先备份再原子替换。加载失败只告警不崩溃，遇到更高 schema 版本时拒绝覆盖。`scan_state.json` 的五通道指纹参与启动跳过判断；取消的扫描不会更新它。隔离降价会写入 `quarantined_drops.json`，但审批只改变标记，不会自动应用数值；干跑模式不产生隔离文件。
+本模组自有 JSON 与 `last_report.txt` 的写入采用「临时文件 + 原子替换」；ProjectE 文件改写同样先备份再原子替换。加载失败只告警不崩溃，遇到更高 schema 版本时拒绝覆盖。`scan_state.json` 的五通道指纹参与启动跳过判断；取消或失败的扫描会显式使其失效，确保下一次启动必然重扫。隔离降价会写入 `quarantined_drops.json`，但审批只改变标记，不会自动应用数值；干跑模式不产生隔离文件。
 
 ---
 
@@ -353,7 +353,7 @@ ProjectE 原生值与 `custom_emc.json` 中的手动值不会进入这条候选�
 1. **查询** — 通过 `IEMCProxy` 判断物品是否已有 EMC；已有值（SudoersEMC 自有条目除外）会被视为已定价。
 2. **计算** — 从配方、标签、稀有度、层级与兜底规则推导候选值；标签与稀有度取自实际物品快照（`getTags()` / `getRarity()`）。同一物品有多个配方时，按多轮求解（含循环检测）取最低的有效确定性成本，成本相同时按 `[recipe] selectionStrategy` 取舍；Phase 23 起 `RecipeSolver` 使用有界 LRU 评估缓存并在配方循环中检查取消令牌。Phase 17 起，配方输出中观测到的 NBT 会生成带 `variantHash` 的变体快照并进入同一求解流程；Phase 19/20 起空 NBT 与仅含默认 `{Damage:0}` 的标签按普通物品处理。原版配方不产生 NBT 输出，真实环境未验证。求解只读取不可变快照、在服务器线程执行，当前没有后台线程。
 3. **安全** — 对生成候选值应用降价保护（超过阈值的降价写入隔离记录并等待审批）、创造专属物品保护与溢出保护；双开关开启时另做 `custom_emc.json` 的受控文件改写。
-4. **持久化** — 把结果写入 `generated_entries.json`，并标记归属（`owned=true`）；后续扫描会先清空自有条目再重新求解，并清理不再参与定价的陈旧自有条目，使配方或标签变化能够反映到生成值上。取消的扫描不会更新 `scan_state.json` 指纹，并跳过陈旧条目清理与 `custom_emc.json` 改写。
+4. **持久化** — 把结果写入 `generated_entries.json`，并标记归属（`owned=true`）；后续扫描会先清空自有条目再重新求解，并清理不再参与定价的陈旧自有条目，使配方或标签变化能够反映到生成值上。取消或失败的扫描会让 `scan_state.json` 指纹失效，并跳过陈旧条目清理与 `custom_emc.json` 改写。
 5. **写入** — 通过 ProjectE 官方的 `@EMCMapper(priority = -1000)` 扩展点，在 ProjectE 重算 EMC 时以 `setValueBefore` 注入自有条目；手动值会被跳过。
 6. **重算** — 在服务器线程触发一次资源重载，ProjectE 随即重建 EMC 映射。
 7. **诊断** — 扫描管线把配方扫描统计、求解轮数、求解缓存命中/未命中、隔离/清理数量、tick 耗时与堆内存采样集中到 `PipelineResult.extraCounters`，扫描结束后写入 `last_report.txt`；取消或失败时由 `AbortListener` 写出部分报告，保留已采集快照的统计与终止原因标记。
@@ -370,7 +370,7 @@ ProjectE 原生值与 `custom_emc.json` 中的手动值不会进入这条候选�
 ./gradlew test
 ```
 
-测试覆盖：加权采样分布与权重重置、阈值边界、幂等性、持久化往返、损坏文件容错、schema 版本保护（含 v1→v2 兼容）、归属刷新、陈旧条目清理、`custom_emc.json` 受控改写（备份、原子替换、未知字段保留）、配置热重载决策、NBT 变体规范化（含空 NBT 与默认 `{Damage:0}`）、隔离记录存储与审批、备选成本持久化与 `explain` 输出、Goety 读取失败语义、Phase 22 的诊断报告计数器与失败明细、tick 耗时最大/平均/P95（最近秩法）、峰值堆采样、`extraCounters` 持久化、取消/失败部分报告、Phase 23 的五通道指纹与变化通道、启动跳过策略、协作式取消检查点、有界 LRU 求解缓存命中/未命中与配方选择策略（含非法值回退），以及扫描接线。当前基线共 **545 个单元测试通过**（0 failures / 0 errors / 0 skipped）。
+测试覆盖：加权采样分布与权重重置、阈值边界、幂等性、持久化往返、损坏文件容错、schema 版本保护（含 v1→v2 兼容）、归属刷新、陈旧条目清理、`custom_emc.json` 受控改写（备份、原子替换、未知字段保留）、配置热重载决策、NBT 变体规范化（含空 NBT 与默认 `{Damage:0}`）、隔离记录存储与审批、备选成本持久化与 `explain` 输出、Goety 读取失败语义、Phase 22 的诊断报告计数器与失败明细、tick 耗时最大/平均/P95（最近秩法）、峰值堆采样、`extraCounters` 持久化、取消/失败部分报告、Phase 23 的五通道指纹与变化通道、启动跳过策略、协作式取消检查点、有界 LRU 求解缓存命中/未命中与配方选择策略（含非法值回退），以及扫描接线。当前基线共 **737 个单元测试通过**（0 failures / 0 errors / 0 skipped）。
 
 ---
 
@@ -386,14 +386,14 @@ ProjectE 原生值与 `custom_emc.json` 中的手动值不会进入这条候选�
 
 ## English Summary
 
-SudoersEMC is an independent Minecraft Forge 1.20.1 mod that generates EMC values for items that ProjectE does not price. Current baseline: Phase 23 implementation commit `dfe2dd3` (branch `phase-23-scan-lifecycle`), **545 unit tests passing** (0 failures / 0 errors / 0 skipped); Phases 18–23 are complete, while live Goety and NBT-variant verification and a live cancellation trigger are still pending.
+SudoersEMC is an independent Minecraft Forge 1.20.1 mod that generates EMC values for items that ProjectE does not price. Current baseline: Phase 23 implementation commit `dfe2dd3` (branch `phase-23-scan-lifecycle`), **737 unit tests passing** (0 failures / 0 errors / 0 skipped); Phases 18–23 are complete, while live Goety and NBT-variant verification and a live cancellation trigger are still pending.
 
 - **Queries** go through ProjectE's public `IEMCProxy`.
 - **Writes** use ProjectE's official `@EMCMapper` extension point (`priority = -1000`, `setValueBefore`), never ProjectE internals.
 - **Manual values** in `custom_emc.json` are read-only by default and are always skipped during injection. Only when both `overflow.overwriteScope = entire_custom_emc` and `overflow.allowProjectEFileRewrite = true` are set does the mod rewrite entries strictly above `threshold`, after writing a timestamped backup, using atomic replacement and preserving unknown fields.
 - **Ownership** is tracked per entry; owned values are re-solved on later scans so recipe or tag changes are picked up, while values not owned by this mod stay untouched.
-- **Incremental scanning**: Phase 23 computes a five-channel input fingerprint (item registry id + rarity, full recipe content, item-tag union, pricing-config whitelist, and ProjectE manual values/tags), stores it in `scan_state.json`, and compares it at startup. With an existing cache and `alwaysRescan=false`, an unchanged fingerprint skips the scan; fingerprint calculation failures fall back to scanning. `/sudoemc rescan-all` always requests a scan. Dev-server runs covered a cold scan, an unchanged-input skip, and a config-change rescan.
-- **Scanning** advances phase by phase across server ticks and samples tick duration and heap usage at every tick boundary, but collection, solving and application still run as single server-thread calls. There is no worker thread and no true work slicing. Phase 23 adds cooperative cancellation checkpoints inside item/recipe scanning, NBT variant generation, existing-value reads, solving and apply loops; a cancelled scan does not update the fingerprint or retire stale entries, and writes a partial report. Basic scan metrics were measured on a dev server, but performance on a representative modpack has not been measured. Live cancellation was not triggered because dev-server scans finished in under one second; that path is covered by unit tests.
+- **Incremental scanning**: Phase 23 computes a five-channel input fingerprint (item registry id + rarity, full recipe content, item→tag mapping, pricing-config whitelist plus a fingerprint/pricing-semantics version salt, and ProjectE manual values/tags plus the ProjectE version), stores it in `scan_state.json`, and compares it at startup. With an existing cache and `alwaysRescan=false`, an unchanged fingerprint skips the scan; fingerprint calculation failures fall back to scanning. `/sudoemc rescan-all` always requests a scan. Dev-server runs covered a cold scan, an unchanged-input skip, and a config-change rescan.
+- **Scanning** advances phase by phase across server ticks and samples tick duration and heap usage at every tick boundary, but collection, solving and application still run as single server-thread calls. There is no worker thread and no true work slicing. Phase 23 adds cooperative cancellation checkpoints inside item/recipe scanning, NBT variant generation, existing-value reads, solving and apply loops; a cancelled or failed scan invalidates the persisted fingerprint and does not retire stale entries, and it writes a partial report. Basic scan metrics were measured on a dev server, but performance on a representative modpack has not been measured. Live cancellation was not triggered because dev-server scans finished in under one second; that path is covered by unit tests.
 - **Pricing**: multi-pass recipe solving with cycle detection and lowest-cost selection per item, a configurable tie-break strategy (`lowest_cost` default, `prefer_simple`, `stable_id`), and a bounded LRU evaluation cache (default 8192 entries keyed by recipe content, evaluation policy, evaluator registry and input-value snapshot) reused across solve rounds, plus a TAG → TIER → RARITY → FALLBACK chain using real item tags and rarity. `fallback.minEmc` is a real TOML key wired into the solver's minimum value.
 - **NBT variants**: Phase 17 wires recipe-output NBT into `VariantScanner` and `ItemSnapshot.variantHash`, and the `[nbt]` keys are effective. Phases 19/20 normalize empty NBT and the default `{Damage:0}` tag to a plain item. However, vanilla recipes produce no NBT output, so this path has not been verified in a real environment; `/sudoemc explain` still only accepts a plain item id.
 - **Overflow protection** resets generated candidate values above `999999` into a weighted range of `100..999000` with a hard per-bucket weight cap; ProjectE-native and manual values are not touched by this path.
