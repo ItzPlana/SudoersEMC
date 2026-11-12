@@ -716,6 +716,37 @@ class ScanPipelineTest {
     }
 
     @Test
+    void taggedFallbackSeedPropagatesThroughRecipeChainWithDefaultPricing() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_chain_default_tagged.json"));
+        // reviewer 原始夹具：带 forge:ores/test 标签的矿石在默认配置下应命中 TAG=128，
+        // 锭与齿轮必须得到 128/512，而不是第一轮兜底的 16/16。
+        ItemSnapshot ore = ItemSnapshot.of(ORE, false, 0L, List.of("forge:ores/test"), Rarity.COMMON);
+        PipelineSnapshot snapshot = snapshot(
+                List.of(ore, item(INGOT, 0L), item(GEAR, 0L)),
+                List.of(oreToIngotRecipe(), gearRecipe()),
+                Map.of());
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null,
+                FallbackPricing.withDefaults(PricingSettings.defaults()));
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(2, result.solvedByRecipe(), "默认配置下锭与齿轮应由配方定价");
+        assertEquals(1, result.solvedByFallback(), "矿石应由标签兜底定价");
+        GeneratedEmcEntry ingot = store.snapshotAll().get(INGOT);
+        GeneratedEmcEntry gear = store.snapshotAll().get(GEAR);
+        assertNotNull(ingot);
+        assertNotNull(gear);
+        assertEquals(PriceSource.RECIPE, ingot.source());
+        assertEquals(PriceSource.RECIPE, gear.source());
+        assertEquals(128L, ingot.value(),
+                "锭必须继承矿石的 TAG 兜底价 128，而不是第一轮兜底的 16");
+        assertEquals(512L, gear.value(),
+                "齿轮必须等于 4 倍锭值 512，而不是第一轮兜底的 16");
+    }
+
+    @Test
     void creativeExclusionBlocksRecipePricingAndDownstream() {
         GeneratedEntryStore store = new GeneratedEntryStore(
                 tempDir.resolve("generated_recipe_exclusion.json"));
