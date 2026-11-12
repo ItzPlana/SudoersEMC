@@ -14,6 +14,7 @@ import com.itzplana.sudoersemc.scanner.RecipeInput;
 import com.itzplana.sudoersemc.scanner.RecipeKind;
 import com.itzplana.sudoersemc.scanner.RecipeOutput;
 import com.itzplana.sudoersemc.scanner.RecipeSnapshot;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -118,6 +119,23 @@ class RecipeSolverTest {
     }
 
     @Test
+    void saturatingCostDoesNotWrapNegative() {
+        ItemKey expensive = item("saturating_input");
+        ItemKey product = item("saturating_product");
+        long half = Long.MAX_VALUE / 2;
+        List<RecipeSnapshot> recipes = List.of(
+                recipe("saturating_recipe", RecipeKind.SHAPED,
+                        List.of(in(expensive, 3)), List.of(out(product, 1))));
+
+        SolveResult result = SOLVER.solve(recipes, new SolveContext(Map.of(expensive, half)), REGISTRY,
+                SolveSettings.defaults());
+
+        assertEquals(Long.MAX_VALUE, result.values().get(product).longValue(),
+                "溢出应饱和到 Long.MAX_VALUE，而不是回绕成负值");
+        assertTrue(result.converged());
+    }
+
+    @Test
     void multiOutputOnlyPricesPrimaryByDefault() {
         ItemKey input = item("multi_in");
         ItemKey primary = item("multi_primary");
@@ -166,6 +184,7 @@ class RecipeSolverTest {
 
         assertTrue(result.values().isEmpty(), "输入不全时不应产出值");
         assertTrue(result.unresolvedItems().contains(unknown));
+        assertTrue(result.cyclicItems().isEmpty(), "缺失输入不应被误判为循环");
         assertEquals(1, result.unresolvedRecipeCount());
     }
 
@@ -182,8 +201,12 @@ class RecipeSolverTest {
 
         assertTrue(result.values().isEmpty(), "环内物品不应被定价");
         assertTrue(result.passesUsed() <= SolveSettings.DEFAULT_MAX_PASSES, "不得突破轮数上限");
-        assertTrue(result.unresolvedItems().contains(a), "环内物品 a 应被报告");
-        assertTrue(result.unresolvedItems().contains(b), "环内物品 b 应被报告");
+        assertEquals(Set.of(a, b), result.unresolvedItems(), "环内物品都应进入未解析诊断");
+        assertEquals(Set.of(a, b), result.cyclicItems(), "环内物品应被识别为循环");
+        assertEquals(List.of(
+                new ResourceLocation("sudoersemc", "a_from_b"),
+                new ResourceLocation("sudoersemc", "b_from_a")), result.unresolvedRecipes(),
+                "环内配方应保持未解析");
     }
 
     @Test
@@ -195,7 +218,52 @@ class RecipeSolverTest {
         SolveResult result = SOLVER.solve(recipes, SolveContext.empty(), REGISTRY, SolveSettings.defaults());
 
         assertTrue(result.values().isEmpty());
-        assertTrue(result.unresolvedItems().contains(self));
+        assertEquals(Set.of(self), result.unresolvedItems());
+        assertEquals(Set.of(self), result.cyclicItems(), "自环物品应被识别为循环");
+    }
+
+    @Test
+    void longCycleIsDetectedWithoutRecursion() {
+        int size = 4096;
+        List<ItemKey> cycle = new ArrayList<>(size);
+        for (int index = 0; index < size; index++) {
+            cycle.add(item("long_cycle_" + index));
+        }
+        List<RecipeSnapshot> recipes = new ArrayList<>(size);
+        for (int index = 0; index < size; index++) {
+            ItemKey output = cycle.get(index);
+            ItemKey input = cycle.get((index + 1) % size);
+            recipes.add(recipe("long_cycle_recipe_" + index, RecipeKind.SHAPED,
+                    List.of(in(input)), List.of(out(output, 1))));
+        }
+
+        SolveResult result = SOLVER.solve(recipes, SolveContext.empty(), REGISTRY, SolveSettings.defaults());
+
+        assertTrue(result.values().isEmpty(), "长环中的物品都不应被定价");
+        assertEquals(Set.copyOf(cycle), result.cyclicItems(), "长环中的所有物品都应被识别为循环");
+        assertEquals(Set.copyOf(cycle), result.unresolvedItems());
+        assertEquals(size, result.unresolvedRecipeCount());
+    }
+
+    @Test
+    void deepUnresolvedChainIsNotReportedAsCyclic() {
+        int size = 4096;
+        List<ItemKey> chain = new ArrayList<>(size);
+        for (int index = 0; index < size; index++) {
+            chain.add(item("deep_chain_" + index));
+        }
+        List<RecipeSnapshot> recipes = new ArrayList<>(size - 1);
+        for (int index = 0; index < size - 1; index++) {
+            recipes.add(recipe("deep_chain_recipe_" + index, RecipeKind.SHAPED,
+                    List.of(in(chain.get(index + 1))), List.of(out(chain.get(index), 1))));
+        }
+
+        SolveResult result = SOLVER.solve(recipes, SolveContext.empty(), REGISTRY, SolveSettings.defaults());
+
+        assertTrue(result.values().isEmpty(), "深链底部输入未知，不应定价");
+        assertTrue(result.cyclicItems().isEmpty(), "深链没有环，不应被误判为循环");
+        assertEquals(size, result.unresolvedItems().size());
+        assertEquals(size - 1, result.unresolvedRecipeCount());
     }
 
     @Test
@@ -235,8 +303,8 @@ class RecipeSolverTest {
                 new SolveSettings(20, false, 1L, 2));
 
         assertEquals(10L, result.values().get(product));
-        assertEquals(2, result.traces().get(product).alternativeCosts().size(),
-                "备选成本应被 maxAlternativeCostsPerItem 截断");
+        assertEquals(List.of(20L, 30L), result.traces().get(product).alternativeCosts(),
+                "备选成本应按升序截断到 maxAlternativeCostsPerItem");
     }
 
     @Test
@@ -314,14 +382,17 @@ class RecipeSolverTest {
     void zeroCostRecipeDoesNotPublishValue() {
         ItemKey freeInput = item("free_input");
         ItemKey product = item("free_product");
-        // 输入 EMC 为 1，输出 1 个，最小 EMC 为 0 → 结果为 1，仍然可定价
+        // 输入 EMC 为 1、输出 2 个 → 单位成本 1/2 向下取整为 0，不应发布
         List<RecipeSnapshot> recipes = List.of(
-                recipe("free_recipe", RecipeKind.FURNACE, List.of(in(freeInput)), List.of(out(product, 1))));
+                recipe("free_recipe", RecipeKind.FURNACE, List.of(in(freeInput)), List.of(out(product, 2))));
 
         SolveResult zeroMinimum = SOLVER.solve(recipes, new SolveContext(Map.of(freeInput, 1L)), REGISTRY,
                 new SolveSettings(20, false, 0L, 8));
 
-        assertEquals(1L, zeroMinimum.values().get(product), "成本为 1 时仍应定价为 1");
+        assertNull(zeroMinimum.values().get(product), "1 / 2 向下取整为 0，不应发布");
+        assertNull(zeroMinimum.traces().get(product), "不应为零成本物品生成轨迹");
+        assertTrue(zeroMinimum.unresolvedItems().contains(product), "零成本目标应进入未解析诊断");
+        assertEquals(1, zeroMinimum.unresolvedRecipeCount());
     }
 
     @Test
@@ -349,15 +420,52 @@ class RecipeSolverTest {
                 recipe("r1", RecipeKind.SHAPED, List.of(in(a)), List.of(out(x, 1))),
                 recipe("r2", RecipeKind.SHAPED, List.of(in(b)), List.of(out(y, 1))),
                 recipe("r3", RecipeKind.SHAPED, List.of(in(x, 2), in(y)), List.of(out(a, 1))));
+        List<RecipeSnapshot> reversed = List.of(recipes.get(2), recipes.get(1), recipes.get(0));
 
         SolveResult first = SOLVER.solve(recipes, new SolveContext(Map.of(b, 7L)), REGISTRY,
                 SolveSettings.defaults());
-        SolveResult second = SOLVER.solve(recipes, new SolveContext(Map.of(b, 7L)), REGISTRY,
+        SolveResult second = SOLVER.solve(reversed, new SolveContext(Map.of(b, 7L)), REGISTRY,
                 SolveSettings.defaults());
 
-        assertEquals(first.values(), second.values());
+        assertEquals(first.values(), second.values(), "结果不应依赖配方输入顺序");
         assertEquals(first.passesUsed(), second.passesUsed());
         assertEquals(first.converged(), second.converged());
+        assertEquals(first.traces(), second.traces(), "轨迹（含 recipeId/pass）也应一致");
+        assertEquals(first.unresolvedItems(), second.unresolvedItems());
+        assertEquals(first.unresolvedRecipes(), second.unresolvedRecipes());
+        assertEquals(first.cyclicItems(), second.cyclicItems());
+        assertEquals(first.recipesEvaluated(), second.recipesEvaluated());
+    }
+
+    @Test
+    void recipesAreEvaluatedInStableIdOrder() {
+        List<ResourceLocation> observed = new ArrayList<>();
+        RecipeEvaluator recorder = new RecipeEvaluator() {
+            @Override
+            public boolean supports(RecipeSnapshot recipe) {
+                return true;
+            }
+
+            @Override
+            public RecipeEvaluation evaluate(RecipeSnapshot recipe, EmcLookup lookup, EvaluationPolicy policy) {
+                observed.add(recipe.id());
+                return RecipeEvaluation.invalid("recorded");
+            }
+        };
+        EvaluatorRegistry registry = EvaluatorRegistry.builder().add(recorder).build();
+        ItemKey input = item("order_input");
+        List<RecipeSnapshot> recipes = List.of(
+                recipe("order_c", RecipeKind.SHAPED, List.of(in(input)), List.of(out(item("order_c_out"), 1))),
+                recipe("order_a", RecipeKind.SHAPED, List.of(in(input)), List.of(out(item("order_a_out"), 1))),
+                recipe("order_b", RecipeKind.SHAPED, List.of(in(input)), List.of(out(item("order_b_out"), 1))));
+
+        SOLVER.solve(recipes, SolveContext.empty(), registry, new SolveSettings(1, false, 1L, 8));
+
+        assertEquals(List.of(
+                new ResourceLocation("sudoersemc", "order_a"),
+                new ResourceLocation("sudoersemc", "order_b"),
+                new ResourceLocation("sudoersemc", "order_c")), observed,
+                "配方应按 id 升序评估，保证同输入得到相同输出");
     }
 
     @Test
