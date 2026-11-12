@@ -82,7 +82,9 @@ public final class BatchProcessor {
         long maximum = maximumBatchSize();
         // 用 budgetNanos / 2 比较，避免 lastBatchNanos * 2 溢出。
         if (lastBatchNanos <= budgetNanos / 2L) {
-            long grown = (long) currentBatchSize * GROWTH_NUMERATOR / GROWTH_DENOMINATOR;
+            // 至少增加 1：整数除法下 size=1 时 1*5/4 仍为 1，会导致自适应批量永远无法增长。
+            long grown = Math.max((long) currentBatchSize + 1L,
+                    (long) currentBatchSize * GROWTH_NUMERATOR / GROWTH_DENOMINATOR);
             return (int) clamp(grown, maximum);
         }
         if (lastBatchNanos > budgetNanos) {

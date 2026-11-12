@@ -114,7 +114,9 @@ public final class RecipeScanner {
      */
     public List<ResourceLocation> orderedRecipeIds(RecipeManager manager) {
         Objects.requireNonNull(manager, "manager");
-        List<ResourceLocation> ids = manager.getRecipeIds().toList();
+        // Stream.toList() 返回不可变列表，必须先复制再排序；真实服务器上直接 sort 会抛
+        // UnsupportedOperationException 并导致整轮配方扫描退化为 0 条可用配方。
+        List<ResourceLocation> ids = new ArrayList<>(manager.getRecipeIds().toList());
         ids.sort(ResourceLocation::compareTo);
         return List.copyOf(ids);
     }
