@@ -61,7 +61,9 @@ public final class RarityPricing {
      * 计算稀有度对应的价格。
      *
      * <p>结果为 {@code floor(base * multiplier)}，永远不会是负数。稀有度缺失或为 {@code null}
-     * 时使用构造时提供的 {@code fallbackValue}，倍率按 {@code 1.0} 处理。</p>
+     * 时使用构造时提供的 {@code fallbackValue}，倍率按 {@code 1.0} 处理。结果超出 {@code long}
+     * 范围时按 Java 窄化规则饱和到 {@code Long.MAX_VALUE}，不会回绕成负数；后续安全层仍会按
+     * 溢出策略处置超过阈值的价格。</p>
      *
      * @param rarity 物品稀有度，允许为 {@code null}
      * @return 非负价格
