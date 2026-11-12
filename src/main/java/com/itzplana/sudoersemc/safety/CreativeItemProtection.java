@@ -191,6 +191,13 @@ public final class CreativeItemProtection {
         public Settings {
             explicitExclusions = explicitExclusions == null ? Set.of() : Set.copyOf(explicitExclusions);
             specialValues = specialValues == null ? Map.of() : Map.copyOf(specialValues);
+            for (Map.Entry<ResourceLocation, Long> entry : specialValues.entrySet()) {
+                if (entry.getValue() == null || entry.getValue() <= 0L) {
+                    throw new IllegalArgumentException(
+                            "specialValues must be positive for " + entry.getKey()
+                                    + ", got " + entry.getValue());
+                }
+            }
             creativeOnlyNamespaces = creativeOnlyNamespaces == null
                     ? Set.of()
                     : Set.copyOf(creativeOnlyNamespaces);

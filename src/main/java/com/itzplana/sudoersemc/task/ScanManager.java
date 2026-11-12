@@ -73,6 +73,18 @@ public final class ScanManager {
     }
 
     /**
+     * 当前扫描输入的指纹提供器，必须在服务器线程调用。
+     */
+    @FunctionalInterface
+    public interface FingerprintSupplier {
+
+        /**
+         * @return 当前输入指纹，不能为 {@code null}
+         */
+        ScanFingerprint current();
+    }
+
+    /**
      * 回调之间传递的最小数据载体。
      *
      * <p>当前阶段只携带标签、物品数量与配方数量，使 {@link ScanManager} 保持对 Minecraft
@@ -103,12 +115,16 @@ public final class ScanManager {
     private final ScanDiagnostics diagnostics;
     @Nullable
     private final AbortListener abortListener;
+    @Nullable
+    private final FingerprintSupplier fingerprintSupplier;
 
     private volatile ScanProgress progress = ScanProgress.idle();
     private volatile boolean cancelRequested;
 
     private SnapshotData snapshot;
+    private ScanFingerprint collectedFingerprint;
     private long lastBatchNanos;
+    private boolean ticking;
 
     /**
      * 兼容旧调用点的构造器：使用内部新建的诊断收集器，不注册终止回调。
@@ -123,7 +139,7 @@ public final class ScanManager {
                        SnapshotCollector collector,
                        ResultApplier applier,
                        long tickBudgetNanos) {
-        this(batchProcessor, collector, applier, tickBudgetNanos, new ScanDiagnostics(), null);
+        this(batchProcessor, collector, applier, tickBudgetNanos, new ScanDiagnostics(), null, null);
     }
 
     /**
@@ -141,6 +157,33 @@ public final class ScanManager {
                        long tickBudgetNanos,
                        @Nullable ScanDiagnostics diagnostics,
                        @Nullable AbortListener abortListener) {
+        this(batchProcessor, collector, applier, tickBudgetNanos, diagnostics, abortListener, null);
+    }
+
+    /**
+     * 创建带快照一致性校验的调度器。
+     *
+     * @param batchProcessor      批量决策器，不能为 {@code null}
+     * @param collector           快照采集回调，不能为 {@code null}
+     * @param applier             结果应用回调，不能为 {@code null}
+     * @param tickBudgetNanos     每 tick 的时间预算（纳秒），不得为负
+     * @param fingerprintSupplier 输入指纹提供器；{@code null} 表示跳过一致性校验
+     */
+    public ScanManager(BatchProcessor batchProcessor,
+                       SnapshotCollector collector,
+                       ResultApplier applier,
+                       long tickBudgetNanos,
+                       @Nullable FingerprintSupplier fingerprintSupplier) {
+        this(batchProcessor, collector, applier, tickBudgetNanos, null, null, fingerprintSupplier);
+    }
+
+    private ScanManager(BatchProcessor batchProcessor,
+                        SnapshotCollector collector,
+                        ResultApplier applier,
+                        long tickBudgetNanos,
+                        @Nullable ScanDiagnostics diagnostics,
+                        @Nullable AbortListener abortListener,
+                        @Nullable FingerprintSupplier fingerprintSupplier) {
         this.batchProcessor = Objects.requireNonNull(batchProcessor, "batchProcessor");
         this.collector = Objects.requireNonNull(collector, "collector");
         this.applier = Objects.requireNonNull(applier, "applier");
@@ -150,6 +193,7 @@ public final class ScanManager {
         this.tickBudgetNanos = tickBudgetNanos;
         this.diagnostics = diagnostics == null ? new ScanDiagnostics() : diagnostics;
         this.abortListener = abortListener;
+        this.fingerprintSupplier = fingerprintSupplier;
     }
 
     /**
@@ -169,11 +213,12 @@ public final class ScanManager {
      * @return 成功开始返回 {@code true}；已有扫描在运行返回 {@code false}
      */
     public synchronized boolean requestScan() {
-        if (isRunning()) {
+        if (ticking || isRunning()) {
             return false;
         }
         cancelRequested = false;
         snapshot = null;
+        collectedFingerprint = null;
         lastBatchNanos = 0L;
         diagnostics.reset();
         diagnostics.recordMemory();
@@ -226,10 +271,14 @@ public final class ScanManager {
      * 细节字段保存异常消息（无消息时退化为异常类名）。本方法不会向外传播这些异常。</p>
      */
     public void tick() {
+        if (ticking) {
+            return;
+        }
         ScanProgress current = progress;
         if (!current.isRunning()) {
             return;
         }
+        ticking = true;
 
         long startedNanos = System.nanoTime();
         diagnostics.recordMemory();
@@ -261,9 +310,12 @@ public final class ScanManager {
                     failureDetail(e));
             abortedPhase = ScanPhase.FAILED;
         } finally {
+            ticking = false;
             long elapsedNanos = System.nanoTime() - startedNanos;
             lastBatchNanos = elapsedNanos;
-            if (batchRecorded) {
+            if (batchRecorded
+                    && (current.phase() == ScanPhase.COLLECTING_SNAPSHOT
+                    || current.phase() == ScanPhase.SOLVING)) {
                 batchProcessor.recordBatch(batch, elapsedNanos);
             }
             // tick 边界统一采样：即使本 tick 被取消或失败，也会留下耗时与内存数据。
@@ -295,8 +347,12 @@ public final class ScanManager {
      * 不会被重置，以便下一次扫描沿用已经学到的批量。</p>
      */
     public synchronized void reset() {
+        if (ticking) {
+            throw new IllegalStateException("tick 回调内不得重置扫描调度器");
+        }
         cancelRequested = false;
         snapshot = null;
+        collectedFingerprint = null;
         lastBatchNanos = 0L;
         diagnostics.reset();
         progress = ScanProgress.idle();
@@ -307,11 +363,17 @@ public final class ScanManager {
      */
     private void collectStep(int batch) {
         if (snapshot == null) {
+            ScanFingerprint before = currentFingerprint();
             SnapshotData collected = collector.collect();
             if (collected == null) {
                 throw new IllegalStateException("快照采集器返回 null");
             }
+            ScanFingerprint after = currentFingerprint();
+            if (before != null && !after.equalsFingerprint(before)) {
+                throw new IllegalStateException("快照采集期间扫描输入发生变化，已放弃本次结果");
+            }
             snapshot = collected;
+            collectedFingerprint = after;
             progress = progress.advance(ScanPhase.COLLECTING_SNAPSHOT, 0, collected.itemCount(),
                     "已采集 " + collected.itemCount() + " 个物品快照");
         }
@@ -371,6 +433,7 @@ public final class ScanManager {
         if (data == null) {
             throw new IllegalStateException("应用阶段缺少快照数据");
         }
+        verifyFingerprintBeforeApply();
         applier.apply(data);
         progress = progress.advance(ScanPhase.SAVING, 0, 0, "结果已应用，开始持久化");
     }
@@ -380,6 +443,36 @@ public final class ScanManager {
      */
     private void saveStep() {
         progress = progress.advance(ScanPhase.COMPLETED, 0, 0, "扫描已完成");
+    }
+
+    /**
+     * 应用前重新读取指纹，拒绝使用采集后已经过期的快照。
+     */
+    private void verifyFingerprintBeforeApply() {
+        if (fingerprintSupplier == null) {
+            return;
+        }
+        ScanFingerprint current = currentFingerprint();
+        if (collectedFingerprint == null || !collectedFingerprint.equalsFingerprint(current)) {
+            throw new IllegalStateException(
+                    "扫描输入在采集后发生变化（可能发生了 /reload 或注册表变更），"
+                            + "已拒绝应用过期结果；请重新扫描");
+        }
+    }
+
+    /**
+     * @return 当前指纹；未配置提供器时返回 {@code null}
+     * @throws IllegalStateException 配置了提供器但它返回 {@code null}
+     */
+    private ScanFingerprint currentFingerprint() {
+        if (fingerprintSupplier == null) {
+            return null;
+        }
+        ScanFingerprint fingerprint = fingerprintSupplier.current();
+        if (fingerprint == null) {
+            throw new IllegalStateException("指纹提供器返回 null");
+        }
+        return fingerprint;
     }
 
     /**

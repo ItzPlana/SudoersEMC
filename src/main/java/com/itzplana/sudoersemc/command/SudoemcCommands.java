@@ -1,22 +1,24 @@
 package com.itzplana.sudoersemc.command;
 
 import com.mojang.brigadier.Command;
-import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.context.CommandContext;
+import com.mojang.brigadier.arguments.StringArgumentType;
 import java.util.function.Function;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
+import net.minecraft.commands.arguments.ResourceLocationArgument;
 import net.minecraft.network.chat.Component;
+import net.minecraft.resources.ResourceLocation;
 import org.jetbrains.annotations.Nullable;
 
 /**
  * {@code /sudoemc} 命令的 Brigadier 注册薄层。
  *
  * <p>本类只负责参数解析、权限检查和文本输出，所有业务判断都委托给 {@link CommandService}。
- * 所有子命令都要求权限等级 2（管理员），并且不会阻塞服务器线程：状态查询与报告读取只访问
- * 内存数据或已经落盘的文本，全量扫描也只是提交请求，由 {@code ScanManager} 在后续 tick 中
- * 分片执行。</p>
+ * 所有子命令都要求权限等级 2（管理员）。状态查询与 {@code explain} 只访问内存，
+ * {@code report} 读取缓存的报告文本；{@code reload} 由管理员显式触发，会同步重读配置文件。
+ * 全量扫描只是提交请求，由 {@code ScanManager} 在后续 tick 中分片执行。</p>
  *
  * <p>命令服务由模组入口在初始化阶段通过 {@link #setService(CommandService)} 注入。未注入时
  * 每个子命令都会输出“命令服务尚未初始化”并返回 0，而不是抛出空指针异常。</p>
@@ -64,7 +66,7 @@ public final class SudoemcCommands {
                 .then(Commands.literal("report")
                         .executes(context -> execute(context.getSource(), CommandService::report)))
                 .then(Commands.literal("explain")
-                        .then(Commands.argument("item", StringArgumentType.string())
+                        .then(Commands.argument("item", ResourceLocationArgument.id())
                                 .executes(SudoemcCommands::explain)))
                 .then(Commands.literal("approve")
                         .then(Commands.argument("item", StringArgumentType.string())
@@ -93,8 +95,8 @@ public final class SudoemcCommands {
      * 解析 {@code explain} 的物品参数并委托给命令服务。
      */
     private static int explain(CommandContext<CommandSourceStack> context) {
-        String item = StringArgumentType.getString(context, "item");
-        return execute(context.getSource(), commandService -> commandService.explain(item));
+        ResourceLocation item = ResourceLocationArgument.getId(context, "item");
+        return execute(context.getSource(), commandService -> commandService.explain(item.toString()));
     }
 
     /**

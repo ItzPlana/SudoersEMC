@@ -10,7 +10,9 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.List;
+import java.util.stream.Stream;
 import net.minecraft.resources.ResourceLocation;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -129,5 +131,157 @@ class KnownItemsStoreTest {
         assertEquals(0, store.size());
         assertFalse(store.contains(ItemKey.of(STONE)));
         assertTrue(store.isDirty());
+    }
+
+    @Test
+    void emptyFileIsBackedUpAndRewritten() throws IOException {
+        Path file = tempDir.resolve(KnownItemsStore.FILE_NAME);
+        Files.writeString(file, "", StandardCharsets.UTF_8);
+
+        KnownItemsStore store = new KnownItemsStore(file);
+        assertDoesNotThrow(store::load);
+        assertEquals(0, store.size());
+        assertFalse(store.isDirty());
+
+        store.recordSeen(ItemKey.of(STONE));
+        store.save();
+
+        assertFalse(store.isDirty());
+        assertTrue(Files.readString(file, StandardCharsets.UTF_8).contains("\"schemaVersion\": 1"));
+        assertEquals(1L, backupCount(), "首次重写空文件前也应生成 .bak");
+    }
+
+    @Test
+    void lowerSchemaVersionIsLoadedAndRewritten() throws IOException {
+        Path file = tempDir.resolve(KnownItemsStore.FILE_NAME);
+        Files.writeString(file, """
+                {
+                  "schemaVersion": 0,
+                  "items": [
+                    {"item": "minecraft:stone", "variant": null, "firstSeen": 10, "lastSeen": 20},
+                    {"item": "minecraft:dirt", "variant": "variant-hash", "firstSeen": 30, "lastSeen": 40}
+                  ]
+                }
+                """, StandardCharsets.UTF_8);
+
+        KnownItemsStore store = new KnownItemsStore(file);
+        store.load();
+
+        assertEquals(2, store.size());
+        assertTrue(store.contains(ItemKey.of(STONE)));
+        assertTrue(store.contains(ItemKey.of(DIRT, "variant-hash")));
+
+        store.save();
+
+        String json = Files.readString(file, StandardCharsets.UTF_8);
+        assertTrue(json.contains("\"schemaVersion\": 1"), "保存时应升级到当前 schemaVersion");
+        assertEquals(1L, backupCount());
+    }
+
+    @Test
+    void missingSchemaVersionIsTreatedAsLegacy() throws IOException {
+        Path file = tempDir.resolve(KnownItemsStore.FILE_NAME);
+        Files.writeString(file, """
+                {
+                  "items": [
+                    {"item": "minecraft:apple", "variant": null, "firstSeen": 1, "lastSeen": 2}
+                  ]
+                }
+                """, StandardCharsets.UTF_8);
+
+        KnownItemsStore store = new KnownItemsStore(file);
+        store.load();
+
+        assertEquals(1, store.size());
+        assertTrue(store.contains(ItemKey.of(APPLE)));
+
+        store.save();
+
+        assertTrue(Files.readString(file, StandardCharsets.UTF_8).contains("\"schemaVersion\": 1"));
+        assertEquals(1L, backupCount());
+    }
+
+    @Test
+    void unknownHigherSchemaVersionIsNeverDestroyed() throws IOException {
+        Path file = tempDir.resolve(KnownItemsStore.FILE_NAME);
+        String content = """
+                {
+                  "schemaVersion": 99,
+                  "items": [
+                    {"item": "minecraft:stone", "variant": null, "firstSeen": 1, "lastSeen": 2}
+                  ]
+                }
+                """;
+        Files.writeString(file, content, StandardCharsets.UTF_8);
+
+        KnownItemsStore store = new KnownItemsStore(file);
+        assertDoesNotThrow(store::load);
+        assertEquals(0, store.size());
+
+        store.recordSeen(ItemKey.of(STONE));
+        assertDoesNotThrow(store::save);
+
+        assertEquals(content, Files.readString(file, StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void failedWriteKeepsDirtyAndRetriesWithBackup() throws IOException {
+        Path file = tempDir.resolve(KnownItemsStore.FILE_NAME);
+        KnownItemsStore store = new KnownItemsStore(file);
+        store.recordSeen(ItemKey.of(STONE));
+        store.save();
+        assertFalse(store.isDirty());
+
+        store.load(); // 文件已存在：下一次重写前必须生成 .bak
+        store.recordSeen(ItemKey.of(DIRT));
+
+        blockTempFile(file);
+        store.save();
+        assertTrue(store.isDirty(), "写入失败后必须保留脏标记，saveIfDirty() 才能重试");
+
+        unblockTempFile(file);
+        Files.writeString(file, "\n/* external-change-marker */", StandardCharsets.UTF_8,
+                StandardOpenOption.APPEND);
+
+        store.saveIfDirty();
+
+        assertFalse(store.isDirty());
+        KnownItemsStore reloaded = new KnownItemsStore(file);
+        reloaded.load();
+        assertEquals(2, reloaded.size());
+        assertTrue(reloaded.contains(ItemKey.of(DIRT)));
+        assertTrue(anyBackupContains("external-change-marker"),
+                "首次写入失败后，下一次成功写入仍必须重新生成 .bak");
+    }
+
+    private long backupCount() throws IOException {
+        try (Stream<Path> files = Files.list(tempDir)) {
+            return files.filter(path -> path.getFileName().toString().endsWith(".bak")).count();
+        }
+    }
+
+    private boolean anyBackupContains(String marker) throws IOException {
+        List<Path> backups;
+        try (Stream<Path> files = Files.list(tempDir)) {
+            backups = files.filter(path -> path.getFileName().toString().endsWith(".bak")).toList();
+        }
+        for (Path backup : backups) {
+            if (Files.readString(backup, StandardCharsets.UTF_8).contains(marker)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void blockTempFile(Path file) throws IOException {
+        Path temp = file.resolveSibling(file.getFileName() + ".tmp");
+        Files.createDirectories(temp);
+        Files.writeString(temp.resolve("blocker"), "x", StandardCharsets.UTF_8);
+    }
+
+    private static void unblockTempFile(Path file) throws IOException {
+        Path temp = file.resolveSibling(file.getFileName() + ".tmp");
+        Files.deleteIfExists(temp.resolve("blocker"));
+        Files.deleteIfExists(temp);
     }
 }
