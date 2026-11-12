@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -221,5 +222,83 @@ class ScanManagerTest {
         assertEquals(0, manager.progress().processed());
         assertEquals(0, manager.progress().total());
         assertEquals("等待采集快照", manager.progress().detail());
+    }
+
+    @Test
+    void diagnosticsRecordTickTimingsAndMemory() {
+        ScanDiagnostics diagnostics = new ScanDiagnostics();
+        ScanManager manager = new ScanManager(new BatchProcessor(10, false),
+                () -> data(0, 0), snapshot -> { }, TICK_BUDGET_NANOS, diagnostics, null);
+
+        assertSame(diagnostics, manager.diagnostics());
+        manager.requestScan();
+        int ticks = 0;
+        while (manager.isRunning() && ticks < TICK_GUARD) {
+            manager.tick();
+            ticks++;
+        }
+
+        assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
+        assertTrue(diagnostics.tickCount() > 0, "每个 tick 都应留下耗时样本");
+        assertTrue(diagnostics.totalTickNanos() >= 0L);
+        assertTrue(diagnostics.maxTickNanos() >= 0L);
+        assertTrue(diagnostics.p95TickNanos() >= 0L);
+        assertTrue(diagnostics.peakHeapBytes() >= 0L, "tick 边界必须采样堆内存");
+        assertTrue(diagnostics.heapBytes() >= 0L);
+    }
+
+    @Test
+    void cancelInvokesAbortListener() {
+        AtomicReference<ScanPhase> observedPhase = new AtomicReference<>();
+        AtomicReference<ScanDiagnostics> observedTelemetry = new AtomicReference<>();
+        ScanDiagnostics diagnostics = new ScanDiagnostics();
+        ScanManager manager = new ScanManager(new BatchProcessor(1, false),
+                () -> data(5, 5), snapshot -> { }, TICK_BUDGET_NANOS, diagnostics,
+                (phase, progress, telemetry) -> {
+                    observedPhase.set(phase);
+                    observedTelemetry.set(telemetry);
+                });
+
+        manager.requestScan();
+        manager.cancel();
+        manager.tick();
+
+        assertEquals(ScanPhase.CANCELLED, observedPhase.get(),
+                "取消必须触发终止回调，供管线写出部分报告");
+        assertSame(diagnostics, observedTelemetry.get());
+        assertTrue(diagnostics.tickCount() > 0, "取消的 tick 也应记录耗时");
+    }
+
+    @Test
+    void collectorFailureInvokesAbortListener() {
+        AtomicReference<ScanPhase> observedPhase = new AtomicReference<>();
+        ScanManager manager = new ScanManager(new BatchProcessor(1, false),
+                () -> {
+                    throw new IllegalStateException("采集爆炸");
+                },
+                snapshot -> { }, TICK_BUDGET_NANOS, new ScanDiagnostics(),
+                (phase, progress, telemetry) -> observedPhase.set(phase));
+
+        manager.requestScan();
+        assertDoesNotThrow(manager::tick);
+
+        assertEquals(ScanPhase.FAILED, observedPhase.get(),
+                "失败必须触发终止回调，供管线写出部分报告");
+    }
+
+    @Test
+    void abortListenerExceptionDoesNotEscape() {
+        ScanManager manager = new ScanManager(new BatchProcessor(1, false),
+                () -> {
+                    throw new IllegalStateException("采集爆炸");
+                },
+                snapshot -> { }, TICK_BUDGET_NANOS, new ScanDiagnostics(),
+                (phase, progress, telemetry) -> {
+                    throw new IllegalStateException("报告回调爆炸");
+                });
+
+        manager.requestScan();
+        assertDoesNotThrow(manager::tick);
+        assertEquals(ScanPhase.FAILED, manager.progress().phase());
     }
 }

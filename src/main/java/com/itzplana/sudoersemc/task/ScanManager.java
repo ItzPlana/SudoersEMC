@@ -1,6 +1,9 @@
 package com.itzplana.sudoersemc.task;
 
 import java.util.Objects;
+import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * 由服务器 tick 驱动的单次扫描状态机。
@@ -20,6 +23,8 @@ import java.util.Objects;
  * 进度细节，绝不允许异常穿透 tick 循环破坏服务器主循环。</p>
  */
 public final class ScanManager {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger("sudoersemc/task/ScanManager");
 
     /**
      * 采集阶段回调，必须在服务器线程执行。
@@ -50,6 +55,24 @@ public final class ScanManager {
     }
 
     /**
+     * 扫描被取消或失败时的终止回调。
+     *
+     * <p>只会在 {@link ScanPhase#CANCELLED} 与 {@link ScanPhase#FAILED} 时触发，用于在
+     * 管线来不及走完正常应用阶段时写出部分诊断报告。实现方不得抛出异常；即使抛出，本类
+     * 也只记录日志并继续。</p>
+     */
+    @FunctionalInterface
+    public interface AbortListener {
+
+        /**
+         * @param phase       终止阶段，只会是 {@link ScanPhase#CANCELLED} 或 {@link ScanPhase#FAILED}
+         * @param progress    终止时的进度快照
+         * @param diagnostics 本次扫描的耗时与内存采样
+         */
+        void onScanAborted(ScanPhase phase, ScanProgress progress, ScanDiagnostics diagnostics);
+    }
+
+    /**
      * 回调之间传递的最小数据载体。
      *
      * <p>当前阶段只携带标签、物品数量与配方数量，使 {@link ScanManager} 保持对 Minecraft
@@ -77,6 +100,9 @@ public final class ScanManager {
     private final SnapshotCollector collector;
     private final ResultApplier applier;
     private final long tickBudgetNanos;
+    private final ScanDiagnostics diagnostics;
+    @Nullable
+    private final AbortListener abortListener;
 
     private volatile ScanProgress progress = ScanProgress.idle();
     private volatile boolean cancelRequested;
@@ -85,6 +111,8 @@ public final class ScanManager {
     private long lastBatchNanos;
 
     /**
+     * 兼容旧调用点的构造器：使用内部新建的诊断收集器，不注册终止回调。
+     *
      * @param batchProcessor 批量决策器，不能为 {@code null}
      * @param collector      快照采集回调，不能为 {@code null}
      * @param applier        结果应用回调，不能为 {@code null}
@@ -95,6 +123,24 @@ public final class ScanManager {
                        SnapshotCollector collector,
                        ResultApplier applier,
                        long tickBudgetNanos) {
+        this(batchProcessor, collector, applier, tickBudgetNanos, new ScanDiagnostics(), null);
+    }
+
+    /**
+     * @param batchProcessor 批量决策器，不能为 {@code null}
+     * @param collector      快照采集回调，不能为 {@code null}
+     * @param applier        结果应用回调，不能为 {@code null}
+     * @param tickBudgetNanos 每 tick 允许用于扫描的时间预算（纳秒），不得为负；
+     *                        0 表示预算未知，自适应模式会沿用当前批量
+     * @param diagnostics    耗时与内存采样器；{@code null} 时新建一个
+     * @param abortListener  取消/失败终止回调，可为 {@code null}
+     */
+    public ScanManager(BatchProcessor batchProcessor,
+                       SnapshotCollector collector,
+                       ResultApplier applier,
+                       long tickBudgetNanos,
+                       @Nullable ScanDiagnostics diagnostics,
+                       @Nullable AbortListener abortListener) {
         this.batchProcessor = Objects.requireNonNull(batchProcessor, "batchProcessor");
         this.collector = Objects.requireNonNull(collector, "collector");
         this.applier = Objects.requireNonNull(applier, "applier");
@@ -102,6 +148,15 @@ public final class ScanManager {
             throw new IllegalArgumentException("tickBudgetNanos 必须 >= 0，实际为 " + tickBudgetNanos);
         }
         this.tickBudgetNanos = tickBudgetNanos;
+        this.diagnostics = diagnostics == null ? new ScanDiagnostics() : diagnostics;
+        this.abortListener = abortListener;
+    }
+
+    /**
+     * @return 本次扫描使用的诊断采样器，便于调用方复用同一份耗时与内存数据
+     */
+    public ScanDiagnostics diagnostics() {
+        return diagnostics;
     }
 
     /**
@@ -120,6 +175,8 @@ public final class ScanManager {
         cancelRequested = false;
         snapshot = null;
         lastBatchNanos = 0L;
+        diagnostics.reset();
+        diagnostics.recordMemory();
         long now = System.currentTimeMillis();
         progress = new ScanProgress(ScanPhase.COLLECTING_SNAPSHOT, 0, 0, now, now, "等待采集快照");
         return true;
@@ -173,33 +230,61 @@ public final class ScanManager {
         if (!current.isRunning()) {
             return;
         }
-        if (cancelRequested) {
-            cancelRequested = false;
-            progress = current.advance(ScanPhase.CANCELLED, current.processed(), current.total(),
-                    "扫描已取消");
-            return;
-        }
 
-        int batch = batchProcessor.nextBatchSize(lastBatchNanos, tickBudgetNanos);
         long startedNanos = System.nanoTime();
+        diagnostics.recordMemory();
+        int batch = 0;
+        boolean batchRecorded = false;
+        ScanPhase abortedPhase = null;
         try {
-            switch (current.phase()) {
-                case COLLECTING_SNAPSHOT -> collectStep(batch);
-                case SOLVING -> solveStep(batch);
-                case APPLYING -> applyStep();
-                case SAVING -> saveStep();
-                default -> {
-                    // 防御性分支：isRunning() 已经排除了所有终止阶段。
+            if (cancelRequested) {
+                cancelRequested = false;
+                progress = current.advance(ScanPhase.CANCELLED, current.processed(),
+                        current.total(), "扫描已取消");
+                abortedPhase = ScanPhase.CANCELLED;
+            } else {
+                batch = batchProcessor.nextBatchSize(lastBatchNanos, tickBudgetNanos);
+                batchRecorded = true;
+                switch (current.phase()) {
+                    case COLLECTING_SNAPSHOT -> collectStep(batch);
+                    case SOLVING -> solveStep(batch);
+                    case APPLYING -> applyStep();
+                    case SAVING -> saveStep();
+                    default -> {
+                        // 防御性分支：isRunning() 已经排除了所有终止阶段。
+                    }
                 }
             }
         } catch (RuntimeException e) {
             ScanProgress failed = progress;
             progress = failed.advance(ScanPhase.FAILED, failed.processed(), failed.total(),
                     failureDetail(e));
+            abortedPhase = ScanPhase.FAILED;
         } finally {
             long elapsedNanos = System.nanoTime() - startedNanos;
             lastBatchNanos = elapsedNanos;
-            batchProcessor.recordBatch(batch, elapsedNanos);
+            if (batchRecorded) {
+                batchProcessor.recordBatch(batch, elapsedNanos);
+            }
+            // tick 边界统一采样：即使本 tick 被取消或失败，也会留下耗时与内存数据。
+            diagnostics.recordTick(elapsedNanos);
+            diagnostics.recordMemory();
+        }
+
+        if (abortedPhase != null) {
+            notifyAborted(abortedPhase);
+        }
+    }
+
+    private void notifyAborted(ScanPhase phase) {
+        AbortListener listener = abortListener;
+        if (listener == null) {
+            return;
+        }
+        try {
+            listener.onScanAborted(phase, progress, diagnostics);
+        } catch (RuntimeException failure) {
+            LOGGER.warn("SudoersEMC 扫描终止回调失败（{}），已忽略", phase, failure);
         }
     }
 
@@ -213,6 +298,7 @@ public final class ScanManager {
         cancelRequested = false;
         snapshot = null;
         lastBatchNanos = 0L;
+        diagnostics.reset();
         progress = ScanProgress.idle();
     }
 

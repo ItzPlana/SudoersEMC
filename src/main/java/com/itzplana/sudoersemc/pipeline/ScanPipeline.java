@@ -29,6 +29,7 @@ import com.itzplana.sudoersemc.solver.SolveTrace;
 import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
 import com.itzplana.sudoersemc.storage.QuarantinedDropsStore;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
+import com.itzplana.sudoersemc.task.ScanDiagnostics;
 import com.itzplana.sudoersemc.task.ScanFingerprint;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -119,6 +120,8 @@ public final class ScanPipeline {
     private volatile int lastUnresolvedCount;
     private volatile int lastSolverRoundCount;
     private volatile long lastDurationMillis;
+    private volatile ScanDiagnostics diagnostics = new ScanDiagnostics();
+    private volatile boolean fullReportWritten;
 
     /**
      * 创建管线。
@@ -217,6 +220,26 @@ public final class ScanPipeline {
      */
     public void setSolveRecipesEnabled(boolean enabled) {
         this.solveRecipesEnabled = enabled;
+    }
+
+    /**
+     * 注入与 {@link com.itzplana.sudoersemc.task.ScanManager} 共享的诊断采样器。
+     *
+     * <p>注入后报告可以读取整个扫描跨 tick 的耗时、P95 与峰值堆内存；传入 {@code null}
+     * 时恢复为管线内部新建的采样器。采集阶段调用 {@link ScanDiagnostics#reset()} 的工作由
+     * 扫描调度器负责，管线只负责读取。</p>
+     *
+     * @param newDiagnostics 诊断采样器，允许为 {@code null}
+     */
+    public void setDiagnostics(@Nullable ScanDiagnostics newDiagnostics) {
+        this.diagnostics = newDiagnostics == null ? new ScanDiagnostics() : newDiagnostics;
+    }
+
+    /**
+     * @return 当前诊断采样器；默认实例也会在报告时被动采样堆内存
+     */
+    public ScanDiagnostics diagnostics() {
+        return diagnostics;
     }
 
     /**
@@ -345,7 +368,8 @@ public final class ScanPipeline {
                     existingValues,
                     scanResult.unsupported(),
                     scanResult.invalid(),
-                    scanResult.failed());
+                    scanResult.failed(),
+                    scanResult.failedRecipeDetails());
         } catch (Throwable failure) {
             LOGGER.error("SudoersEMC 扫描采集失败，本轮按空快照处理", failure);
             return PipelineSnapshot.empty();
@@ -461,6 +485,7 @@ public final class ScanPipeline {
      * @param snapshot 采集结果，允许为 {@code null}
      */
     public void stash(@Nullable PipelineSnapshot snapshot) {
+        fullReportWritten = false;
         stashedSnapshot.set(snapshot);
     }
 
@@ -540,7 +565,8 @@ public final class ScanPipeline {
                 separation.existingValues(),
                 snapshot.unsupportedRecipes(),
                 snapshot.invalidRecipes(),
-                snapshot.failedRecipes());
+                snapshot.failedRecipes(),
+                snapshot.failedRecipeDetails());
     }
 
     /**
@@ -584,6 +610,7 @@ public final class ScanPipeline {
      */
     public PipelineResult solveAndApply(@Nullable PipelineSnapshot snapshot) {
         PipelineSnapshot data = snapshot == null ? PipelineSnapshot.empty() : snapshot;
+        fullReportWritten = false;
         long startedAtNanos = System.nanoTime();
 
         try {
@@ -688,10 +715,11 @@ public final class ScanPipeline {
 
             boolean appliedToStore = store != null;
             updateScanState(data, durationMillis, applied, unresolved);
-            writeDiagnosticReport(data, lastSolveResult, unresolved, applied, quarantined,
-                    overflowResets, durationMillis, appliedToStore, sourceCounts, retiredEntries);
 
-            return new PipelineResult(
+            Map<String, Long> extraCounters = buildExtraCounters(data, lastSolveResult,
+                    quarantined, overflowResets, durationMillis, appliedToStore,
+                    retiredEntries, roundsUsed, diagnostics);
+            PipelineResult result = new PipelineResult(
                     solvedByRecipe,
                     solvedByFallback,
                     applied,
@@ -700,14 +728,20 @@ public final class ScanPipeline {
                     unresolved,
                     durationMillis,
                     appliedToStore,
-                    sourceCounts);
+                    sourceCounts,
+                    extraCounters);
+            writeDiagnosticReport(data, result);
+            return result;
         } catch (Throwable failure) {
             long durationMillis = elapsedMillis(startedAtNanos);
             lastSolvedCount = 0;
             lastUnresolvedCount = 0;
             lastSolverRoundCount = 0;
             lastDurationMillis = durationMillis;
-            LOGGER.error("SudoersEMC 扫描管线求解与应用失败，本轮返回全零结果", failure);
+            LOGGER.error("SudoersEMC 扫描管线求解与应用失败，本轮返回全零结果：{}",
+                    failureDetail(failure), failure);
+            // 失败也要留下部分报告；报告层自身保证不抛出异常。
+            writePartialReport(data, diagnostics, false, "扫描失败");
             return PipelineResult.zeroed(durationMillis);
         }
     }
@@ -1145,63 +1179,169 @@ public final class ScanPipeline {
     }
 
     /**
-     * 写出诊断报告。报告写入失败只影响诊断文件，不影响本轮数值结果。
+     * 写出完整诊断报告。报告写入失败只影响诊断文件，不影响本轮数值结果。
      */
-    private void writeDiagnosticReport(PipelineSnapshot snapshot, SolveResult solveResult,
-                                       int unresolvedCount, int applied, int quarantined,
-                                       int overflowResets, long durationMillis,
-                                       boolean appliedToStore, Map<String, Long> sourceCounts,
-                                       int retiredEntries) {
+    private void writeDiagnosticReport(PipelineSnapshot snapshot, PipelineResult result) {
         if (!generateReportsEnabled || reportManager == null) {
             return;
         }
         try {
-            reportManager.writeReport(buildReport(snapshot, solveResult, unresolvedCount,
-                    quarantined, overflowResets, durationMillis, appliedToStore, sourceCounts,
-                    retiredEntries));
+            reportManager.writeReport(buildReport(snapshot, result, result.extraCounters()));
+            fullReportWritten = true;
         } catch (RuntimeException failure) {
             LOGGER.warn("写入诊断报告失败，本轮结果仍然有效", failure);
         }
     }
 
     /**
+     * 扫描被取消时写出部分报告。
+     *
+     * <p>扫描可能停在采集或求解阶段，因此只保证输出耗时、内存与已经采集到的快照统计，
+     * 不强求完整的求解结果。报告写入开关关闭时直接忽略。</p>
+     *
+     * @param telemetry 调度器共享的诊断采样器；{@code null} 时使用管线内部实例
+     */
+    public void writeCancelledReport(@Nullable ScanDiagnostics telemetry) {
+        PipelineSnapshot snapshot = stashedSnapshot.getAndSet(null);
+        writePartialReport(snapshot, telemetry, true, "扫描已取消");
+    }
+
+    /**
+     * 扫描失败时写出部分报告。
+     *
+     * <p>异常消息只写入日志，报告本身保持纯文本结构稳定。报告写入开关关闭时直接忽略。</p>
+     *
+     * @param detail    失败原因，仅用于日志，可为 {@code null}
+     * @param telemetry 调度器共享的诊断采样器；{@code null} 时使用管线内部实例
+     */
+    public void writeFailedReport(@Nullable String detail, @Nullable ScanDiagnostics telemetry) {
+        if (detail != null && !detail.isBlank()) {
+            LOGGER.warn("SudoersEMC 扫描未完成，生成部分诊断报告：{}", detail);
+        }
+        PipelineSnapshot snapshot = stashedSnapshot.getAndSet(null);
+        writePartialReport(snapshot, telemetry, false, "扫描失败");
+    }
+
+    private void writePartialReport(@Nullable PipelineSnapshot snapshot,
+                                    @Nullable ScanDiagnostics telemetry,
+                                    boolean cancelled, String reason) {
+        if (!generateReportsEnabled || reportManager == null) {
+            return;
+        }
+        if (fullReportWritten) {
+            LOGGER.debug("完整诊断报告已写出，跳过部分报告（{}）", reason);
+            return;
+        }
+        ScanDiagnostics selected = telemetry == null ? diagnostics : telemetry;
+        try {
+            selected.recordMemory();
+            PipelineSnapshot data = snapshot == null ? PipelineSnapshot.empty() : snapshot;
+            long durationMillis = Math.max(0L, selected.elapsedSinceResetMillis());
+            PipelineResult partial = PipelineResult.zeroed(durationMillis);
+            Map<String, Long> counters = buildExtraCounters(data, skippedSolveResult(), 0, 0,
+                    durationMillis, store != null, 0, 0, selected);
+            counters.put("partialReport", 1L);
+            counters.put("scanCancelled", cancelled ? 1L : 0L);
+            counters.put("scanFailed", cancelled ? 0L : 1L);
+            counters.put("scanAborts", 1L);
+            reportManager.writeReport(buildReport(data, partial, counters));
+            LOGGER.info("SudoersEMC 已写出部分诊断报告（{}）", reason);
+        } catch (RuntimeException failure) {
+            LOGGER.warn("写出部分诊断报告失败，本轮结果仍然有效", failure);
+        }
+    }
+
+    /**
+     * 汇总本轮全部计数器。
+     *
+     * <p>计数器同时用于 {@link PipelineResult#extraCounters()} 与诊断报告，保证两处数据
+     * 完全一致。配方统计、求解轮数、隔离/清理数量、逐 tick 耗时与内存采样都集中在这里，
+     * 报告层无需再次推算。</p>
+     */
+    private static Map<String, Long> buildExtraCounters(PipelineSnapshot snapshot,
+                                                         SolveResult solveResult,
+                                                         int quarantined, int overflowResets,
+                                                         long durationMillis,
+                                                         boolean appliedToStore,
+                                                         int retiredEntries, int solverRounds,
+                                                         @Nullable ScanDiagnostics telemetry) {
+        ScanDiagnostics selected = telemetry == null ? new ScanDiagnostics() : telemetry;
+        selected.recordMemory();
+
+        long tickCount = selected.tickCount();
+        long scanTotalMillis = tickCount > 0L
+                ? selected.elapsedSinceResetMillis()
+                : durationMillis;
+        long usableRecipes = snapshot.recipeCount();
+        long unsupported = snapshot.unsupportedRecipes();
+        long invalid = snapshot.invalidRecipes();
+        long failed = snapshot.failedRecipes();
+        long totalRecipes = usableRecipes + unsupported + invalid + failed;
+
+        Map<String, Long> counters = new LinkedHashMap<>();
+        counters.put("totalRecipes", totalRecipes);
+        counters.put("usableRecipes", usableRecipes);
+        counters.put("unsupportedRecipes", unsupported);
+        counters.put("invalidRecipes", invalid);
+        counters.put("failedRecipes", failed);
+        counters.put("failedRecipeDetailsRecorded", (long) snapshot.failedRecipeDetails().size());
+        counters.put("solverPasses", (long) solveResult.passesUsed());
+        counters.put("solverRounds", (long) solverRounds);
+        counters.put("recipesEvaluated", (long) solveResult.recipesEvaluated());
+        counters.put("solverConverged", solveResult.converged() ? 1L : 0L);
+        counters.put("quarantinedDrops", (long) quarantined);
+        counters.put("overflowResets", (long) overflowResets);
+        counters.put("retiredEntries", (long) retiredEntries);
+        counters.put("dryRun", appliedToStore ? 0L : 1L);
+        counters.put("scanTotalMillis", Math.max(0L, scanTotalMillis));
+        counters.put("scanTicks", tickCount);
+        counters.put("tickMaxMicros", nanosToMicros(selected.maxTickNanos()));
+        counters.put("tickAvgMicros", Math.round(selected.averageTickNanos() / 1_000.0D));
+        counters.put("tickP95Micros", nanosToMicros(selected.p95TickNanos()));
+        counters.put("peakHeapBytes", selected.peakHeapBytes());
+        counters.put("heapAtReportBytes", selected.heapBytes());
+        counters.put("partialReport", 0L);
+        return counters;
+    }
+
+    private static long nanosToMicros(long nanos) {
+        return Math.max(0L, (nanos + 500L) / 1_000L);
+    }
+
+    /**
      * 根据本轮运行数据构造诊断报告。
      *
-     * <p>标准字段只统计实际应用的条目；求解器的失败配方、轮数与干跑标记等放入
+     * <p>标准字段只统计实际应用的条目；配方扫描统计、求解轮数与耗时采样等放入
      * {@code extraCounters}，便于后续解析器在不改变报告结构的情况下读取。未解析物品数
      * 使用多轮收敛后的最终计数，而不是某一轮的中间结果。</p>
      */
-    private static DiagnosticReport buildReport(PipelineSnapshot snapshot, SolveResult solveResult,
-                                                int unresolvedCount, int quarantined,
-                                                int overflowResets, long durationMillis,
-                                                boolean appliedToStore,
-                                                Map<String, Long> sourceCounts,
-                                                int retiredEntries) {
-        Map<String, Long> extraCounters = new LinkedHashMap<>();
-        extraCounters.put("unsupportedRecipes", (long) snapshot.unsupportedRecipes());
-        extraCounters.put("invalidRecipes", (long) snapshot.invalidRecipes());
-        extraCounters.put("failedRecipes", (long) snapshot.failedRecipes());
-        extraCounters.put("solverPasses", (long) solveResult.passesUsed());
-        extraCounters.put("recipesEvaluated", (long) solveResult.recipesEvaluated());
-        extraCounters.put("solverConverged", solveResult.converged() ? 1L : 0L);
-        extraCounters.put("overflowResets", (long) overflowResets);
-        extraCounters.put("dryRun", appliedToStore ? 0L : 1L);
-        extraCounters.put("retiredEntries", (long) retiredEntries);
-
+    private static DiagnosticReport buildReport(PipelineSnapshot snapshot, PipelineResult result,
+                                                Map<String, Long> extraCounters) {
         return new DiagnosticReport(
                 snapshot.itemCount(),
                 snapshot.existingValues().size(),
-                sourceCounts.getOrDefault(PriceSource.RECIPE.name(), 0L),
-                sourceCounts.getOrDefault(PriceSource.TAG.name(), 0L),
-                sourceCounts.getOrDefault(PriceSource.RARITY.name(), 0L),
-                sourceCounts.getOrDefault(PriceSource.TIER.name(), 0L),
-                sourceCounts.getOrDefault(PriceSource.FALLBACK.name(), 0L),
-                unresolvedCount,
-                quarantined,
+                result.sourceBreakdown().getOrDefault(PriceSource.RECIPE.name(), 0L),
+                result.sourceBreakdown().getOrDefault(PriceSource.TAG.name(), 0L),
+                result.sourceBreakdown().getOrDefault(PriceSource.RARITY.name(), 0L),
+                result.sourceBreakdown().getOrDefault(PriceSource.TIER.name(), 0L),
+                result.sourceBreakdown().getOrDefault(PriceSource.FALLBACK.name(), 0L),
+                result.unresolved(),
+                result.quarantined(),
                 snapshot.failedRecipes(),
-                durationMillis,
-                usedHeapBytes(),
-                extraCounters);
+                result.durationMillis(),
+                extraCounters.getOrDefault("peakHeapBytes", 0L),
+                extraCounters,
+                snapshot.failedRecipeDetails());
+    }
+
+    private static String failureDetail(Throwable failure) {
+        if (failure == null) {
+            return "未知错误";
+        }
+        String message = failure.getMessage();
+        return message == null || message.isBlank()
+                ? failure.getClass().getSimpleName()
+                : message;
     }
 
     /**
@@ -1219,10 +1359,6 @@ public final class ScanPipeline {
         return ScanFingerprint.of(itemIds, recipeIds, List.of(), List.of(), List.of());
     }
 
-    private static long usedHeapBytes() {
-        Runtime runtime = Runtime.getRuntime();
-        return Math.max(0L, runtime.totalMemory() - runtime.freeMemory());
-    }
 
     private static long elapsedMillis(long startedAtNanos) {
         return Math.max(0L, (System.nanoTime() - startedAtNanos) / 1_000_000L);

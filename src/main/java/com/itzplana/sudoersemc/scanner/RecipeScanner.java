@@ -37,6 +37,9 @@ public final class RecipeScanner {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("sudoersemc/scanner/RecipeScanner");
 
+    /** 单个扫描结果最多保留的失败明细条数，避免异常配方数量失控时占用过多内存。 */
+    static final int MAX_FAILED_DETAILS = 50;
+
     private final GoetyRitualReader goetyReader;
 
     public RecipeScanner() {
@@ -58,6 +61,7 @@ public final class RecipeScanner {
     public ScanResult scan(RecipeManager manager) {
         Objects.requireNonNull(manager, "manager");
         List<RecipeSnapshot> snapshots = new ArrayList<>();
+        List<String> failedDetails = new ArrayList<>();
         int unsupported = 0;
         int invalid = 0;
         int failed = 0;
@@ -69,7 +73,8 @@ public final class RecipeScanner {
             ids = manager.getRecipeIds().toList();
         } catch (RuntimeException e) {
             LOGGER.warn("Could not enumerate recipe ids", e);
-            return new ScanResult(List.of(), 0, 0, 0);
+            return new ScanResult(List.of(), 0, 0, 1,
+                    List.of("recipe-manager: " + failureText(e)));
         }
 
         for (ResourceLocation id : ids) {
@@ -78,6 +83,7 @@ public final class RecipeScanner {
                 maybeRecipe = manager.byKey(id);
             } catch (RuntimeException e) {
                 failed++;
+                addFailureDetail(failedDetails, id, e);
                 continue;
             }
             if (maybeRecipe.isEmpty()) {
@@ -98,6 +104,7 @@ public final class RecipeScanner {
                 snapshots.add(snapshot);
             } catch (RuntimeException e) {
                 failed++;
+                addFailureDetail(failedDetails, id, e);
                 LOGGER.debug("Failed to describe recipe {}; skipping it", id, e);
             }
         }
@@ -106,7 +113,36 @@ public final class RecipeScanner {
             LOGGER.debug("Recipe scan: {} usable, {} unsupported, {} invalid, {} failed",
                     snapshots.size(), unsupported, invalid, failed);
         }
-        return new ScanResult(List.copyOf(snapshots), unsupported, invalid, failed);
+        return new ScanResult(List.copyOf(snapshots), unsupported, invalid, failed,
+                List.copyOf(failedDetails));
+    }
+
+    /**
+     * 把一条失败配方整理成稳定、可读的单行明细。
+     *
+     * <p>明细数量达到 {@link #MAX_FAILED_DETAILS} 后停止记录，但调用方仍会继续累加失败
+     * 总数，因此报告可以显示“已记录 X / 共 Y 条”。</p>
+     */
+    private static void addFailureDetail(List<String> details, ResourceLocation id,
+                                         RuntimeException failure) {
+        if (details.size() >= MAX_FAILED_DETAILS) {
+            return;
+        }
+        String recipeId = id == null ? "unknown" : id.toString();
+        details.add(recipeId + ": " + failureText(failure));
+    }
+
+    private static String failureText(Throwable failure) {
+        if (failure == null) {
+            return "未知错误";
+        }
+        String message = failure.getMessage();
+        String type = failure.getClass().getSimpleName();
+        if (message == null || message.isBlank()) {
+            return type;
+        }
+        String singleLine = message.replace('\r', ' ').replace('\n', ' ').trim();
+        return type + ": " + singleLine;
     }
 
     /**
@@ -290,15 +326,27 @@ public final class RecipeScanner {
     /**
      * Outcome of one recipe scan.
      *
-     * @param recipes     every usable snapshot
-     * @param unsupported recipes whose type this build cannot evaluate
-     * @param invalid     recipes missing an id, inputs or outputs
-     * @param failed      recipes that threw while being described
+     * @param recipes             every usable snapshot
+     * @param unsupported         recipes whose type this build cannot evaluate
+     * @param invalid             recipes missing an id, inputs or outputs
+     * @param failed              recipes that threw while being described
+     * @param failedRecipeDetails 失败配方的可读明细；最多保留 {@link RecipeScanner#MAX_FAILED_DETAILS} 条
      */
-    public record ScanResult(List<RecipeSnapshot> recipes, int unsupported, int invalid, int failed) {
+    public record ScanResult(List<RecipeSnapshot> recipes, int unsupported, int invalid, int failed,
+                             List<String> failedRecipeDetails) {
 
         public ScanResult {
             recipes = List.copyOf(recipes);
+            failedRecipeDetails = failedRecipeDetails == null
+                    ? List.of()
+                    : List.copyOf(failedRecipeDetails);
+        }
+
+        /**
+         * 兼容旧调用点的构造器：不携带失败明细。
+         */
+        public ScanResult(List<RecipeSnapshot> recipes, int unsupported, int invalid, int failed) {
+            this(recipes, unsupported, invalid, failed, List.of());
         }
 
         public int total() {

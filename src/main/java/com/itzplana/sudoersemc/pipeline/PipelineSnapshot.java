@@ -3,6 +3,7 @@ package com.itzplana.sudoersemc.pipeline;
 import com.itzplana.sudoersemc.core.ItemKey;
 import com.itzplana.sudoersemc.scanner.ItemSnapshot;
 import com.itzplana.sudoersemc.scanner.RecipeSnapshot;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -25,6 +26,7 @@ import java.util.TreeMap;
  * @param unsupportedRecipes 当前构建无法评估的配方数量
  * @param invalidRecipes     缺少 id、输入或输出的配方数量
  * @param failedRecipes      在描述过程中抛出异常的配方数量
+ * @param failedRecipeDetails 失败配方的可读明细；报告层会再次做数量与长度截断
  */
 public record PipelineSnapshot(
         List<ItemSnapshot> items,
@@ -32,7 +34,8 @@ public record PipelineSnapshot(
         Map<ItemKey, Long> existingValues,
         int unsupportedRecipes,
         int invalidRecipes,
-        int failedRecipes
+        int failedRecipes,
+        List<String> failedRecipeDetails
 ) {
 
     public PipelineSnapshot {
@@ -43,13 +46,33 @@ public record PipelineSnapshot(
         requireNonNegative("unsupportedRecipes", unsupportedRecipes);
         requireNonNegative("invalidRecipes", invalidRecipes);
         requireNonNegative("failedRecipes", failedRecipes);
+        List<String> details = new ArrayList<>();
+        if (failedRecipeDetails != null) {
+            for (String detail : failedRecipeDetails) {
+                details.add(detail == null ? "" : detail);
+            }
+        }
+        failedRecipeDetails = Collections.unmodifiableList(details);
+    }
+
+    /**
+     * 兼容 Phase 21 及更早调用点的构造器：不携带失败配方明细。
+     */
+    public PipelineSnapshot(List<ItemSnapshot> items,
+                            List<RecipeSnapshot> recipes,
+                            Map<ItemKey, Long> existingValues,
+                            int unsupportedRecipes,
+                            int invalidRecipes,
+                            int failedRecipes) {
+        this(items, recipes, existingValues, unsupportedRecipes, invalidRecipes, failedRecipes,
+                List.of());
     }
 
     /**
      * @return 不含任何物品、配方与既有值的空快照
      */
     public static PipelineSnapshot empty() {
-        return new PipelineSnapshot(List.of(), List.of(), Map.of(), 0, 0, 0);
+        return new PipelineSnapshot(List.of(), List.of(), Map.of(), 0, 0, 0, List.of());
     }
 
     /**

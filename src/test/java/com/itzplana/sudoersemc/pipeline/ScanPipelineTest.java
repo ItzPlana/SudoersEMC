@@ -32,6 +32,7 @@ import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
 import com.itzplana.sudoersemc.storage.OverflowResetLog;
 import com.itzplana.sudoersemc.storage.QuarantinedDropsStore;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
+import com.itzplana.sudoersemc.task.ScanDiagnostics;
 import com.itzplana.sudoersemc.task.ScanFingerprint;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -1050,6 +1051,76 @@ class ScanPipelineTest {
         assertNotNull(kept, "非自有条目绝不能被清理");
         assertEquals(128L, kept.value());
         assertFalse(kept.owned());
+    }
+
+    @Test
+    void diagnosticReportIncludesRecipeStatsAndExtraCounters() throws IOException {
+        ReportManager reportManager = new ReportManager(tempDir);
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_phase22_report.json"));
+        store.stage(new GeneratedEmcEntry(
+                RESULT, 1_000L, PriceSource.RECIPE, null, true, 0L));
+        PipelineSnapshot snapshot = new PipelineSnapshot(
+                List.of(item(RESULT, 0L)), List.of(), Map.of(), 2, 1, 3,
+                List.of("bad_recipe: boom"));
+        ScanPipeline pipeline = pipeline(
+                store, null, reportManager, null, null, null, genericFallback(7L));
+        ScanDiagnostics diagnostics = new ScanDiagnostics();
+        diagnostics.recordTick(2_000_000L);
+        diagnostics.recordTick(6_000_000L);
+        diagnostics.recordMemory();
+        pipeline.setDiagnostics(diagnostics);
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1, result.quarantined());
+        assertEquals(6L, result.extraCounter("totalRecipes", -1L),
+                "总配方数应等于可用 + 不支持 + 无效 + 失败");
+        assertEquals(1L, result.extraCounter("quarantinedDrops", -1L));
+        assertEquals(1L, result.extraCounter("failedRecipeDetailsRecorded", -1L));
+        assertEquals(2L, result.extraCounter("scanTicks", -1L));
+
+        String report = Files.readString(reportManager.reportFile());
+        assertTrue(hasCounterLine(report, "配方扫描总数", 6L));
+        assertTrue(hasCounterLine(report, "可用配方", 0L));
+        assertTrue(hasCounterLine(report, "不支持配方", 2L));
+        assertTrue(hasCounterLine(report, "无效配方", 1L));
+        assertTrue(hasCounterLine(report, "失败配方", 3L));
+        assertTrue(report.contains("bad_recipe: boom"), "失败配方明细必须写入报告");
+        assertTrue(report.lines().anyMatch(line -> line.contains("quarantinedDrops: 1")),
+                "PipelineResult.extraCounters 中的计数器必须全部输出");
+        assertTrue(report.lines().anyMatch(line -> line.contains("retiredEntries: 0")));
+        assertTrue(report.contains("tick 采样数"));
+        assertTrue(report.contains("6.00 ms"), "最大 tick 耗时必须按 ms 渲染");
+
+        pipeline.writeCancelledReport(diagnostics);
+        String afterCancel = Files.readString(reportManager.reportFile());
+        assertFalse(afterCancel.contains("部分报告"),
+                "完整报告已写出时不得被后续部分报告覆盖");
+        assertTrue(afterCancel.contains("bad_recipe: boom"));
+    }
+
+    @Test
+    void cancelledAndFailedReportsAreWritten() throws IOException {
+        ReportManager reportManager = new ReportManager(tempDir.resolve("partial_reports"));
+        ScanPipeline pipeline = pipeline(
+                null, null, reportManager, null, null, null, disabledFallback());
+        ScanDiagnostics diagnostics = new ScanDiagnostics();
+        diagnostics.recordTick(4_000_000L);
+        diagnostics.recordMemory();
+
+        pipeline.writeCancelledReport(diagnostics);
+        String cancelled = Files.readString(reportManager.reportFile());
+        assertTrue(cancelled.contains("部分报告（扫描已取消）"));
+        assertTrue(cancelled.lines().anyMatch(line -> line.contains("scanCancelled: 1")));
+        assertTrue(cancelled.lines().anyMatch(line -> line.contains("partialReport: 1")));
+        assertTrue(cancelled.contains("tick 采样数"));
+
+        pipeline.writeFailedReport("boom", diagnostics);
+        String failed = Files.readString(reportManager.reportFile());
+        assertTrue(failed.contains("部分报告（扫描失败）"));
+        assertTrue(failed.lines().anyMatch(line -> line.contains("scanFailed: 1")));
+        assertTrue(failed.lines().anyMatch(line -> line.contains("scanAborts: 1")));
     }
 
     /**

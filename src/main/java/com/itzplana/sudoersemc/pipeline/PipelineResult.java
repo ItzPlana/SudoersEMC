@@ -3,6 +3,7 @@ package com.itzplana.sudoersemc.pipeline;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import org.jetbrains.annotations.Nullable;
 
 /**
  * 一次“求解并应用”运行的结果汇总。
@@ -21,6 +22,7 @@ import java.util.Map;
  * @param durationMillis    本次运行的耗时毫秒数
  * @param appliedToStore    是否真正写入了持久化存储；存储为 {@code null} 的干跑模式为 {@code false}
  * @param sourceBreakdown   实际应用条目的来源分布
+ * @param extraCounters     额外的具名计数器（例如 retiredEntries、隔离数量、耗时采样）；不能包含 null 键或负值
  */
 public record PipelineResult(
         int solvedByRecipe,
@@ -31,7 +33,8 @@ public record PipelineResult(
         int unresolved,
         long durationMillis,
         boolean appliedToStore,
-        Map<String, Long> sourceBreakdown
+        Map<String, Long> sourceBreakdown,
+        Map<String, Long> extraCounters
 ) {
 
     public PipelineResult {
@@ -63,6 +66,40 @@ public record PipelineResult(
             }
         }
         sourceBreakdown = Collections.unmodifiableMap(copied);
+
+        Map<String, Long> copiedCounters = new LinkedHashMap<>();
+        if (extraCounters != null) {
+            for (Map.Entry<String, Long> entry : extraCounters.entrySet()) {
+                String key = entry.getKey();
+                Long value = entry.getValue();
+                if (key == null) {
+                    throw new IllegalArgumentException("extraCounters 不能包含 null 键");
+                }
+                if (value == null || value < 0L) {
+                    throw new IllegalArgumentException(
+                            "extraCounters[" + key + "] 必须为非负数值，实际为 " + value);
+                }
+                // 与 sourceBreakdown 不同，零值计数器同样保留，报告需要展示完整计数器集合。
+                copiedCounters.put(key, value);
+            }
+        }
+        extraCounters = Collections.unmodifiableMap(copiedCounters);
+    }
+
+    /**
+     * 兼容 Phase 21 及更早调用点的构造器：不携带额外计数器。
+     */
+    public PipelineResult(int solvedByRecipe,
+                          int solvedByFallback,
+                          int applied,
+                          int quarantined,
+                          int overflowResets,
+                          int unresolved,
+                          long durationMillis,
+                          boolean appliedToStore,
+                          Map<String, Long> sourceBreakdown) {
+        this(solvedByRecipe, solvedByFallback, applied, quarantined, overflowResets,
+                unresolved, durationMillis, appliedToStore, sourceBreakdown, Map.of());
     }
 
     /**
@@ -75,7 +112,8 @@ public record PipelineResult(
      * @return 所有计数为零的结果
      */
     public static PipelineResult zeroed(long durationMillis) {
-        return new PipelineResult(0, 0, 0, 0, 0, 0, Math.max(0L, durationMillis), false, Map.of());
+        return new PipelineResult(0, 0, 0, 0, 0, 0, Math.max(0L, durationMillis), false,
+                Map.of(), Map.of());
     }
 
     /**
@@ -87,6 +125,21 @@ public record PipelineResult(
             total += value;
         }
         return total;
+    }
+
+    /**
+     * 读取一个额外计数器；名称缺失或值为 {@code null} 时返回给定缺省值。
+     *
+     * @param name         计数器名称，可为 {@code null}
+     * @param defaultValue 缺失时的返回值
+     * @return 计数器值或缺省值
+     */
+    public long extraCounter(@Nullable String name, long defaultValue) {
+        if (name == null) {
+            return defaultValue;
+        }
+        Long value = extraCounters.get(name);
+        return value == null ? defaultValue : value;
     }
 
     private static void requireNonNegative(String name, int value) {

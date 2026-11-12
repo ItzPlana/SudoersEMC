@@ -27,7 +27,9 @@ import com.itzplana.sudoersemc.storage.QuarantinedDropsStore;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
 import com.itzplana.sudoersemc.task.AutoScanPolicy;
 import com.itzplana.sudoersemc.task.BatchProcessor;
+import com.itzplana.sudoersemc.task.ScanDiagnostics;
 import com.itzplana.sudoersemc.task.ScanManager;
+import com.itzplana.sudoersemc.task.ScanPhase;
 import com.mojang.logging.LogUtils;
 import java.util.List;
 import java.util.Map;
@@ -502,11 +504,21 @@ public final class Sudoersemc {
             adaptive = true;
         }
         BatchProcessor processor = new BatchProcessor(Math.max(1, itemsPerTick), adaptive);
+        ScanDiagnostics diagnostics = new ScanDiagnostics();
+        pipeline.setDiagnostics(diagnostics);
         return new ScanManager(
                 processor,
                 () -> collectSnapshot(pipeline),
                 data -> applySnapshot(pipeline),
-                TICK_BUDGET_NANOS);
+                TICK_BUDGET_NANOS,
+                diagnostics,
+                (phase, progress, telemetry) -> {
+                    if (phase == ScanPhase.CANCELLED) {
+                        pipeline.writeCancelledReport(telemetry);
+                    } else if (phase == ScanPhase.FAILED) {
+                        pipeline.writeFailedReport(progress.detail(), telemetry);
+                    }
+                });
     }
 
     /**
