@@ -52,22 +52,26 @@ public final class TagPricing {
     /**
      * 计算物品的标签基准价格。
      *
-     * <p>先检查按物品配置的覆盖值；没有覆盖值时，按传入顺序查找第一个“能被识别且配置了基准值”
-     * 的类别。无法识别的类别（{@link MaterialCategory#UNKNOWN}）会被跳过。列表为空或为
-     * {@code null} 时返回 {@link Optional#empty()}。本方法不会抛出异常。</p>
+     * <p>先检查按物品配置的覆盖值；覆盖值与标签列表是否为空无关。没有覆盖值时，按传入顺序
+     * 查找第一个“能被识别且配置了基准值”的类别。无法识别的类别（{@link MaterialCategory#UNKNOWN}）
+     * 会被跳过。标签列表为空或为 {@code null} 时返回 {@link Optional#empty()}。本方法不会抛出异常。</p>
      *
      * @param item     待定价物品，为 {@code null} 时返回空
      * @param tagPaths 物品拥有的标签路径，按优先级排列
      * @return 命中的价格，未命中时为空
      */
     public Optional<Long> price(ItemKey item, List<String> tagPaths) {
-        if (item == null || tagPaths == null || tagPaths.isEmpty()) {
+        if (item == null) {
             return Optional.empty();
         }
 
         Long override = overrides.get(item);
         if (override != null) {
             return Optional.of(override);
+        }
+
+        if (tagPaths == null || tagPaths.isEmpty()) {
+            return Optional.empty();
         }
 
         for (String tagPath : tagPaths) {

@@ -125,6 +125,9 @@ gradlew.bat build
 配置文件：`config/sudoersemc-common.toml`
 
 ```toml
+# Root-level schema version (managed by ConfigFileMigration; do not edit manually).
+schemaVersion = 2
+
 [general]
 enabled = true
 alwaysRescan = false
@@ -205,42 +208,73 @@ generateReports = true
 | `nbt.maxNbtVariantsPerItem`         | `100`        | 每个物品最多扫描的 NBT 变体数                     |
 | `safety.maxAllowedDropRatio`        | `0.5`        | 单次生成值允许的最大相对跌幅                      |
 
-### 当前实现的校验
+> **`minEmc` 说明**：当前构建没有 `minEmc` 配置键。求解器下限固定为
+> `SolveSettings.DEFAULT_MINIMUM_EMC = 1`（与 `EvaluationPolicy.DEFAULT_MINIMUM_EMC` 相同）。
+> 配置化该值属于后续阶段；此前的 README 把它列为配置项是错误的，已移除。
 
-> **状态：** 当前分支只实现了 Forge 单字段范围校验和溢出配置的跨字段警告。`ConfigValidator`、`ConfigWatcher` 与 `ConfigMigrations` 已有组件和单元测试，但**尚未接入生产配置流程**；`/sudoemc reload` 也只返回“配置校验与迁移在下一阶段接线”的提示，不会重新读取磁盘或重建运行时组件。
+### 校验矩阵
 
-单字段范围由 Forge 的 `defineInRange` 在加载时校验，越界值会被纠正到允许区间：
+加载或重载配置后会执行交叉字段校验。以下取值会被判定为非法，并阻止新配置生效：
 
-| 配置项                                         | 允许范围                       |
-| ---------------------------------------------- | ------------------------------ |
-| `performance.itemsPerTick`                     | `>= 1`                         |
-| `recipe.maxRecipePasses`                       | `>= 1`                         |
-| `overflow.threshold` / `resetMin` / `resetMax` | `>= 1`                         |
-| `overflow.bucketCount` / `weightCap`           | `>= 1`                         |
-| `nbt.maxNbtVariantsPerItem`                    | `>= 1`（没有 1000 上限）       |
-| `safety.maxAllowedDropRatio`                   | `[0.0, 1.0]`（`0.0` 会被接受） |
+| 配置项                       | 拒绝条件                                                         |
+| ---------------------------- | ---------------------------------------------------------------- |
+| `performance.itemsPerTick`   | `< 1`                                                            |
+| `recipe.maxRecipePasses`     | `< 1`                                                            |
+| `overflow.overwriteScope`    | 不是 `owned_only` 或 `entire_custom_emc`（忽略大小写与首尾空白） |
+| `overflow.resetMin`          | `< 1`                                                            |
+| `overflow.resetMin`          | `> resetMax`                                                     |
+| `overflow.threshold`         | `<= resetMax`                                                    |
+| `overflow.bucketCount`       | `< 1`                                                            |
+| `overflow.weightCap`         | `< 1`                                                            |
+| `nbt.maxNbtVariantsPerItem`  | `< 1` 或 `> 1000`                                                |
+| `safety.maxAllowedDropRatio` | 不在 `(0.0, 1.0]` 内，包括 `0.0`、负数与 `NaN`                   |
 
-`SudoersemcConfig.validateLoadedConfig()` 在配置加载/重载时只记录**警告**，不会拒绝或回滚配置：
+所有 `overflow.*` 区间不变量始终校验；`overflow.enabled = false` 只表示运行时跳过重置，
+不会放宽配置合法性。`OverflowProtection.Settings` 即使关闭也会构造采样器并强制这些不变量，
+因此校验器必须在关闭时继续拒绝非法区间，否则非法配置会在组件重建时抛异常。
 
-- `overflow.threshold <= overflow.resetMax`；
-- `overflow.resetMin > overflow.resetMax`；
-- `overflow.overwriteScope = entire_custom_emc` 且 `allowProjectEFileRewrite = false`。
+接线方式：`SudoersemcConfig.onConfigLoading` / `onConfigReloading` 会从当前 Forge 值构造
+`ConfigValidator.Values`，调用 `ConfigValidator.validate(...)`，再交给
+`ConfigWatcher.fireReload(...)`。校验通过时重建并缓存不可变快照（`overflowSettings()` 返回该
+快照）；失败时 `fireReload` 不通知监听器，上一份有效快照继续生效，首次加载即非法时使用内置
+安全默认值。事件可能由配置加载线程触发，处理器只读取配置并交换 volatile 不可变快照，不访问
+服务器或世界状态。
 
-非法的 `overflow.overwriteScope` 在解析时回退为 `owned_only` 并记录警告。
+### 警告条件
 
-### 尚未实现（后续阶段）
+以下情况不会阻止配置生效，但会记录一条警告：
 
-以下内容在早期设计中被描述为已生效，但当前分支尚未接线：
+| 条件                                                                       | 提示                           |
+| -------------------------------------------------------------------------- | ------------------------------ |
+| `overwriteScope = entire_custom_emc` 且 `allowProjectEFileRewrite = false` | ProjectE 文件改写将被跳过      |
+| `itemsPerTick > 5000`                                                      | 单 tick 处理量过大可能导致卡顿 |
+| `maxRecipePasses > 100`                                                    | 扫描耗时可能显著增加           |
+| `overflow.enabled = false`                                                 | 超大 EMC 值不会被重置          |
 
-- `ConfigValidator` 的完整跨字段校验与“拒绝新配置”语义；
-- `ConfigWatcher` 的配置变化监听与警告去重；
-- `ConfigMigrations` 的启动迁移（当前 TOML 没有 `schemaVersion` 键）；
-- `/sudoemc reload` 的真实重载与组件重建；
-- `fallback.minEmc` 配置键（当前 `SudoersemcConfig` 中不存在）。
+同一条警告在一次运行中只记录一次：`ConfigWatcher.fireReload` 对成功结果统一调用
+`logConflictWarnings`，重复重载不会刷屏。
 
-`ConfigMigrations` 的 v1→v2 规则（缺少 `overflow.threshold` 时补 `999999`，缺少 `overflow.overwriteScope` 时补 `owned_only`）及其单元测试已经存在，但只有后续阶段接入 Forge TOML 后才会在运行时生效。
+### 迁移
 
-> **English:** Only Forge per-field range checks and overflow cross-field warnings are active. `ConfigValidator`, `ConfigWatcher` and `ConfigMigrations` exist with unit tests but are not wired into the production config lifecycle in this branch; `/sudoemc reload` is a stub. TOML migration is therefore not performed at runtime.
+配置根级键 `schemaVersion` 表示 schema 版本，当前为 `2`，旧版本为 `1`；缺失该键的文件按
+`1` 处理。启动时 `SudoersemcConfig.register()` 在 Forge 解析 TOML 之前调用
+`ConfigFileMigration`，后者使用 `ConfigMigrations` 迁移文件：
+
+- **v1 → v2**：缺少 `overflow.threshold` 时补充 `999999`，缺少 `overflow.overwriteScope`
+  时补充 `owned_only`；已有值保持不变。
+- **v2 → v2**：不做任何修改，也不产生提示。
+- **高于 v2**：保持原样不做修改，并记录提示，防止旧构建覆盖新版本配置。
+- **未知版本（`<= 0`）**：按当前版本处理并记录提示。
+- `ConfigMigrations` 的 raw map 支持扁平键（`threshold`）、点分键（`overflow.threshold`）
+  和嵌套 `overflow` map；迁移沿用输入已有的键形状，不会把默认值写到错误层级。
+- 迁移只改写 `schemaVersion`、`overflow.threshold`、`overflow.overwriteScope`，保留注释与
+  未知键；先写同目录临时文件，尽力备份后原子替换，任何失败都保留原文件。
+
+> **English:** Schema version 2 validates numeric ranges and cross-field invariants in pure Java.
+> Invalid reloads keep the previously active snapshot, each distinct warning is logged once, and
+> v1 migrations only fill in missing `overflow.threshold` (`999999`) and `overflow.overwriteScope`
+> (`"owned_only"`). Configs declaring a newer schema are left untouched. There is no `minEmc`
+> config key in this phase; the solver lower bound is hard-coded to `1`.
 
 ---
 

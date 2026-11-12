@@ -14,7 +14,7 @@ package com.itzplana.sudoersemc.task;
  *   <li><strong>没有有效样本：</strong>自适应模式下，上一批耗时或预算小于等于 0 时，
  *       直接沿用当前批量，避免在数据不足时做出错误调整。</li>
  *   <li><strong>扩容：</strong>上一批耗时不超过预算的 50% 时，按
- *       {@code size * 5 / 4} 扩大 25%（整数除法向零截断）。</li>
+ *       {@code max(size + 1, size * 5 / 4)} 扩大（至少 +1，避免 size=1 时被整数除法吞掉）。</li>
  *   <li><strong>缩容：</strong>上一批耗时严格超过预算的 100% 时，按 {@code size / 2}
  *       缩小 50%（整数除法向零截断）。</li>
  *   <li><strong>保持：</strong>耗时落在 {@code (50%, 100%]} 区间时维持当前批量。</li>
@@ -82,7 +82,8 @@ public final class BatchProcessor {
         long maximum = maximumBatchSize();
         // 用 budgetNanos / 2 比较，避免 lastBatchNanos * 2 溢出。
         if (lastBatchNanos <= budgetNanos / 2L) {
-            long grown = (long) currentBatchSize * GROWTH_NUMERATOR / GROWTH_DENOMINATOR;
+            long grown = Math.max((long) currentBatchSize + 1L,
+                    (long) currentBatchSize * GROWTH_NUMERATOR / GROWTH_DENOMINATOR);
             return (int) clamp(grown, maximum);
         }
         if (lastBatchNanos > budgetNanos) {
