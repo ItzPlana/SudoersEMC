@@ -7,10 +7,17 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.itzplana.sudoersemc.core.GeneratedEmcEntry;
+import com.itzplana.sudoersemc.core.ItemKey;
+import com.itzplana.sudoersemc.core.PriceSource;
+import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
 import com.itzplana.sudoersemc.task.BatchProcessor;
 import com.itzplana.sudoersemc.task.ScanManager;
 import com.itzplana.sudoersemc.task.ScanPhase;
+import java.nio.file.Path;
+import net.minecraft.resources.ResourceLocation;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 /**
  * 入口层生命周期开关的单元测试。
@@ -75,6 +82,49 @@ class SudoersemcLifecycleTest {
 
         assertEquals(ScanPhase.IDLE, manager.progress().phase());
         assertFalse(manager.isRunning(), "停服清理后不得继续 tick 旧扫描");
+        assertTrue(manager.requestScan(), "停服清理后应允许下一次启动重新请求扫描");
+    }
+
+    @Test
+    void ownedEntryCountIgnoresAdoptedEntries(@TempDir Path tempDir) {
+        GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("generated_entries.json"));
+        assertTrue(store.stage(new GeneratedEmcEntry(
+                ItemKey.of(new ResourceLocation("minecraft", "stone")), 1L,
+                PriceSource.TAG, null, true, 1L)));
+        assertTrue(store.stage(new GeneratedEmcEntry(
+                ItemKey.of(new ResourceLocation("minecraft", "dirt")), 2L,
+                PriceSource.EXISTING, null, false, 2L)));
+
+        assertEquals(2, store.size());
+        assertEquals(1, Sudoersemc.countOwnedGeneratedEntries(store),
+                "non-owned adopt/人工条目不应被算作自动扫描缓存");
+        assertEquals(0, Sudoersemc.countOwnedGeneratedEntries(null));
+    }
+
+    @Test
+    void startupScanSettingsReadConfiguredValues() {
+        Sudoersemc.StartupScanSettings settings =
+                Sudoersemc.StartupScanSettings.read(() -> true, () -> true);
+
+        assertTrue(settings.enabled());
+        assertTrue(settings.alwaysRescan());
+    }
+
+    @Test
+    void unreadableStartupScanSettingsFailClosed() {
+        Sudoersemc.StartupScanSettings enabledFailure = Sudoersemc.StartupScanSettings.read(() -> {
+            throw new IllegalStateException("配置尚未加载");
+        }, () -> true);
+        assertFalse(enabledFailure.enabled());
+        assertFalse(enabledFailure.alwaysRescan());
+
+        Sudoersemc.StartupScanSettings rescanFailure = Sudoersemc.StartupScanSettings.read(
+                () -> true,
+                () -> {
+                    throw new IllegalStateException("配置尚未加载");
+                });
+        assertFalse(rescanFailure.enabled());
+        assertFalse(rescanFailure.alwaysRescan());
     }
 
     @Test
