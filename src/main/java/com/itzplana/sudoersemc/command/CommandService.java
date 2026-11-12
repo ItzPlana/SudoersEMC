@@ -122,7 +122,8 @@ public final class CommandService {
     }
 
     /**
-     * 兼容构造器：默认启用“批准后立即应用”，排除检测不可用（视为不排除），最小 EMC 为 1。
+     * 兼容构造器：默认启用“批准后立即应用”，排除检测不可用（审批时 fail-closed 拒绝），
+     * 最小 EMC 为 1。
      *
      * @param scanManager           扫描状态机，可为 {@code null}
      * @param reportManager         诊断报告管理器，可为 {@code null}
@@ -157,7 +158,7 @@ public final class CommandService {
      * @param emcProvider               ProjectE（或其它后端）的 EMC 查询接口，可为 {@code null}
      * @param manualValues              ProjectE 手动值视图，可为 {@code null}
      * @param approveAppliesImmediately 配置开关：批准后是否立即写入降价值
-     * @param pricingExclusionSupplier  定价排除判定器提供者；{@code null} 视为不排除
+     * @param pricingExclusionSupplier  定价排除判定器提供者；{@code null} 时应用器 fail-closed 拒绝
      * @param minimumEmcSupplier        允许应用的最小 EMC 提供者；{@code null} 使用 1
      */
     public CommandService(@Nullable ScanManager scanManager,
@@ -293,13 +294,15 @@ public final class CommandService {
      * 批准某个物品当前被隔离的降价记录，并在配置允许时立即应用降价值。
      *
      * <p>审批会先经过 {@link ApprovedDropApplier} 的全部安全规则：已批准记录不重复应用、
-     * ProjectE 手动值 fail-closed 拒绝、定价排除项拒绝、低于最小 EMC 拒绝。应用成功后写入
-     * {@link GeneratedEntryStore}（来源 {@code APPROVED}）并请求 ProjectE 重映射；本方法
-     * 绝不直接改写 ProjectE 的 {@code custom_emc.json}。参数必须是普通物品 id；带 NBT 的
-     * 变体暂不支持。</p>
+     * ProjectE 手动值 fail-closed 拒绝、排除规则缺失或命中同样拒绝、低于最小 EMC 拒绝。
+     * 应用成功后写入 {@link GeneratedEntryStore}（来源 {@code APPROVED}）并请求 ProjectE
+     * 重映射；当 {@code safety.approveAppliesImmediately=false} 时退化为“只批准、不应用”的
+     * 审计模式：仅标记审批状态并落盘。本方法绝不直接改写 ProjectE 的
+     * {@code custom_emc.json}。参数必须是普通物品 id；带 NBT 的变体暂不支持。</p>
      *
      * @param itemId 物品 id 原文，例如 {@code minecraft:stone}
-     * @return 明确的中文结果：已应用、已批准过、拒绝原因、无此记录或 id 非法；永不抛出异常
+     * @return 明确的中文结果：已应用、已批准（仅记录状态）、已批准过、拒绝原因、无此记录或
+     *         id 非法；永不抛出异常
      */
     public CommandResult approve(String itemId) {
         try {
@@ -357,6 +360,16 @@ public final class CommandService {
                         "已批准过 " + trimmed + " 的隔离降价记录（未重复应用）");
             }
 
+            if (result.status() == ApprovedDropApplier.Status.REFUSED_DISABLED) {
+                // 审计模式：开关关闭时“批准成功但不应用”。只记录审批状态，不写 EMC、不重映射。
+                if (!store.markApproved(key)) {
+                    return CommandResult.failure("隔离记录在审批过程中消失，未标记批准");
+                }
+                store.saveIfDirty();
+                return CommandResult.ok("已批准 " + trimmed
+                        + "（safety.approveAppliesImmediately=false，仅记录审批状态，未修改 EMC）");
+            }
+
             String reason = result.message() == null
                     ? result.status().name()
                     : result.message();
@@ -373,10 +386,9 @@ public final class CommandService {
         ProjectEManualValues values = manualValues;
         return values == null ? null : values::isManuallySet;
     }
-
-    /**
-     * 解析定价排除判定器。提供者缺失时返回 {@code null}（视为不排除）；提供者抛异常时
-     * 返回恒真判定器，宁可拒绝应用也不写入可能被下一次扫描清理的值。
+/**
+     * 解析定价排除判定器。提供者缺失时返回 {@code null}，由应用器 fail-closed 拒绝；提供者
+     * 抛异常时返回恒真判定器，宁可拒绝应用也不写入可能被下一次扫描清理的值。
      */
     private @Nullable Predicate<ItemKey> resolveExclusionDetector() {
         Supplier<Predicate<ItemKey>> supplier = pricingExclusionSupplier;

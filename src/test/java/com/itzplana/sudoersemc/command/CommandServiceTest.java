@@ -329,7 +329,7 @@ class CommandServiceTest {
         GeneratedEntryStore entryStore = new GeneratedEntryStore(
                 tempDir.resolve(GeneratedEntryStore.FILE_NAME));
         CommandService service = approvalService(
-                entryStore, quarantineStore, noManualValues(), true, null, 1L);
+                entryStore, quarantineStore, noManualValues(), true, key -> false, 1L);
 
         CommandResult result = service.approve("minecraft:stone");
 
@@ -349,7 +349,7 @@ class CommandServiceTest {
         GeneratedEntryStore entryStore = new GeneratedEntryStore(
                 tempDir.resolve(GeneratedEntryStore.FILE_NAME));
         CommandService service = approvalService(
-                entryStore, quarantineStore, noManualValues(), true, null, 1L);
+                entryStore, quarantineStore, noManualValues(), true, key -> false, 1L);
 
         CommandResult result = service.approve("minecraft:stone");
 
@@ -370,7 +370,7 @@ class CommandServiceTest {
         GeneratedEntryStore entryStore = new GeneratedEntryStore(
                 tempDir.resolve(GeneratedEntryStore.FILE_NAME));
         CommandService service = approvalService(
-                entryStore, quarantineStore, noManualValues(), true, null, 1L);
+                entryStore, quarantineStore, noManualValues(), true, key -> false, 1L);
 
         assertTrue(service.approve("minecraft:stone").success());
         assertEquals(1, entryStore.size());
@@ -428,7 +428,7 @@ class CommandServiceTest {
     }
 
     @Test
-    void approveRefusesWhenApplyDisabled() {
+    void approveWithApplyDisabledMarksApprovedWithoutApplying() {
         QuarantinedDropsStore quarantineStore = quarantineStoreWith(STONE);
         GeneratedEntryStore entryStore = new GeneratedEntryStore(
                 tempDir.resolve(GeneratedEntryStore.FILE_NAME));
@@ -437,10 +437,51 @@ class CommandServiceTest {
 
         CommandResult result = service.approve("minecraft:stone");
 
-        assertFalse(result.success());
-        assertTrue(result.joinLines().contains("已禁用"));
+        assertTrue(result.success(), "审计模式下的批准必须成功");
+        String text = result.joinLines();
+        assertTrue(text.contains("仅记录审批状态"), "消息必须说明未修改 EMC: " + text);
+        assertTrue(text.contains("approveAppliesImmediately=false"));
+        assertTrue(quarantineStore.entries().get(0).approved(),
+                "审计模式仍必须把记录标记为已批准");
+        assertFalse(quarantineStore.isDirty(), "审批状态必须立即落盘");
+        assertEquals(0, entryStore.size(), "审计模式不得写入生成条目");
         assertTrue(entryStore.snapshotAll().isEmpty());
-        assertFalse(quarantineStore.entries().get(0).approved());
+        assertFalse(entryStore.isDirty());
+    }
+
+    @Test
+    void approveWithApplyDisabledIsIdempotent() {
+        QuarantinedDropsStore quarantineStore = quarantineStoreWith(STONE);
+        GeneratedEntryStore entryStore = new GeneratedEntryStore(
+                tempDir.resolve(GeneratedEntryStore.FILE_NAME));
+        CommandService service = approvalService(
+                entryStore, quarantineStore, noManualValues(), false, null, 1L);
+
+        assertTrue(service.approve("minecraft:stone").success());
+        CommandResult second = service.approve("minecraft:stone");
+
+        assertTrue(second.success());
+        assertTrue(second.joinLines().contains("未重复应用"));
+        assertTrue(quarantineStore.entries().get(0).approved());
+        assertEquals(0, entryStore.size());
+    }
+
+    @Test
+    void approveRefusesWhenExclusionDetectorUnavailable() {
+        QuarantinedDropsStore quarantineStore = quarantineStoreWith(STONE);
+        GeneratedEntryStore entryStore = new GeneratedEntryStore(
+                tempDir.resolve(GeneratedEntryStore.FILE_NAME));
+        // exclusion == null 会传入 null supplier，应用器必须 fail-closed 拒绝。
+        CommandService service = approvalService(
+                entryStore, quarantineStore, noManualValues(), true, null, 1L);
+
+        CommandResult result = service.approve("minecraft:stone");
+
+        assertFalse(result.success());
+        assertTrue(result.joinLines().contains("排除规则服务不可用"));
+        assertTrue(entryStore.snapshotAll().isEmpty(), "排除规则不可用时不得写入生成条目");
+        assertFalse(quarantineStore.entries().get(0).approved(),
+                "拒绝应用时不得把记录标记为已批准");
     }
 
     @Test
