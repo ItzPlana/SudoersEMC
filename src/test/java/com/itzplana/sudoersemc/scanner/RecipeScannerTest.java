@@ -167,6 +167,20 @@ class RecipeScannerTest {
     }
 
     @Test
+    void multiCandidateIngredientSkipsRemainderCredit() {
+        ShapelessRecipe recipe = new ShapelessRecipe(
+                new ResourceLocation("sudoersemc_test", "cake_from_any_bucket"), "test",
+                CraftingBookCategory.MISC, new ItemStack(Items.CAKE),
+                NonNullList.withSize(1, Ingredient.of(Items.MILK_BUCKET, Items.WATER_BUCKET)));
+
+        RecipeSnapshot snapshot = new RecipeScanner().describe(recipe, recipe.getId());
+
+        assertNotNull(snapshot);
+        assertTrue(snapshot.containerRemainders().isEmpty(),
+                "多候选输入的返还物无法与最便宜成本口径对齐，必须放弃抵扣");
+    }
+
+    @Test
     void containerRemainderScanningCanBeDisabled() {
         ShapelessRecipe recipe = new ShapelessRecipe(
                 new ResourceLocation("sudoersemc_test", "cake_without_remainders"), "test",

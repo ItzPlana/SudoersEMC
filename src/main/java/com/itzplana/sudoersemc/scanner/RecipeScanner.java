@@ -310,8 +310,9 @@ public final class RecipeScanner {
     /**
      * 使用配方输入的代表性物品构造临时合成网格，并读取 remaining items。
      *
-     * <p>标签输入可能有多个候选；扫描阶段没有玩家选择，因此固定使用第一个候选。计算结果只用于
-     * 成本抵扣，不会发布为产物。无法计算余量时返回空列表，配方仍然参与定价。</p>
+     * <p>标签输入可能有多个候选；求解器按“最便宜候选”计算成本，而返还物只能按一个具体候选读取。
+     * 为了保持成本与抵扣口径一致，只要任一输入槽存在多个候选就放弃本配方的返还物抵扣。
+     * 计算结果只用于成本抵扣，不会发布为产物。无法计算余量时返回空列表，配方仍然参与定价。</p>
      */
     private static List<RecipeOutput> containerRemainderOutputs(CraftingRecipe recipe,
                                                                NonNullList<Ingredient> ingredients,
@@ -325,9 +326,13 @@ public final class RecipeScanner {
                     continue;
                 }
                 ItemStack[] stacks = ingredient.getItems();
-                if (stacks.length > 0 && !stacks[0].isEmpty()) {
-                    items.set(index, stacks[0].copyWithCount(1));
+                if (stacks.length != 1 || stacks[0].isEmpty()
+                        || IngredientStacks.isEmptyTagPlaceholder(stacks[0])) {
+                    // 多候选标签的首个候选可能不同于求解器选中的最便宜输入，
+                    // 返还物无法与成本口径对齐，直接放弃本配方的返还物抵扣。
+                    return List.of();
                 }
+                items.set(index, stacks[0].copyWithCount(1));
             }
             TransientCraftingContainer container = new TransientCraftingContainer(
                     null, Math.max(1, width), Math.max(1, height), items);

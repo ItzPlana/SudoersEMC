@@ -122,6 +122,19 @@ class LargeDropProtectionTest {
     }
 
     @Test
+    void itemExemptionCoversNbtVariants() {
+        LargeDropProtection protection = new LargeDropProtection(new LargeDropProtection.Settings(
+                true, 0.5, Set.of(), Set.of(IRON)));
+        ItemKey variant = ItemKey.of(IRON_ID, "{Damage:3}");
+
+        PriceDropDecision decision = protection.evaluate(variant, 1_000L, 1L);
+
+        assertTrue(decision.allowed(), "物品 id 豁免必须覆盖其全部 NBT 变体");
+        assertEquals("exempt-item", decision.reason());
+        assertEquals(0, protection.quarantineCount());
+    }
+
+    @Test
     void namespaceExemptionAllowsLargeDrop() {
         // 元素只使用 namespace 部分，path 是占位符；任何 minecraft 物品都应被豁免。
         LargeDropProtection protection = new LargeDropProtection(new LargeDropProtection.Settings(

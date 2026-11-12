@@ -47,6 +47,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.function.Predicate;
@@ -70,7 +71,9 @@ import org.slf4j.LoggerFactory;
  * <ol>
  *   <li>{@link #collect(MinecraftServer)} 在服务器线程读取物品注册表与配方管理器，产出不可变的
  *       {@link PipelineSnapshot}；</li>
- *   <li>{@link #solveAndApply(PipelineSnapshot)} 只做纯计算与存储写入，不再访问注册表。</li>
+ *   <li>{@link #solveAndApply(PipelineSnapshot)} 只做计算与存储写入；它自身不直接读取注册表，
+ *       但注入的 ProjectE 手工值判定器在解析标签条目时可能访问物品注册表与标签管理器，
+ *       因此该方法必须由服务器线程调用。</li>
  * </ol>
  *
  * <p>{@link com.itzplana.sudoersemc.task.ScanManager} 会在采集阶段与阶段之间跨越多个 tick，
@@ -146,6 +149,10 @@ public final class ScanPipeline {
     private volatile int lastSolverCacheMisses;
     private volatile int lastOwnershipExternalModifications;
     private volatile int lastOwnershipReleased;
+    /** 最近一次请求的后端重映射完成信号；非空表示写入可能尚未反映到后端。 */
+    private final AtomicReference<CompletableFuture<?>> remapInFlight = new AtomicReference<>();
+    /** 最近一次重映射失败后保持保守：在下一次确认成功前跳过外部修改释放。 */
+    private volatile boolean remapUnconfirmed;
 
     private volatile EmcProvider emcProvider;
     private volatile OverflowScope overflowScope = OverflowScope.OWNED_ONLY;
@@ -298,6 +305,43 @@ public final class ScanPipeline {
      */
     public void setPreserveExternallyModifiedValues(boolean enabled) {
         this.preserveExternallyModifiedValues = enabled;
+    }
+
+    /**
+     * 记录一次已请求的后端 EMC 重映射，并在完成后解除“外部修改检测暂停”状态。
+     *
+     * <p>重映射是异步的：完成前后端仍可能返回 SudoersEMC 写入前的旧值。如果此时把旧值
+     * 当作外部修改，会误释放所有权；由于存储拒绝覆盖非自有条目，错误释放后这些物品无法
+     * 自动重新接管。因此完成信号落地前只检测 ProjectE 手工值，不比较后端漂移。</p>
+     *
+     * <p>传入 {@code null} 表示后端无法报告完成信号，此时保持现有检测行为不变。</p>
+     *
+     * @param completion 重映射完成信号，允许为 {@code null}
+     */
+    public void trackRemapCompletion(@Nullable CompletableFuture<?> completion) {
+        if (completion == null) {
+            return;
+        }
+        remapInFlight.set(completion);
+        completion.whenComplete((ignored, failure) -> {
+            if (!remapInFlight.compareAndSet(completion, null)) {
+                // 已被更新的重映射请求取代，旧结果不得改变当前状态。
+                return;
+            }
+            if (failure == null) {
+                remapUnconfirmed = false;
+            } else {
+                remapUnconfirmed = true;
+                LOGGER.warn("SudoersEMC 的 ProjectE 重映射未成功完成，下一轮继续跳过外部修改释放", failure);
+            }
+        });
+    }
+
+    /**
+     * @return 是否存在尚未确认完成的后端重映射
+     */
+    private boolean remapConfirmationPending() {
+        return remapInFlight.get() != null || remapUnconfirmed;
     }
 
     /**
@@ -660,18 +704,26 @@ public final class ScanPipeline {
             }
 
             Map<ItemKey, Long> existingValues = new TreeMap<>();
+            List<ItemSnapshot> resolvedItems = new ArrayList<>(allItems.size());
             int inspected = 0;
             for (ItemSnapshot item : allItems) {
                 if (inspected++ % EXISTING_VALUE_CANCEL_CHECK_INTERVAL == 0 && isCancelled()) {
                     return partialSnapshot(allItems, scanResult.recipes());
                 }
-                if (item.hasExistingEmc()) {
-                    existingValues.put(item.key(), item.existingValue());
+                // 基础扫描只查询无 NBT 的默认堆叠；变体必须单独回读后端值，
+                // 否则 owned 变体的外部修改永远不会进入外部修改检测。
+                ItemSnapshot resolved = item;
+                if (!item.hasExistingEmc() && item.key().hasVariant()) {
+                    resolved = readVariantExistingValue(item, query);
                 }
+                if (resolved.hasExistingEmc()) {
+                    existingValues.put(resolved.key(), resolved.existingValue());
+                }
+                resolvedItems.add(resolved);
             }
 
             return new PipelineSnapshot(
-                    allItems,
+                    List.copyOf(resolvedItems),
                     scanResult.recipes(),
                     existingValues,
                     scanResult.unsupported(),
@@ -681,6 +733,61 @@ public final class ScanPipeline {
         } catch (Throwable failure) {
             LOGGER.error("SudoersEMC 扫描采集失败，本轮按空快照处理", failure);
             return PipelineSnapshot.empty();
+        }
+    }
+
+    /**
+     * 为单个 NBT 变体补读后端当前值。
+     *
+     * <p>{@link ItemScanner} 只查询无 NBT 的默认堆叠，变体快照默认没有既有值。若不补读，
+     * owned 变体的外部修改永远不会进入外部修改检测，非自有变体的后端值也会被配方定价覆盖。
+     * 后端不可用、无法还原变体或查询失败时原样返回。</p>
+     *
+     * @param snapshot 变体快照
+     * @param query    EMC 查询，必须与基础扫描使用同一后端
+     * @return 携带既有值的新快照，或原快照
+     */
+    static ItemSnapshot readVariantExistingValue(ItemSnapshot snapshot, ItemScanner.EmcQuery query) {
+        if (snapshot == null || !snapshot.key().hasVariant() || query == null) {
+            return snapshot;
+        }
+        ItemStack stack = variantStack(snapshot.key());
+        if (stack == null) {
+            return snapshot;
+        }
+        try {
+            if (!query.hasValue(stack)) {
+                return snapshot;
+            }
+            long value = Math.max(0L, query.getValue(stack));
+            return ItemSnapshot.of(snapshot.key(), true, value,
+                    snapshot.tagPaths(), snapshot.rarity());
+        } catch (RuntimeException failure) {
+            LOGGER.debug("读取 NBT 变体 {} 的后端 EMC 失败，按无既有值处理", snapshot.key(), failure);
+            return snapshot;
+        }
+    }
+
+    /**
+     * 把变体键还原为带 NBT 的物品堆叠；无法解析时返回 {@code null}。
+     */
+    @Nullable
+    private static ItemStack variantStack(ItemKey key) {
+        if (key == null || !key.hasVariant()) {
+            return null;
+        }
+        Item item = BuiltInRegistries.ITEM.get(key.itemId());
+        if (item == null || item == Items.AIR) {
+            return null;
+        }
+        try {
+            CompoundTag tag = TagParser.parseTag(key.variantHash());
+            ItemStack stack = new ItemStack(item);
+            stack.setTag(tag);
+            return stack;
+        } catch (Exception failure) {
+            LOGGER.debug("无法把变体 {} 还原为 ItemStack，跳过既有值读取", key, failure);
+            return null;
         }
     }
 
@@ -1007,11 +1114,18 @@ public final class ScanPipeline {
 
         OwnershipManager manager = new OwnershipManager(store, new MapEmcValueReader(observed));
         List<ItemKey> drifted;
-        try {
-            drifted = manager.detectExternalModifications(considered);
-        } catch (RuntimeException failure) {
-            LOGGER.warn("SudoersEMC 检测外部修改失败，本轮保留现有归属", failure);
+        if (remapConfirmationPending()) {
+            // 重映射尚未确认完成时，后端可能仍返回我们写入前的旧值；
+            // 此时比较漂移会误释放所有权，因此只保留手工值检测。
+            LOGGER.debug("SudoersEMC 的后端重映射尚未确认完成，本轮跳过 owned 条目的漂移检测");
             drifted = List.of();
+        } else {
+            try {
+                drifted = manager.detectExternalModifications(considered);
+            } catch (RuntimeException failure) {
+                LOGGER.warn("SudoersEMC 检测外部修改失败，本轮保留现有归属", failure);
+                drifted = List.of();
+            }
         }
 
         Set<ItemKey> candidates = new TreeSet<>(drifted);
@@ -1028,9 +1142,7 @@ public final class ScanPipeline {
             detected++;
             protectedItems.add(item);
             Long observedValue = observed.get(item);
-            long preservedValue = observedValue != null && observedValue > 0L
-                    ? observedValue
-                    : entry.value();
+            long preservedValue = preservedExternalValue(observedValue, entry.value());
             // 即使所有权释放写入失败，也保留外部值并阻止本轮覆盖；失败只影响后续
             // 扫描是否还能看到 owned 标记，不影响本轮的经济安全。
             if (preservedValue > 0L) {
@@ -1065,6 +1177,19 @@ public final class ScanPipeline {
         } catch (RuntimeException failure) {
             return false;
         }
+    }
+
+    /**
+     * 选择释放所有权时要保留的外部值。
+     *
+     * <p>后端明确报告的 {@code 0} 是有效观测；只有未观测（{@code null}）才回退到最后已知值。</p>
+     *
+     * @param observedValue  本轮后端观测值，未观测时为 {@code null}
+     * @param lastKnownValue 持久化条目中的最后已知值
+     * @return 应保留的值
+     */
+    static long preservedExternalValue(@Nullable Long observedValue, long lastKnownValue) {
+        return observedValue != null ? observedValue : lastKnownValue;
     }
 
     /**
@@ -1125,7 +1250,8 @@ public final class ScanPipeline {
     /**
      * 求解快照并为可定价物品写入生成值。
      *
-     * <p>本方法不访问注册表，只使用快照中的纯数据。处理顺序固定为：</p>
+     * <p>本方法自身不直接读取注册表，只使用快照中的纯数据；但手工值判定器可能通过标签解析
+     * 间接访问注册表，因此必须由服务器线程调用。处理顺序固定为：</p>
      * <ol>
      *   <li>以已有 EMC 为初始种子，最多执行 {@link #MAX_SOLVE_ROUNDS} 轮
      *       “配方求解 → 兜底补种”循环：每轮把本轮求解值并入种子，再对仍无种子的物品

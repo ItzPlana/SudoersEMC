@@ -45,7 +45,7 @@ public final class LargeDropProtection {
      *                             该值才会隔离
      * @param exemptNamespaces     按命名空间整体豁免的物品来源；集合元素的 {@code path} 部分
      *                             会被忽略，只有 {@code namespace} 参与匹配
-     * @param exemptItems          按物品精确豁免的条目
+     * @param exemptItems          按物品 id 豁免的条目；匹配时忽略变体，覆盖该物品的全部 NBT 变体
      */
     public record Settings(
             boolean enabled,
@@ -184,7 +184,10 @@ public final class LargeDropProtection {
             return PriceDropDecision.allowed(
                     previousValue, proposedValue, 0.0, "protection-disabled");
         }
-        if (settings.exemptItems().contains(item)) {
+        // 配置只接受无变体的 namespace:path，而运行时物品键可能携带 variantHash。
+        // 因此精确豁免必须按物品 id 匹配，才能同时覆盖基础物品与其全部 NBT 变体。
+        if (settings.exemptItems().contains(item)
+                || settings.exemptItems().contains(ItemKey.of(item.itemId()))) {
             return PriceDropDecision.exempt(previousValue, proposedValue, 0.0, "exempt-item");
         }
         if (isNamespaceExempt(item)) {

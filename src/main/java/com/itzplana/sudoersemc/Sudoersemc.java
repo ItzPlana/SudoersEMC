@@ -37,6 +37,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.BooleanSupplier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraftforge.common.ForgeConfigSpec;
@@ -649,9 +650,11 @@ public final class Sudoersemc {
         MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
         if (server != null) {
             try {
-                OptionalIntegrationManager.provider()
-                        .ifPresent(provider -> provider.requestRemap(server));
+                OptionalIntegrationManager.provider().ifPresent(provider ->
+                        pipeline.trackRemapCompletion(provider.requestRemapAsync(server)));
             } catch (RuntimeException e) {
+                // 同步请求失败同样视为“未确认”：保留保守状态，避免下一轮误释放所有权。
+                pipeline.trackRemapCompletion(CompletableFuture.failedFuture(e));
                 LOGGER.warn("SudoersEMC 请求 ProjectE 重映射失败，已生成条目仍会保存", e);
             }
         }
