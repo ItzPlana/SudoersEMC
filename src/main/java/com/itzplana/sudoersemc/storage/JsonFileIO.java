@@ -85,14 +85,28 @@ public final class JsonFileIO {
      * @param data object to serialize; must not be {@code null}
      */
     public static void writeAtomically(Path file, Object data) {
+        writeAtomicallyAndReport(file, data);
+    }
+
+    /**
+     * Writes a JSON document to a temporary sibling file and moves it over the target.
+     *
+     * <p>Behavior matches {@link #writeAtomically(Path, Object)} but reports whether the target
+     * file was actually replaced, so callers that must not audit a failed write can react.</p>
+     *
+     * @param file destination
+     * @param data object to serialize; must not be {@code null}
+     * @return {@code true} when the target file was replaced, {@code false} on any failure
+     */
+    public static boolean writeAtomicallyAndReport(Path file, Object data) {
         if (file == null || data == null) {
             LOGGER.warn("Refusing to write JSON: file={} data={}", file, data);
-            return;
+            return false;
         }
         Path fileName = file.getFileName();
         if (fileName == null) {
             LOGGER.warn("Refusing to write JSON to a path without a file name: {}", file);
-            return;
+            return false;
         }
 
         Path temp = file.resolveSibling(fileName + TEMP_SUFFIX);
@@ -115,9 +129,11 @@ public final class JsonFileIO {
                 LOGGER.debug("Atomic move not supported for {}; falling back to a plain replace", file);
                 Files.move(temp, file, StandardCopyOption.REPLACE_EXISTING);
             }
+            return true;
         } catch (IOException | RuntimeException e) {
             LOGGER.warn("Failed to write JSON file {}", file, e);
             deleteQuietly(temp);
+            return false;
         }
     }
 
@@ -131,16 +147,29 @@ public final class JsonFileIO {
      * @param file file to back up
      */
     public static void backupIfExists(Path file) {
+        backupIfExistsAndReturn(file);
+    }
+
+    /**
+     * Copies an existing file to {@code <name>.<epochMillis>.bak}.
+     *
+     * <p>Behavior matches {@link #backupIfExists(Path)}; the created backup path is returned so
+     * callers can report or verify it. Returns {@code null} when no backup was made.</p>
+     *
+     * @param file file to back up
+     * @return the created backup path, or {@code null}
+     */
+    public static Path backupIfExistsAndReturn(Path file) {
         if (file == null) {
-            return;
+            return null;
         }
         try {
             if (!Files.isRegularFile(file)) {
-                return;
+                return null;
             }
             Path fileName = file.getFileName();
             if (fileName == null) {
-                return;
+                return null;
             }
             Path parent = file.toAbsolutePath().getParent();
             if (parent != null) {
@@ -149,8 +178,10 @@ public final class JsonFileIO {
             Path backup = file.resolveSibling(fileName + "." + System.currentTimeMillis() + BACKUP_SUFFIX);
             Files.copy(file, backup, StandardCopyOption.REPLACE_EXISTING);
             LOGGER.debug("Backed up {} to {}", file, backup);
+            return backup;
         } catch (IOException | RuntimeException e) {
             LOGGER.warn("Could not back up {} before rewriting it", file, e);
+            return null;
         }
     }
 

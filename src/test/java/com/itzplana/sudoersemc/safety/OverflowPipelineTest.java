@@ -149,4 +149,22 @@ class OverflowPipelineTest {
         assertEquals(0, disabledPipeline.resetsApplied());
         assertTrue(log.entries().isEmpty());
     }
+
+    @Test
+    void customEmcResetIsAuditedWithEntireScope() {
+        pipeline.recordCustomEmcReset(ITEM, 1_500_000L, 500L);
+
+        assertEquals(1, pipeline.auditCount());
+        assertEquals(1, pipeline.resetsApplied());
+
+        List<OverflowReset> entries = log.entries();
+        assertEquals(1, entries.size());
+        OverflowReset audit = entries.get(0);
+        assertEquals(ITEM, audit.item());
+        assertEquals(1_500_000L, audit.originalValue());
+        assertEquals(500L, audit.resetValue());
+        assertEquals(THRESHOLD, audit.threshold());
+        assertEquals(OverflowScope.ENTIRE_CUSTOM_EMC, audit.scope());
+        assertTrue(audit.timestamp() > 0L);
+    }
 }

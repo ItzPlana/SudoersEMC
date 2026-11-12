@@ -106,6 +106,44 @@ public final class OverflowPipeline {
     }
 
     /**
+     * 记录一条来自 ProjectE {@code custom_emc.json} 受控改写的重置。
+     *
+     * <p>与 {@link #applyAndAudit(ItemKey, long, OverflowScope)} 不同，数值已经由
+     * {@code ProjectECustomEmcFile} 计算并写回，这里只负责生成作用域为
+     * {@link OverflowScope#ENTIRE_CUSTOM_EMC} 的审计记录。审计写入失败不会抛出异常。</p>
+     *
+     * @param item          被改写的物品
+     * @param originalValue 改写前的值，必须严格大于阈值
+     * @param resetValue    写回的新值
+     */
+    public void recordCustomEmcReset(ItemKey item, long originalValue, long resetValue) {
+        if (item == null) {
+            return;
+        }
+        try {
+            OverflowReset audit = new OverflowReset(
+                    item,
+                    originalValue,
+                    resetValue,
+                    protection.settings().threshold(),
+                    OverflowScope.ENTIRE_CUSTOM_EMC,
+                    System.currentTimeMillis());
+            log.record(audit);
+            recordedResets.incrementAndGet();
+            resetsApplied.incrementAndGet();
+        } catch (RuntimeException e) {
+            LOGGER.warn("记录 ProjectE custom_emc.json 溢出重置审计失败（物品 {}）", item, e);
+        }
+    }
+
+    /**
+     * @return 本流水线使用的溢出策略，供文件改写等外围接线读取阈值与回落区间
+     */
+    public OverflowProtection protection() {
+        return protection;
+    }
+
+    /**
      * @return 本流水线实例实际改变数值的次数；审计写入失败但值确实被重置时也计入
      */
     public int resetsApplied() {

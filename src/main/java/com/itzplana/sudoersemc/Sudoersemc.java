@@ -3,6 +3,7 @@ package com.itzplana.sudoersemc;
 import com.itzplana.sudoersemc.command.CommandService;
 import com.itzplana.sudoersemc.command.SudoemcCommands;
 import com.itzplana.sudoersemc.config.SudoersemcConfig;
+import com.itzplana.sudoersemc.core.OverflowScope;
 import com.itzplana.sudoersemc.diagnostic.ReportManager;
 import com.itzplana.sudoersemc.diagnostic.SmokeTestHook;
 import com.itzplana.sudoersemc.integration.GeneratedEmcMapper;
@@ -205,6 +206,19 @@ public final class Sudoersemc {
                 fallbackPricing,
                 solveSettings);
         pipeline.setEmcProvider(OptionalIntegrationManager.provider().orElse(null));
+
+        OverflowScope overflowScope = OverflowScope.OWNED_ONLY;
+        boolean allowProjectEFileRewrite = false;
+        try {
+            overflowScope = SudoersemcConfig.parseOverflowScope(
+                    SudoersemcConfig.OVERFLOW_OVERWRITE_SCOPE.get());
+            allowProjectEFileRewrite = SudoersemcConfig.OVERFLOW_ALLOW_PROJECTE_FILE_REWRITE.get();
+        } catch (RuntimeException e) {
+            // 配置尚未加载或读取失败时回退到最保守的组合，绝不阻止模组启动。
+            LOGGER.warn("SudoersEMC 无法读取溢出作用域配置，回退 owned_only 并禁用 ProjectE 文件改写", e);
+        }
+        pipeline.setOverflowScope(overflowScope);
+        pipeline.setProjectEFileRewriteEnabled(allowProjectEFileRewrite);
         return pipeline;
     }
 

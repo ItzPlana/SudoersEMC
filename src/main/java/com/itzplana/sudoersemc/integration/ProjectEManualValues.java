@@ -77,7 +77,7 @@ public final class ProjectEManualValues {
         this.configFile = Objects.requireNonNull(configFile, "configFile");
     }
 
-    private static Path defaultConfigPath() {
+    static Path defaultConfigPath() {
         try {
             return FMLPaths.CONFIGDIR.get().resolve("ProjectE").resolve("custom_emc.json");
         } catch (Throwable t) {
