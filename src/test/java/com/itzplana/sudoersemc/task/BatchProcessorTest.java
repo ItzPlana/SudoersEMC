@@ -115,4 +115,16 @@ class BatchProcessorTest {
         assertThrows(IllegalArgumentException.class, () -> new BatchProcessor(0, true));
         assertThrows(IllegalArgumentException.class, () -> new BatchProcessor(-3, false));
     }
+
+    @Test
+    void adaptiveGrowthAddsAtLeastOneWhenCurrentBatchIsOne() {
+        BatchProcessor processor = new BatchProcessor(1, true);
+
+        assertEquals(2, processor.nextBatchSize(1L, 1_000L),
+                "size=1 时也必须至少增长到 2");
+
+        processor.recordBatch(1, 1L);
+        assertEquals(2, processor.nextBatchSize(1L, 1_000L),
+                "记录 size=1 的批次后仍应至少增长到 2");
+    }
 }

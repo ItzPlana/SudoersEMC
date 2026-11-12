@@ -32,6 +32,7 @@ import com.mojang.logging.LogUtils;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.BooleanSupplier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraftforge.common.ForgeConfigSpec;
 import net.minecraftforge.common.MinecraftForge;
@@ -285,7 +286,8 @@ public final class Sudoersemc {
                 newCreativeProtection,
                 newFallbackPricing,
                 newSolveSettings);
-        ScanManager manager = createScanManager(pipeline);
+        boolean scanEnabled = readBoolean("general.enabled", SudoersemcConfig.GENERAL_ENABLED, true);
+        ScanManager manager = scanEnabled ? createScanManager(pipeline) : null;
         CommandService service = new CommandService(
                 manager,
                 reports,
@@ -510,6 +512,41 @@ public final class Sudoersemc {
     }
 
     /**
+     * 兼容测试与命令入口的开关判断：关闭时返回 {@code null}。
+     */
+    static ScanManager createScanManagerIfEnabled(BooleanSupplier enabledSupplier) {
+        boolean enabled = true;
+        try {
+            enabled = enabledSupplier.getAsBoolean();
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法读取 [general] enabled，按启用处理", e);
+        }
+        return enabled ? createScanManager(null) : null;
+    }
+
+    /**
+     * 兼容测试的启动扫描开关判断。
+     */
+    static boolean shouldRequestScanOnStart(BooleanSupplier alwaysRescanSupplier) {
+        try {
+            return alwaysRescanSupplier.getAsBoolean();
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法读取 [general] alwaysRescan，按不重扫处理", e);
+            return false;
+        }
+    }
+
+    /**
+     * 停服时取消并重置调度器。
+     */
+    static void resetScanManager(ScanManager manager) {
+        if (manager != null) {
+            manager.cancel();
+            manager.reset();
+        }
+    }
+
+    /**
      * 采集阶段回调：读取当前服务器并生成不可变快照。
      *
      * <p>服务器尚未就绪时返回空快照，避免调度器因为空指针进入失败状态。</p>
@@ -595,6 +632,7 @@ public final class Sudoersemc {
     }
 
     private void onServerStarted(ServerStartedEvent event) {
+        SudoemcCommands.setService(commandService);
         GeneratedEntryStore store = entryStore;
         if (store != null) {
             LOGGER.info("SudoersEMC active: {} generated entries, ProjectE {}",
@@ -640,6 +678,7 @@ public final class Sudoersemc {
     }
 
     private void onServerStopping(ServerStoppingEvent event) {
+        resetScanManager(scanManager);
         GeneratedEntryStore store = entryStore;
         if (store != null) {
             store.saveIfDirty();
@@ -656,6 +695,9 @@ public final class Sudoersemc {
         if (resetLog != null) {
             resetLog.save();
         }
+        pendingReload = false;
+        // 不保留指向旧世界的命令服务；下一次 ServerStartedEvent 会重新注入。
+        SudoemcCommands.setService(null);
     }
 
     /**

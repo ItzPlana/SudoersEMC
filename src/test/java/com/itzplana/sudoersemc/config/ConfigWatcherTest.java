@@ -49,6 +49,32 @@ class ConfigWatcherTest {
     }
 
     @Test
+    void invalidReloadKeepsPreviouslyAppliedComponent() {
+        ConfigWatcher watcher = new ConfigWatcher();
+        java.util.concurrent.atomic.AtomicReference<String> active =
+                new java.util.concurrent.atomic.AtomicReference<>("old");
+        watcher.register(result -> active.set("new"));
+
+        watcher.fireReload(ConfigValidationResult.ok());
+        assertEquals("new", active.get());
+
+        watcher.fireReload(ConfigValidationResult.failed(List.of("bad"), List.of()));
+        assertEquals("new", active.get(), "a rejected reload must keep the previous component");
+    }
+
+    @Test
+    void fireReloadLogsWarningsOnceOnSuccess() {
+        ConfigWatcher watcher = new ConfigWatcher();
+        ConfigValidationResult result = ConfigValidationResult.ok(List.of("w1", "w2"));
+
+        watcher.fireReload(result);
+        assertEquals(2, watcher.loggedWarningCount());
+
+        watcher.fireReload(ConfigValidationResult.ok(List.of("w1", "w2")));
+        assertEquals(2, watcher.loggedWarningCount());
+    }
+
+    @Test
     void duplicateWarningsAreLoggedOnce() {
         ConfigWatcher watcher = new ConfigWatcher();
         ConfigValidationResult result = ConfigValidationResult.ok(List.of("w1", "w2", "w1"));

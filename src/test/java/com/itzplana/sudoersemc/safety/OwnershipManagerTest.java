@@ -253,6 +253,41 @@ class OwnershipManagerTest {
         assertTrue(sink.get(IRON).owned(), "存储失败时不得改动已有条目");
     }
 
+    @Test
+    void unknownCurrentValueIsUnknownAndNeverReleased() {
+        InMemorySink sink = new InMemorySink();
+        FakeReader reader = new FakeReader();
+        sink.put(entry(IRON, 100L, true));
+        sink.put(entry(GOLD, 200L, true));
+        reader.set(IRON, 100L);
+        // GOLD 没有当前值：按 EmcValueReader 契约返回 0，代表无法确定。
+
+        OwnershipManager manager = new OwnershipManager(sink, reader);
+
+        assertEquals(OwnershipState.OWNED_BY_US, manager.classify(IRON));
+        assertEquals(OwnershipState.UNKNOWN, manager.classify(GOLD));
+        assertTrue(manager.detectExternalModifications().isEmpty(),
+                "当前值未知不能被当作外部修改");
+        assertEquals(0, manager.migrateOwnership());
+        assertTrue(sink.get(GOLD).owned(), "未知当前值绝不能导致误释放所有权");
+        assertEquals(OwnershipState.UNKNOWN, manager.snapshotStates().get(GOLD));
+    }
+
+    @Test
+    void migrateOwnershipReadsStoreSnapshotOnce() {
+        InMemorySink sink = new InMemorySink();
+        FakeReader reader = new FakeReader();
+        sink.put(entry(IRON, 100L, true));
+        sink.put(entry(GOLD, 200L, true));
+        sink.put(entry(DIAMOND, 300L, true));
+        reader.set(IRON, 90L);
+        reader.set(GOLD, 200L);
+        reader.set(DIAMOND, 350L);
+
+        assertEquals(2, new OwnershipManager(sink, reader).migrateOwnership());
+        assertEquals(1, sink.snapshotCalls, "迁移应只读取一次快照，避免逐条重新快照");
+    }
+
     private static GeneratedEmcEntry entry(ItemKey item, long value, boolean owned) {
         return new GeneratedEmcEntry(item, value, PriceSource.RECIPE, RECIPE_ID, owned, TIMESTAMP);
     }
@@ -260,6 +295,7 @@ class OwnershipManagerTest {
     private static final class InMemorySink implements OwnedEntrySink {
 
         private final Map<ItemKey, GeneratedEmcEntry> entries = new HashMap<>();
+        private int snapshotCalls;
         private boolean failOnSnapshot;
         private boolean failOnStage;
 
@@ -294,6 +330,7 @@ class OwnershipManagerTest {
 
         @Override
         public Map<ItemKey, GeneratedEmcEntry> snapshotAll() {
+            snapshotCalls++;
             if (failOnSnapshot) {
                 throw new IllegalStateException("simulated snapshot failure");
             }
