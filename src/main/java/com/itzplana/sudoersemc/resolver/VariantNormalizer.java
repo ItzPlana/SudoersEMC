@@ -26,8 +26,10 @@ import org.jetbrains.annotations.Nullable;
  * <p>经济相关数据必须保留，包括 {@code Enchantments}、{@code StoredEnchantments}、
  * {@code Potion}/{@code CustomPotionEffects}、{@code BlockEntityTag}（容器内容）、
  * {@code Items} 与 {@code SkullOwner}。{@link #keyFor(ResourceLocation, CompoundTag)}
- * 还会对可损坏物品剥离顶层的 {@code Damage}：ProjectE 的 {@code DamageProcessor} 在
- * 查询时按耐久动态折价，把每个耐久值都枚举成独立变体会造成变体爆炸与重复折价。
+ * 会把可损坏物品顶层的 {@code Damage} 规范化为 {@code 0}：ProjectE 的
+ * {@code DamageProcessor} 在查询时按耐久动态折价，把每个耐久值都枚举成独立变体会造成
+ * 变体爆炸与重复折价；若清洗后仍有附魔等经济字段，则保留 {@code {Damage:0,...}} 以匹配
+ * ProjectE 精确 NBT 的 {@code ItemInfo}，原始标签不含 {@code Damage} 时不凭空添加。
  * {@link #normalize(CompoundTag)} 不知道物品类型，因此保留 {@code Damage}，仅用于
  * 无法确定物品身份的嵌套数据。所有复合标签的键都会按字典序排序，因此相同的标签无论插入
  * 顺序如何都会得到完全相同的字符串。返回值是合法的 SNBT，可直接交给
@@ -70,14 +72,10 @@ public final class VariantNormalizer {
      * @return 规范化的 SNBT；清洗后没有经济相关数据时返回 {@code null}
      */
     public static @Nullable String normalize(@Nullable CompoundTag tag) {
-        return normalize(tag, false);
-    }
-
-    private static @Nullable String normalize(@Nullable CompoundTag tag, boolean stripTopLevelDamage) {
         if (tag == null || tag.isEmpty()) {
             return null;
         }
-        CompoundTag sanitized = sanitizeCompound(tag, stripTopLevelDamage);
+        CompoundTag sanitized = sanitizeCompound(tag, false);
         if (sanitized.isEmpty()) {
             return null;
         }
@@ -89,9 +87,12 @@ public final class VariantNormalizer {
     /**
      * 为指定物品构建带有规范化变体哈希的物品键。
      *
-     * <p>可损坏物品（例如剑、工具）的顶层 {@code Damage} 会被剥离：ProjectE 的
-     * {@code DamageProcessor} 在 EMC 查询时按剩余耐久折价。若把每个耐久值都作为独立
-     * 变体写入映射，既会占满变体上限，又会在查询时被再次折价。</p>
+     * <p>可损坏物品（例如剑、工具）的顶层 {@code Damage} 会被规范化为 {@code 0}：ProjectE 的
+     * {@code DamageProcessor} 在 EMC 查询时按剩余耐久折价。若把每个耐久值都作为独立变体写入
+     * 映射，既会占满变体上限，又会在查询时被再次折价。清洗后若还有附魔等其它经济字段，则保留
+     * {@code {Damage:0,...}} 以与 ProjectE 实际生成的 {@code ItemInfo} 对齐；原始标签不含
+     * {@code Damage} 时保持 ProjectE 的无伤害形状（其 {@code ItemInfo} 按完整 NBT 精确匹配），
+     * 若只剩默认伤害则返回普通物品键。</p>
      *
      * @param itemId 物品注册 id
      * @param tag    原始物品标签，允许为 {@code null}
@@ -99,9 +100,33 @@ public final class VariantNormalizer {
      */
     public static ItemKey keyFor(ResourceLocation itemId, @Nullable CompoundTag tag) {
         Objects.requireNonNull(itemId, "itemId");
-        Item item = BuiltInRegistries.ITEM.getOptional(itemId).orElse(null);
-        boolean stripTopLevelDamage = item != null && item.canBeDepleted();
-        return ItemKey.of(itemId, normalize(tag, stripTopLevelDamage));
+        return keyFor(itemId, tag, BuiltInRegistries.ITEM.getOptional(itemId).orElse(null));
+    }
+
+    /**
+     * 已解析 {@link Item} 的重载，供同一调用链复用注册表查询结果。
+     */
+    static ItemKey keyFor(ResourceLocation itemId, @Nullable CompoundTag tag, @Nullable Item item) {
+        Objects.requireNonNull(itemId, "itemId");
+        if (item == null || !item.canBeDepleted()) {
+            return ItemKey.of(itemId, normalize(tag));
+        }
+        boolean hadDamage = tag != null && tag.contains(DAMAGE);
+        CompoundTag sanitized = tag == null || tag.isEmpty()
+                ? new CompoundTag()
+                : sanitizeCompound(tag, true);
+        if (sanitized.isEmpty()) {
+            return ItemKey.of(itemId);
+        }
+        // ProjectE 的 ItemInfo 按完整 NBT 精确匹配：带其它 NBT 的可损坏物品若原本带有
+        // Damage，其默认形状是 {Damage:0,...}；若原本没有 Damage，则必须保持无伤害形状。
+        // 把 Damage 统一归一到 0 只消除“每耐久一个变体”，不会凭空改变 ItemInfo 的形状。
+        if (hadDamage) {
+            sanitized.putInt(DAMAGE, 0);
+        }
+        StringBuilder out = new StringBuilder();
+        writeCompound(sanitized, out);
+        return ItemKey.of(itemId, out.toString());
     }
 
     private static CompoundTag sanitizeCompound(CompoundTag source, boolean stripTopLevelDamage) {

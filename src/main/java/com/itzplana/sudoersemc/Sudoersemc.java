@@ -259,7 +259,7 @@ public final class Sudoersemc {
         BatchProcessor processor = new BatchProcessor(Math.max(1, itemsPerTick), adaptive);
         return new ScanManager(
                 processor,
-                () -> collectSnapshot(pipeline),
+                () -> ScanManager.oneShot(collectSnapshot(pipeline)).begin(),
                 data -> applySnapshot(pipeline),
                 TICK_BUDGET_NANOS);
     }
@@ -589,13 +589,10 @@ public final class Sudoersemc {
         if (stateStore != null) {
             stateStore.saveIfDirty();
         }
-<<<<<<< HEAD
         OverflowResetLog resetLog = overflowResetLog;
         if (resetLog != null) {
             resetLog.save();
         }
-=======
->>>>>>> phase-13-runtime-pricing
         pendingReload = false;
         // 不保留指向旧世界的命令服务；下一次 ServerStartedEvent 会重新注入。
         SudoemcCommands.setService(null);
