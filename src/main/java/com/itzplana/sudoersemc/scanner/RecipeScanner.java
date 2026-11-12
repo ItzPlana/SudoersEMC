@@ -92,25 +92,58 @@ public final class RecipeScanner {
     public ScanResult scan(RecipeManager manager, BooleanSupplier cancellation) {
         Objects.requireNonNull(manager, "manager");
         Objects.requireNonNull(cancellation, "cancellation");
+        List<ResourceLocation> ids;
+        try {
+            ids = orderedRecipeIds(manager);
+        } catch (RuntimeException e) {
+            LOGGER.warn("Could not enumerate recipe ids", e);
+            return new ScanResult(List.of(), 0, 0, 1,
+                    List.of("recipe-manager: " + failureText(e)));
+        }
+        return scanBatch(manager, ids, cancellation);
+    }
+
+    /**
+     * 返回按 {@link ResourceLocation} 自然顺序排序的配方 id。
+     *
+     * <p>采集会话在开始配方阶段时固化一次顺序，随后按页推进；这样配方管理器的迭代顺序
+     * 变化不会导致跨 tick 游标漂移。</p>
+     *
+     * @param manager 当前配方管理器
+     * @return 不可变、排序后的配方 id 列表
+     */
+    public List<ResourceLocation> orderedRecipeIds(RecipeManager manager) {
+        Objects.requireNonNull(manager, "manager");
+        List<ResourceLocation> ids = manager.getRecipeIds().toList();
+        ids.sort(ResourceLocation::compareTo);
+        return List.copyOf(ids);
+    }
+
+    /**
+     * 扫描一页已经排好序的配方 id。
+     *
+     * <p>本方法不修改扫描器状态，调用方负责维护游标与累计计数器。每
+     * {@value #CANCELLATION_CHECK_INTERVAL} 条配方检查一次取消信号；取消时返回本页已经描述的
+     * 部分配方。失败明细每页最多保留 {@link #MAX_FAILED_DETAILS} 条，跨页合并由调用方负责。</p>
+     *
+     * @param manager      当前配方管理器
+     * @param orderedIds   稳定顺序的配方 id 列表
+     * @param cancellation 取消检查；返回 {@code true} 时停止本页
+     * @return 本页可用配方与跳过计数
+     */
+    public ScanResult scanBatch(RecipeManager manager, List<ResourceLocation> orderedIds,
+                                BooleanSupplier cancellation) {
+        Objects.requireNonNull(manager, "manager");
+        Objects.requireNonNull(orderedIds, "orderedIds");
+        Objects.requireNonNull(cancellation, "cancellation");
         List<RecipeSnapshot> snapshots = new ArrayList<>();
         List<String> failedDetails = new ArrayList<>();
         int unsupported = 0;
         int invalid = 0;
         int failed = 0;
 
-        // getRecipeIds()/byKey() is the only 1.20.1 API that pairs an id with its recipe without
-        // touching private state.
-        List<ResourceLocation> ids;
-        try {
-            ids = manager.getRecipeIds().toList();
-        } catch (RuntimeException e) {
-            LOGGER.warn("Could not enumerate recipe ids", e);
-            return new ScanResult(List.of(), 0, 0, 1,
-                    List.of("recipe-manager: " + failureText(e)));
-        }
-
         int processed = 0;
-        for (ResourceLocation id : ids) {
+        for (ResourceLocation id : orderedIds) {
             if (processed % CANCELLATION_CHECK_INTERVAL == 0 && cancellation.getAsBoolean()) {
                 break;
             }

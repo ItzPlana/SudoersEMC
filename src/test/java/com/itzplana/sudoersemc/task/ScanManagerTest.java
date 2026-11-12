@@ -6,6 +6,15 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.itzplana.sudoersemc.pipeline.PipelineSnapshot;
+import com.itzplana.sudoersemc.pipeline.ScanPipeline;
+import com.itzplana.sudoersemc.pipeline.SolveOutcome;
+import com.itzplana.sudoersemc.solver.SolveResult;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
@@ -347,5 +356,240 @@ class ScanManagerTest {
         manager.tick();
         assertEquals(ScanPhase.CANCELLED, manager.progress().phase(),
                 "管线内部请求的取消信号应在下一次 tick 被调度器观察");
+    }
+    // ------------------------------------------------------------------
+    // Phase 27：分片采集 + 工作线程求解
+    // ------------------------------------------------------------------
+
+    @Test
+    void pipelineCollectingSpansAtLeastThreeTicksWithSmallBudget() {
+        AtomicInteger steps = new AtomicInteger();
+        AtomicInteger applied = new AtomicInteger();
+        SolveWorker worker = new SolveWorker(snapshot -> emptyOutcome());
+        ScanManager manager = pipelineManager(worker, false,
+                pipelineSession(5, 0, steps), applied);
+
+        manager.requestScan();
+        int collectingTicks = 0;
+        while (manager.progress().phase() == ScanPhase.COLLECTING_SNAPSHOT
+                && collectingTicks < TICK_GUARD) {
+            manager.tick();
+            collectingTicks++;
+        }
+
+        assertTrue(collectingTicks >= 3, "小批量下采集必须跨至少 3 个 tick");
+        while (manager.isRunning() && collectingTicks < TICK_GUARD) {
+            manager.tick();
+            collectingTicks++;
+        }
+        assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
+        assertEquals(1, applied.get(), "应用回调只能执行一次");
+        worker.shutdownNow();
+    }
+
+    @Test
+    void pipelineSolveRunsOnDedicatedWorkerThread() {
+        AtomicReference<String> solverThread = new AtomicReference<>();
+        SolveWorker worker = new SolveWorker(snapshot -> {
+            solverThread.set(Thread.currentThread().getName());
+            return emptyOutcome();
+        });
+        AtomicInteger applied = new AtomicInteger();
+        ScanManager manager = pipelineManager(worker, true,
+                pipelineSession(1, 0, new AtomicInteger()), applied);
+
+        manager.requestScan();
+        boolean sawSolvingDetail = false;
+        int ticks = 0;
+        while (manager.isRunning() && ticks < TICK_GUARD) {
+            manager.tick();
+            ticks++;
+            if (manager.progress().phase() == ScanPhase.SOLVING
+                    && manager.progress().detail().contains("工作线程")) {
+                sawSolvingDetail = true;
+            }
+        }
+
+        assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
+        assertTrue(solverThread.get() != null
+                && solverThread.get().contains(SolveWorker.THREAD_NAME),
+                "纯求解必须在 sudoersemc-solver 线程执行，实际为 " + solverThread.get());
+        assertTrue(sawSolvingDetail, "SOLVING 进度必须标明工作线程");
+        assertEquals(1, applied.get());
+        worker.shutdownNow();
+    }
+
+    @Test
+    void pipelineWorkerFailureEndsInFailedState() {
+        SolveWorker worker = new SolveWorker(snapshot -> {
+            throw new IllegalStateException("求解爆炸");
+        });
+        AtomicInteger applied = new AtomicInteger();
+        ScanManager manager = pipelineManager(worker, true,
+                pipelineSession(1, 0, new AtomicInteger()), applied);
+
+        manager.requestScan();
+        int ticks = 0;
+        while (manager.isRunning() && ticks < TICK_GUARD) {
+            manager.tick();
+            ticks++;
+        }
+
+        assertEquals(ScanPhase.FAILED, manager.progress().phase());
+        assertTrue(manager.progress().detail().contains("求解爆炸"),
+                "工作线程异常消息必须写入进度：" + manager.progress().detail());
+        assertEquals(0, applied.get(), "失败时不得进入应用阶段");
+        worker.shutdownNow();
+    }
+
+    @Test
+    void pipelineCancelDuringSolvingCancelsFutureAndInterruptsWorker() throws Exception {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch interrupted = new CountDownLatch(1);
+        SolveWorker worker = new SolveWorker(snapshot -> {
+            started.countDown();
+            try {
+                Thread.sleep(30_000L);
+            } catch (InterruptedException interruption) {
+                interrupted.countDown();
+                Thread.currentThread().interrupt();
+            }
+            return emptyOutcome();
+        });
+        AtomicInteger applied = new AtomicInteger();
+        ScanManager manager = pipelineManager(worker, true,
+                pipelineSession(1, 0, new AtomicInteger()), applied);
+
+        manager.requestScan();
+        manager.tick();
+        assertEquals(ScanPhase.SOLVING, manager.progress().phase());
+        assertTrue(started.await(2L, TimeUnit.SECONDS), "求解任务应在线程池启动");
+
+        manager.cancel();
+        manager.tick();
+
+        assertEquals(ScanPhase.CANCELLED, manager.progress().phase());
+        assertTrue(interrupted.await(2L, TimeUnit.SECONDS), "取消必须中断工作线程");
+        assertEquals(0, applied.get());
+        worker.shutdownNow();
+    }
+
+    @Test
+    void solveOffThreadFalseCompletesInline() {
+        AtomicReference<String> solverThread = new AtomicReference<>();
+        SolveWorker worker = new SolveWorker(snapshot -> {
+            solverThread.set(Thread.currentThread().getName());
+            return emptyOutcome();
+        });
+        AtomicInteger applied = new AtomicInteger();
+        ScanManager manager = pipelineManager(worker, false,
+                pipelineSession(1, 0, new AtomicInteger()), applied);
+
+        manager.requestScan();
+        int ticks = 0;
+        while (manager.isRunning() && ticks < TICK_GUARD) {
+            manager.tick();
+            ticks++;
+        }
+
+        assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
+        assertFalse(solverThread.get() != null
+                        && solverThread.get().contains(SolveWorker.THREAD_NAME),
+                "solveOffThread=false 时不应使用工作线程");
+        assertEquals(1, applied.get());
+        worker.shutdownNow();
+    }
+
+    @Test
+    void pipelineProgressShowsCollectingBatchDetail() {
+        SolveWorker worker = new SolveWorker(snapshot -> emptyOutcome());
+        ScanManager manager = pipelineManager(worker, false,
+                pipelineSession(3, 0, new AtomicInteger()), new AtomicInteger());
+
+        manager.requestScan();
+        manager.tick();
+
+        assertEquals(ScanPhase.COLLECTING_SNAPSHOT, manager.progress().phase());
+        assertTrue(manager.progress().detail().contains("采集物品 1/3"),
+                "进度必须显示物品批次：" + manager.progress().detail());
+        assertTrue(manager.progress().detail().contains("批 1"),
+                "进度必须显示当前批量：" + manager.progress().detail());
+        worker.shutdownNow();
+    }
+
+    private static ScanManager pipelineManager(SolveWorker worker, boolean solveOffThread,
+                                               ScanPipeline.CollectSession session,
+                                               AtomicInteger applied) {
+        return new ScanManager(new BatchProcessor(1, false),
+                () -> session,
+                (snapshot, outcome) -> {
+                    applied.incrementAndGet();
+                    return 1;
+                },
+                TICK_BUDGET_NANOS, new ScanDiagnostics(), null, new ScanCancellation(),
+                worker, solveOffThread);
+    }
+
+    private static ScanPipeline.CollectSession pipelineSession(int items, int recipes,
+                                                               AtomicInteger steps) {
+        return new ScanPipeline.CollectSession() {
+            private int itemCursor;
+            private int recipeCursor;
+            private boolean done;
+
+            @Override
+            public boolean isDone() {
+                return done;
+            }
+
+            @Override
+            public int itemCount() {
+                return items;
+            }
+
+            @Override
+            public int recipeCount() {
+                return recipes;
+            }
+
+            @Override
+            public int processedItems() {
+                return itemCursor;
+            }
+
+            @Override
+            public int processedRecipes() {
+                return recipeCursor;
+            }
+
+            @Override
+            public void step(int budget) {
+                steps.incrementAndGet();
+                int batch = Math.max(1, budget);
+                if (itemCursor < items) {
+                    itemCursor = (int) Math.min((long) items, (long) itemCursor + batch);
+                    done = itemCursor >= items && recipeCursor >= recipes;
+                    return;
+                }
+                if (recipeCursor < recipes) {
+                    recipeCursor = (int) Math.min((long) recipes, (long) recipeCursor + batch);
+                    done = itemCursor >= items && recipeCursor >= recipes;
+                    return;
+                }
+                done = true;
+            }
+
+            @Override
+            public PipelineSnapshot finish() {
+                done = true;
+                return PipelineSnapshot.empty();
+            }
+        };
+    }
+
+    private static SolveOutcome emptyOutcome() {
+        return new SolveOutcome(PipelineSnapshot.empty(), List.of(),
+                new SolveResult(Map.of(), Map.of(), List.of(), Set.of(), 0, false, 0L, 0),
+                0, 1, 0, 0, 0, Set.of(), 0, false, false, "", System.nanoTime(), 0L);
     }
 }

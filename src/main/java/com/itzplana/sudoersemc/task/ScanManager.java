@@ -1,6 +1,12 @@
 package com.itzplana.sudoersemc.task;
 
+import com.itzplana.sudoersemc.pipeline.PipelineSnapshot;
+import com.itzplana.sudoersemc.pipeline.ScanPipeline;
+import com.itzplana.sudoersemc.pipeline.SolveOutcome;
 import java.util.Objects;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -8,27 +14,32 @@ import org.slf4j.LoggerFactory;
 /**
  * 由服务器 tick 驱动的单次扫描状态机。
  *
- * <p>一次扫描的生命周期为：请求扫描 → 采集快照 → 求解配方 → 应用结果 → 持久化 → 完成。
- * 每次 {@link #tick()} 最多推进一步当前阶段，并根据 {@link BatchProcessor} 的建议批量
- * 增加已处理数量。这样把可能较重的全量扫描拆散到多个 tick，避免服务器出现长时间卡顿。</p>
+ * <p>一次扫描的生命周期为：请求扫描 → 分片采集快照 → 求解配方 → 应用结果 → 持久化 → 完成。
+ * 每次 {@link #tick()} 最多推进一个阶段的一批工作：</p>
+ * <ul>
+ *   <li>{@link ScanPhase#COLLECTING_SNAPSHOT}：首次 tick 创建增量采集会话，随后每 tick 用
+ *       {@link BatchProcessor#nextBatchSize(long, long)} 决定预算并调用
+ *       {@link ScanPipeline.CollectSession#step(int)}；</li>
+ *   <li>{@link ScanPhase#SOLVING}：主线程只轮询 {@link Future#isDone()}，不阻塞等待；</li>
+ *   <li>{@link ScanPhase#APPLYING}：一次调用应用回调完成安全层与写入；</li>
+ *   <li>{@link ScanPhase#SAVING}：保留原有落盘阶段。</li>
+ * </ul>
  *
- * <p><strong>线程约定：</strong>快照采集（{@link SnapshotCollector}）与结果应用
- * （{@link ResultApplier}）必须在服务器线程执行，因为真实实现会读取 Minecraft 注册表、
- * 配方管理器或写入 EMC 后端。只有不接触游戏状态的纯计算才可以移到工作线程。{@link #tick()}
- * 同样由服务器线程调用。{@link #progress()} 通过 {@code volatile} 字段发布，其他线程可以
- * 安全读取最近一次完整进度；{@link #cancel()} 也可以从其他线程调用。状态机仍在下一次
- * tick 转入 {@link ScanPhase#CANCELLED}，但共享 {@link ScanCancellation} 令牌允许管线在
- * 物品采集、配方扫描、NBT 变体、求解与应用循环内部提前停止重活。</p>
+ * <p><strong>线程约定：</strong>快照采集（{@link SnapshotCollector} / {@link PipelineCollector}）
+ * 与结果应用（{@link ResultApplier} / {@link PipelineApplier}）必须在服务器线程执行；只有不接触
+ * 游戏状态的纯计算可以通过 {@link SolveWorker} 移到工作线程。{@link #tick()} 同样由服务器线程
+ * 调用。{@link #progress()} 通过 {@code volatile} 字段发布，其他线程可以安全读取最近一次完整
+ * 进度；{@link #cancel()} 也可以从其他线程调用。</p>
  *
- * <p>任何回调抛出的运行时异常都会被捕获并转换为 {@link ScanPhase#FAILED}，异常消息写入
- * 进度细节，绝不允许异常穿透 tick 循环破坏服务器主循环。</p>
+ * <p>任何回调抛出的运行时异常都会被捕获并转换为 {@link ScanPhase#FAILED}，异常消息写入进度
+ * 细节，绝不允许异常穿透 tick 循环破坏服务器主循环。</p>
  */
 public final class ScanManager {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("sudoersemc/task/ScanManager");
 
     /**
-     * 采集阶段回调，必须在服务器线程执行。
+     * 传统一次性采集回调，必须在服务器线程执行。
      */
     @FunctionalInterface
     public interface SnapshotCollector {
@@ -42,7 +53,7 @@ public final class ScanManager {
     }
 
     /**
-     * 应用阶段回调，必须在服务器线程执行。
+     * 传统应用回调，必须在服务器线程执行。
      */
     @FunctionalInterface
     public interface ResultApplier {
@@ -53,6 +64,32 @@ public final class ScanManager {
          * @param data 采集阶段产生的快照数据
          */
         void apply(SnapshotData data);
+    }
+
+    /**
+     * 分片采集回调：每次扫描开始时创建新的增量会话。
+     */
+    @FunctionalInterface
+    public interface PipelineCollector {
+
+        /**
+         * @return 新的增量采集会话；不能为 {@code null}
+         */
+        ScanPipeline.CollectSession begin();
+    }
+
+    /**
+     * 分片应用回调：在服务器线程应用纯求解结果。
+     */
+    @FunctionalInterface
+    public interface PipelineApplier {
+
+        /**
+         * @param snapshot 采集快照
+         * @param outcome  工作线程（或同步）求解结果
+         * @return 实际应用的条目数量，仅用于进度显示
+         */
+        int apply(PipelineSnapshot snapshot, SolveOutcome outcome);
     }
 
     /**
@@ -74,11 +111,7 @@ public final class ScanManager {
     }
 
     /**
-     * 回调之间传递的最小数据载体。
-     *
-     * <p>当前阶段只携带标签、物品数量与配方数量，使 {@link ScanManager} 保持对 Minecraft
-     * 的零依赖。Phase 9+ 接入真实流水线时，可以通过泛型化或子类承载更丰富的快照内容，
-     * 而无需让状态机本身引用游戏类型。</p>
+     * 传统回调之间传递的最小数据载体。
      *
      * @param label       快照来源或批次的中文标签
      * @param itemCount   采集到的物品数量，不得为负
@@ -98,27 +131,39 @@ public final class ScanManager {
     }
 
     private final BatchProcessor batchProcessor;
+    @Nullable
     private final SnapshotCollector collector;
+    @Nullable
     private final ResultApplier applier;
+    @Nullable
+    private final PipelineCollector pipelineCollector;
+    @Nullable
+    private final PipelineApplier pipelineApplier;
     private final long tickBudgetNanos;
     private final ScanDiagnostics diagnostics;
     @Nullable
     private final AbortListener abortListener;
+    @Nullable
+    private final SolveWorker solveWorker;
+    private final boolean solveOffThread;
 
     private volatile ScanProgress progress = ScanProgress.idle();
     private final ScanCancellation cancellation;
 
+    @Nullable
     private SnapshotData snapshot;
+    @Nullable
+    private PipelineSnapshot pipelineSnapshot;
+    @Nullable
+    private ScanPipeline.CollectSession collectSession;
+    @Nullable
+    private Future<SolveOutcome> solveFuture;
+    @Nullable
+    private SolveOutcome solveOutcome;
     private long lastBatchNanos;
 
     /**
      * 兼容旧调用点的构造器：使用内部新建的诊断收集器，不注册终止回调。
-     *
-     * @param batchProcessor 批量决策器，不能为 {@code null}
-     * @param collector      快照采集回调，不能为 {@code null}
-     * @param applier        结果应用回调，不能为 {@code null}
-     * @param tickBudgetNanos 每 tick 允许用于扫描的时间预算（纳秒），不得为负；
-     *                        0 表示预算未知，自适应模式会沿用当前批量
      */
     public ScanManager(BatchProcessor batchProcessor,
                        SnapshotCollector collector,
@@ -128,13 +173,7 @@ public final class ScanManager {
     }
 
     /**
-     * @param batchProcessor 批量决策器，不能为 {@code null}
-     * @param collector      快照采集回调，不能为 {@code null}
-     * @param applier        结果应用回调，不能为 {@code null}
-     * @param tickBudgetNanos 每 tick 允许用于扫描的时间预算（纳秒），不得为负；
-     *                        0 表示预算未知，自适应模式会沿用当前批量
-     * @param diagnostics    耗时与内存采样器；{@code null} 时新建一个
-     * @param abortListener  取消/失败终止回调，可为 {@code null}
+     * 兼容旧调用点的构造器。
      */
     public ScanManager(BatchProcessor batchProcessor,
                        SnapshotCollector collector,
@@ -147,19 +186,7 @@ public final class ScanManager {
     }
 
     /**
-     * 使用共享取消令牌创建调度器。
-     *
-     * <p>真实管线可以持有同一个 {@link ScanCancellation}，在物品采集、配方扫描、NBT 变体、
-     * 求解与应用循环中主动检查取消信号，从而不必等到下一次 {@link #tick()}。传入
-     * {@code null} 时新建令牌，行为与旧构造器一致。</p>
-     *
-     * @param batchProcessor 批量决策器，不能为 {@code null}
-     * @param collector      快照采集回调，不能为 {@code null}
-     * @param applier        结果应用回调，不能为 {@code null}
-     * @param tickBudgetNanos 每 tick 允许用于扫描的时间预算（纳秒），不得为负
-     * @param diagnostics    耗时与内存采样器；{@code null} 时新建一个
-     * @param abortListener  取消/失败终止回调，可为 {@code null}
-     * @param cancellation   共享取消令牌，可为 {@code null}
+     * 使用共享取消令牌创建传统调度器。
      */
     public ScanManager(BatchProcessor batchProcessor,
                        SnapshotCollector collector,
@@ -168,9 +195,80 @@ public final class ScanManager {
                        @Nullable ScanDiagnostics diagnostics,
                        @Nullable AbortListener abortListener,
                        @Nullable ScanCancellation cancellation) {
+        this(batchProcessor, collector, applier, null, null, tickBudgetNanos, diagnostics,
+                abortListener, cancellation, null, false);
+    }
+
+    /**
+     * 创建分片调度器。
+     *
+     * <p>{@code solveWorker} 提供纯求解函数；{@code solveOffThread=true} 时在
+     * {@link SolveWorker#THREAD_NAME} 线程执行，{@code false} 时在同一 tick 内同步执行。
+     * 通过旧构造器创建的调度器保持原有一次性采集/应用语义。</p>
+     *
+     * @param batchProcessor  批量决策器，不能为 {@code null}
+     * @param collector       分片采集回调，不能为 {@code null}
+     * @param applier         应用回调，不能为 {@code null}
+     * @param tickBudgetNanos 每 tick 允许用于扫描的时间预算（纳秒），不得为负
+     * @param diagnostics     耗时与内存采样器；{@code null} 时新建
+     * @param abortListener   取消/失败终止回调，可为 {@code null}
+     * @param cancellation    共享取消令牌，可为 {@code null}
+     * @param solveWorker     纯求解工作线程；分片模式必须提供
+     * @param solveOffThread  是否把纯求解移到工作线程
+     */
+    public ScanManager(BatchProcessor batchProcessor,
+                       PipelineCollector collector,
+                       PipelineApplier applier,
+                       long tickBudgetNanos,
+                       @Nullable ScanDiagnostics diagnostics,
+                       @Nullable AbortListener abortListener,
+                       @Nullable ScanCancellation cancellation,
+                       @Nullable SolveWorker solveWorker,
+                       boolean solveOffThread) {
+        this(batchProcessor, null, null, collector, applier, tickBudgetNanos, diagnostics,
+                abortListener, cancellation, solveWorker, solveOffThread);
+    }
+
+    /**
+     * 便捷分片构造器：使用内部诊断采样器与新建取消令牌。
+     */
+    public ScanManager(BatchProcessor batchProcessor,
+                       PipelineCollector collector,
+                       PipelineApplier applier,
+                       long tickBudgetNanos,
+                       @Nullable SolveWorker solveWorker,
+                       boolean solveOffThread) {
+        this(batchProcessor, collector, applier, tickBudgetNanos, new ScanDiagnostics(), null,
+                new ScanCancellation(), solveWorker, solveOffThread);
+    }
+
+    private ScanManager(BatchProcessor batchProcessor,
+                        @Nullable SnapshotCollector collector,
+                        @Nullable ResultApplier applier,
+                        @Nullable PipelineCollector pipelineCollector,
+                        @Nullable PipelineApplier pipelineApplier,
+                        long tickBudgetNanos,
+                        @Nullable ScanDiagnostics diagnostics,
+                        @Nullable AbortListener abortListener,
+                        @Nullable ScanCancellation cancellation,
+                        @Nullable SolveWorker solveWorker,
+                        boolean solveOffThread) {
         this.batchProcessor = Objects.requireNonNull(batchProcessor, "batchProcessor");
-        this.collector = Objects.requireNonNull(collector, "collector");
-        this.applier = Objects.requireNonNull(applier, "applier");
+        boolean pipelineMode = pipelineCollector != null || pipelineApplier != null;
+        if (pipelineMode) {
+            if (pipelineCollector == null || pipelineApplier == null) {
+                throw new IllegalArgumentException("分片采集与分片应用回调必须同时提供");
+            }
+            this.collector = null;
+            this.applier = null;
+            this.pipelineCollector = pipelineCollector;
+            this.pipelineApplier = pipelineApplier;
+        } else {
+            this.collector = Objects.requireNonNull(collector, "collector");
+            this.applier = Objects.requireNonNull(applier, "applier");
+            this.pipelineCollector = null;
+            this.pipelineApplier = null;
+        }
         if (tickBudgetNanos < 0L) {
             throw new IllegalArgumentException("tickBudgetNanos 必须 >= 0，实际为 " + tickBudgetNanos);
         }
@@ -178,17 +276,19 @@ public final class ScanManager {
         this.diagnostics = diagnostics == null ? new ScanDiagnostics() : diagnostics;
         this.abortListener = abortListener;
         this.cancellation = cancellation == null ? new ScanCancellation() : cancellation;
+        this.solveWorker = solveWorker;
+        this.solveOffThread = solveOffThread;
     }
 
     /**
-     * @return 本次调度器使用的共享取消令牌；管线可以持有同一实例并做协作式检查
+     * @return 本次调度器使用的共享取消令牌
      */
     public ScanCancellation cancellation() {
         return cancellation;
     }
 
     /**
-     * @return 本次扫描使用的诊断采样器，便于调用方复用同一份耗时与内存数据
+     * @return 本次扫描使用的诊断采样器
      */
     public ScanDiagnostics diagnostics() {
         return diagnostics;
@@ -197,32 +297,29 @@ public final class ScanManager {
     /**
      * 请求开始一次新扫描。
      *
-     * <p>已有扫描处于活动状态时返回 {@code false}，因此重复请求不会创建第二个扫描。
-     * 成功请求会清空上一次的快照与取消标志，并把进度重置为
-     * {@link ScanPhase#COLLECTING_SNAPSHOT}。扫描完成、取消或失败后可以再次请求。</p>
-     *
      * @return 成功开始返回 {@code true}；已有扫描在运行返回 {@code false}
      */
     public synchronized boolean requestScan() {
         if (isRunning()) {
             return false;
         }
+        cancelOutstandingFuture();
         cancellation.clear();
         snapshot = null;
+        pipelineSnapshot = null;
+        collectSession = null;
+        solveOutcome = null;
         lastBatchNanos = 0L;
         diagnostics.reset();
         diagnostics.recordMemory();
         long now = System.currentTimeMillis();
-        progress = new ScanProgress(ScanPhase.COLLECTING_SNAPSHOT, 0, 0, now, now, "等待采集快照");
+        progress = new ScanProgress(ScanPhase.COLLECTING_SNAPSHOT, 0, 0, now, now,
+                pipelineMode() ? "等待开始分片采集" : "等待采集快照");
         return true;
     }
 
     /**
      * 请求取消当前扫描。
-     *
-     * <p>本方法只设置标志，不直接修改阶段；正在运行的扫描会在下一次 {@link #tick()} 中
-     * 观察到并转入 {@link ScanPhase#CANCELLED}。空闲时设置该标志没有副作用，下一次
-     * {@link #requestScan()} 会将其清除。</p>
      */
     public void cancel() {
         cancellation.request();
@@ -249,16 +346,12 @@ public final class ScanManager {
         return cancellation.isRequested();
     }
 
+    private boolean pipelineMode() {
+        return pipelineCollector != null;
+    }
+
     /**
      * 推进一次扫描状态机。
-     *
-     * <p>非活动状态下直接返回，不调用任何回调，也不消耗批量预算。取消标志优先于阶段推进。
-     * 采集阶段只调用一次采集器；随后按建议批量累加已处理数量。求解阶段同样按批量推进。
-     * 应用阶段调用一次应用器后进入持久化，持久化阶段完成后转入
-     * {@link ScanPhase#COMPLETED}。</p>
-     *
-     * <p>回调抛出的 {@link RuntimeException} 会被捕获并转为 {@link ScanPhase#FAILED}，
-     * 细节字段保存异常消息（无消息时退化为异常类名）。本方法不会向外传播这些异常。</p>
      */
     public void tick() {
         ScanProgress current = progress;
@@ -273,23 +366,46 @@ public final class ScanManager {
         ScanPhase abortedPhase = null;
         try {
             if (cancellation.isRequested()) {
+                cancelOutstandingFuture();
                 cancellation.clear();
                 progress = current.advance(ScanPhase.CANCELLED, current.processed(),
                         current.total(), "扫描已取消");
                 abortedPhase = ScanPhase.CANCELLED;
             } else {
                 batch = batchProcessor.nextBatchSize(lastBatchNanos, tickBudgetNanos);
-                batchRecorded = true;
+                batchRecorded = !(pipelineMode() && current.phase() == ScanPhase.SOLVING);
                 switch (current.phase()) {
-                    case COLLECTING_SNAPSHOT -> collectStep(batch);
-                    case SOLVING -> solveStep(batch);
-                    case APPLYING -> applyStep();
+                    case COLLECTING_SNAPSHOT -> {
+                        if (pipelineMode()) {
+                            collectPipelineStep(batch);
+                        } else {
+                            collectStep(batch);
+                        }
+                    }
+                    case SOLVING -> {
+                        if (pipelineMode()) {
+                            solvePipelineStep();
+                        } else {
+                            solveStep(batch);
+                        }
+                    }
+                    case APPLYING -> {
+                        if (pipelineMode()) {
+                            applyPipelineStep();
+                        } else {
+                            applyStep();
+                        }
+                    }
                     case SAVING -> saveStep();
                     default -> {
                         // 防御性分支：isRunning() 已经排除了所有终止阶段。
                     }
                 }
             }
+        } catch (CancellationException cancelled) {
+            progress = progress.advance(ScanPhase.CANCELLED, progress.processed(),
+                    progress.total(), "扫描已取消");
+            abortedPhase = ScanPhase.CANCELLED;
         } catch (RuntimeException e) {
             ScanProgress failed = progress;
             progress = failed.advance(ScanPhase.FAILED, failed.processed(), failed.total(),
@@ -301,7 +417,6 @@ public final class ScanManager {
             if (batchRecorded) {
                 batchProcessor.recordBatch(batch, elapsedNanos);
             }
-            // tick 边界统一采样：即使本 tick 被取消或失败，也会留下耗时与内存数据。
             diagnostics.recordTick(elapsedNanos);
             diagnostics.recordMemory();
         }
@@ -325,21 +440,23 @@ public final class ScanManager {
 
     /**
      * 把状态机恢复到空闲，并清除取消标志、快照与计时样本。
-     *
-     * <p>可在运行中调用；后续 {@link #tick()} 将不再推进旧扫描。批量决策器的自适应基准
-     * 不会被重置，以便下一次扫描沿用已经学到的批量。</p>
      */
     public synchronized void reset() {
+        cancelOutstandingFuture();
         cancellation.clear();
         snapshot = null;
+        pipelineSnapshot = null;
+        collectSession = null;
+        solveOutcome = null;
         lastBatchNanos = 0L;
         diagnostics.reset();
         progress = ScanProgress.idle();
     }
 
-    /**
-     * 采集阶段：首次进入时调用采集器，随后按批量推进物品数量。
-     */
+    // ---------------------------------------------------------------------
+    // 传统一次性路径
+    // ---------------------------------------------------------------------
+
     private void collectStep(int batch) {
         if (snapshot == null) {
             SnapshotData collected = collector.collect();
@@ -366,18 +483,12 @@ public final class ScanManager {
         }
     }
 
-    /**
-     * 物品采集完成后转入配方求解，并把总量切换为配方数量。
-     */
     private void beginSolving() {
         SnapshotData data = snapshot;
         int total = data == null ? 0 : data.recipeCount();
         progress = progress.advance(ScanPhase.SOLVING, 0, total, "开始求解配方");
     }
 
-    /**
-     * 求解阶段：按批量推进配方数量，完成后进入应用阶段。
-     */
     private void solveStep(int batch) {
         SnapshotData data = snapshot;
         if (data == null) {
@@ -398,9 +509,6 @@ public final class ScanManager {
         }
     }
 
-    /**
-     * 应用阶段：调用一次应用器，随后进入持久化。
-     */
     private void applyStep() {
         SnapshotData data = snapshot;
         if (data == null) {
@@ -410,17 +518,147 @@ public final class ScanManager {
         progress = progress.advance(ScanPhase.SAVING, 0, 0, "结果已应用，开始持久化");
     }
 
-    /**
-     * 持久化阶段：当前版本没有独立持久化回调，直接标记完成。Phase 9+ 可在此接入落盘逻辑。
-     */
+    // ---------------------------------------------------------------------
+    // 分片采集 / 工作线程求解路径
+    // ---------------------------------------------------------------------
+
+    private void collectPipelineStep(int batch) {
+        if (collectSession == null) {
+            if (pipelineCollector == null) {
+                throw new IllegalStateException("分片采集回调缺失");
+            }
+            collectSession = pipelineCollector.begin();
+            if (collectSession == null) {
+                throw new IllegalStateException("分片采集会话返回 null");
+            }
+            publishCollectProgress(batch);
+        }
+
+        if (collectSession.isDone()) {
+            finishCollection();
+            return;
+        }
+
+        collectSession.step(batch);
+        if (cancellation.isRequested()) {
+            progress = progress.advance(ScanPhase.COLLECTING_SNAPSHOT,
+                    collectSession.processedItems(), collectSession.itemCount(),
+                    "采集已请求取消");
+            return;
+        }
+        publishCollectProgress(batch);
+        if (collectSession.isDone()) {
+            finishCollection();
+        }
+    }
+
+    private void publishCollectProgress(int batch) {
+        if (collectSession == null) {
+            return;
+        }
+        int itemTotal = collectSession.itemCount();
+        int recipeTotal = collectSession.recipeCount();
+        int processedItems = collectSession.processedItems();
+        int processedRecipes = collectSession.processedRecipes();
+        if (processedItems < itemTotal) {
+            progress = progress.advance(ScanPhase.COLLECTING_SNAPSHOT, processedItems, itemTotal,
+                    "采集物品 " + processedItems + "/" + itemTotal + "（批 " + batch + "）");
+        } else if (processedRecipes < recipeTotal) {
+            progress = progress.advance(ScanPhase.COLLECTING_SNAPSHOT, processedRecipes, recipeTotal,
+                    "采集配方 " + processedRecipes + "/" + recipeTotal + "（批 " + batch + "）");
+        } else if (itemTotal == 0 && recipeTotal == 0) {
+            progress = progress.advance(ScanPhase.COLLECTING_SNAPSHOT, 0, 0,
+                    "汇总快照（批 " + batch + "）");
+        } else {
+            progress = progress.advance(ScanPhase.COLLECTING_SNAPSHOT, 1, 1,
+                    "汇总变体与既有值（批 " + batch + "）");
+        }
+    }
+
+    private void finishCollection() {
+        if (collectSession == null) {
+            throw new IllegalStateException("采集阶段缺少会话");
+        }
+        PipelineSnapshot collected = collectSession.finish();
+        if (collected == null) {
+            throw new IllegalStateException("分片采集会话返回 null 快照");
+        }
+        pipelineSnapshot = collected;
+        collectSession = null;
+
+        if (solveWorker == null) {
+            throw new IllegalStateException("分片求解需要 SolveWorker");
+        }
+        if (solveOffThread) {
+            solveFuture = solveWorker.submit(collected);
+            progress = progress.advance(ScanPhase.SOLVING, 0, 0, "求解中（工作线程）");
+        } else {
+            solveOutcome = solveWorker.solveNow(collected);
+            progress = progress.advance(ScanPhase.APPLYING, 0,
+                    solveOutcome == null ? 0 : solveOutcome.candidateCount(),
+                    "求解完成（同步），准备应用 "
+                            + (solveOutcome == null ? 0 : solveOutcome.candidateCount()) + " 条");
+        }
+    }
+
+    private void solvePipelineStep() {
+        Future<SolveOutcome> future = solveFuture;
+        if (future == null) {
+            throw new IllegalStateException("求解阶段缺少工作线程任务");
+        }
+        if (!future.isDone()) {
+            progress = progress.advance(ScanPhase.SOLVING, 0, 0, "求解中（工作线程）");
+            return;
+        }
+        try {
+            solveOutcome = future.get();
+        } catch (ExecutionException failure) {
+            Throwable cause = failure.getCause() == null ? failure : failure.getCause();
+            throw new IllegalStateException("工作线程求解失败: " + failureDetail(cause), cause);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("求解等待被中断", interrupted);
+        } finally {
+            solveFuture = null;
+        }
+        if (solveOutcome == null) {
+            throw new IllegalStateException("工作线程求解返回 null");
+        }
+        progress = progress.advance(ScanPhase.APPLYING, 0, solveOutcome.candidateCount(),
+                "求解完成，准备应用 " + solveOutcome.candidateCount() + " 条");
+    }
+
+    private void applyPipelineStep() {
+        if (pipelineSnapshot == null) {
+            throw new IllegalStateException("应用阶段缺少快照数据");
+        }
+        if (solveOutcome == null) {
+            throw new IllegalStateException("应用阶段缺少求解结果");
+        }
+        if (pipelineApplier == null) {
+            throw new IllegalStateException("分片应用回调缺失");
+        }
+        int applied = pipelineApplier.apply(pipelineSnapshot, solveOutcome);
+        progress = progress.advance(ScanPhase.SAVING, 0, 0,
+                "应用 " + applied + " 条，开始持久化");
+    }
+
     private void saveStep() {
         progress = progress.advance(ScanPhase.COMPLETED, 0, 0, "扫描已完成");
     }
 
-    /**
-     * 把异常转换为适合展示的失败细节，保证不会因为消息为空而丢失错误类型。
-     */
-    private static String failureDetail(RuntimeException error) {
+    private void cancelOutstandingFuture() {
+        Future<SolveOutcome> future = solveFuture;
+        solveFuture = null;
+        if (future != null) {
+            future.cancel(true);
+        }
+    }
+
+    private static String failureDetail(Throwable error) {
+        if (error == null) {
+            return "未知错误";
+        }
         String message = error.getMessage();
         return message == null || message.isBlank() ? error.getClass().getSimpleName() : message;
     }
