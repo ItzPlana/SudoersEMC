@@ -87,13 +87,19 @@ class TagPricingTest {
     }
 
     @Test
-    void emptyOrUnknownTagsYieldNoPrice() {
+    void emptyOrUnknownTagsYieldNoPriceUnlessOverridden() {
         TagPricing pricing = pricing();
 
         assertTrue(pricing.price(item("no_tags"), List.of()).isEmpty());
         assertTrue(pricing.price(item("no_tags"), null).isEmpty());
         assertTrue(pricing.price(item("no_tags"), List.of("forge:logs/oak")).isEmpty());
         assertTrue(pricing.price(null, List.of("forge:ingots/iron")).isEmpty());
+        assertEquals(65_536L, pricing.price(item("special_gem"), List.of()).orElseThrow(),
+                "按物品覆盖不应依赖标签列表非空");
+        assertEquals(65_536L, pricing.price(item("special_gem"), null).orElseThrow(),
+                "按物品覆盖不应依赖标签列表非空");
+        assertEquals(65_536L, pricing.price(item("special_gem"), List.of("forge:logs/oak")).orElseThrow(),
+                "按物品覆盖不应依赖标签能被识别");
     }
 
     @Test
