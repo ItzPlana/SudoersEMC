@@ -12,16 +12,19 @@ import com.itzplana.sudoersemc.core.ItemKey;
 import com.itzplana.sudoersemc.core.PriceSource;
 import com.itzplana.sudoersemc.diagnostic.DiagnosticReport;
 import com.itzplana.sudoersemc.diagnostic.ReportManager;
+import com.itzplana.sudoersemc.integration.ProjectEManualValues;
 import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
 import com.itzplana.sudoersemc.storage.QuarantinedDropsStore;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
 import com.itzplana.sudoersemc.task.BatchProcessor;
 import com.itzplana.sudoersemc.task.ScanFingerprint;
 import com.itzplana.sudoersemc.task.ScanManager;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Predicate;
 import net.minecraft.resources.ResourceLocation;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -55,6 +58,31 @@ class CommandServiceTest {
                 ItemKey.of(itemId), 100L, 10L, 0.9D,
                 "drop-exceeds-threshold", 1_730_000_000_000L, false));
         return store;
+    }
+
+    private ProjectEManualValues noManualValues() {
+        return new ProjectEManualValues(
+                tempDir.resolve("ProjectE").resolve("custom_emc.json"));
+    }
+
+    private ProjectEManualValues manualValuesWith(ResourceLocation itemId, long value) throws Exception {
+        Path file = tempDir.resolve("manual-custom_emc.json");
+        Files.writeString(file, "{\"entries\":[{\"item\":\"" + itemId
+                + "\",\"emc\":" + value + "}]}", StandardCharsets.UTF_8);
+        return new ProjectEManualValues(file);
+    }
+
+    private static CommandService approvalService(GeneratedEntryStore entries,
+                                                  QuarantinedDropsStore quarantine,
+                                                  ProjectEManualValues manual,
+                                                  boolean applyEnabled,
+                                                  Predicate<ItemKey> exclusion,
+                                                  long minimumEmc) {
+        return new CommandService(
+                null, null, entries, null, null, quarantine, null, manual,
+                applyEnabled,
+                exclusion == null ? null : () -> exclusion,
+                () -> minimumEmc);
     }
 
     private static DiagnosticReport sampleReport() {
@@ -298,17 +326,121 @@ class CommandServiceTest {
     @Test
     void approveMarksRecordAndPersistsIt() {
         QuarantinedDropsStore quarantineStore = quarantineStoreWith(STONE);
-        CommandService service = new CommandService(
-                null, null, null, null, null, quarantineStore);
+        GeneratedEntryStore entryStore = new GeneratedEntryStore(
+                tempDir.resolve(GeneratedEntryStore.FILE_NAME));
+        CommandService service = approvalService(
+                entryStore, quarantineStore, noManualValues(), true, null, 1L);
 
         CommandResult result = service.approve("minecraft:stone");
 
         assertTrue(result.success());
-        assertTrue(result.joinLines().contains("已批准"));
+        assertTrue(result.joinLines().contains("已应用 10"));
         assertEquals(1, quarantineStore.size());
         assertTrue(quarantineStore.entries().get(0).approved());
         assertFalse(quarantineStore.isDirty(), "审批后必须立即落盘");
         assertTrue(Files.isRegularFile(quarantineStore.file()), "隔离记录文件必须存在");
+        assertFalse(entryStore.isDirty(), "应用后生成条目必须立即落盘");
+        assertTrue(Files.isRegularFile(entryStore.file()), "生成条目文件必须存在");
+    }
+
+    @Test
+    void approveWritesProposedValueWithApprovedSource() {
+        QuarantinedDropsStore quarantineStore = quarantineStoreWith(STONE);
+        GeneratedEntryStore entryStore = new GeneratedEntryStore(
+                tempDir.resolve(GeneratedEntryStore.FILE_NAME));
+        CommandService service = approvalService(
+                entryStore, quarantineStore, noManualValues(), true, null, 1L);
+
+        CommandResult result = service.approve("minecraft:stone");
+
+        assertTrue(result.success());
+        assertTrue(result.joinLines().contains("来源 APPROVED"));
+        GeneratedEmcEntry applied = entryStore.snapshotAll().get(ItemKey.of(STONE));
+        assertNotNull(applied);
+        assertEquals(10L, applied.value());
+        assertEquals(PriceSource.APPROVED, applied.source());
+        assertTrue(applied.owned());
+        assertTrue(applied.alternativeCosts().isEmpty());
+        assertEquals(List.of(), applied.alternativeCosts());
+    }
+
+    @Test
+    void approveTwiceDoesNotOverwriteAppliedValue() {
+        QuarantinedDropsStore quarantineStore = quarantineStoreWith(STONE);
+        GeneratedEntryStore entryStore = new GeneratedEntryStore(
+                tempDir.resolve(GeneratedEntryStore.FILE_NAME));
+        CommandService service = approvalService(
+                entryStore, quarantineStore, noManualValues(), true, null, 1L);
+
+        assertTrue(service.approve("minecraft:stone").success());
+        assertEquals(1, entryStore.size());
+
+        // 模拟后续扫描更新同一个 owned 条目；第二次审批不得覆盖它。
+        assertTrue(entryStore.stage(new GeneratedEmcEntry(
+                ItemKey.of(STONE), 999L, PriceSource.RECIPE, null, true, 2L)));
+
+        CommandResult second = service.approve("minecraft:stone");
+
+        assertTrue(second.success());
+        assertTrue(second.joinLines().contains("未重复应用"));
+        assertEquals(1, entryStore.size());
+        GeneratedEmcEntry current = entryStore.snapshotAll().get(ItemKey.of(STONE));
+        assertNotNull(current);
+        assertEquals(999L, current.value());
+        assertEquals(PriceSource.RECIPE, current.source());
+        assertEquals(1, quarantineStore.size());
+        assertTrue(quarantineStore.entries().get(0).approved());
+    }
+
+    @Test
+    void approveRefusesManualValueAndLeavesStoreUnchanged() throws Exception {
+        QuarantinedDropsStore quarantineStore = quarantineStoreWith(STONE);
+        GeneratedEntryStore entryStore = new GeneratedEntryStore(
+                tempDir.resolve(GeneratedEntryStore.FILE_NAME));
+        CommandService service = approvalService(
+                entryStore, quarantineStore, manualValuesWith(STONE, 123L), true, null, 1L);
+
+        CommandResult result = service.approve("minecraft:stone");
+
+        assertFalse(result.success());
+        assertTrue(result.joinLines().contains("手动值"));
+        assertTrue(entryStore.snapshotAll().isEmpty(), "手动值物品不得写入生成条目");
+        assertFalse(quarantineStore.entries().get(0).approved(),
+                "拒绝应用时不得把记录标记为已批准");
+    }
+
+    @Test
+    void approveRefusesExcludedItemAndLeavesStoreUnchanged() {
+        QuarantinedDropsStore quarantineStore = quarantineStoreWith(STONE);
+        GeneratedEntryStore entryStore = new GeneratedEntryStore(
+                tempDir.resolve(GeneratedEntryStore.FILE_NAME));
+        Predicate<ItemKey> exclusion = key -> key.equals(ItemKey.of(STONE));
+        CommandService service = approvalService(
+                entryStore, quarantineStore, noManualValues(), true, exclusion, 1L);
+
+        CommandResult result = service.approve("minecraft:stone");
+
+        assertFalse(result.success());
+        assertTrue(result.joinLines().contains("排除"));
+        assertTrue(entryStore.snapshotAll().isEmpty(), "排除项不得写入生成条目");
+        assertFalse(quarantineStore.entries().get(0).approved(),
+                "拒绝应用时不得把记录标记为已批准");
+    }
+
+    @Test
+    void approveRefusesWhenApplyDisabled() {
+        QuarantinedDropsStore quarantineStore = quarantineStoreWith(STONE);
+        GeneratedEntryStore entryStore = new GeneratedEntryStore(
+                tempDir.resolve(GeneratedEntryStore.FILE_NAME));
+        CommandService service = approvalService(
+                entryStore, quarantineStore, noManualValues(), false, null, 1L);
+
+        CommandResult result = service.approve("minecraft:stone");
+
+        assertFalse(result.success());
+        assertTrue(result.joinLines().contains("已禁用"));
+        assertTrue(entryStore.snapshotAll().isEmpty());
+        assertFalse(quarantineStore.entries().get(0).approved());
     }
 
     @Test

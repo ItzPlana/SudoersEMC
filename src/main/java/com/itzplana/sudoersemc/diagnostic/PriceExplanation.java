@@ -124,12 +124,23 @@ public record PriceExplanation(
         StringBuilder text = new StringBuilder();
         text.append("物品: ").append(item).append('\n');
         text.append("EMC : ").append(value).append('\n');
-        text.append("来源: ").append(source.name()).append('\n');
+        text.append("来源: ").append(formatSource(source)).append('\n');
         text.append("配方: ").append(recipeId == null ? "无" : recipeId.toString()).append('\n');
         text.append("归属: ").append(ownership).append('\n');
         text.append("备选成本: ").append(formatAlternatives()).append('\n');
         text.append("备注: ").append(note == null || note.isBlank() ? "无" : note);
         return text.toString();
+    }
+
+    /**
+     * 把枚举名转换为可读标签。只有管理员批准的降价需要额外中文说明，其余保持稳定的枚举名，
+     * 避免改变既有命令输出与日志解析。
+     */
+    private static String formatSource(PriceSource source) {
+        return switch (source) {
+            case APPROVED -> "APPROVED（管理员批准）";
+            case EXISTING, EXTERNAL_BASELINE, RECIPE, TAG, RARITY, TIER, FALLBACK -> source.name();
+        };
     }
 
     private String formatAlternatives() {

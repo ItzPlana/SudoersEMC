@@ -8,6 +8,7 @@ import com.itzplana.sudoersemc.config.ConfigValidator;
 import com.itzplana.sudoersemc.config.ConfigWatcher;
 import com.itzplana.sudoersemc.config.ReloadDecision;
 import com.itzplana.sudoersemc.config.SudoersemcConfig;
+import com.itzplana.sudoersemc.core.ItemKey;
 import com.itzplana.sudoersemc.core.OverflowScope;
 import com.itzplana.sudoersemc.diagnostic.DebugLog;
 import com.itzplana.sudoersemc.diagnostic.ReportManager;
@@ -44,6 +45,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraftforge.common.ForgeConfigSpec;
 import net.minecraftforge.common.MinecraftForge;
@@ -208,7 +211,10 @@ public final class Sudoersemc {
                         () -> requestReload("command"),
                         quarantineStore,
                         OptionalIntegrationManager.provider().orElse(null),
-                        OptionalIntegrationManager.manualValues());
+                        OptionalIntegrationManager.manualValues(),
+                        approveAppliesImmediately(),
+                        exclusionDetectorSupplier(),
+                        Sudoersemc::minimumEmcForApproval);
                 SudoemcCommands.setService(commandService);
                 LOGGER.warn("SudoersEMC 初始运行时组件构建失败，已保留可重载的命令服务，等待配置修正");
             }
@@ -355,7 +361,10 @@ public final class Sudoersemc {
                 () -> requestReload("command"),
                 quarantineStore,
                 OptionalIntegrationManager.provider().orElse(null),
-                OptionalIntegrationManager.manualValues());
+                OptionalIntegrationManager.manualValues(),
+                approveAppliesImmediately(),
+                () -> pipeline::isExcludedFromPricing,
+                Sudoersemc::minimumEmcForApproval);
         return new RuntimeComponents(
                 newFallbackPricing,
                 newSolveSettings,
@@ -578,6 +587,34 @@ public final class Sudoersemc {
             LOGGER.warn("SudoersEMC 无法读取 {} 配置，使用默认值 {}", key, fallback, e);
             return fallback;
         }
+    }
+
+    /**
+     * 读取“批准后立即应用”开关；读取失败时使用安全默认值 {@code true}（与配置默认值一致）。
+     */
+    private static boolean approveAppliesImmediately() {
+        return readBoolean("safety.approveAppliesImmediately",
+                SudoersemcConfig.SAFETY_APPROVE_APPLIES_IMMEDIATELY, true);
+    }
+
+    /**
+     * 读取审批应用的最小 EMC；读取失败时回退到 1。
+     */
+    private static long minimumEmcForApproval() {
+        try {
+            return Math.max(0L, SudoersemcConfig.FALLBACK_MIN_EMC.get());
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法读取 fallback.minEmc 配置，审批应用使用默认值 1", e);
+            return 1L;
+        }
+    }
+
+    /**
+     * 构造审批时使用的定价排除判定器提供者；扫描管线尚未建立时返回 {@code null}。
+     */
+    private static @Nullable Supplier<Predicate<ItemKey>> exclusionDetectorSupplier() {
+        ScanPipeline pipeline = scanPipeline;
+        return pipeline == null ? null : () -> pipeline::isExcludedFromPricing;
     }
 
     /**

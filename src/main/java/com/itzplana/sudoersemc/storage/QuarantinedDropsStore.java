@@ -8,6 +8,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import net.minecraft.resources.ResourceLocation;
 import org.slf4j.Logger;
@@ -275,6 +276,37 @@ public final class QuarantinedDropsStore {
             dirty.set(true);
             return true;
         }
+    }
+
+    /**
+     * 在锁内读取某个物品当前的隔离记录。
+     *
+     * @param key 物品身份，可为 {@code null}
+     * @return 记录存在时的不可变快照；不存在、key 为 {@code null} 或读取失败时为空
+     */
+    public Optional<QuarantinedDrop> find(ItemKey key) {
+        if (key == null) {
+            return Optional.empty();
+        }
+        synchronized (lock) {
+            try {
+                return Optional.ofNullable(entries.get(key));
+            } catch (RuntimeException e) {
+                LOGGER.warn("读取隔离降价失败：{}", key, e);
+                return Optional.empty();
+            }
+        }
+    }
+
+    /**
+     * 把某条隔离记录标记为已批准。与 {@link #approve(ItemKey)} 语义相同，命名更明确，
+     * 供审批后立即应用的调用点使用。
+     *
+     * @param key 物品身份，可为 {@code null}
+     * @return 记录存在时返回 {@code true}（已是批准状态也返回 {@code true}）
+     */
+    public boolean markApproved(ItemKey key) {
+        return approve(key);
     }
 
     /**

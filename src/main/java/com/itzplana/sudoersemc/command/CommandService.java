@@ -6,7 +6,9 @@ import com.itzplana.sudoersemc.core.ItemKey;
 import com.itzplana.sudoersemc.diagnostic.PriceExplanation;
 import com.itzplana.sudoersemc.diagnostic.ReportManager;
 import com.itzplana.sudoersemc.integration.EmcProvider;
+import com.itzplana.sudoersemc.integration.OptionalIntegrationManager;
 import com.itzplana.sudoersemc.integration.ProjectEManualValues;
+import com.itzplana.sudoersemc.safety.ApprovedDropApplier;
 import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
 import com.itzplana.sudoersemc.storage.QuarantinedDropsStore;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
@@ -16,12 +18,19 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.LongSupplier;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraftforge.server.ServerLifecycleHooks;
 import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * 命令层的纯逻辑实现，不依赖 Brigadier 或 Minecraft 命令类型。
@@ -35,6 +44,8 @@ import org.jetbrains.annotations.Nullable;
  * {@link CommandResult#failure(String)}，因此调用方无需再额外防御。</p>
  */
 public final class CommandService {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger("sudoersemc/command/CommandService");
 
     private static final String SCAN_UNAVAILABLE = "扫描服务不可用";
     private static final String REPORT_UNAVAILABLE = "报告服务不可用";
@@ -53,6 +64,9 @@ public final class CommandService {
     private final @Nullable QuarantinedDropsStore quarantinedDropsStore;
     private final @Nullable EmcProvider emcProvider;
     private final @Nullable ProjectEManualValues manualValues;
+    private final boolean approveAppliesImmediately;
+    private final @Nullable Supplier<Predicate<ItemKey>> pricingExclusionSupplier;
+    private final @Nullable LongSupplier minimumEmcSupplier;
 
     /**
      * 创建不执行真实配置重载的命令服务。
@@ -108,7 +122,7 @@ public final class CommandService {
     }
 
     /**
-     * 完整构造器。
+     * 兼容构造器：默认启用“批准后立即应用”，排除检测不可用（视为不排除），最小 EMC 为 1。
      *
      * @param scanManager           扫描状态机，可为 {@code null}
      * @param reportManager         诊断报告管理器，可为 {@code null}
@@ -127,6 +141,36 @@ public final class CommandService {
                           @Nullable QuarantinedDropsStore quarantinedDropsStore,
                           @Nullable EmcProvider emcProvider,
                           @Nullable ProjectEManualValues manualValues) {
+        this(scanManager, reportManager, entryStore, scanStateStore, reloadAction,
+                quarantinedDropsStore, emcProvider, manualValues, true, null, null);
+    }
+
+    /**
+     * 完整构造器。
+     *
+     * @param scanManager               扫描状态机，可为 {@code null}
+     * @param reportManager             诊断报告管理器，可为 {@code null}
+     * @param entryStore                已生成条目的存储，可为 {@code null}
+     * @param scanStateStore            上一次扫描状态的存储，可为 {@code null}
+     * @param reloadAction              真实配置重载动作，可为 {@code null}
+     * @param quarantinedDropsStore     隔离记录存储，可为 {@code null}
+     * @param emcProvider               ProjectE（或其它后端）的 EMC 查询接口，可为 {@code null}
+     * @param manualValues              ProjectE 手动值视图，可为 {@code null}
+     * @param approveAppliesImmediately 配置开关：批准后是否立即写入降价值
+     * @param pricingExclusionSupplier  定价排除判定器提供者；{@code null} 视为不排除
+     * @param minimumEmcSupplier        允许应用的最小 EMC 提供者；{@code null} 使用 1
+     */
+    public CommandService(@Nullable ScanManager scanManager,
+                          @Nullable ReportManager reportManager,
+                          @Nullable GeneratedEntryStore entryStore,
+                          @Nullable ScanStateStore scanStateStore,
+                          @Nullable ReloadAction reloadAction,
+                          @Nullable QuarantinedDropsStore quarantinedDropsStore,
+                          @Nullable EmcProvider emcProvider,
+                          @Nullable ProjectEManualValues manualValues,
+                          boolean approveAppliesImmediately,
+                          @Nullable Supplier<Predicate<ItemKey>> pricingExclusionSupplier,
+                          @Nullable LongSupplier minimumEmcSupplier) {
         this.scanManager = scanManager;
         this.reportManager = reportManager;
         this.entryStore = entryStore;
@@ -135,6 +179,9 @@ public final class CommandService {
         this.quarantinedDropsStore = quarantinedDropsStore;
         this.emcProvider = emcProvider;
         this.manualValues = manualValues;
+        this.approveAppliesImmediately = approveAppliesImmediately;
+        this.pricingExclusionSupplier = pricingExclusionSupplier;
+        this.minimumEmcSupplier = minimumEmcSupplier;
     }
 
     /**
@@ -243,13 +290,16 @@ public final class CommandService {
     }
 
     /**
-     * 批准某个物品当前被隔离的降价记录。
+     * 批准某个物品当前被隔离的降价记录，并在配置允许时立即应用降价值。
      *
-     * <p>本操作只把隔离记录标记为已批准并立即落盘，不会修改 {@link GeneratedEntryStore} 中的
-     * 任何 EMC 数值，也不会触发重扫。参数必须是普通物品 id；带 NBT 的变体暂不支持。</p>
+     * <p>审批会先经过 {@link ApprovedDropApplier} 的全部安全规则：已批准记录不重复应用、
+     * ProjectE 手动值 fail-closed 拒绝、定价排除项拒绝、低于最小 EMC 拒绝。应用成功后写入
+     * {@link GeneratedEntryStore}（来源 {@code APPROVED}）并请求 ProjectE 重映射；本方法
+     * 绝不直接改写 ProjectE 的 {@code custom_emc.json}。参数必须是普通物品 id；带 NBT 的
+     * 变体暂不支持。</p>
      *
      * @param itemId 物品 id 原文，例如 {@code minecraft:stone}
-     * @return 明确的中文结果：已批准、无此记录或 id 非法；永不抛出异常
+     * @return 明确的中文结果：已应用、已批准过、拒绝原因、无此记录或 id 非法；永不抛出异常
      */
     public CommandResult approve(String itemId) {
         try {
@@ -261,20 +311,123 @@ public final class CommandService {
             if (parsed == null) {
                 return CommandResult.failure("无效的物品 id: " + itemId);
             }
-            if (quarantinedDropsStore == null) {
+            QuarantinedDropsStore store = quarantinedDropsStore;
+            if (store == null) {
                 return CommandResult.failure(QUARANTINE_UNAVAILABLE);
             }
 
             ItemKey key = ItemKey.of(parsed);
-            if (!quarantinedDropsStore.approve(key)) {
+            Optional<QuarantinedDropsStore.QuarantinedDrop> found = store.find(key);
+            if (found.isEmpty()) {
                 return CommandResult.failure("未找到 " + trimmed + " 的隔离降价记录");
             }
-            // 审批语义只落盘标记，不修改生成值，也不请求重扫。
-            quarantinedDropsStore.saveIfDirty();
-            return CommandResult.ok(
-                    "已批准 " + trimmed + " 的隔离降价记录（仅标记审批状态，不修改 EMC 数值）");
+            QuarantinedDropsStore.QuarantinedDrop drop = found.get();
+            if (drop.approved()) {
+                return CommandResult.ok(
+                        "已批准过 " + trimmed + " 的隔离降价记录（未重复应用）");
+            }
+
+            ApprovedDropApplier.Result result = ApprovedDropApplier.apply(
+                    drop,
+                    entryStore,
+                    approveAppliesImmediately,
+                    resolveMinimumEmc(),
+                    manualDetector(),
+                    resolveExclusionDetector());
+
+            if (result.status() == ApprovedDropApplier.Status.APPLIED) {
+                if (!store.markApproved(key)) {
+                    return CommandResult.failure("隔离记录在应用过程中消失，未标记批准");
+                }
+                store.saveIfDirty();
+                if (entryStore != null) {
+                    entryStore.saveIfDirty();
+                }
+                boolean remapRequested = requestProjectERemap();
+                String appliedMessage = result.message() == null
+                        ? "已应用 " + drop.proposedValue() + "（来源 APPROVED）"
+                        : result.message();
+                return CommandResult.ok(appliedMessage + (remapRequested
+                        ? "，已请求 ProjectE 重映射"
+                        : "，ProjectE 不可用，将在下次启动注入"));
+            }
+
+            if (result.status() == ApprovedDropApplier.Status.ALREADY_APPLIED) {
+                return CommandResult.ok(
+                        "已批准过 " + trimmed + " 的隔离降价记录（未重复应用）");
+            }
+
+            String reason = result.message() == null
+                    ? result.status().name()
+                    : result.message();
+            return CommandResult.failure(reason);
         } catch (RuntimeException e) {
             return unexpectedFailure(e);
+        }
+    }
+
+    /**
+     * 构造 ProjectE 手动值判定器；没有手动值视图时返回 {@code null}，由应用器 fail-closed。
+     */
+    private @Nullable Predicate<ItemKey> manualDetector() {
+        ProjectEManualValues values = manualValues;
+        return values == null ? null : values::isManuallySet;
+    }
+
+    /**
+     * 解析定价排除判定器。提供者缺失时返回 {@code null}（视为不排除）；提供者抛异常时
+     * 返回恒真判定器，宁可拒绝应用也不写入可能被下一次扫描清理的值。
+     */
+    private @Nullable Predicate<ItemKey> resolveExclusionDetector() {
+        Supplier<Predicate<ItemKey>> supplier = pricingExclusionSupplier;
+        if (supplier == null) {
+            return null;
+        }
+        try {
+            return supplier.get();
+        } catch (RuntimeException | LinkageError failure) {
+            LOGGER.warn("读取定价排除判定器失败，按全部排除处理", failure);
+            return key -> true;
+        }
+    }
+
+    /**
+     * 读取允许应用的最小 EMC；缺失或读取失败时回退到 1。
+     */
+    private long resolveMinimumEmc() {
+        LongSupplier supplier = minimumEmcSupplier;
+        if (supplier == null) {
+            return 1L;
+        }
+        try {
+            return Math.max(0L, supplier.getAsLong());
+        } catch (RuntimeException | LinkageError failure) {
+            LOGGER.warn("读取最小 EMC 配置失败，使用默认值 1", failure);
+            return 1L;
+        }
+    }
+
+    /**
+     * 请求 ProjectE 重映射。失败只记录日志，不影响已经落盘的生成条目。
+     *
+     * @return 是否真正向可用的 ProjectE 后端发出了重映射请求
+     */
+    private static boolean requestProjectERemap() {
+        try {
+            Optional<EmcProvider> available = OptionalIntegrationManager.provider()
+                    .filter(EmcProvider::isAvailable);
+            if (available.isEmpty()) {
+                return false;
+            }
+            MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
+            if (server == null) {
+                return false;
+            }
+            available.get().requestRemap(server);
+            return true;
+        } catch (RuntimeException | LinkageError failure) {
+            LOGGER.warn("请求 ProjectE 重映射失败；已应用的值仍保存在生成条目存储中", failure);
+            return false;
         }
     }
 

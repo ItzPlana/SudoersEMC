@@ -1635,7 +1635,7 @@ public final class ScanPipeline {
      * @param item 待判定物品身份
      * @return {@code true} 表示该物品不得进入候选或写入存储
      */
-    private boolean isExcludedFromPricing(ItemKey item) {
+    public boolean isExcludedFromPricing(ItemKey item) {
         if (item == null) {
             return false;
         }

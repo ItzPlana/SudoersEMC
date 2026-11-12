@@ -18,5 +18,10 @@ public enum PriceSource {
     /** Computed from an explicit tier rule. */
     TIER,
     /** Generic configurable fallback value. */
-    FALLBACK
+    FALLBACK,
+    /**
+     * Value written after an administrator approved a quarantined drop via
+     * {@code /sudoemc approve}; the proposed (lower) value is applied unchanged.
+     */
+    APPROVED
 }

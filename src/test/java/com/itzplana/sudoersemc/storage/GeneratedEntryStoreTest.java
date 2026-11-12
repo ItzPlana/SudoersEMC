@@ -302,4 +302,59 @@ class GeneratedEntryStoreTest {
         assertEquals(7L, stone.value());
         assertEquals(STONE, stone.recipeId());
     }
+
+    @Test
+    void approvedSourceRoundTripsThroughDisk() throws IOException {
+        Path file = tempDir.resolve(GeneratedEntryStore.FILE_NAME);
+        GeneratedEntryStore store = new GeneratedEntryStore(file);
+        long timestamp = 1_730_000_000_000L;
+
+        assertTrue(store.stage(new GeneratedEmcEntry(
+                ItemKey.of(STONE), 10L, PriceSource.APPROVED, null, true, timestamp)));
+        store.save();
+
+        String json = Files.readString(file, StandardCharsets.UTF_8);
+        assertTrue(json.contains("\"source\": \"APPROVED\""));
+
+        GeneratedEntryStore reloaded = new GeneratedEntryStore(file);
+        reloaded.load();
+
+        GeneratedEmcEntry stone = reloaded.snapshotAll().get(ItemKey.of(STONE));
+        assertNotNull(stone);
+        assertEquals(10L, stone.value());
+        assertEquals(PriceSource.APPROVED, stone.source());
+        assertTrue(stone.owned());
+        assertTrue(stone.alternativeCosts().isEmpty());
+    }
+
+    @Test
+    void legacyFileWithoutApprovedSourceStillLoads() throws IOException {
+        Path file = tempDir.resolve(GeneratedEntryStore.FILE_NAME);
+        String content = """
+                {
+                  "schemaVersion": 2,
+                  "entries": [
+                    {
+                      "item": "minecraft:stone",
+                      "variant": null,
+                      "value": 7,
+                      "source": "RECIPE",
+                      "recipe": null,
+                      "owned": true,
+                      "timestamp": 4,
+                      "alternatives": []
+                    }
+                  ]
+                }
+                """;
+        Files.writeString(file, content, StandardCharsets.UTF_8);
+
+        GeneratedEntryStore store = new GeneratedEntryStore(file);
+        assertDoesNotThrow(store::load);
+
+        GeneratedEmcEntry stone = store.snapshotAll().get(ItemKey.of(STONE));
+        assertNotNull(stone);
+        assertEquals(PriceSource.RECIPE, stone.source());
+        assertEquals(7L, stone.value());
+    }
 }

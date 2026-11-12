@@ -170,9 +170,10 @@ public record DiagnosticReport(
     /**
      * 按固定顺序返回非零的定价来源分布。
      *
-     * <p>顺序固定为 {@code RECIPE → EXTERNAL_BASELINE → TAG → RARITY → TIER → FALLBACK}，
-     * 与枚举声明顺序无关，这样同一份数据在任何构建中都会产生相同的键顺序。值为 0 的来源
-     * 不会出现在结果里。</p>
+     * <p>顺序固定为 {@code RECIPE → EXTERNAL_BASELINE → TAG → RARITY → TIER → FALLBACK →
+     * APPROVED}，与枚举声明顺序无关，这样同一份数据在任何构建中都会产生相同的键顺序。值为 0
+     * 的来源不会出现在结果里。{@code APPROVED} 的数量来自额外计数器同名键，通常由下一次扫描
+     * 观察到已批准条目后写入。</p>
      *
      * @return 不可变的“来源名称 → 数量”映射
      */
@@ -184,6 +185,7 @@ public record DiagnosticReport(
         putIfPositive(breakdown, PriceSource.RARITY, itemsSolvedByRarity);
         putIfPositive(breakdown, PriceSource.TIER, itemsSolvedByTier);
         putIfPositive(breakdown, PriceSource.FALLBACK, itemsSolvedByFallback);
+        putIfPositive(breakdown, PriceSource.APPROVED, counter(PriceSource.APPROVED.name(), 0L));
         return Collections.unmodifiableMap(breakdown);
     }
 

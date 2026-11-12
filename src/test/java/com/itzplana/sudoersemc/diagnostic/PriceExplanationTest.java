@@ -90,4 +90,16 @@ class PriceExplanationTest {
         assertTrue(nullOwnership.formatText().contains("归属: 无"));
         assertTrue(blankOwnership.formatText().contains("归属: 无"));
     }
+
+    @Test
+    void approvedSourceRendersReadableLabel() {
+        PriceExplanation explanation = PriceExplanation.of(
+                ItemKey.of(STONE), 10L, PriceSource.APPROVED, null, true,
+                "SudoersEMC 生成", List.of());
+
+        String text = explanation.formatText();
+
+        assertTrue(text.contains("来源: APPROVED（管理员批准）"));
+        assertEquals(7, text.lines().count(), "解释文本仍固定为七行");
+    }
 }
