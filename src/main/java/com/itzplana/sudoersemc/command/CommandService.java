@@ -246,7 +246,8 @@ public final class CommandService {
      * 批准某个物品当前被隔离的降价记录。
      *
      * <p>本操作只把隔离记录标记为已批准并立即落盘，不会修改 {@link GeneratedEntryStore} 中的
-     * 任何 EMC 数值，也不会触发重扫。参数必须是普通物品 id；带 NBT 的变体暂不支持。</p>
+     * 任何 EMC 数值，也不会触发重扫。落盘失败时返回失败提示，记录仍在内存中保持已批准
+     * 状态并等待下次保存。参数必须是普通物品 id；带 NBT 的变体暂不支持。</p>
      *
      * @param itemId 物品 id 原文，例如 {@code minecraft:stone}
      * @return 明确的中文结果：已批准、无此记录或 id 非法；永不抛出异常
@@ -270,9 +271,12 @@ public final class CommandService {
                 return CommandResult.failure("未找到 " + trimmed + " 的隔离降价记录");
             }
             // 审批语义只落盘标记，不修改生成值，也不请求重扫。
-            quarantinedDropsStore.saveIfDirty();
+            if (!quarantinedDropsStore.saveIfDirty()) {
+                return CommandResult.failure(
+                        "已批准 " + trimmed + " 的隔离降价记录，但保存到磁盘失败；将在下次保存时重试");
+            }
             return CommandResult.ok(
-                    "已批准 " + trimmed + " 的隔离降价记录（仅标记审批状态，不修改 EMC 数值）");
+                    "已批准 " + trimmed + " 的隔离降价记录（仅标记审批状态，不修改 EMC，也不改变后续扫描判定）");
         } catch (RuntimeException e) {
             return unexpectedFailure(e);
         }

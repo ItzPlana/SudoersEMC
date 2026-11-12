@@ -592,6 +592,11 @@ public final class Sudoersemc {
         if (stateStore != null) {
             stateStore.saveIfDirty();
         }
+
+        QuarantinedDropsStore quarantineStore = quarantinedDropsStore;
+        if (quarantineStore != null && !quarantineStore.saveIfDirty()) {
+            LOGGER.warn("SudoersEMC 扫描结束后保存隔离记录失败，将在停服或下次审批时重试");
+        }
     }
 
     private static void onModConfigEvent(ModConfigEvent event) {

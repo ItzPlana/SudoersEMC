@@ -584,6 +584,8 @@ public final class ScanPipeline {
      */
     public PipelineResult solveAndApply(@Nullable PipelineSnapshot snapshot) {
         PipelineSnapshot data = snapshot == null ? PipelineSnapshot.empty() : snapshot;
+        // 持久化隔离存储已经接管审计；每轮扫描开始时清空内存列表，避免长期自动扫描无限累积。
+        dropProtection.clearQuarantine();
         long startedAtNanos = System.nanoTime();
 
         try {
@@ -649,6 +651,11 @@ public final class ScanPipeline {
                 }
 
                 if (store != null) {
+                    // 溢出保护已经改变数值时，求解器给出的备选成本不再与最终值可比，
+                    // 继续持久化会让 /sudoemc explain 展示误导性的对比结果。
+                    List<Long> alternativeCosts = finalValue == candidate.value()
+                            ? candidate.alternativeCosts()
+                            : List.of();
                     boolean staged = store.stage(new GeneratedEmcEntry(
                             candidate.item(),
                             finalValue,
@@ -656,7 +663,7 @@ public final class ScanPipeline {
                             candidate.recipeId(),
                             true,
                             System.currentTimeMillis(),
-                            candidate.alternativeCosts()));
+                            alternativeCosts));
                     if (!staged) {
                         LOGGER.debug("物品 {} 的生成值未被存储接受，可能已有非 SudoersEMC 拥有的条目",
                                 candidate.item());
@@ -1049,6 +1056,7 @@ public final class ScanPipeline {
                     decision.dropRatio(),
                     decision.reason(),
                     System.currentTimeMillis(),
+                    // 审批状态由 QuarantinedDropsStore.record 在“同一经济判定”时保留。
                     false));
         } catch (RuntimeException failure) {
             LOGGER.warn("写入隔离记录失败，物品 {} 的隔离计数仍然有效", candidate.item(), failure);

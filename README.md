@@ -24,20 +24,20 @@ SudoersEMC 是一个**独立实现**的 Minecraft Forge 1.20.1 模组。它扫�
 
 ### 核心原则
 
-| 原则                 | 说明                                                                                                                                                                                                                                                                  |
-| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **默认不覆盖手动值** | `config/ProjectE/custom_emc.json` 默认只读，注入阶段也会跳过手动值。仅当 `overflow.overwriteScope = entire_custom_emc` 与 `overflow.allowProjectEFileRewrite = true` 双开关同时开启时，才会对该文件中严格超过阈值的条目做受控改写（先备份、原子替换、保留未知字段）。 |
-| **归属可追踪**       | 每个生成值都记录来源（配方 / 标签 / 稀有度 / 层级 / 兜底）、配方 ID、归属、NBT 变体哈希（如有）与时间戳。                                                                                                                                                             |
-| **计算可解释**       | SudoersEMC 已生成的无 NBT 变体普通条目可用 `/sudoemc explain <item>` 查看来源、配方、归属与最多 5 条备选成本（同一轮求解中其它有效配方的成本）；带 NBT 变体的条目暂不支持，ProjectE 原生值与手动值只在没有生成记录时单独提示。                                        |
-| **安全优先**         | 生成候选值的大幅降价会在非干跑模式下写入 `config/sudoersemc/quarantined_drops.json` 等待审批（`/sudoemc approve` 只标记审批状态，不修改 EMC）；超出上限的生成候选值会被重置到受控区间；创造专属物品保护默认开启，排除项、固定值与命名空间已配置化。                   |
-| **分阶段推进**       | 扫描按阶段跨 tick 推进并更新进度计数；采集、求解与应用仍在服务器线程整体执行，尚未实现工作线程或真正分片；取消只在 tick 边界被观察；性能未测量。                                                                                                                      |
-| **可选依赖**         | 未安装 ProjectE 时模组正常加载，仍会扫描并持久化生成值，但不会向 ProjectE 注入 EMC。                                                                                                                                                                                  |
+| 原则                 | 说明                                                                                                                                                                                                                                                                              |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **默认不覆盖手动值** | `config/ProjectE/custom_emc.json` 默认只读，注入阶段也会跳过手动值。仅当 `overflow.overwriteScope = entire_custom_emc` 与 `overflow.allowProjectEFileRewrite = true` 双开关同时开启时，才会对该文件中严格超过阈值的条目做受控改写（先备份、原子替换、保留未知字段）。             |
+| **归属可追踪**       | 每个生成值都记录来源（配方 / 标签 / 稀有度 / 层级 / 兜底）、配方 ID、归属、NBT 变体哈希（如有）与时间戳。                                                                                                                                                                         |
+| **计算可解释**       | SudoersEMC 已生成的无 NBT 变体普通条目可用 `/sudoemc explain <item>` 查看来源、配方、归属与最多 5 条备选成本（同一轮求解中其它有效配方的成本）；带 NBT 变体的条目暂不支持，ProjectE 原生值与手动值只在没有生成记录时单独提示。                                                    |
+| **安全优先**         | 生成候选值的大幅降价会在非干跑模式下记录到 `config/sudoersemc/quarantined_drops.json` 等待审批（扫描结束、停服或审批时落盘；`/sudoemc approve` 只标记审批状态，不修改 EMC）；超出上限的生成候选值会被重置到受控区间；创造专属物品保护默认开启，排除项、固定值与命名空间已配置化。 |
+| **分阶段推进**       | 扫描按阶段跨 tick 推进并更新进度计数；采集、求解与应用仍在服务器线程整体执行，尚未实现工作线程或真正分片；取消只在 tick 边界被观察；性能未测量。                                                                                                                                  |
+| **可选依赖**         | 未安装 ProjectE 时模组正常加载，仍会扫描并持久化生成值，但不会向 ProjectE 注入 EMC。                                                                                                                                                                                              |
 
 ---
 
 ## 当前状态
 
-项目按阶段推进。当前代码基线为 Phase 21 提交 `afa5f81`（分支 `phase-21-quarantine-explain`），**510 个单元测试通过**（0 failures / 0 errors / 0 skipped）；Phase 18–21 已完成，Goety 与 NBT 变体的真实环境验证仍待进行。
+项目按阶段推进。当前代码基线为 Phase 21 分支 `phase-21-quarantine-explain`，**607 个单元测试通过**（0 failures / 0 errors / 0 skipped）；Phase 18–21 已完成，Goety 与 NBT 变体的真实环境验证仍待进行。
 
 | 阶段       | 内容                                                                                                                                  | 状态                              |
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
@@ -50,7 +50,7 @@ SudoersEMC 是一个**独立实现**的 Minecraft Forge 1.20.1 模组。它扫�
 | Phase 18   | solve → fallback 多轮收敛；创造物品保护配置化（`safety.creativeItemExclusions` / `creativeItemSpecialValues` / `creativeNamespaces`） | ✅ 完成                           |
 | Phase 19   | 空 NBT 归一、排除规则覆盖配方路径、陈旧 owned 条目清理                                                                                | ✅ 完成                           |
 | Phase 20   | 默认 `{Damage:0}` 变体归一、Goety 读取器 fail-closed 加固                                                                             | ✅ 完成（Goety 实机未验证）       |
-| Phase 21   | 隔离降价落盘与 `/sudoemc approve`、`GeneratedEmcEntry.alternativeCosts`（schema v1→v2）、`/sudoemc explain` 备选成本                  | ✅ 完成（单元测试；实机验收待补） |
+| Phase 21   | 隔离降价审计落盘与 `/sudoemc approve`（仅标记）、`GeneratedEmcEntry.alternativeCosts`（schema v1→v2）、`/sudoemc explain` 备选成本    | ✅ 完成（单元测试；实机验收待补） |
 
 Phase 1 曾在专用服务器上验证写入生效、重启后自动恢复、手动值不被覆盖与缺少 ProjectE 时的降级行为；该记录属于历史验证，不代表当前全链路已在所有模组组合下复测。Phase 15 的双开关改写已在独立环境实机验证：默认配置与单独开启任一开关都不会改动 `custom_emc.json`；双开关同时开启时，严格超过阈值的条目被重置，并生成时间戳备份与 `overflow_resets.json` 审计记录。Phase 17 的 NBT 变体路径只有单元测试；由于原版配方不产生 NBT 输出，真实环境尚未验证。Phase 18–21 的新增能力均有单元测试；其中隔离落盘与审批流程的实机验收结果待补，Goety 反射路径仍未在真实环境验证。
 
@@ -61,7 +61,7 @@ Phase 1 曾在专用服务器上验证写入生效、重启后自动恢复、手
 - **空 NBT 与默认伤害归一** —— Phase 19/20 完成。配方输出中的空 `CompoundTag`（包括序列化为 `{}` 的形式）按无 NBT 处理；仅包含默认 `{Damage:0}` 的标签不再生成伪变体。
 - **排除规则覆盖配方路径** —— Phase 19 完成。`ScanPipeline.isExcludedFromPricing(...)` 同时用于配方候选与兜底候选，被层级规则或创造物品保护排除的物品不会经配方路径重新进入存储。
 - **陈旧 owned 条目清理** —— Phase 19 完成。`ScanPipeline.retireStaleOwnedEntries(...)` 会删除本轮既不在候选中、也不在受保护既有值中的自有条目；干跑模式或空快照时跳过。
-- **隔离降价落盘与审批** —— Phase 21 完成。非干跑模式下每次隔离写入 `quarantined_drops.json`（同一物品保留一条，最多 5000 条）；`/sudoemc approve <item>` 只把记录标记为已批准并落盘，不修改 EMC，也不触发重扫。
+- **隔离降价审计落盘与审批标记** —— Phase 21 完成。非干跑模式下每次隔离先记录在内存，并在扫描结束、停服或 `/sudoemc approve` 时原子写入 `quarantined_drops.json`（同一物品保留一条，最多 5000 条；同一经济判定再次隔离时保留已有审批标记）；`/sudoemc approve <item>` 只把记录标记为已批准并落盘，不修改 EMC，也不触发重扫；审批后的自动应用尚未实现（见下文）。
 - **备选成本与 schema v2** —— Phase 21 完成。`GeneratedEmcEntry.alternativeCosts` 记录同一轮求解中其它有效配方的成本；`generated_entries.json` 从 schema v1 升到 v2（新增 `alternatives` 数组），仍可读取 v1 文件但只写出 v2；`/sudoemc explain` 最多显示 5 条备选成本。
 
 ### 尚未实现 / 当前不生效
@@ -235,15 +235,15 @@ ProjectE 原生值与 `custom_emc.json` 中的手动值不会进入这条候选�
 
 所有子命令都注册在 `/sudoemc` 下，并要求权限等级 2（管理员）。
 
-| 命令                      | 作用                                           | 说明                                                                                 |
-| ------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------------ |
-| `/sudoemc status`         | 查看扫描阶段、进度、上次耗时与上次结果         | 只读内存进度与扫描状态文件                                                           |
-| `/sudoemc rescan-all`     | 请求一次全量重新扫描                           | 已有扫描进行中时返回失败提示                                                         |
-| `/sudoemc cancel`         | 请求取消当前扫描                               | 只在下一个服务器 tick 被观察到；不能中断正在执行的采集、求解或应用                   |
-| `/sudoemc reload`         | 按当前已加载的配置重建运行时组件               | 扫描中延后到扫描结束；校验失败时保留上一份有效配置                                   |
-| `/sudoemc report`         | 读取 `config/sudoersemc/last_report.txt`       | 尚无报告时提示先执行一次扫描                                                         |
-| `/sudoemc explain <item>` | 解释某个已生成条目的来源、配方、归属与备选成本 | 只支持无 NBT 变体的普通条目；最多显示 5 条备选成本；ProjectE 原生值/手动值会单独提示 |
-| `/sudoemc approve <item>` | 批准该物品当前的隔离降价记录                   | 只标记并落盘，不修改 EMC、不触发重扫；仅支持普通物品 id（不支持 NBT 变体）           |
+| 命令                      | 作用                                           | 说明                                                                                           |
+| ------------------------- | ---------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `/sudoemc status`         | 查看扫描阶段、进度、上次耗时与上次结果         | 只读内存进度与扫描状态文件                                                                     |
+| `/sudoemc rescan-all`     | 请求一次全量重新扫描                           | 已有扫描进行中时返回失败提示                                                                   |
+| `/sudoemc cancel`         | 请求取消当前扫描                               | 只在下一个服务器 tick 被观察到；不能中断正在执行的采集、求解或应用                             |
+| `/sudoemc reload`         | 按当前已加载的配置重建运行时组件               | 扫描中延后到扫描结束；校验失败时保留上一份有效配置                                             |
+| `/sudoemc report`         | 读取 `config/sudoersemc/last_report.txt`       | 尚无报告时提示先执行一次扫描                                                                   |
+| `/sudoemc explain <item>` | 解释某个已生成条目的来源、配方、归属与备选成本 | 只支持无 NBT 变体的普通条目；最多显示 5 条备选成本；ProjectE 原生值/手动值会单独提示           |
+| `/sudoemc approve <item>` | 批准该物品当前的隔离降价记录                   | 只标记并落盘，不修改 EMC、不触发重扫，后续扫描仍重新判定；仅支持普通物品 id（不支持 NBT 变体） |
 
 ---
 
@@ -321,16 +321,16 @@ ProjectE 原生值与 `custom_emc.json` 中的手动值不会进入这条候选�
 
 ## 数据文件
 
-| 路径                                       | 说明                                                                                                                                              |
-| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `config/sudoersemc/generated_entries.json` | 生成值、来源、配方、归属、NBT `variantHash`（如有）、备选成本与时间戳；schema v2，仍可读取 v1；只允许更新/删除 `owned=true` 的条目                |
-| `config/sudoersemc/overflow_resets.json`   | 溢出重置审计记录；只记录经溢出处理且实际改变数值的条目（含 `ENTIRE_CUSTOM_EMC` 文件改写），服务器停止时落盘                                       |
-| `config/sudoersemc/scan_state.json`        | 上次扫描时间、耗时、已定价/未解析数量与指纹；**已生成，但 `ScanStateStore.matches(...)` 没有调用方，不参与跳过判断**                              |
-| `config/sudoersemc/quarantined_drops.json` | 大幅降价隔离记录：旧值、拟写入值、降幅、原因、时间戳与 `approved`；同一物品最多一条，最多 5000 条，首次重写前备份；干跑模式不写盘                 |
-| `config/sudoersemc/last_report.txt`        | 每轮扫描后写出的诊断报告                                                                                                                          |
-| `config/ProjectE/custom_emc.json`          | ProjectE 手动配置；**默认只读**；`entire_custom_emc` + `allowProjectEFileRewrite` 双开关开启时会被受控改写并备份为 `custom_emc.json.<时间戳>.bak` |
+| 路径                                       | 说明                                                                                                                                                          |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `config/sudoersemc/generated_entries.json` | 生成值、来源、配方、归属、NBT `variantHash`（如有）、备选成本与时间戳；schema v2，仍可读取 v1；只允许更新/删除 `owned=true` 的条目                            |
+| `config/sudoersemc/overflow_resets.json`   | 溢出重置审计记录；只记录经溢出处理且实际改变数值的条目（含 `ENTIRE_CUSTOM_EMC` 文件改写），服务器停止时落盘                                                   |
+| `config/sudoersemc/scan_state.json`        | 上次扫描时间、耗时、已定价/未解析数量与指纹；**已生成，但 `ScanStateStore.matches(...)` 没有调用方，不参与跳过判断**                                          |
+| `config/sudoersemc/quarantined_drops.json` | 大幅降价隔离记录：旧值、拟写入值、降幅、原因、时间戳与 `approved`；同一物品最多一条，最多 5000 条，首次重写前备份；扫描结束、停服或审批时落盘；干跑模式不写盘 |
+| `config/sudoersemc/last_report.txt`        | 每轮扫描后写出的诊断报告                                                                                                                                      |
+| `config/ProjectE/custom_emc.json`          | ProjectE 手动配置；**默认只读**；`entire_custom_emc` + `allowProjectEFileRewrite` 双开关开启时会被受控改写并备份为 `custom_emc.json.<时间戳>.bak`             |
 
-本模组自有 JSON 与 `last_report.txt` 的写入采用「临时文件 + 原子替换」；ProjectE 文件改写同样先备份再原子替换。加载失败只告警不崩溃，遇到更高 schema 版本时拒绝覆盖。隔离降价会写入 `quarantined_drops.json`，但审批只改变标记，不会自动应用数值；干跑模式不产生隔离文件。
+本模组自有 JSON 与 `last_report.txt` 的写入采用「临时文件 + 原子替换」；ProjectE 文件改写同样先备份再原子替换。加载失败只告警不崩溃，遇到更高 schema 版本时拒绝覆盖。隔离降价会在扫描结束、停服或审批时写入 `quarantined_drops.json`，但审批只改变标记，不会自动应用数值；干跑模式不产生隔离文件。
 
 ---
 
@@ -355,7 +355,7 @@ ProjectE 原生值与 `custom_emc.json` 中的手动值不会进入这条候选�
 ./gradlew test
 ```
 
-测试覆盖：加权采样分布与权重重置、阈值边界、幂等性、持久化往返、损坏文件容错、schema 版本保护（含 v1→v2 兼容）、归属刷新、陈旧条目清理、`custom_emc.json` 受控改写（备份、原子替换、未知字段保留）、配置热重载决策、NBT 变体规范化（含空 NBT 与默认 `{Damage:0}`）、隔离记录存储与审批、备选成本持久化与 `explain` 输出、Goety 读取失败语义，以及扫描接线。当前基线共 **510 个单元测试通过**（0 failures / 0 errors / 0 skipped）。
+测试覆盖：加权采样分布与权重重置、阈值边界、幂等性、持久化往返、损坏文件容错、schema 版本保护（含 v1→v2 兼容）、归属刷新、陈旧条目清理、`custom_emc.json` 受控改写（备份、原子替换、未知字段保留）、配置热重载决策、NBT 变体规范化（含空 NBT 与默认 `{Damage:0}`）、隔离记录存储与审批、备选成本持久化与 `explain` 输出、Goety 读取失败语义，以及扫描接线。当前基线共 **607 个单元测试通过**（0 failures / 0 errors / 0 skipped）。
 
 ---
 
@@ -371,7 +371,7 @@ ProjectE 原生值与 `custom_emc.json` 中的手动值不会进入这条候选�
 
 ## English Summary
 
-SudoersEMC is an independent Minecraft Forge 1.20.1 mod that generates EMC values for items that ProjectE does not price. Current baseline: Phase 21 commit `afa5f81`, **510 unit tests passing** (0 failures / 0 errors / 0 skipped); Phases 18–21 are complete, while live Goety and NBT-variant verification are still pending.
+SudoersEMC is an independent Minecraft Forge 1.20.1 mod that generates EMC values for items that ProjectE does not price. Current baseline: Phase 21 branch `phase-21-quarantine-explain`, **607 unit tests passing** (0 failures / 0 errors / 0 skipped); Phases 18–21 are complete, while live Goety and NBT-variant verification are still pending.
 
 - **Queries** go through ProjectE's public `IEMCProxy`.
 - **Writes** use ProjectE's official `@EMCMapper` extension point (`priority = -1000`, `setValueBefore`), never ProjectE internals.

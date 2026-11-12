@@ -289,6 +289,35 @@ class ScanPipelineTest {
     }
 
     @Test
+    void approvedQuarantineIsPreservedWhenSameDropIsReevaluated() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_drop_approved.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 1_000L, PriceSource.RECIPE, null, true, 0L));
+        QuarantinedDropsStore quarantineStore = new QuarantinedDropsStore(
+                tempDir.resolve(QuarantinedDropsStore.FILE_NAME));
+        LargeDropProtection dropProtection =
+                new LargeDropProtection(LargeDropProtection.Settings.defaults());
+
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 100L), item(RESULT, 0L)),
+                List.of(recipe(INGOT, RESULT)),
+                Map.of(INGOT, 100L));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, dropProtection, null, null, disabledFallback());
+        pipeline.setQuarantinedDropsStore(quarantineStore);
+
+        assertEquals(1, pipeline.solveAndApply(snapshot).quarantined());
+        assertTrue(quarantineStore.approve(RESULT));
+
+        PipelineResult second = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1, second.quarantined(), "审批只做审计，下一次扫描仍执行降价保护");
+        assertTrue(quarantineStore.entries().get(0).approved(),
+                "相同经济判定再次隔离时不得清除审批标记");
+        assertEquals(1_000L, store.snapshotAll().get(RESULT).value(), "审批不得修改 EMC");
+    }
+
+    @Test
     void priceDropWithinThresholdIsApplied() {
         GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("generated_drop_ok.json"));
         store.stage(new GeneratedEmcEntry(RESULT, 1_000L, PriceSource.RECIPE, null, true, 0L));
@@ -336,6 +365,57 @@ class ScanPipelineTest {
         assertNotNull(staged);
         assertTrue(staged.value() >= 1L && staged.value() <= 10L,
                 "溢出回落值必须落在 [resetMin, resetMax] 内，实际为 " + staged.value());
+    }
+
+    @Test
+    void overflowResetDropsSolverAlternativeCosts() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_overflow_alternatives.json"));
+        OverflowProtection.Settings settings = new OverflowProtection.Settings(
+                true, 50L, 1L, 10L, 10, 5, OverflowScope.OWNED_ONLY, false, 42L);
+        OverflowResetLog resetLog = new OverflowResetLog(tempDir.resolve("overflow_resets.json"));
+        OverflowPipeline overflowPipeline =
+                new OverflowPipeline(new OverflowProtection(settings), resetLog);
+        ResourceLocation expensiveRecipeId =
+                new ResourceLocation("sudoersemc", "iron_block_from_two_ingots");
+        RecipeSnapshot cheap = recipe(INGOT, RESULT);
+        RecipeSnapshot expensive = RecipeSnapshot.of(
+                expensiveRecipeId,
+                RecipeKind.SHAPED,
+                List.of(new RecipeInput(IngredientOption.of(INGOT), 2)),
+                List.of(RecipeOutput.of(RESULT)));
+
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 1_000L), item(RESULT, 0L)),
+                List.of(cheap, expensive),
+                Map.of(INGOT, 1_000L));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, overflowPipeline, disabledFallback());
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1, result.overflowResets());
+        GeneratedEmcEntry staged = store.snapshotAll().get(RESULT);
+        assertNotNull(staged);
+        assertTrue(staged.value() >= 1L && staged.value() <= 10L,
+                "溢出回落值必须落在 [1, 10] 内，实际为 " + staged.value());
+        assertTrue(staged.alternativeCosts().isEmpty(),
+                "溢出改变数值后备选成本不再可比，必须丢弃");
+    }
+
+    @Test
+    void scanStartClearsInMemoryQuarantineHistory() {
+        LargeDropProtection dropProtection =
+                new LargeDropProtection(LargeDropProtection.Settings.defaults());
+        dropProtection.evaluate(GEAR, 1_000L, 100L);
+        assertEquals(1, dropProtection.quarantineCount());
+
+        ScanPipeline pipeline = pipeline(
+                null, null, null, dropProtection, null, null, disabledFallback());
+        pipeline.solveAndApply(PipelineSnapshot.empty());
+
+        assertEquals(0, dropProtection.quarantineCount(),
+                "持久化存储接管后，每轮扫描必须清空内存隔离列表");
     }
 
     @Test
