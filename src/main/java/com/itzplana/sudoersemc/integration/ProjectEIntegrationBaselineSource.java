@@ -73,7 +73,7 @@ public final class ProjectEIntegrationBaselineSource implements ExternalBaseline
 
     @Override
     public void prepare(@Nullable MinecraftServer server) {
-        if (server == null || !isPeiLoaded() || !OptionalIntegrationManager.isProjectEAvailable()) {
+        if (server == null || !isPeiLoaded() || !isProjectEBackendAvailable()) {
             values = Map.of();
             fingerprint = UNAVAILABLE_FINGERPRINT;
             return;
@@ -246,6 +246,18 @@ public final class ProjectEIntegrationBaselineSource implements ExternalBaseline
     private static boolean isPeiLoaded() {
         try {
             return ModList.get().isLoaded(MOD_ID);
+        } catch (Throwable failure) {
+            return false;
+        }
+    }
+
+    /**
+     * ProjectE 仅“存在 jar”还不够：EMC API/provider 必须真的初始化成功。provider 为空时
+     * 读取 baseline 只会产生无法生效的值，因此按不可用处理。
+     */
+    private static boolean isProjectEBackendAvailable() {
+        try {
+            return OptionalIntegrationManager.provider().isPresent();
         } catch (Throwable failure) {
             return false;
         }

@@ -38,6 +38,7 @@ import com.itzplana.sudoersemc.task.ScanFingerprint;
 import com.itzplana.sudoersemc.task.ScanManager;
 import com.itzplana.sudoersemc.task.ScanPhase;
 import com.mojang.logging.LogUtils;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -55,6 +56,7 @@ import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.event.config.ModConfigEvent;
 import net.minecraftforge.fml.event.lifecycle.FMLCommonSetupEvent;
 import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
+import net.minecraftforge.fml.loading.FMLPaths;
 import net.minecraftforge.server.ServerLifecycleHooks;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
@@ -74,6 +76,9 @@ public final class Sudoersemc {
 
     public static final String MODID = "sudoersemc";
     public static final Logger LOGGER = LogUtils.getLogger();
+
+    /** Forge 为 COMMON 配置生成的默认文件名。 */
+    private static final String COMMON_CONFIG_FILE_NAME = "sudoersemc-common.toml";
 
     /** 单 tick 分配给扫描工作的时间预算，1 毫秒。 */
     private static final long TICK_BUDGET_NANOS = 1_000_000L;
@@ -124,10 +129,43 @@ public final class Sudoersemc {
         MinecraftForge.EVENT_BUS.addListener(this::onServerStopping);
         MinecraftForge.EVENT_BUS.addListener(SmokeTestHook::onServerTick);
 
+        // 真正的“解析前迁移”：Forge 会在 ModConfigEvent 之前按 spec 重写 TOML（补 schemaVersion、
+        // 丢注释与未知键）。因此在 register() 之前直接对磁盘文件做一次幂等迁移。文件不存在时
+        // SKIPPED，绝不抢先创建。事件路径保留作为 reload/兜底。
+        migrateConfigBeforeForgeLoads();
+
         // 必须在构造阶段注册，Forge 之后才会加载配置。
         SudoersemcConfig.register();
 
         LOGGER.info("SudoersEMC is loading");
+    }
+
+    /**
+     * 在 Forge 解析/重写 TOML 之前迁移磁盘上的 COMMON 配置文件。
+     *
+     * <p>Forge 会在 {@code ModConfigEvent} 之前按 spec 补键并重写文件，可能丢失注释与未知键；
+     * 这个入口是唯一能保留原始文件内容的时机。迁移是幂等的：文件已是最新版本时返回
+     * {@code NO_OP}，文件不存在时返回 {@code SKIPPED}，绝不抢先创建。</p>
+     */
+    private static void migrateConfigBeforeForgeLoads() {
+        try {
+            Path configPath = FMLPaths.CONFIGDIR.get().resolve(COMMON_CONFIG_FILE_NAME);
+            ConfigTomlMigration.MigrationOutcome outcome =
+                    ConfigTomlMigration.migrate(configPath);
+            if (outcome.status() == ConfigTomlMigration.Status.MIGRATED) {
+                LOGGER.info("SudoersEMC 已在 Forge 解析前完成配置迁移：schema {} → {}，{}",
+                        outcome.fromVersion(), outcome.toVersion(), outcome.notes());
+            } else if (outcome.status() == ConfigTomlMigration.Status.REFUSED_NEWER) {
+                LOGGER.error("SudoersEMC 配置版本高于当前构建，解析前迁移已拒绝：{}",
+                        outcome.notes());
+            } else if (outcome.status() == ConfigTomlMigration.Status.FAILED_RETAINED) {
+                LOGGER.warn("SudoersEMC 解析前配置迁移失败，保留原文件：{}", outcome.notes());
+            } else {
+                LOGGER.debug("SudoersEMC 解析前配置迁移无需执行：{}", outcome.status());
+            }
+        } catch (Throwable failure) {
+            LOGGER.warn("SudoersEMC 解析前配置迁移异常，继续交给 Forge 处理", failure);
+        }
     }
 
     private void onCommonSetup(FMLCommonSetupEvent event) {

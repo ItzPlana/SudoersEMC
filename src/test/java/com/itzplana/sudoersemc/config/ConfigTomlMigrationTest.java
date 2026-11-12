@@ -114,6 +114,70 @@ class ConfigTomlMigrationTest {
     }
 
     @Test
+    void oversizedSchemaVersionIsRefusedWithoutWrite() throws IOException {
+        Path file = tempDir.resolve("oversized-version.toml");
+        Files.writeString(file, """
+                schemaVersion = 9999999999
+                futureKey = "keep"
+
+                [overflow]
+                threshold = 5
+                """, StandardCharsets.UTF_8);
+        byte[] before = Files.readAllBytes(file);
+
+        ConfigTomlMigration.MigrationOutcome outcome = ConfigTomlMigration.migrate(file);
+
+        assertEquals(ConfigTomlMigration.Status.REFUSED_NEWER, outcome.status());
+        assertArrayEquals(before, Files.readAllBytes(file));
+        assertEquals(0, countBackups(file));
+        assertFalse(Files.exists(temp(file)));
+    }
+
+    @Test
+    void nonNumericSchemaVersionIsRetained() throws IOException {
+        Path file = tempDir.resolve("non-numeric-version.toml");
+        String text = """
+                schemaVersion = "not-a-number"
+
+                [overflow]
+                threshold = 5
+                """;
+        Files.writeString(file, text, StandardCharsets.UTF_8);
+
+        ConfigTomlMigration.MigrationOutcome outcome = ConfigTomlMigration.migrate(file);
+
+        assertEquals(ConfigTomlMigration.Status.FAILED_RETAINED, outcome.status());
+        assertEquals(text, Files.readString(file, StandardCharsets.UTF_8));
+        assertEquals(0, countBackups(file));
+        assertFalse(Files.exists(temp(file)));
+    }
+
+    @Test
+    void nonPositiveSchemaVersionIsRetained() throws IOException {
+        Path negative = tempDir.resolve("negative-version.toml");
+        String negativeText = """
+                schemaVersion = -1
+
+                [overflow]
+                threshold = 5
+                """;
+        Files.writeString(negative, negativeText, StandardCharsets.UTF_8);
+        ConfigTomlMigration.MigrationOutcome negativeOutcome =
+                ConfigTomlMigration.migrate(negative);
+        assertEquals(ConfigTomlMigration.Status.FAILED_RETAINED, negativeOutcome.status());
+        assertEquals(negativeText, Files.readString(negative, StandardCharsets.UTF_8));
+
+        Path zero = tempDir.resolve("zero-version.toml");
+        String zeroText = "schemaVersion = 0\n";
+        Files.writeString(zero, zeroText, StandardCharsets.UTF_8);
+        ConfigTomlMigration.MigrationOutcome zeroOutcome = ConfigTomlMigration.migrate(zero);
+        assertEquals(ConfigTomlMigration.Status.FAILED_RETAINED, zeroOutcome.status());
+        assertEquals(zeroText, Files.readString(zero, StandardCharsets.UTF_8));
+        assertEquals(0, countBackups(negative));
+        assertEquals(0, countBackups(zero));
+    }
+
+    @Test
     void malformedTomlIsRetained() throws IOException {
         Path broken = tempDir.resolve("broken.toml");
         String text = "not = [valid";

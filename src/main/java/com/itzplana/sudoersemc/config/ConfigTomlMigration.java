@@ -5,6 +5,8 @@ import com.electronwill.nightconfig.core.file.CommentedFileConfig;
 import com.electronwill.nightconfig.toml.TomlFormat;
 import com.itzplana.sudoersemc.storage.JsonFileIO;
 import java.io.IOException;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
@@ -24,8 +26,16 @@ import org.slf4j.LoggerFactory;
 /**
  * 把 {@link ConfigMigrations} 的裸键迁移规则接入 Forge 的 TOML 配置文件。
  *
- * <p>Forge 1.20.1 没有公开的“解析前”配置钩子，因此本类在 {@code ModConfigEvent.Loading}
- * 与 {@code ModConfigEvent.Reloading} 事件内、运行时组件重建之前执行。迁移只读写以下三个键：</p>
+ * <p>Forge 1.20.1 没有公开的“解析前”配置钩子。本类提供两条入口：</p>
+ * <ul>
+ *   <li>{@link #migrate(java.nio.file.Path)}：由 {@code Sudoersemc} 在
+ *       {@code SudoersemcConfig.register()} 之前直接调用磁盘文件，此时 Forge 尚未按 spec
+ *       重写 TOML，因此能保留用户注释与未知键；</li>
+ *   <li>{@link #migrate(ModConfig)}：在 {@code Loading}/{@code Reloading} 事件内作为
+ *       reload/兜底入口，已迁移文件会返回 {@code NO_OP}。</li>
+ * </ul>
+ *
+ * <p>迁移只读写以下三个键：</p>
  *
  * <ul>
  *   <li>{@code schemaVersion}（根级）；</li>
@@ -197,8 +207,25 @@ public final class ConfigTomlMigration {
             try {
                 toml.load();
 
-                fromVersion = readInt(toml, SCHEMA_VERSION_KEY,
-                        ConfigMigrations.LEGACY_SCHEMA_VERSION);
+                VersionRead versionRead = readVersion(toml);
+                if (versionRead.status() == VersionStatus.TOO_HIGH) {
+                    LOGGER.error(
+                            "[config] {} 的 schemaVersion 超出本构建可表示范围；拒绝迁移并保留原文件",
+                            target);
+                    return new MigrationOutcome(Status.REFUSED_NEWER,
+                            Integer.MAX_VALUE, Integer.MAX_VALUE, null,
+                            List.of("配置版本超出当前构建可表示范围"));
+                }
+                if (versionRead.status() == VersionStatus.INVALID) {
+                    LOGGER.warn(
+                            "[config] {} 的 schemaVersion 非法（必须是正整数）；保留原文件等待人工修复",
+                            target);
+                    return new MigrationOutcome(Status.FAILED_RETAINED, -1, -1, null,
+                            List.of("schemaVersion 非法，保留原文件"));
+                }
+                fromVersion = versionRead.status() == VersionStatus.MISSING
+                        ? ConfigMigrations.LEGACY_SCHEMA_VERSION
+                        : versionRead.version();
                 if (fromVersion > ConfigMigrations.SCHEMA_VERSION) {
                     LOGGER.error(
                             "[config] {} 的 schemaVersion={} 高于本构建支持的 {}；拒绝迁移并保留原文件",
@@ -297,22 +324,71 @@ public final class ConfigTomlMigration {
         }
     }
 
-    static int readInt(CommentedConfig config, String key, int defaultValue) {
-        if (config == null || key == null) {
-            return defaultValue;
+    private enum VersionStatus {
+        MISSING,
+        VALID,
+        TOO_HIGH,
+        INVALID
+    }
+
+    private record VersionRead(VersionStatus status, int version) {
+    }
+
+    /**
+     * 严格读取 {@code schemaVersion}：
+     *
+     * <ul>
+     *   <li>键不存在 → legacy 1；</li>
+     *   <li>正整数且不超过 {@link Integer#MAX_VALUE} → 有效版本；</li>
+     *   <li>数值超过 int 上限 → {@link VersionStatus#TOO_HIGH}，入口返回 REFUSED_NEWER；</li>
+     *   <li>0/负数、非数字字符串、布尔/数组/小数等非法类型 → {@link VersionStatus#INVALID}，
+     *       入口返回 FAILED_RETAINED。</li>
+     * </ul>
+     *
+     * <p>绝不能把超大 Long 静默截断成 int：那会让旧构建误以为未来配置是当前版本并覆盖它。</p>
+     */
+    private static VersionRead readVersion(CommentedConfig config) {
+        if (config == null || !config.contains(SCHEMA_VERSION_KEY)) {
+            return new VersionRead(VersionStatus.MISSING,
+                    ConfigMigrations.LEGACY_SCHEMA_VERSION);
         }
-        Object raw = config.get(key);
-        if (raw instanceof Number number) {
-            return number.intValue();
+        Object raw = config.get(SCHEMA_VERSION_KEY);
+        if (raw == null) {
+            return new VersionRead(VersionStatus.INVALID, -1);
         }
-        if (raw instanceof String text) {
-            try {
-                return Integer.parseInt(text.trim());
-            } catch (NumberFormatException ignored) {
-                return defaultValue;
+        try {
+            BigDecimal decimal = toDecimal(raw);
+            if (decimal == null) {
+                return new VersionRead(VersionStatus.INVALID, -1);
             }
+            BigInteger integer = decimal.toBigIntegerExact();
+            if (integer.signum() <= 0) {
+                return new VersionRead(VersionStatus.INVALID, -1);
+            }
+            if (integer.compareTo(BigInteger.valueOf(Integer.MAX_VALUE)) > 0) {
+                return new VersionRead(VersionStatus.TOO_HIGH, Integer.MAX_VALUE);
+            }
+            return new VersionRead(VersionStatus.VALID, integer.intValue());
+        } catch (ArithmeticException | NumberFormatException failure) {
+            // 小数、NaN/Infinity 等无法精确转为整数的输入都属于非法版本。
+            return new VersionRead(VersionStatus.INVALID, -1);
         }
-        return defaultValue;
+    }
+
+    @Nullable
+    private static BigDecimal toDecimal(Object raw) {
+        if (!(raw instanceof Number) && !(raw instanceof CharSequence)) {
+            return null;
+        }
+        String text = raw.toString().trim();
+        if (text.isEmpty()) {
+            return null;
+        }
+        try {
+            return new BigDecimal(text);
+        } catch (NumberFormatException failure) {
+            return null;
+        }
     }
 
     private static MigrationOutcome failed(Path target, int fromVersion, String note) {
