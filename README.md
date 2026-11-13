@@ -168,17 +168,17 @@ allowProjectEFileRewrite = false
 randomSeed = 0                  # 0 = 非确定性
 
 [nbt]
-scanNbtVariants = true                   # Phase 17 接线；Phase 16 构建暂不读取
-maxNbtVariantsPerItem = 100              # Phase 17 接线；Phase 16 仅做范围校验
+scanNbtVariants = true                   # Phase 17 接线，控制是否生成 NBT 变体
+maxNbtVariantsPerItem = 100              # Phase 17 接线，单物品变体数上限 [1, 1000]
 
 [diagnostic]
 debugLogging = false                     # Phase 25 接线；Phase 16 构建暂不读取
 generateReports = true
 ```
 
-> **[nbt] 说明**：Phase 16 只校验 `maxNbtVariantsPerItem` 的 `[1, 1000]` 范围，
-> `scanNbtVariants` 与 `maxNbtVariantsPerItem` 的扫描行为均由 Phase 17 接线；
-> 当前构建开启/关闭这两个键不会改变扫描结果。
+> **[nbt] 说明**：Phase 17 已消费 `scanNbtVariants` 与 `maxNbtVariantsPerItem`：
+> 关闭开关会跳过变体生成，`maxNbtVariantsPerItem` 同时受
+> `VariantScanner.HARD_VARIANT_CEILING = 1000` 约束。
 
 ### 自动扫描开关
 
@@ -215,19 +215,19 @@ generateReports = true
 
 ### 默认值
 
-| 配置项                              | 默认值       | 说明                                                                |
-| ----------------------------------- | ------------ | ------------------------------------------------------------------- |
-| `performance.itemsPerTick`          | `100`        | 服务端线程每 tick 最多处理的物品数                                  |
-| `recipe.maxRecipePasses`            | `20`         | 单次扫描的配方求解遍数上限                                          |
-| `overflow.threshold`                | `999999`     | 严格大于该值的 EMC 会被重置                                         |
-| `overflow.resetMin`                 | `100`        | 重置区间下界（含）                                                  |
-| `overflow.resetMax`                 | `999000`     | 重置区间上界（含）                                                  |
-| `overflow.bucketCount`              | `100`        | 加权采样桶数量                                                      |
-| `overflow.weightCap`                | `20`         | 单个桶的权重上限                                                    |
-| `overflow.overwriteScope`           | `owned_only` | 重置范围，可选 `owned_only` / `entire_custom_emc`                   |
-| `overflow.allowProjectEFileRewrite` | `false`      | 是否允许改写 `custom_emc.json` 中归 SudoersEMC 所有的条目           |
-| `nbt.maxNbtVariantsPerItem`         | `100`        | 每个物品最多扫描的 NBT 变体数（Phase 17 消费；Phase 16 仅校验范围） |
-| `safety.maxAllowedDropRatio`        | `0.5`        | 单次生成值允许的最大相对跌幅                                        |
+| 配置项                              | 默认值       | 说明                                                      |
+| ----------------------------------- | ------------ | --------------------------------------------------------- |
+| `performance.itemsPerTick`          | `100`        | 服务端线程每 tick 最多处理的物品数                        |
+| `recipe.maxRecipePasses`            | `20`         | 单次扫描的配方求解遍数上限                                |
+| `overflow.threshold`                | `999999`     | 严格大于该值的 EMC 会被重置                               |
+| `overflow.resetMin`                 | `100`        | 重置区间下界（含）                                        |
+| `overflow.resetMax`                 | `999000`     | 重置区间上界（含）                                        |
+| `overflow.bucketCount`              | `100`        | 加权采样桶数量                                            |
+| `overflow.weightCap`                | `20`         | 单个桶的权重上限                                          |
+| `overflow.overwriteScope`           | `owned_only` | 重置范围，可选 `owned_only` / `entire_custom_emc`         |
+| `overflow.allowProjectEFileRewrite` | `false`      | 是否允许改写 `custom_emc.json` 中归 SudoersEMC 所有的条目 |
+| `nbt.maxNbtVariantsPerItem`         | `100`        | 每个物品最多扫描的 NBT 变体数（Phase 17 消费）            |
+| `safety.maxAllowedDropRatio`        | `0.5`        | 单次生成值允许的最大相对跌幅                              |
 
 > **`minEmc` 说明**：当前构建没有 `minEmc` 配置键。求解器下限固定为
 > `SolveSettings.DEFAULT_MINIMUM_EMC = 1`（与 `EvaluationPolicy.DEFAULT_MINIMUM_EMC` 相同）。
@@ -347,7 +347,7 @@ generateReports = true
 
 测试覆盖：加权采样分布与权重重置、阈值边界、幂等性、持久化往返、损坏文件容错、schema 版本保护、分片扫描管线、双扫描器 API 兼容、命令层、扫描状态机、General 开关降级与停服清理。
 
-当前共 **667** 个单元/组件测试（54 个测试类），0 failure / 0 error；尚未加入专用服务器端到端测试。
+当前共 **687** 个单元/组件测试（55 个测试类），0 failure / 0 error；尚未加入专用服务器端到端测试。
 
 ---
 

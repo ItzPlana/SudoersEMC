@@ -1,6 +1,7 @@
 package com.itzplana.sudoersemc.scanner;
 
 import com.itzplana.sudoersemc.core.ItemKey;
+import com.itzplana.sudoersemc.resolver.VariantNormalizer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -8,6 +9,7 @@ import java.util.Optional;
 import java.util.function.Consumer;
 import net.minecraft.core.NonNullList;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.nbt.CompoundTag;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.crafting.AbstractCookingRecipe;
@@ -451,8 +453,18 @@ public final class RecipeScanner {
     private record ConvertedIngredients(List<RecipeInput> inputs, List<RecipeOutput> remainders) {
     }
 
+    /**
+     * 把输出堆叠转换为不可变产物，并保留其 SNBT。
+     *
+     * <p>输出身份与变体扫描共用 {@link VariantNormalizer#keyFor(ResourceLocation, CompoundTag)}：
+     * 只有经济相关字段会进入 {@link ItemKey#variantHash()}，展示字段、可损坏物品的
+     * {@code Damage} 等不会产生额外变体。原始 SNBT 单独保存在 {@link RecipeOutput#outputNbt()}，
+     * 供后续注册 ProjectE 的精确 NBT key。</p>
+     *
+     * <p>该方法为包级可见，便于单元测试直接验证 SNBT 保留与空标签语义。</p>
+     */
     @Nullable
-    private static RecipeOutput convertStack(@Nullable ItemStack stack) {
+    static RecipeOutput convertStack(@Nullable ItemStack stack) {
         if (stack == null || stack.isEmpty()) {
             return null;
         }
@@ -460,7 +472,47 @@ public final class RecipeScanner {
         if (id == null) {
             return null;
         }
-        return new RecipeOutput(ItemKey.of(id), Math.max(1, stack.getCount()));
+        CompoundTag tag = effectiveVariantTag(stack);
+        ItemKey key = tag == null ? ItemKey.of(id) : VariantNormalizer.keyFor(id, tag);
+        return new RecipeOutput(key, Math.max(1, stack.getCount()), serializeTag(tag));
+    }
+
+    /**
+     * 读取参与变体身份计算的标签，并把“仅 {@code Damage:0}”归一为无 NBT。
+     *
+     * <p>可损坏物品默认携带 {@code Damage:0}，它只表示“未受损”，不是经济变体；
+     * 若保留该标签，非可损坏物品还会产生无意义的 {@code {Damage:0}} 伪变体。</p>
+     */
+    @Nullable
+    private static CompoundTag effectiveVariantTag(ItemStack stack) {
+        CompoundTag tag = stack.getTag();
+        if (tag == null || tag.isEmpty()) {
+            return null;
+        }
+        if (tag.size() == 1 && tag.contains("Damage") && tag.getInt("Damage") == 0) {
+            return null;
+        }
+        return tag;
+    }
+
+    /**
+     * 把输出堆叠的 NBT 序列化为 SNBT。
+     *
+     * <p>没有标签、空标签或仅 {@code Damage:0} 时返回 {@code null}；序列化失败时记录调试日志
+     * 并返回 {@code null}，绝不因为单个损坏的标签中断整轮配方扫描。</p>
+     */
+    @Nullable
+    private static String serializeTag(@Nullable CompoundTag tag) {
+        if (tag == null || tag.isEmpty()) {
+            return null;
+        }
+        try {
+            String snbt = tag.toString();
+            return snbt.isBlank() ? null : snbt;
+        } catch (RuntimeException failure) {
+            LOGGER.debug("序列化配方输出 NBT 失败，按无 NBT 处理", failure);
+            return null;
+        }
     }
 
     /**

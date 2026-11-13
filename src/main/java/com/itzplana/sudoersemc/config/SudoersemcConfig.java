@@ -211,14 +211,13 @@ public final class SudoersemcConfig {
         BUILDER.comment("ItemStack NBT variant scanning.").push("nbt");
         NBT_SCAN_NBT_VARIANTS = BUILDER.comment(
                         "Scan economically relevant NBT variants of items.",
-                        "Reserved for Phase 17; this Phase 16 build does not read this key yet.")
+                        "Consumed by the Phase 17 variant pipeline; disabling it skips variant generation.")
                 .define("scanNbtVariants", true);
         // Upper bound mirrors VariantScanner.HARD_VARIANT_CEILING; a larger spec value would be
         // silently clamped by the consumer, so reject it at the config boundary instead.
         NBT_MAX_NBT_VARIANTS_PER_ITEM = BUILDER.comment(
                         "Maximum number of NBT variants scanned per item, in [1, 1000].",
-                        "Reserved for Phase 17; this Phase 16 build only validates the value and",
-                        "does not scan NBT variants yet.")
+                        "Consumed by the Phase 17 variant pipeline; larger values are rejected at this boundary.")
                 .defineInRange("maxNbtVariantsPerItem", 100, 1, 1000);
         BUILDER.pop();
 
@@ -381,6 +380,7 @@ public final class SudoersemcConfig {
             boolean allowProjectEFileRewrite = OVERFLOW_ALLOW_PROJECTE_FILE_REWRITE.get();
             long overflowRandomSeed = OVERFLOW_RANDOM_SEED.get();
             int maxNbtVariantsPerItem = NBT_MAX_NBT_VARIANTS_PER_ITEM.get();
+            boolean nbtScanVariants = NBT_SCAN_NBT_VARIANTS.get();
             double maxAllowedDropRatio = SAFETY_MAX_ALLOWED_DROP_RATIO.get();
             boolean largeDropProtection = SAFETY_LARGE_DROP_PROTECTION.get();
             boolean protectCreativeOnlyItems = SAFETY_PROTECT_CREATIVE_ONLY_ITEMS.get();
@@ -454,7 +454,9 @@ public final class SudoersemcConfig {
                     generalEnabled,
                     alwaysRescan,
                     solveRecipes,
-                    generateReports);
+                    generateReports,
+                    nbtScanVariants,
+                    maxNbtVariantsPerItem);
 
             activeValues = values;
             activeSnapshot = snapshot;

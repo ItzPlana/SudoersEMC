@@ -4,12 +4,15 @@ import com.itzplana.sudoersemc.core.GeneratedEmcEntry;
 import com.itzplana.sudoersemc.core.ItemKey;
 import com.itzplana.sudoersemc.core.OverflowScope;
 import com.itzplana.sudoersemc.core.PriceSource;
+import com.itzplana.sudoersemc.core.VariantRegistration;
 import com.itzplana.sudoersemc.diagnostic.DiagnosticReport;
 import com.itzplana.sudoersemc.diagnostic.ReportManager;
 import com.itzplana.sudoersemc.integration.EmcProvider;
 import com.itzplana.sudoersemc.integration.ProjectECustomEmcFile;
 import com.itzplana.sudoersemc.pricing.FallbackPricing;
 import com.itzplana.sudoersemc.pricing.TierPricing;
+import com.itzplana.sudoersemc.resolver.VariantNormalizer;
+import com.itzplana.sudoersemc.resolver.VariantScanner;
 import com.itzplana.sudoersemc.safety.CreativeItemProtection;
 import com.itzplana.sudoersemc.safety.LargeDropProtection;
 import com.itzplana.sudoersemc.safety.OverflowPipeline;
@@ -18,6 +21,7 @@ import com.itzplana.sudoersemc.safety.PriceDropDecision;
 import com.itzplana.sudoersemc.scanner.ItemScanner;
 import com.itzplana.sudoersemc.scanner.ItemSnapshot;
 import com.itzplana.sudoersemc.scanner.RecipeScanner;
+import com.itzplana.sudoersemc.scanner.RecipeOutput;
 import com.itzplana.sudoersemc.scanner.RecipeSnapshot;
 import com.itzplana.sudoersemc.solver.EvaluatorRegistry;
 import com.itzplana.sudoersemc.solver.EvaluationPolicy;
@@ -33,10 +37,12 @@ import com.itzplana.sudoersemc.task.ScanManager;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Supplier;
 import java.util.Set;
@@ -47,9 +53,14 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.TagParser;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -111,6 +122,8 @@ public final class ScanPipeline {
     private final SolveSettings solveSettings;
     private volatile boolean solveRecipesEnabled = true;
     private volatile boolean generateReportsEnabled = true;
+    private volatile boolean nbtVariantsEnabled = true;
+    private volatile int maxNbtVariantsPerItem = 100;
 
     private final AtomicReference<PipelineSnapshot> stashedSnapshot = new AtomicReference<>();
     private final AtomicReference<CompletableFuture<Computation>> pendingSolve = new AtomicReference<>();
@@ -233,6 +246,31 @@ public final class ScanPipeline {
      */
     public void setGenerateReportsEnabled(boolean enabled) {
         this.generateReportsEnabled = enabled;
+    }
+
+    /**
+     * 设置是否扫描并生成 NBT 变体快照。
+     *
+     * <p>关闭后 {@link #collect(MinecraftServer)} 完全不生成变体，基础物品快照不受影响。
+     * 该开关在每次采集开始时读取，重建管线后立即生效。</p>
+     *
+     * @param enabled {@code true} 表示启用 NBT 变体扫描；默认启用
+     */
+    public void setNbtVariantsEnabled(boolean enabled) {
+        this.nbtVariantsEnabled = enabled;
+    }
+
+    /**
+     * 设置每个物品最多保留的 NBT 变体数量。
+     *
+     * <p>取值会被限制在 {@code [1, }{@link VariantScanner#HARD_VARIANT_CEILING}{@code ]}
+     * 内，避免异常配置导致变体数量失控。该上限在每次采集开始时读取。</p>
+     *
+     * @param maxVariantsPerItem 每个物品最多保留的变体数
+     */
+    public void setMaxNbtVariantsPerItem(int maxVariantsPerItem) {
+        this.maxNbtVariantsPerItem = Math.max(
+                1, Math.min(maxVariantsPerItem, VariantScanner.HARD_VARIANT_CEILING));
     }
 
     /**
@@ -420,20 +458,233 @@ public final class ScanPipeline {
             RecipeScanner.ScanResult scanResult = recipeSession == null
                     ? new RecipeScanner.ScanResult(List.of(), 0, 0, 0)
                     : recipeSession.result();
-            Map<ItemKey, Long> existingValues = new TreeMap<>();
-            for (ItemSnapshot item : items) {
-                if (item.hasExistingEmc()) {
-                    existingValues.put(item.key(), item.existingValue());
+            return collectSnapshotData(items, scanResult, emcQuery());
+        }
+    }
+
+    /**
+     * 把已完成的物品与配方扫描结果组装成不可变快照。
+     *
+     * <p>该方法从管线字段读取 NBT 变体开关与单物品上限，是 {@link #collect(MinecraftServer)}
+     * 的可测试接缝：生产路径与测试都走同一段变体生成与既有值查询逻辑。</p>
+     *
+     * @param items      基础物品扫描结果，不能为 null
+     * @param scanResult 配方扫描结果，不能为 null
+     * @param emcQuery   后端查询；允许为 {@code null}（测试或后端缺失时按无既有值处理）
+     * @return 组装后的快照
+     */
+    PipelineSnapshot collectSnapshotData(List<ItemSnapshot> items,
+                                         RecipeScanner.ScanResult scanResult,
+                                         @Nullable ItemScanner.EmcQuery emcQuery) {
+        Objects.requireNonNull(items, "items");
+        Objects.requireNonNull(scanResult, "scanResult");
+        List<ItemSnapshot> variantItems = collectVariantSnapshots(
+                items, scanResult.recipes(), nbtVariantsEnabled, maxNbtVariantsPerItem, emcQuery);
+        List<ItemSnapshot> allItems = items;
+        if (!variantItems.isEmpty()) {
+            List<ItemSnapshot> combined = new ArrayList<>(items.size() + variantItems.size());
+            combined.addAll(items);
+            combined.addAll(variantItems);
+            allItems = List.copyOf(combined);
+        }
+
+        Map<ItemKey, Long> existingValues = new TreeMap<>();
+        for (ItemSnapshot item : allItems) {
+            if (item.hasExistingEmc()) {
+                existingValues.put(item.key(), item.existingValue());
+            }
+        }
+
+        return new PipelineSnapshot(
+                allItems,
+                scanResult.recipes(),
+                existingValues,
+                scanResult.unsupported(),
+                scanResult.invalid(),
+                scanResult.failed());
+    }
+
+    /**
+     * 根据配方输出中观测到的 SNBT 生成 NBT 变体快照。
+     *
+     * <p>先按物品 id 汇总并去重原始 SNBT，再逐个解析、规范化；每个物品只保留字典序最小的
+     * {@code maxNbtVariantsPerItem} 个变体。解析是流式的：同一时刻只持有一个临时
+     * {@link CompoundTag}，不会把与配方数成正比的解析结果全部留在内存中。全部物品共享
+     * {@link VariantScanner#HARD_TOTAL_VARIANT_CEILING} 的总预算。只有已在基础物品快照中
+     * 出现过的物品才会生成变体，因此忽略规则与注册表缺失物品不会被变体扫描重新引入。</p>
+     *
+     * <p>变体快照的 {@code hasExistingEmc}/{@code existingValue} 来自对带原始 NBT 堆叠的
+     * 精确查询：只要任一观测原始 SNBT 已有 NBT 专属 EMC，就取最大值作为既有值，避免覆盖
+     * 其它模组或 ProjectE NBT 处理器注册的值。标签路径与稀有度继承基础物品。</p>
+     *
+     * @param baseItems            基础物品快照，保持扫描器返回的顺序
+     * @param recipes              本轮可用配方
+     * @param enabled              是否启用变体扫描
+     * @param maxNbtVariantsPerItem 每个物品最多保留的变体数
+     * @return 不可变的变体快照列表；未启用、无观测变体或全部无法解析时为空
+     */
+    static List<ItemSnapshot> collectVariantSnapshots(List<ItemSnapshot> baseItems,
+                                                      List<RecipeSnapshot> recipes,
+                                                      boolean enabled,
+                                                      int maxNbtVariantsPerItem) {
+        return collectVariantSnapshots(baseItems, recipes, enabled, maxNbtVariantsPerItem, null);
+    }
+
+    /**
+     * 带 EMC 精确查询的变体采集重载。
+     *
+     * @param emcQuery 精确 NBT 查询；{@code null} 时按无既有值处理
+     */
+    static List<ItemSnapshot> collectVariantSnapshots(List<ItemSnapshot> baseItems,
+                                                      List<RecipeSnapshot> recipes,
+                                                      boolean enabled,
+                                                      int maxNbtVariantsPerItem,
+                                                      @Nullable ItemScanner.EmcQuery emcQuery) {
+        if (!enabled || baseItems == null || baseItems.isEmpty()
+                || recipes == null || recipes.isEmpty()) {
+            return List.of();
+        }
+        int limit = Math.max(1, Math.min(maxNbtVariantsPerItem, VariantScanner.HARD_VARIANT_CEILING));
+
+        Map<ResourceLocation, TreeSet<String>> observedByItem = new TreeMap<>();
+        for (RecipeSnapshot recipe : recipes) {
+            for (RecipeOutput output : recipe.outputs()) {
+                String outputNbt = output.outputNbt();
+                if (outputNbt == null || outputNbt.isBlank()) {
+                    continue;
+                }
+                observedByItem
+                        .computeIfAbsent(output.item().itemId(), id -> new TreeSet<>())
+                        .add(outputNbt);
+            }
+        }
+        if (observedByItem.isEmpty()) {
+            return List.of();
+        }
+
+        Map<ResourceLocation, ItemSnapshot> baseByItem = new LinkedHashMap<>();
+        for (ItemSnapshot item : baseItems) {
+            if (!item.key().hasVariant()) {
+                baseByItem.putIfAbsent(item.registryId(), item);
+            }
+        }
+
+        Set<ItemKey> seen = new HashSet<>();
+        List<ItemSnapshot> variants = new ArrayList<>();
+        int totalBudget = VariantScanner.HARD_TOTAL_VARIANT_CEILING;
+        boolean budgetExhausted = false;
+
+        for (Map.Entry<ResourceLocation, TreeSet<String>> entry : observedByItem.entrySet()) {
+            ItemSnapshot base = baseByItem.get(entry.getKey());
+            if (base == null) {
+                // 基础物品未被扫描（被忽略或未注册）时不生成变体，避免绕过排除规则。
+                continue;
+            }
+            Item item = BuiltInRegistries.ITEM.get(entry.getKey());
+            if (item == null || item == Items.AIR) {
+                continue;
+            }
+
+            // 原始 SNBT 已按字典序去重；逐个解析并即时裁剪到 limit，保持结果与配方顺序无关。
+            TreeSet<ItemKey> uniqueKeys = new TreeSet<>();
+            Map<ItemKey, TreeSet<String>> rawFormsByKey = new LinkedHashMap<>();
+            for (String snbt : entry.getValue()) {
+                CompoundTag tag;
+                try {
+                    tag = TagParser.parseTag(snbt);
+                } catch (Exception failure) {
+                    LOGGER.debug("无法解析配方输出 SNBT，跳过该观测变体：{}", snbt, failure);
+                    continue;
+                }
+                ItemKey key = VariantNormalizer.keyFor(entry.getKey(), tag);
+                if (!key.hasVariant()) {
+                    continue;
+                }
+                uniqueKeys.add(key);
+                TreeSet<String> forms = rawFormsByKey.computeIfAbsent(key, ignored -> new TreeSet<>());
+                if (forms.size() < VariantRegistration.MAX_OBSERVED_NBT_PER_VARIANT) {
+                    forms.add(snbt);
+                }
+                if (uniqueKeys.size() > limit) {
+                    ItemKey removed = uniqueKeys.pollLast();
+                    rawFormsByKey.remove(removed);
                 }
             }
-            return new PipelineSnapshot(
-                    items,
-                    scanResult.recipes(),
-                    existingValues,
-                    scanResult.unsupported(),
-                    scanResult.invalid(),
-                    scanResult.failed());
+            if (uniqueKeys.isEmpty()) {
+                continue;
+            }
+
+            for (ItemKey variantKey : uniqueKeys) {
+                if (!seen.add(variantKey)) {
+                    continue;
+                }
+                if (variants.size() >= totalBudget) {
+                    budgetExhausted = true;
+                    break;
+                }
+                long existingValue = queryVariantExistingValue(
+                        item, variantKey, rawFormsByKey.getOrDefault(variantKey, new TreeSet<>()), emcQuery);
+                variants.add(ItemSnapshot.of(
+                        variantKey, existingValue > 0L, existingValue, base.tagPaths(), base.rarity()));
+            }
+            if (variants.size() >= totalBudget) {
+                budgetExhausted = true;
+                break;
+            }
         }
+
+        if (budgetExhausted) {
+            LOGGER.debug("NBT 变体生成达到全局上限 {}，后续物品不再采集", totalBudget);
+        }
+        if (variants.isEmpty()) {
+            return List.of();
+        }
+        variants.sort(Comparator.comparing(ItemSnapshot::key));
+        return List.copyOf(variants);
+    }
+
+    /**
+     * 查询一个变体身份的精确既有值。
+     *
+     * <p>注册侧会同时写入规范 SNBT 与观测到的原始 SNBT，因此这里也必须覆盖两类形态：
+     * 规范 key 可能已经被 ProjectE 的 NBT 处理器或其它模组注册，原始形态则对应真实堆叠。
+     * 同一经济变体可能对应多个原始 SNBT；采用最大值可避免把任何一个已存在的 NBT 专属
+     * 值当成“无值”后覆盖。任一查询失败只按该形态无值处理。</p>
+     *
+     * @return 精确 NBT 既有值；没有专属映射时返回 {@code 0}
+     */
+    private static long queryVariantExistingValue(Item item, ItemKey variantKey,
+                                                  Iterable<String> rawSnbts,
+                                                  @Nullable ItemScanner.EmcQuery emcQuery) {
+        if (emcQuery == null) {
+            return 0L;
+        }
+        TreeSet<String> probes = new TreeSet<>();
+        String canonical = variantKey.variantHash();
+        if (canonical != null && !canonical.isBlank()) {
+            probes.add(canonical);
+        }
+        for (String snbt : rawSnbts) {
+            if (snbt != null && !snbt.isBlank()) {
+                probes.add(snbt);
+            }
+        }
+
+        long maxValue = 0L;
+        for (String snbt : probes) {
+            try {
+                CompoundTag tag = TagParser.parseTag(snbt);
+                ItemStack probe = new ItemStack(item);
+                probe.setTag(tag);
+                long value = Math.max(0L, emcQuery.getExactValue(probe));
+                if (value > maxValue) {
+                    maxValue = value;
+                }
+            } catch (Exception failure) {
+                LOGGER.debug("查询变体 {} 的精确 NBT 既有值失败，跳过该形态：{}", variantKey, snbt, failure);
+            }
+        }
+        return maxValue;
     }
 
     /**
@@ -468,6 +719,23 @@ public final class ScanPipeline {
                     return Math.max(0L, provider.getValue(stack));
                 } catch (RuntimeException | LinkageError failure) {
                     LOGGER.debug("EMC 后端读取物品数值失败，按 0 处理", failure);
+                    return 0L;
+                }
+            }
+
+            @Override
+            public long getExactValue(ItemStack stack) {
+                EmcProvider provider = emcProvider;
+                if (provider == null) {
+                    return 0L;
+                }
+                try {
+                    if (!provider.isAvailable()) {
+                        return 0L;
+                    }
+                    return Math.max(0L, provider.getExactValue(stack));
+                } catch (RuntimeException | LinkageError failure) {
+                    LOGGER.debug("EMC 后端读取精确 NBT 数值失败，按 0 处理", failure);
                     return 0L;
                 }
             }
@@ -714,8 +982,9 @@ public final class ScanPipeline {
                     Map.of(), Map.of(), List.of(), Set.of(), 0, true, 0L, 0, Set.of());
         }
 
+        Set<ItemKey> variantItems = variantItemKeys(data.items());
         List<Candidate> candidates = new ArrayList<>();
-        int solvedByRecipe = addRecipeCandidates(solveResult, candidates);
+        int solvedByRecipe = addRecipeCandidates(solveResult, candidates, variantItems);
         int solvedByFallback = addFallbackCandidates(data, solveResult, candidates);
         return new Computation(data, solveResult, List.copyOf(candidates),
                 solvedByRecipe, solvedByFallback, separation.refreshedOwned(),
@@ -729,6 +998,9 @@ public final class ScanPipeline {
         PipelineSnapshot data = computation.snapshot();
         SolveResult solveResult = computation.solveResult();
         List<Candidate> candidates = computation.candidates();
+        Set<ItemKey> variantItems = variantItemKeys(data.items());
+        Map<ItemKey, List<String>> variantRegistrationNbts =
+                collectVariantRegistrationNbts(data.recipes(), variantItems);
 
         releaseExternallyModifiedOwnership(computation.externallyModified());
 
@@ -766,7 +1038,8 @@ public final class ScanPipeline {
                         candidate.source(),
                         candidate.recipeId(),
                         true,
-                        System.currentTimeMillis()));
+                        System.currentTimeMillis()),
+                        variantRegistrationNbts.getOrDefault(candidate.item(), List.of()));
                 if (!staged) {
                     LOGGER.debug("物品 {} 的生成值未被存储接受，可能已有非 SudoersEMC 拥有的条目",
                             candidate.item());
@@ -1022,12 +1295,20 @@ public final class ScanPipeline {
      * {@link PriceSource#RECIPE}。配方 id 来自对应的 {@link SolveTrace}，缺失时允许为
      * {@code null}，不影响数值本身。</p>
      *
+     * <p>变体输出只允许发布到本轮真实采集到的变体快照。这样 {@code nbt.scanNbtVariants=false}
+     * 或被排除的基础物品不会经由配方求解重新进入持久化。</p>
+     *
+     * @param variantItems 本轮采集到的变体物品键
      * @return 追加的候选数量
      */
-    private int addRecipeCandidates(SolveResult solveResult, List<Candidate> candidates) {
+    private int addRecipeCandidates(SolveResult solveResult, List<Candidate> candidates,
+                                    Set<ItemKey> variantItems) {
         int added = 0;
         for (Map.Entry<ItemKey, Long> entry : solveResult.values().entrySet()) {
             ItemKey item = entry.getKey();
+            if (item.hasVariant() && !variantItems.contains(item)) {
+                continue;
+            }
             if (isTierExcluded(item)) {
                 LOGGER.debug("物品 {} 被层级规则排除，跳过配方候选", item);
                 continue;
@@ -1054,6 +1335,57 @@ public final class ScanPipeline {
             added++;
         }
         return added;
+    }
+
+    /**
+     * @return 本轮物品快照中所有带变体哈希的身份
+     */
+    private static Set<ItemKey> variantItemKeys(List<ItemSnapshot> items) {
+        Set<ItemKey> keys = new HashSet<>();
+        for (ItemSnapshot item : items) {
+            if (item.key().hasVariant()) {
+                keys.add(item.key());
+            }
+        }
+        return keys;
+    }
+
+    /**
+     * 从配方输出收集“变体身份 -> 观测到的原始 SNBT”。
+     *
+     * <p>求解阶段只携带规范化身份，ProjectE 注册需要原始 NBT。这里只汇总本轮真实采集到的
+     * 变体，按经济身份截断原始形态，随后随生成条目一并持久化。</p>
+     *
+     * @param recipes         本轮可用配方
+     * @param acceptedVariants 本轮通过采集门禁的变体身份
+     */
+    private static Map<ItemKey, List<String>> collectVariantRegistrationNbts(
+            List<RecipeSnapshot> recipes, Set<ItemKey> acceptedVariants) {
+        if (acceptedVariants.isEmpty()) {
+            return Map.of();
+        }
+        Map<ItemKey, TreeSet<String>> observed = new TreeMap<>();
+        for (RecipeSnapshot recipe : recipes) {
+            for (RecipeOutput output : recipe.outputs()) {
+                ItemKey key = output.item();
+                String snbt = output.outputNbt();
+                if (!key.hasVariant() || !acceptedVariants.contains(key)
+                        || snbt == null || snbt.isBlank()) {
+                    continue;
+                }
+                TreeSet<String> forms = observed.computeIfAbsent(key, ignored -> new TreeSet<>());
+                forms.add(snbt);
+                if (forms.size() > VariantRegistration.MAX_OBSERVED_NBT_PER_VARIANT) {
+                    forms.pollLast();
+                }
+            }
+        }
+        if (observed.isEmpty()) {
+            return Map.of();
+        }
+        Map<ItemKey, List<String>> registrations = new TreeMap<>();
+        observed.forEach((key, forms) -> registrations.put(key, List.copyOf(forms)));
+        return Map.copyOf(registrations);
     }
 
     /**

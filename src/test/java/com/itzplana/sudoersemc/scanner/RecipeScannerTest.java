@@ -10,10 +10,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.itzplana.sudoersemc.core.ItemKey;
 import java.util.Optional;
 import java.util.stream.Stream;
+import net.minecraft.SharedConstants;
 import java.util.List;
 import net.minecraft.core.NonNullList;
 import net.minecraft.core.registries.Registries;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.TagParser;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.Bootstrap;
 import net.minecraft.tags.TagKey;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
@@ -27,9 +31,16 @@ import net.minecraft.world.item.crafting.ShapelessRecipe;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+/**
+ * {@link RecipeScanner} 的扫描与 SNBT 保留行为测试。
+ *
+ * <p>测试只覆盖不依赖配方管理器的转换路径，因此不需要启动服务器；引导逻辑集中在
+ * {@link MinecraftTestBootstrap}。</p>
+ */
 class RecipeScannerTest {
 
     private static final ResourceLocation RECIPE_ID = new ResourceLocation("sudoersemc_test", "recipe");
+    private static final ResourceLocation STONE_ID = new ResourceLocation("minecraft", "stone");
     private final RecipeScanner scanner = new RecipeScanner();
 
     @BeforeAll
@@ -164,6 +175,79 @@ class RecipeScannerTest {
         assertEquals(2, session.result().recipes().size());
         assertEquals(2, scanner.scan(manager).recipes().size(),
                 "分片会话与一次性 scan 必须得到相同配方数量");
+    }
+
+    @Test
+    void nbtOutputIsPreservedAsSnbt() throws Exception {
+        ItemStack stack = new ItemStack(Items.DIAMOND_SWORD);
+        stack.setCount(2);
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 7);
+        stack.setTag(tag);
+
+        RecipeOutput output = RecipeScanner.convertStack(stack);
+
+        assertNotNull(output);
+        assertEquals(ItemKey.of(new ResourceLocation("minecraft", "diamond_sword")), output.item());
+        assertEquals(2, output.count());
+        assertNotNull(output.outputNbt(), "带 NBT 的输出必须保留 SNBT");
+        assertFalse(output.outputNbt().isBlank());
+        assertEquals(tag.toString(), output.outputNbt());
+
+        CompoundTag parsed = TagParser.parseTag(output.outputNbt());
+        assertEquals(7, parsed.getInt("Damage"), "保留的 SNBT 必须可往返解析");
+    }
+
+    @Test
+    void outputWithoutNbtHasNullSnbt() {
+        RecipeOutput output = RecipeScanner.convertStack(new ItemStack(Items.STONE));
+
+        assertNotNull(output);
+        assertNull(output.outputNbt(), "无 NBT 的输出应为 null");
+    }
+
+    @Test
+    void emptyTagIsNormalizedToNullSnbt() {
+        ItemStack stack = new ItemStack(Items.STONE);
+        stack.setTag(new CompoundTag());
+
+        RecipeOutput output = RecipeScanner.convertStack(stack);
+
+        assertNotNull(output);
+        assertNull(output.outputNbt(), "空标签不应产生空的 SNBT 字符串");
+    }
+
+    @Test
+    void zeroDamageOnlyTagIsNormalizedToPlainItem() {
+        ItemStack stack = new ItemStack(Items.STONE);
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 0);
+        stack.setTag(tag);
+
+        RecipeOutput output = RecipeScanner.convertStack(stack);
+
+        assertNotNull(output);
+        assertNull(output.outputNbt(), "仅 Damage:0 不应生成配方输出 NBT");
+        assertEquals(ItemKey.of(STONE_ID), output.item(), "仅 Damage:0 不应产生伪变体身份");
+    }
+
+    @Test
+    void nonDamageableNbtOutputUsesVariantIdentityAndKeepsRawNbt() {
+        ItemStack stack = new ItemStack(Items.STONE);
+        CompoundTag display = new CompoundTag();
+        display.putString("Name", "{\"text\":\"只影响展示\"}");
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Marker", 7);
+        tag.put("display", display);
+        stack.setTag(tag);
+
+        RecipeOutput output = RecipeScanner.convertStack(stack);
+
+        assertNotNull(output);
+        assertEquals(ItemKey.of(STONE_ID, "{Marker:7}"), output.item(),
+                "求解与变体扫描必须使用同一规范化身份");
+        assertEquals(tag.toString(), output.outputNbt(),
+                "注册 ProjectE 仍需要包含 display 的原始 SNBT");
     }
 
     private static TagKey<Item> unboundTag() {

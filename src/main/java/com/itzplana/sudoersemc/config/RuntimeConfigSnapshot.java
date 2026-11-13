@@ -33,6 +33,8 @@ import java.util.Set;
  * @param alwaysRescan                 服务器启动时是否强制重扫
  * @param solveRecipes                 是否启用配方求解
  * @param generateReports              是否写出诊断报告
+ * @param nbtScanVariants              是否扫描 NBT 变体
+ * @param maxNbtVariantsPerItem        每个物品最多扫描的 NBT 变体数
  */
 public record RuntimeConfigSnapshot(
         long generation,
@@ -47,7 +49,9 @@ public record RuntimeConfigSnapshot(
         boolean generalEnabled,
         boolean alwaysRescan,
         boolean solveRecipes,
-        boolean generateReports
+        boolean generateReports,
+        boolean nbtScanVariants,
+        int maxNbtVariantsPerItem
 ) {
 
     public RuntimeConfigSnapshot {
@@ -56,6 +60,10 @@ public record RuntimeConfigSnapshot(
         }
         if (itemsPerTick < 1) {
             throw new IllegalArgumentException("itemsPerTick 必须 >= 1，实际为 " + itemsPerTick);
+        }
+        if (maxNbtVariantsPerItem < 1) {
+            throw new IllegalArgumentException(
+                    "maxNbtVariantsPerItem 必须 >= 1，实际为 " + maxNbtVariantsPerItem);
         }
         Objects.requireNonNull(values, "values");
         Objects.requireNonNull(overflowSettings, "overflowSettings");
@@ -101,7 +109,9 @@ public record RuntimeConfigSnapshot(
                 true,
                 false,
                 true,
-                true);
+                true,
+                true,
+                100);
     }
 
     /**
@@ -124,6 +134,8 @@ public record RuntimeConfigSnapshot(
                 generalEnabled,
                 alwaysRescan,
                 solveRecipes,
-                generateReports);
+                generateReports,
+                nbtScanVariants,
+                maxNbtVariantsPerItem);
     }
 }

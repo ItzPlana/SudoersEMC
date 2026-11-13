@@ -229,6 +229,10 @@ public final class Sudoersemc {
 
         applyOverflowSettings(pipeline, snapshot.overflowSettings());
         applyRuntimeSwitches(pipeline, snapshot.solveRecipes(), snapshot.generateReports());
+        // Phase 17：NBT 变体开关同样必须在每次重建管线时注入。二者来自同一份已校验快照，
+        // 与溢出作用域、配方求解等开关保持同一配置版本，避免运行期混用新旧配置。
+        pipeline.setNbtVariantsEnabled(snapshot.nbtScanVariants());
+        pipeline.setMaxNbtVariantsPerItem(snapshot.maxNbtVariantsPerItem());
 
         ScanManager manager;
         if (snapshot.generalEnabled()) {
@@ -335,6 +339,7 @@ public final class Sudoersemc {
                     true, Set.of(), Map.of(), Set.of()));
         }
     }
+
 
     /**
      * 把配置中的最大允许降幅夹到 {@link LargeDropProtection.Settings} 接受的 {@code (0.0, 1.0]} 区间。
