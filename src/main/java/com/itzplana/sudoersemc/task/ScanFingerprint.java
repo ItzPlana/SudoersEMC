@@ -16,9 +16,11 @@ import java.util.Objects;
  * 摘要。排序保证同一组输入不受遍历顺序影响，空字节分隔避免 {@code ["ab","c"]} 与
  * {@code ["a","bc"]} 产生相同摘要。</p>
  *
- * <p>下一次启动时重新计算指纹并用 {@link #equalsFingerprint(ScanFingerprint)} 比较；五个
- * 字段完全一致时可以跳过重新扫描并复用上次结果，避免无意义的全量注册表遍历。指纹只描述
- * 输入内容，不含时间戳、随机数或对象身份，因此同一组输入在任何进程中都会得到相同结果。</p>
+ * <p>本类只提供指纹计算与比较能力；是否跳过一次扫描、以及如何持久化上次指纹，
+ * 由调用方决定。Phase 7 的 {@code ScanCollectionPipeline} 会把指纹写入
+ * {@code scan_state.json}，并在服务器启动时比较以跳过未变化的扫描；本类自身仍不访问磁盘。
+ * 指纹只描述输入内容，不含时间戳、随机数或对象身份，因此同一组输入在任何进程中都会得到
+ * 相同结果。</p>
  *
  * @param itemFingerprint     物品注册表输入摘要
  * @param recipeFingerprint   配方输入摘要

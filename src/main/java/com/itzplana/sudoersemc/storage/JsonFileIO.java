@@ -83,16 +83,17 @@ public final class JsonFileIO {
      *
      * @param file destination
      * @param data object to serialize; must not be {@code null}
+     * @return {@code true} 表示文件已成功写入；参数非法或写入失败时返回 {@code false}
      */
-    public static void writeAtomically(Path file, Object data) {
+    public static boolean writeAtomically(Path file, Object data) {
         if (file == null || data == null) {
             LOGGER.warn("Refusing to write JSON: file={} data={}", file, data);
-            return;
+            return false;
         }
         Path fileName = file.getFileName();
         if (fileName == null) {
             LOGGER.warn("Refusing to write JSON to a path without a file name: {}", file);
-            return;
+            return false;
         }
 
         Path temp = file.resolveSibling(fileName + TEMP_SUFFIX);
@@ -115,9 +116,11 @@ public final class JsonFileIO {
                 LOGGER.debug("Atomic move not supported for {}; falling back to a plain replace", file);
                 Files.move(temp, file, StandardCopyOption.REPLACE_EXISTING);
             }
+            return true;
         } catch (IOException | RuntimeException e) {
             LOGGER.warn("Failed to write JSON file {}", file, e);
             deleteQuietly(temp);
+            return false;
         }
     }
 
