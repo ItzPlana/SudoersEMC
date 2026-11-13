@@ -28,6 +28,7 @@ import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
 import com.itzplana.sudoersemc.storage.OverflowResetLog;
 import com.itzplana.sudoersemc.storage.QuarantinedDropsStore;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
+import com.itzplana.sudoersemc.task.AutoScanPolicy;
 import com.itzplana.sudoersemc.task.BatchProcessor;
 import com.itzplana.sudoersemc.task.ScanFingerprint;
 import com.itzplana.sudoersemc.task.ScanManager;
@@ -653,6 +654,34 @@ public final class Sudoersemc {
     }
 
     /**
+     * 启动自动扫描所需的配置值。
+     *
+     * @param enabled      是否启用启动自动扫描
+     * @param alwaysRescan 是否忽略缓存强制重扫
+     */
+    record StartupScanSettings(boolean enabled, boolean alwaysRescan) {
+
+        /**
+         * 读取启动自动扫描配置。任一读取失败都按禁用处理（fail-closed），避免在无法确认
+         * 管理员意图时自动写入经济数据。
+         *
+         * @param enabledSupplier      {@code [general] enabled} 读取器
+         * @param alwaysRescanSupplier {@code [general] alwaysRescan} 读取器
+         * @return 启动自动扫描配置；读取失败时为 {@code enabled=false, alwaysRescan=false}
+         */
+        static StartupScanSettings read(BooleanSupplier enabledSupplier,
+                                        BooleanSupplier alwaysRescanSupplier) {
+            try {
+                return new StartupScanSettings(
+                        enabledSupplier.getAsBoolean(), alwaysRescanSupplier.getAsBoolean());
+            } catch (RuntimeException e) {
+                LOGGER.warn("SudoersEMC 无法读取自动扫描配置，自动扫描按禁用处理", e);
+                return new StartupScanSettings(false, false);
+            }
+        }
+    }
+
+    /**
      * 停服时清理扫描调度器。未完成的扫描会被重置为空闲，避免下一个世界继续 tick
      * 旧快照或旧回调。
      *
@@ -665,44 +694,23 @@ public final class Sudoersemc {
     }
 
     /**
-     * 服务器启动后按 {@code [general] alwaysRescan} 与缓存状态请求扫描。
+     * 统计 SudoersEMC 拥有的生成条目数量。
      *
-     * <p>判定顺序：{@code alwaysRescan=true} 时无条件重扫；否则上次扫描时刻或已生成条目
-     * 任一缺失时仍然请求扫描；两者都存在时视为已有可用缓存并跳过，避免每次启动重复全量
-     * 求解。只有扫描调度器存在（即 {@code [general] enabled = true}）时才会真正提交请求。</p>
+     * <p>{@link GeneratedEntryStore#size()} 包含 adopt/人工条目（{@code owned=false}），
+     * 不能用来判断“是否已有自动扫描缓存”。只有 owned 条目代表本模组实际生成的值。</p>
+     *
+     * @param store 生成值存储，允许为 {@code null}
+     * @return owned 条目数量；存储缺失或统计失败时为 0
      */
-    private void requestStartupScanIfConfigured() {
-        boolean alwaysRescan = shouldRequestScanOnStart(SudoersemcConfig.GENERAL_ALWAYS_RESCAN::get);
-        ScanManager manager = scanManager;
-        if (manager == null) {
-            if (alwaysRescan) {
-                LOGGER.info("SudoersEMC [general] alwaysRescan = true，但扫描调度器未启用，跳过启动扫描");
-            }
-            return;
+    static int countOwnedGeneratedEntries(GeneratedEntryStore store) {
+        if (store == null) {
+            return 0;
         }
-
-        ScanStateStore stateStore = scanStateStore;
-        GeneratedEntryStore store = entryStore;
-        long lastScanEpochMillis = stateStore == null ? 0L : stateStore.lastScanEpochMillis();
-        int generatedEntryCount = store == null ? 0 : store.size();
-        ScanFingerprint currentFingerprint;
         try {
-            currentFingerprint = currentScanFingerprint();
-        } catch (RuntimeException failure) {
-            LOGGER.warn("SudoersEMC 无法计算当前扫描输入指纹，启动扫描将保守执行", failure);
-            currentFingerprint = null;
-        }
-        if (!alwaysRescan && hasReusableScanCache(stateStore, store, currentFingerprint)) {
-            LOGGER.info("SudoersEMC 已有可用扫描缓存（上次扫描={}，已生成条目={}，指纹匹配），跳过启动扫描",
-                    lastScanEpochMillis, generatedEntryCount);
-            return;
-        }
-
-        if (manager.requestScan()) {
-            LOGGER.info("SudoersEMC 已请求启动扫描（alwaysRescan={}，上次扫描={}，已生成条目={}）",
-                    alwaysRescan, lastScanEpochMillis, generatedEntryCount);
-        } else {
-            LOGGER.info("SudoersEMC 已有扫描在进行中，跳过启动扫描");
+            return store.snapshotOwnedValues().size();
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法统计已生成条目，按 0 处理", e);
+            return 0;
         }
     }
 
@@ -1158,8 +1166,35 @@ public final class Sudoersemc {
                     store.size(),
                     OptionalIntegrationManager.isProjectEAvailable() ? "detected" : "absent");
         }
+
+        StartupScanSettings scanSettings = StartupScanSettings.read(
+                SudoersemcConfig.GENERAL_ENABLED::get,
+                SudoersemcConfig.GENERAL_ALWAYS_RESCAN::get);
+        boolean enabled = scanSettings.enabled();
+        boolean alwaysRescan = scanSettings.alwaysRescan();
+
+        ScanStateStore stateStore = scanStateStore;
+        long lastScanEpochMillis = stateStore == null ? 0L : stateStore.lastScanEpochMillis();
+        int generatedEntryCount = countOwnedGeneratedEntries(store);
+
+        if (!enabled) {
+            LOGGER.info("SudoersEMC 自动扫描已禁用（general.enabled=false）");
+        } else if (AutoScanPolicy.shouldScan(
+                enabled, alwaysRescan, lastScanEpochMillis, generatedEntryCount)) {
+            if (manager == null) {
+                LOGGER.warn("SudoersEMC 自动扫描已请求，但扫描调度器尚未就绪（common setup 未完成）");
+            } else if (manager.requestScan()) {
+                LOGGER.info("SudoersEMC 自动扫描已请求（alwaysRescan={}，上次扫描={}，已生成条目={}）",
+                        alwaysRescan, lastScanEpochMillis, generatedEntryCount);
+            } else {
+                LOGGER.info("SudoersEMC 自动扫描被拒绝：已有扫描正在运行");
+            }
+        } else {
+            LOGGER.info("SudoersEMC 自动扫描被拒绝（已有缓存状态：上次扫描={}，已生成条目={}）",
+                    lastScanEpochMillis, generatedEntryCount);
+        }
+
         SmokeTestHook.onServerStarted(event);
-        requestStartupScanIfConfigured();
     }
 
     private void onServerStopping(ServerStoppingEvent event) {

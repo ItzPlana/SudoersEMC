@@ -10,6 +10,7 @@
 - Phase 0–10 组件：物品/配方扫描、递归求解、兜底定价、NBT 变体、批处理、安全保护、诊断与 `/sudoemc` 命令。
 - Phase 11 入口接线：命令树注册、服务器 tick 驱动、`ScanCollectionPipeline` 分片扫描/后台求解/持久化、`scan_state.json` 加载/保存、ProjectE 可选集成。
 - Phase 12 扫描管线集成：`ScanPipeline` 统一完成分片采集、后台求解、所有权分离、统一排除、TagPricing 锚点、降价/溢出保护、审计落盘与诊断报告；启动缓存按完整输入指纹复用。
+- Phase 13 自动扫描与兜底定价真实化：`AutoScanPolicy` 按 owned 条目/上次扫描时刻判定启动扫描，配置读取失败关闭；扫描器支持注入标签/稀有度元数据，兜底定价与审批动作接入运行时。
 - `[general] enabled` 主开关：关闭时不再创建或驱动扫描调度器。
 - `[general] alwaysRescan`：开启时在服务器启动后自动请求一次扫描。
 - 停服时重置扫描调度器，避免下一个世界继续推进旧扫描。

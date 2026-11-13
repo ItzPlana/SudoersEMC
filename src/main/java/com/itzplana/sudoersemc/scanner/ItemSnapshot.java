@@ -46,6 +46,13 @@ public record ItemSnapshot(
 
     /**
      * 向后兼容构造函数：没有标签信息时按空列表与 {@link Rarity#COMMON} 处理。
+     *
+     * @param key            物品身份
+     * @param registryId     注册表 id
+     * @param namespace      命名空间
+     * @param path           注册表路径
+     * @param hasExistingEmc 是否已有 EMC
+     * @param existingValue  已有 EMC 值，{@code 0} 表示没有
      */
     public ItemSnapshot(ItemKey key, ResourceLocation registryId, String namespace, String path,
                         boolean hasExistingEmc, long existingValue) {
@@ -55,6 +62,11 @@ public record ItemSnapshot(
 
     /**
      * 创建不带标签信息的快照，稀有度按 {@link Rarity#COMMON} 处理。
+     *
+     * @param key            物品身份
+     * @param hasExistingEmc 是否已有 EMC
+     * @param existingValue  已有 EMC 值，{@code 0} 表示没有
+     * @return 不可变快照
      */
     public static ItemSnapshot of(ItemKey key, boolean hasExistingEmc, long existingValue) {
         return of(key, hasExistingEmc, existingValue, List.of(), Rarity.COMMON);
@@ -62,6 +74,13 @@ public record ItemSnapshot(
 
     /**
      * 创建带标签与稀有度信息的快照。
+     *
+     * @param key            物品身份
+     * @param hasExistingEmc 是否已有 EMC
+     * @param existingValue  已有 EMC 值，{@code 0} 表示没有
+     * @param tagPaths       标签路径列表，允许为 {@code null}
+     * @param rarity         物品稀有度，允许为 {@code null}
+     * @return 不可变快照
      */
     public static ItemSnapshot of(ItemKey key, boolean hasExistingEmc, long existingValue,
                                   List<String> tagPaths, Rarity rarity) {

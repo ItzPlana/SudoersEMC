@@ -137,4 +137,54 @@ class TagPricingTest {
                 () -> pricing.baseValues().put(MaterialCategory.INGOT, 1L));
         assertFalse(pricing.baseValues().isEmpty());
     }
+
+    @Test
+    void defaultsExposeConservativeLowerBoundAnchors() {
+        TagPricing pricing = TagPricing.defaults();
+
+        long ingot = pricing.baseValues().get(MaterialCategory.INGOT);
+        assertEquals(64L, ingot, "默认锭锚点必须是保守下限，而不是铁系 256");
+        assertEquals(7L, pricing.baseValues().get(MaterialCategory.NUGGET));
+        assertEquals(576L, pricing.baseValues().get(MaterialCategory.STORAGE_BLOCK));
+        assertEquals(128L, pricing.baseValues().get(MaterialCategory.GEM));
+        assertEquals(16L, pricing.baseValues().get(MaterialCategory.DUST));
+        assertEquals(32L, pricing.baseValues().get(MaterialCategory.RAW_MATERIAL));
+        assertEquals(64L, pricing.baseValues().get(MaterialCategory.PLATE));
+        assertEquals(32L, pricing.baseValues().get(MaterialCategory.ROD));
+        assertEquals(32L, pricing.baseValues().get(MaterialCategory.ORE));
+        assertEquals(ingot * 9L, pricing.baseValues().get(MaterialCategory.STORAGE_BLOCK),
+                "储存块必须保持 9 锭 = 1 块的比例");
+        assertEquals(ingot / 9L, pricing.baseValues().get(MaterialCategory.NUGGET),
+                "粒必须保持 9 粒 = 1 锭的比例");
+        assertTrue(pricing.overrides().isEmpty(), "默认配置不得包含按物品覆盖");
+    }
+
+    @Test
+    void defaultsPriceCommonForgeMaterialTags() {
+        TagPricing pricing = TagPricing.defaults();
+
+        assertEquals(64L, pricing.price(item("iron_ingot"),
+                List.of("forge:ingots/iron")).orElseThrow());
+        assertEquals(576L, pricing.price(item("iron_block"),
+                List.of("forge:storage_blocks/iron")).orElseThrow());
+    }
+
+    @Test
+    void defaultsDoNotCreatePositiveArbitrageBetweenCheapIngotAndBlock() {
+        TagPricing pricing = TagPricing.defaults();
+
+        long ingot = pricing.price(item("copper_ingot"),
+                List.of("forge:ingots/copper")).orElseThrow();
+        long block = pricing.price(item("copper_block"),
+                List.of("forge:storage_blocks/copper")).orElseThrow();
+
+        assertTrue(block <= ingot * 9L,
+                "默认锚点不得让 1 块换 9 锭产生正收益（块=" + block + "，9 锭=" + ingot * 9L + "）");
+    }
+
+    @Test
+    void defaultsYieldNoPriceForUnknownTags() {
+        assertTrue(TagPricing.defaults()
+                .price(item("mystery"), List.of("forge:logs/oak")).isEmpty());
+    }
 }

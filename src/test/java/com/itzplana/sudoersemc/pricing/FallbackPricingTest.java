@@ -248,6 +248,16 @@ class FallbackPricingTest {
     }
 
     @Test
+    void excludedItemStaysUnpricedEvenWithTagsAndRarity() {
+        FallbackPricing pricing = pricing(PricingSettings.defaults());
+
+        Optional<FallbackPricing.PricedValue> value = pricing.price(new FallbackPricing.PricingRequest(
+                item("pig_spawn_egg"), List.of("forge:ingots/iron"), Rarity.EPIC, 0L, 0L));
+
+        assertTrue(value.isEmpty(), "排除项必须先于 TAG 与 RARITY 生效");
+    }
+
+    @Test
     void pureMultiplierTierRuleDoesNotBlockRarity() {
         TierPricing tierPricing = new TierPricing(List.of(
                 new TierPricing.TierRule(

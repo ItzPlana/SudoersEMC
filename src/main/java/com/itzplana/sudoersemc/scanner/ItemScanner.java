@@ -35,6 +35,7 @@ public final class ItemScanner {
     private final EmcQuery emcQuery;
     private final Set<String> ignoredNamespaces;
     private final Set<ResourceLocation> ignoredItems;
+    private final MetadataReader metadataReader;
 
     /**
      * @param emcQuery          backend query used to detect existing values
@@ -42,9 +43,20 @@ public final class ItemScanner {
      * @param ignoredItems      exact item ids that must not be priced
      */
     public ItemScanner(EmcQuery emcQuery, Set<String> ignoredNamespaces, Set<ResourceLocation> ignoredItems) {
+        this(emcQuery, ignoredNamespaces, ignoredItems, ItemScanner::readMetadata);
+    }
+
+    /**
+     * 测试/集成可注入的构造器。
+     *
+     * @param metadataReader 标签与稀有度读取器，不能为 {@code null}
+     */
+    ItemScanner(EmcQuery emcQuery, Set<String> ignoredNamespaces, Set<ResourceLocation> ignoredItems,
+                MetadataReader metadataReader) {
         this.emcQuery = Objects.requireNonNull(emcQuery, "emcQuery");
         this.ignoredNamespaces = Set.copyOf(ignoredNamespaces == null ? Set.of() : ignoredNamespaces);
         this.ignoredItems = Set.copyOf(ignoredItems == null ? Set.of() : ignoredItems);
+        this.metadataReader = Objects.requireNonNull(metadataReader, "metadataReader");
     }
 
     /**
@@ -66,7 +78,7 @@ public final class ItemScanner {
      * @return 新的物品扫描游标
      */
     public ItemScanSession beginSession() {
-        return new ItemScanSession(emcQuery, ignoredNamespaces, ignoredItems);
+        return new ItemScanSession(emcQuery, ignoredNamespaces, ignoredItems, metadataReader);
     }
 
     /**
@@ -81,6 +93,38 @@ public final class ItemScanner {
             session.step(Integer.MAX_VALUE);
         }
         return session.snapshots();
+    }
+
+    /**
+     * 单个物品的标签与稀有度元数据。
+     *
+     * @param tagPaths 标签路径；{@code null} 归一为空列表
+     * @param rarity   稀有度；{@code null} 归一为 {@link Rarity#COMMON}
+     */
+    record ItemMetadata(List<String> tagPaths, Rarity rarity) {
+
+        ItemMetadata {
+            tagPaths = tagPaths == null ? List.of() : List.copyOf(tagPaths);
+            rarity = rarity == null ? Rarity.COMMON : rarity;
+        }
+    }
+
+    /**
+     * 标签与稀有度读取器。生产实现读取 {@link ItemStack}；测试可注入固定值或故障。
+     */
+    @FunctionalInterface
+    interface MetadataReader {
+
+        ItemMetadata read(ItemStack stack);
+    }
+
+    private static ItemMetadata readMetadata(ItemStack stack) {
+        List<String> tagPaths = stack.getTags()
+                .map(tag -> tag.location().toString())
+                .distinct()
+                .sorted()
+                .toList();
+        return new ItemMetadata(tagPaths, stack.getRarity());
     }
 
     private static boolean isIgnored(Set<String> ignoredNamespaces,
@@ -108,6 +152,7 @@ public final class ItemScanner {
         private final EmcQuery emcQuery;
         private final Set<String> ignoredNamespaces;
         private final Set<ResourceLocation> ignoredItems;
+        private final MetadataReader metadataReader;
         private final Iterator<Item> iterator;
         private final int total;
         private final List<ItemSnapshot> snapshots = new ArrayList<>();
@@ -120,10 +165,12 @@ public final class ItemScanner {
 
         private ItemScanSession(EmcQuery emcQuery,
                                 Set<String> ignoredNamespaces,
-                                Set<ResourceLocation> ignoredItems) {
+                                Set<ResourceLocation> ignoredItems,
+                                MetadataReader metadataReader) {
             this.emcQuery = Objects.requireNonNull(emcQuery, "emcQuery");
             this.ignoredNamespaces = Set.copyOf(ignoredNamespaces == null ? Set.of() : ignoredNamespaces);
             this.ignoredItems = Set.copyOf(ignoredItems == null ? Set.of() : ignoredItems);
+            this.metadataReader = Objects.requireNonNull(metadataReader, "metadataReader");
             this.iterator = BuiltInRegistries.ITEM.iterator();
             this.total = BuiltInRegistries.ITEM.size();
         }
@@ -233,12 +280,9 @@ public final class ItemScanner {
             List<String> tagPaths;
             Rarity rarity;
             try {
-                tagPaths = stack.getTags()
-                        .map(tag -> tag.location().toString())
-                        .distinct()
-                        .sorted()
-                        .toList();
-                rarity = stack.getRarity();
+                ItemMetadata metadata = metadataReader.read(stack);
+                tagPaths = metadata.tagPaths();
+                rarity = metadata.rarity();
             } catch (RuntimeException e) {
                 // Tag/rarity lookup is best-effort: a single item must not abort the whole scan.
                 LOGGER.warn("读取物品 {} 的标签或稀有度失败，按空标签与 COMMON 处理", id, e);

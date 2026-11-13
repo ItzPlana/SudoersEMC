@@ -16,6 +16,7 @@ import net.minecraft.world.item.Rarity;
  *   <li>{@link PriceSource#EXISTING}：物品已有 EMC，且大于 0；</li>
  *   <li>排除检查：层级规则明确排除的物品直接终止，不参与后续任何定价；</li>
  *   <li>{@link PriceSource#EXTERNAL_BASELINE}：外部基线值大于 0；</li>
+ *   <li>排除检查：层级规则明确排除的物品直接终止，不参与后续任何定价；</li>
  *   <li>{@link PriceSource#TAG}：命中材料标签基准值（受 {@link PricingSettings#useTagPricing()} 控制）；</li>
  *   <li>{@link PriceSource#TIER}：命中层级固定值（受 {@link PricingSettings#useTierPricing()} 控制）；</li>
  *   <li>{@link PriceSource#RARITY}：按稀有度取值（受 {@link PricingSettings#useRarityPricing()} 控制）；</li>
@@ -110,7 +111,7 @@ public final class FallbackPricing {
     }
 
     /**
-     * 使用空标签配置、默认稀有度定价与默认层级规则创建定价链。
+     * 使用默认标签锚点、默认稀有度定价与默认层级规则创建定价链。
      *
      * @param settings 定价开关与通用兜底值
      * @return 可直接使用的兜底定价链
@@ -169,12 +170,6 @@ public final class FallbackPricing {
                     item, externalBaseline, PriceSource.EXTERNAL_BASELINE, "external-baseline"));
         }
 
-        // 排除语义与价格优先级是两件事：排除表示「拒绝定价」，不是「价格来源」。
-        // 稀有度定价对任何输入都会返回值，若把排除检查放在它之后，层级排除规则将永远不可达，
-        // 导致 spawn egg、命令方块等物品被误定价。因此排除检查必须先于所有定价步骤。
-        if (settings.useTierPricing() && isExcluded(item)) {
-            return Optional.empty();
-        }
 
         if (settings.useTagPricing()) {
             Optional<Long> tagValue = tagPricing.price(item, request.tagPaths());

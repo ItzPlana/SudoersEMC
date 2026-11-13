@@ -85,10 +85,14 @@ public final class SudoersemcConfig {
     static {
         // [general]
         BUILDER.comment("General operation switches.").push("general");
-        GENERAL_ENABLED = BUILDER.comment("Master switch for automatic EMC generation.")
+        GENERAL_ENABLED = BUILDER.comment(
+                        "Master switch for the scan service.",
+                        "When false no ScanManager is created: startup auto scanning and manual",
+                        "/sudoemc rescan-all are both unavailable.")
                 .define("enabled", true);
         GENERAL_ALWAYS_RESCAN = BUILDER.comment(
-                        "Rescan all items on every server start instead of reusing cached state.")
+                        "Rescan all items on every server start instead of reusing cached state.",
+                        "Only takes effect when [general] enabled is true.")
                 .define("alwaysRescan", false);
         BUILDER.pop();
 
@@ -120,7 +124,10 @@ public final class SudoersemcConfig {
                         "Use a generic fallback value for items no other source can price.")
                 .define("useFallbackForUnsolvable", true);
         FALLBACK_USE_TAG_PRICING = BUILDER.comment(
-                        "Derive values from item tags and material relationships.")
+                        "Derive values from item tags and material relationships.",
+                        "Category anchors are conservative low-tier floors (INGOT 64, STORAGE_BLOCK 576),",
+                        "not per-material values; cheap renewable materials can still be overvalued",
+                        "relative to ProjectE values. Use ProjectE custom values for exact pricing.")
                 .define("useTagPricing", true);
         FALLBACK_USE_RARITY_PRICING = BUILDER.comment("Derive values from item rarity.")
                 .define("useRarityPricing", true);

@@ -39,6 +39,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.world.item.Rarity;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -419,6 +420,26 @@ class ScanPipelineTest {
     }
 
     @Test
+    void taggedSnapshotProducesTagCandidate() {
+        GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("generated_tag.json"));
+        ItemSnapshot tagged = ItemSnapshot.of(RESULT, false, 0L,
+                List.of("forge:ingots/iron"), Rarity.COMMON);
+        PipelineSnapshot snapshot = snapshot(List.of(tagged), List.of(), Map.of());
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null,
+                FallbackPricing.withDefaults(PricingSettings.defaults()));
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1, result.solvedByFallback());
+        assertEquals(1, result.applied());
+        GeneratedEmcEntry staged = store.snapshotAll().get(RESULT);
+        assertNotNull(staged);
+        assertEquals(64L, staged.value(), "forge:ingots/iron 应命中默认 INGOT 保守锚点");
+        assertEquals(PriceSource.TAG, staged.source());
+    }
+
+    @Test
     void ownedExistingValueIsRefreshedOnRescan() {
         GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("generated_owned_refresh.json"));
         store.stage(new GeneratedEmcEntry(RESULT, 1_000L, PriceSource.RECIPE, RECIPE_ID, true, 0L));
@@ -518,8 +539,27 @@ class ScanPipelineTest {
         assertEquals(1, result.applied());
         GeneratedEmcEntry staged = store.snapshotAll().get(tagged);
         assertNotNull(staged);
-        assertEquals(256L, staged.value(), "TAG 定价必须使用采集阶段写入的标签路径");
+        assertEquals(64L, staged.value(), "TAG 定价必须使用采集阶段写入的标签路径");
         assertEquals(PriceSource.TAG, staged.source());
+    }
+
+    @Test
+    void rareSnapshotWithoutTagsProducesRarityCandidate() {
+        GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("generated_rarity.json"));
+        ItemSnapshot rare = ItemSnapshot.of(RESULT, false, 0L, List.of(), Rarity.RARE);
+        PipelineSnapshot snapshot = snapshot(List.of(rare), List.of(), Map.of());
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null,
+                FallbackPricing.withDefaults(PricingSettings.defaults()));
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1, result.solvedByFallback());
+        assertEquals(1, result.applied());
+        GeneratedEmcEntry staged = store.snapshotAll().get(RESULT);
+        assertNotNull(staged);
+        assertEquals(256L, staged.value(), "RARE 稀有度应使用默认 256 基准值");
+        assertEquals(PriceSource.RARITY, staged.source());
     }
 
     @Test
@@ -566,7 +606,6 @@ class ScanPipelineTest {
         assertNotNull(store.snapshotAll().get(RESULT),
                 "应用阶段必须在调用线程写入求解结果");
     }
-
     /**
      * 创建使用默认求解参数的管线，未提供的协作者由管线自行采用安全默认值。
      */
