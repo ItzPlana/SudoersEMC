@@ -58,7 +58,11 @@ public final class ConfigTomlMigration {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("sudoersemc/config/ConfigTomlMigration");
 
-    /** 迁移结果状态。 */
+    /**
+     * Outcome of one migration attempt. Every status except {@link #MIGRATED} guarantees the
+     * target file is left byte-for-byte intact; a timestamped {@code .bak} may still be created
+     * on the refused/failed paths because Forge can rewrite the file afterwards.
+     */
     public enum Status {
         /** 当前版本已经是本构建支持的版本，未写盘。 */
         NO_OP,

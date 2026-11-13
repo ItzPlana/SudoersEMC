@@ -1,15 +1,16 @@
 package com.itzplana.sudoersemc.pricing;
 
 /**
- * 兜底定价链的开关与通用兜底值。
+ * Switches and generic fallback value for the fallback pricing chain.
  *
- * <p>各开关只控制对应步骤是否参与定价，不会改变 {@link FallbackPricing} 中定义的优先级顺序。</p>
+ * <p>Each switch only controls whether its step participates in pricing; it never changes the priority
+ * order defined in {@link FallbackPricing}.</p>
  *
- * @param useTagPricing              是否启用材料标签定价
- * @param useRarityPricing           是否启用稀有度定价
- * @param useTierPricing             是否启用层级规则定价
- * @param useFallbackForUnsolvable   是否对仍然无法求解的物品使用通用兜底值
- * @param genericFallbackValue       通用兜底值，必须为非负数，默认 {@code 1}
+ * @param useTagPricing              whether to enable material-tag pricing
+ * @param useRarityPricing           whether to enable rarity pricing
+ * @param useTierPricing             whether to enable tier-rule pricing
+ * @param useFallbackForUnsolvable   whether to use the generic fallback value for items still unsolvable
+ * @param genericFallbackValue       generic fallback value, must be non-negative, default {@code 1}
  */
 public record PricingSettings(
         boolean useTagPricing,
@@ -19,7 +20,7 @@ public record PricingSettings(
         long genericFallbackValue
 ) {
 
-    /** 默认通用兜底值。 */
+    /** Default generic fallback value. */
     public static final long DEFAULT_GENERIC_FALLBACK_VALUE = 1L;
 
     public PricingSettings {
@@ -29,7 +30,7 @@ public record PricingSettings(
     }
 
     /**
-     * @return 所有定价步骤开启、通用兜底值为 {@code 1} 的默认配置
+     * @return default configuration with all pricing steps enabled and a generic fallback value of {@code 1}
      */
     public static PricingSettings defaults() {
         return new PricingSettings(true, true, true, true, DEFAULT_GENERIC_FALLBACK_VALUE);

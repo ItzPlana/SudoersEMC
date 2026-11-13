@@ -405,7 +405,6 @@ public final class QuarantinedDropsStore {
         }
     }
 
-    /** @return 当前保存的隔离条目数量 */
     public int size() {
         synchronized (lock) {
             return entries.size();

@@ -32,10 +32,10 @@ import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 
 /**
- * {@link GoetyRitualReader} 的必需字段与失败关闭语义测试。
+ * Required-field and fail-closed semantics tests for {@link GoetyRitualReader}.
  *
- * <p>通过包级 {@link GoetyRitualReader#withAccess(GoetyRitualAccess)} 注入假访问器，
- * 因此测试 JVM 无需安装 Goety，也不需要启动服务器。</p>
+ * <p>Injects a fake accessor via the package-level {@link GoetyRitualReader#withAccess(GoetyRitualAccess)}, so the test
+ * JVM needs neither Goety installed nor a running server.</p>
  */
 class GoetyRitualReaderTest {
 
@@ -43,12 +43,12 @@ class GoetyRitualReaderTest {
     private static final ResourceLocation DIAMOND_ID = new ResourceLocation("minecraft", "diamond");
 
     static {
-        // ItemStack / BuiltInRegistries 的静态初始化需要先完成版本探测与注册表引导。
+        // Static initialisation of ItemStack / BuiltInRegistries requires version detection and registry bootstrap first.
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
     }
 
-    // ---------------------------------------------------------------- 必需字段失败
+    // ---------------------------------------------------------------- required-field failures
 
     @Test
     void activationReadFailureSkipsWholeRecipe() {
@@ -116,7 +116,7 @@ class GoetyRitualReaderTest {
         assertNull(reader(access).describeReadable(new Object(), RECIPE_ID));
     }
 
-    // ---------------------------------------------------------------- 类型闸门与不可用
+    // ---------------------------------------------------------------- type gate and unavailability
 
     @Test
     void nonRitualRecipeIsRejectedBeforeAnyFieldRead() {
@@ -165,7 +165,7 @@ class GoetyRitualReaderTest {
         assertEquals(0, access.calls);
     }
 
-    // ---------------------------------------------------------------- 正常与边界转换
+    // ---------------------------------------------------------------- normal and boundary conversions
 
     @Test
     void normalCraftRitualProducesSnapshot() {
@@ -274,7 +274,7 @@ class GoetyRitualReaderTest {
         assertEquals(3, parsed.getInt("Damage"));
     }
 
-    // ---------------------------------------------------------------- 访问器异常防御
+    // ---------------------------------------------------------------- accessor exception defence
 
     @Test
     void accessRuntimeExceptionSkipsRecipeWithoutThrowing() {
@@ -294,7 +294,7 @@ class GoetyRitualReaderTest {
                 "访问器 LinkageError 必须降级为字段读取失败");
     }
 
-    // ---------------------------------------------------------------- 日志限流
+    // ---------------------------------------------------------------- log rate limiting
 
     @Test
     void nonRitualTypeDoesNotEmitLogs() {
@@ -327,7 +327,7 @@ class GoetyRitualReaderTest {
                 "重复失败只保留一次 debug，不得再次 warn");
     }
 
-    // ---------------------------------------------------------------- 测试辅助
+    // ---------------------------------------------------------------- test helpers
 
     private static GoetyRitualReader reader(FakeAccess access) {
         return GoetyRitualReader.withAccess(access);
@@ -342,7 +342,7 @@ class GoetyRitualReaderTest {
             ModList modList = ModList.get();
             return modList != null && modList.isLoaded("goety");
         } catch (Throwable failure) {
-            // 单元测试 JVM 未初始化 Forge 时按未安装处理。
+            // Treat as not installed when the unit-test JVM has not initialised Forge.
             return false;
         }
     }
@@ -439,7 +439,7 @@ class GoetyRitualReaderTest {
     }
 
     /**
-     * 可编程假访问器：每个字段独立设置三态结果，并统计字段读取次数。
+     * Programmable fake accessor: each field independently set to a three-state result, and counts field reads.
      */
     private static final class FakeAccess implements GoetyRitualAccess {
 
@@ -481,7 +481,7 @@ class GoetyRitualReaderTest {
     }
 
     /**
-     * 可控制 {@code isEmpty()} 与 {@code getItems()} 的测试材料。
+     * Test ingredient with controllable {@code isEmpty()} and {@code getItems()}.
      */
     private static final class StubIngredient extends Ingredient {
 

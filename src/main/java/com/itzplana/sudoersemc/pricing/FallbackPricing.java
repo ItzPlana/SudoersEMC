@@ -9,46 +9,51 @@ import java.util.Optional;
 import net.minecraft.world.item.Rarity;
 
 /**
- * 兜底定价链：当配方求解无法给出数值时，按固定优先级为物品选择价格来源。
+ * Fallback pricing chain: when recipe solving cannot produce a value, selects a price source for an item
+ * by fixed priority.
  *
- * <p>优先级从高到低（必须与此顺序完全一致）：</p>
+ * <p>Priority from high to low (must match this order exactly):</p>
  * <ol>
- *   <li>{@link PriceSource#EXISTING}：物品已有 EMC，且大于 0；</li>
-
- *   <li>排除检查：层级规则明确排除的物品直接终止，不参与后续任何定价；</li>
- *   <li>{@link PriceSource#EXTERNAL_BASELINE}：外部基线值大于 0；</li>
- *   <li>{@link PriceSource#TAG}：命中材料标签基准值（受 {@link PricingSettings#useTagPricing()} 控制）；</li>
- *   <li>{@link PriceSource#TIER}：命中层级固定值（受 {@link PricingSettings#useTierPricing()} 控制）；</li>
- *   <li>{@link PriceSource#RARITY}：按稀有度取值（受 {@link PricingSettings#useRarityPricing()} 控制）；</li>
- *   <li>{@link PriceSource#FALLBACK}：通用兜底值（受
- *       {@link PricingSettings#useFallbackForUnsolvable()} 控制）。</li>
+ *   <li>{@link PriceSource#EXISTING}: the item already has EMC greater than 0;</li>
+ *   <li>exclusion check: an item explicitly excluded by a tier rule terminates immediately and takes part
+ *       in no further pricing;</li>
+ *   <li>{@link PriceSource#EXTERNAL_BASELINE}: external baseline value greater than 0;</li>
+ *   <li>{@link PriceSource#TAG}: hits a material-tag base value (controlled by {@link PricingSettings#useTagPricing()});</li>
+ *   <li>{@link PriceSource#TIER}: hits a tier fixed value (controlled by {@link PricingSettings#useTierPricing()});</li>
+ *   <li>{@link PriceSource#RARITY}: value by rarity (controlled by {@link PricingSettings#useRarityPricing()});</li>
+ *   <li>{@link PriceSource#FALLBACK}: generic fallback value (controlled by
+ *       {@link PricingSettings#useFallbackForUnsolvable()}).</li>
  * </ol>
  *
- * <p>层级规则返回 {@code Optional.of(0L)} 表示“明确排除”。此时本类直接返回
- * {@link Optional#empty()}，绝不把被排除的物品当成免费物品。任何情况下都不会返回负值。</p>
+ * <p>A tier rule returning {@code Optional.of(0L)} means "explicitly excluded". This class then returns
+ * {@link Optional#empty()} directly and never treats an excluded item as free. A negative value is never
+ * returned under any circumstance.</p>
  *
- * <p>排除语义与价格优先级是两件事：排除表示“拒绝定价”，不是“价格来源”。稀有度定价对任何输入
- * 都会返回值，若把排除检查放在它之后，层级排除规则将永远不可达，因此排除检查先于所有定价步骤。</p>
+ * <p>Exclusion semantics and price priority are two different things: exclusion means "refuse to price",
+ * not "a price source". Rarity pricing returns a value for any input, so if the exclusion check came after
+ * it the tier exclusion rule would be unreachable; therefore the exclusion check precedes every pricing
+ * step.</p>
  *
- * <p>层级规则的纯倍率规则不会单独产生价格：{@link TierPricing#price} 对它返回空，定价链会继续
- * 尝试稀有度与通用兜底值。需要缩放的调用方应自行使用 {@link TierPricing#multiplierFor}。</p>
+ * <p>A pure-multiplier tier rule does not produce a price on its own: {@link TierPricing#price} returns
+ * empty for it and the chain continues to rarity and the generic fallback. Callers needing scaling should
+ * use {@link TierPricing#multiplierFor} themselves.</p>
  *
- * <p>{@link PricedValue#value()} 为 {@code 0} 表示“免费价格”（配置显式给出 0），而不是未定价；
- * 未定价一律用 {@link Optional#empty()} 表达。</p>
+ * <p>{@link PricedValue#value()} of {@code 0} means a "free price" (explicitly configured as 0), not
+ * unpriced; unpriced is always expressed as {@link Optional#empty()}.</p>
  */
 public final class FallbackPricing {
 
     /**
-     * 一次兜底定价请求。
+     * One fallback pricing request.
      *
-     * <p>标签列表会被复制并过滤 {@code null} 元素；负数的既有值与外部基线会被视为 0，
-     * 以保证定价链不会返回负值。</p>
+     * <p>The tag list is copied and {@code null} elements filtered; negative existing values and external
+     * baselines are treated as 0 so the chain never returns a negative value.</p>
      *
-     * @param item             待定价物品
-     * @param tagPaths         物品拥有的标签路径
-     * @param rarity           物品稀有度，允许为 {@code null}
-     * @param existingValue    物品当前已有的 EMC，{@code 0} 表示没有
-     * @param externalBaseline 外部基线值，{@code 0} 表示没有
+     * @param item             the item to price
+     * @param tagPaths         tag paths the item has
+     * @param rarity           item rarity, may be {@code null}
+     * @param existingValue    the item's current EMC; {@code 0} means none
+     * @param externalBaseline external baseline value; {@code 0} means none
      */
     public record PricingRequest(
             ItemKey item,
@@ -80,12 +85,12 @@ public final class FallbackPricing {
     }
 
     /**
-     * 一次兜底定价的结果。
+     * Result of one fallback pricing.
      *
-     * @param item   被定价的物品
-     * @param value  非负价格
-     * @param source 价格来源
-     * @param reason 供诊断使用的简短原因标记
+     * @param item   the priced item
+     * @param value  non-negative price
+     * @param source price source
+     * @param reason short reason marker for diagnostics
      */
     public record PricedValue(ItemKey item, long value, PriceSource source, String reason) {
 
@@ -111,22 +116,23 @@ public final class FallbackPricing {
     }
 
     /**
-     * 返回定价链使用的层级规则。
+     * Returns the tier rules used by the pricing chain.
      *
-     * <p>扫描管线需要复用 {@link TierPricing#price} 的排除语义（{@code Optional.of(0L)}），
-     * 以便在被排除物品存在配方时也能提前拒绝定价，而不是只能依赖兜底链。</p>
+     * <p>The scan pipeline needs to reuse {@link TierPricing#price}'s exclusion semantics
+     * ({@code Optional.of(0L)}) so it can refuse pricing early even when an excluded item has a recipe,
+     * rather than relying only on the fallback chain.</p>
      *
-     * @return 当前实例使用的层级定价器，永不为 {@code null}
+     * @return the tier pricer used by this instance, never {@code null}
      */
     public TierPricing tierPricing() {
         return tierPricing;
     }
 
     /**
-     * 使用默认标签锚点、默认稀有度定价与默认层级规则创建定价链。
+     * Creates a pricing chain with default tag anchors, default rarity pricing and default tier rules.
      *
-     * @param settings 定价开关与通用兜底值
-     * @return 可直接使用的兜底定价链
+     * @param settings pricing switches and generic fallback value
+     * @return a ready-to-use fallback pricing chain
      */
     public static FallbackPricing withDefaults(PricingSettings settings) {
         return new FallbackPricing(
@@ -139,15 +145,16 @@ public final class FallbackPricing {
 
 
     /**
-     * 按 {@code EXISTING → 排除检查 → EXTERNAL_BASELINE → TAG → TIER → RARITY → FALLBACK}
-     * 的顺序定价。
+     * Prices in the order {@code EXISTING → exclusion check → EXTERNAL_BASELINE → TAG → TIER → RARITY → FALLBACK}.
      *
-* <p>排除检查先于外部基线：外部基线只是“另一个定价来源”，绝不能把刷怪蛋、命令方块等
-     * 明确排除的物品变成可交易资源。层级规则的排除标记（{@code 0L}）会立即终止整个定价链
-     * 并返回 {@link Optional#empty()}。纯倍率层级规则返回空，因此不会阻断后续的稀有度定价。</p>
+     * <p>The exclusion check precedes the external baseline: the baseline is just "another pricing source"
+     * and must never turn explicitly excluded items such as spawn eggs or command blocks into tradeable
+     * resources. A tier exclusion marker ({@code 0L}) terminates the whole chain immediately and returns
+     * {@link Optional#empty()}. A pure-multiplier tier rule returns empty, so it does not block subsequent
+     * rarity pricing.</p>
      *
-     * @param request 定价请求
-     * @return 命中的价格与来源，未定价时为空
+     * @param request pricing request
+     * @return the hit price and source; empty when unpriced
      */
     public Optional<PricedValue> price(PricingRequest request) {
         Objects.requireNonNull(request, "request");
@@ -158,9 +165,9 @@ public final class FallbackPricing {
             return Optional.of(new PricedValue(item, existingValue, PriceSource.EXISTING, "existing-value"));
         }
 
-// 排除语义与价格优先级是两件事：排除表示「拒绝定价」，不是「价格来源」。
-        // 稀有度定价对任何输入都会返回值，若把排除检查放在它之后，层级排除规则将永远不可达，
-        // 导致 spawn egg、命令方块等物品被误定价。因此排除检查必须先于所有定价步骤。
+        // Exclusion semantics and price priority are two different things: exclusion means "refuse to price", not "a price source".
+        // Rarity pricing returns a value for any input; if the exclusion check came after it, the tier exclusion rule would be
+        // unreachable and items like spawn eggs or command blocks would be mispriced. So the exclusion check must precede every pricing step.
         if (settings.useTierPricing() && isExcluded(item)) {
             return Optional.empty();
         }
@@ -183,7 +190,7 @@ public final class FallbackPricing {
             if (tierValue.isPresent()) {
                 long value = tierValue.get();
                 if (value <= 0L) {
-                    // 明确的排除规则：宁可不定价，也不要把物品变成免费物品
+                    // Explicit exclusion rule: rather leave the item unpriced than turn it into a free item
                     return Optional.empty();
                 }
                 return Optional.of(new PricedValue(item, value, PriceSource.TIER, "tier-rule"));
@@ -206,11 +213,11 @@ public final class FallbackPricing {
     }
 
     /**
-     * 判断物品是否被层级规则明确排除。
+     * Whether the item is explicitly excluded by a tier rule.
      *
-     * <p>{@link TierPricing#price} 用 {@code Optional.of(0L)} 表示「明确排除」。这里单独抽出来，
-     * 是因为排除与定价是两种语义：排除必须在任何定价步骤之前生效，否则会被总会返回值的
-     * 稀有度定价遮蔽。</p>
+     * <p>{@link TierPricing#price} uses {@code Optional.of(0L)} to mean "explicitly excluded". This is
+     * extracted separately because exclusion and pricing are two semantics: exclusion must take effect
+     * before any pricing step, or it would be shadowed by rarity pricing, which always returns a value.</p>
      */
     private boolean isExcluded(ItemKey item) {
         Optional<Long> tierValue = tierPricing.price(item);

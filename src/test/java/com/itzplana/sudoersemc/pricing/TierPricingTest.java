@@ -12,10 +12,11 @@ import net.minecraft.resources.ResourceLocation;
 import org.junit.jupiter.api.Test;
 
 /**
- * 层级定价测试。
+ * Tier pricing tests.
  *
- * <p>规则按注册顺序求值，第一个生效的规则决定结果：排除 → 固定值 → 倍率。
- * 引擎不得内置大型模组清单，默认规则只覆盖没有经济意义的原版物品。</p>
+ * <p>Rules are evaluated in registration order and the first effective rule decides the result: exclusion → fixed
+ * value → multiplier. The engine must not embed a large mod list; default rules only cover vanilla items with no
+ * economic meaning.</p>
  */
 class TierPricingTest {
 

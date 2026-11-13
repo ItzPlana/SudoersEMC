@@ -17,22 +17,26 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * 通过反射读取 Goety 仪式配方。
+ * Reads Goety ritual recipes via reflection.
  *
- * <p>Goety 是可选依赖，本类不能在编译期链接任何 Goety 类型；所有访问点都委托给
- * {@link GoetyRitualAccess}，生产环境使用 {@link ReflectiveGoetyRitualAccess}，单元测试
- * 可以注入假实现。这样既保持无 Goety 环境可运行，也能在纯 JVM 中验证失败语义。</p>
+ * <p>Goety is an optional dependency, so this class must not link any Goety type at compile time; all
+ * access points delegate to {@link GoetyRitualAccess}, using {@link ReflectiveGoetyRitualAccess} in
+ * production and allowing a fake implementation in unit tests. This keeps a no-Goety environment
+ * runnable and lets failure semantics be verified in a pure JVM.</p>
  *
- * <p><strong>必需字段：</strong>{@code result}、{@code ritualType}、{@code ingredients} 与
- * {@code activationItem} 四者任一读取失败（访问器缺失、调用异常或必需值为 {@code null}）
- * 时，整条配方返回 {@code null}，由 {@link RecipeScanner} 计入 {@code unsupported}。
- * 这样宁可少覆盖一条配方，也不生成「缺少成本项」的错误定价。</p>
+ * <p><strong>Required fields:</strong> if any of {@code result}, {@code ritualType}, {@code ingredients}
+ * or {@code activationItem} fails to read (accessor absent, call exception, or required value
+ * {@code null}), the whole recipe returns {@code null} and is counted as {@code unsupported} by
+ * {@link RecipeScanner}. Rather cover one fewer recipe than generate a wrong price "missing a cost
+ * term".</p>
  *
- * <p>日志按失败点限流：同一个访问器在 JVM 生命周期内最多 warn 一次，后续重复出现只保留
- * 一条 debug；非 {@code goety:ritual} 类型是扫描热路径，完全不记录。</p>
+ * <p>Logging is rate-limited per failure point: the same accessor warns at most once per JVM lifetime,
+ * with subsequent repeats keeping only a debug; non-{@code goety:ritual} types are on the scan hot path
+ * and are not logged at all.</p>
  *
- * <p>类型闸门与字段读取都会隔离第三方配方类初始化失败产生的 {@link LinkageError}
- * （例如 {@link NoClassDefFoundError}），确保单条损坏配方只被跳过，不会让整轮扫描失败。</p>
+ * <p>Both the type gate and field reads isolate {@link LinkageError} (e.g. {@link NoClassDefFoundError})
+ * from third-party recipe class initialisation failures, ensuring a single corrupt recipe is only
+ * skipped and never fails the whole scan.</p>
  */
 public final class GoetyRitualReader {
 
@@ -51,51 +55,51 @@ public final class GoetyRitualReader {
     }
 
     /**
-     * @return 不读取任何字段的读取器
+     * @return a reader that reads no fields
      */
     public static GoetyRitualReader unavailable() {
         return new GoetyRitualReader(GoetyRitualAccess.unavailable());
     }
 
     /**
-     * @return Goety 已加载且四个访问器全部解析成功时为 {@code true}
+     * @return {@code true} when Goety is loaded and all four accessors resolved successfully
      */
     public static boolean available() {
         return ReflectiveGoetyRitualAccess.INSTANCE.available();
     }
 
     /**
-     * @return 绑定当前 Goety 版本的读取器
+     * @return a reader bound to the current Goety version
      */
     public static GoetyRitualReader create() {
         return new GoetyRitualReader(ReflectiveGoetyRitualAccess.INSTANCE);
     }
 
     /**
-     * 包级测试钩子：注入假访问器，完全不触碰反射。
+     * Package-level test hook: inject a fake accessor, touching no reflection at all.
      *
-     * @param access 字段访问实现
-     * @return 使用指定访问实现的读取器
+     * @param access the field-access implementation
+     * @return a reader using the given access implementation
      */
     static GoetyRitualReader withAccess(GoetyRitualAccess access) {
         return new GoetyRitualReader(access);
     }
 
     /**
-     * 包级测试钩子：返回读取器使用的限流日志助手。
+     * Package-level test hook: returns the rate-limited log helper used by the reader.
      *
-     * @return 静态限流日志助手
+     * @return the static rate-limited log helper
      */
     static OnceLogger testLogger() {
         return LOG;
     }
 
     /**
-     * 描述一条 Goety 仪式配方。
+     * Describes one Goety ritual recipe.
      *
-     * @param recipe 任意配方；只有类型为 {@code goety:ritual} 时才会读取字段
-     * @param id     配方 id
-     * @return 配方快照；非本类型、读取器不可用或必需字段失败时返回 {@code null}
+     * @param recipe any recipe; fields are read only when its type is {@code goety:ritual}
+     * @param id     recipe id
+     * @return recipe snapshot; {@code null} when not this type, the reader is unavailable, or a required field fails
      */
     @Nullable
     public RecipeSnapshot describe(Recipe<?> recipe, ResourceLocation id) {
@@ -111,21 +115,22 @@ public final class GoetyRitualReader {
             return null;
         }
         if (!RITUAL_ID.equals(typeId)) {
-            // 热路径：每个非仪式配方都会走到这里，禁止逐条记录日志。
+            // Hot path: every non-ritual recipe reaches here; per-recipe logging is forbidden.
             return null;
         }
         return describeReadable(recipe, id);
     }
 
     /**
-     * 包级测试钩子：跳过类型闸门，直接验证字段必需性与转换逻辑。
+     * Package-level test hook: skips the type gate to directly verify field required-ness and conversion
+     * logic.
      *
-     * <p>访问器实现自身抛出的 {@link RuntimeException} 或 {@link LinkageError} 也按字段
-     * 读取失败处理，整条配方返回 {@code null}。</p>
+     * <p>A {@link RuntimeException} or {@link LinkageError} thrown by the accessor implementation itself
+     * is also treated as a field-read failure, returning {@code null} for the whole recipe.</p>
      *
-     * @param recipe Goety 仪式配方对象
-     * @param id     配方 id
-     * @return 配方快照；任一必需字段失败时返回 {@code null}
+     * @param recipe the Goety ritual recipe object
+     * @param id     recipe id
+     * @return recipe snapshot; {@code null} when any required field fails
      */
     @Nullable
     RecipeSnapshot describeReadable(Object recipe, ResourceLocation id) {
@@ -185,16 +190,17 @@ public final class GoetyRitualReader {
 
         return new RecipeSnapshot(id, RecipeKind.GOETY_RITUAL, inputs, List.of(output),
                 List.of(),
-                // 暗黑祭坛与基座是催化剂，不属于被消耗的 inputs。
+                // The dark altar and pedestals are catalysts, not part of the consumed inputs.
                 true,
                 Map.of(GoetyRitualEvaluator.ATTRIBUTE_RITUAL_TYPE, ritualType.value()));
     }
 
     /**
-     * 访问器实现自身的异常也按字段读取失败处理。
+     * Exceptions from the accessor implementation itself are also treated as field-read failures.
      *
-     * <p>生产实现已经捕获反射调用的 {@link Throwable}，这里再做一层防御，避免未来替换
-     * {@link GoetyRitualAccess} 时单个字段异常穿透到整轮扫描。</p>
+     * <p>The production implementation already catches {@link Throwable} from reflective calls; this adds
+     * another layer of defence so that replacing {@link GoetyRitualAccess} in future cannot let a single
+     * field exception pierce the whole scan.</p>
      */
     private static <T> GoetyRitualAccess.FieldRead<T> readField(
             Supplier<GoetyRitualAccess.FieldRead<T>> reader) {
@@ -206,7 +212,8 @@ public final class GoetyRitualReader {
     }
 
     /**
-     * 必需字段读取失败时统一跳过整条配方，并对同一失败点限流记录。
+     * On a required-field read failure, skips the whole recipe uniformly and rate-limits logging per
+     * failure point.
      */
     @Nullable
     private static RecipeSnapshot skipRequired(String field,
@@ -214,14 +221,15 @@ public final class GoetyRitualReader {
         String message = "Goety 仪式字段 " + field + " 读取失败；跳过该配方";
         Throwable cause = read.failure();
         if (!LOG.warn("goety.read." + field, message, cause)) {
-            // 同一个失败点已经 warn 过一次，后续重复只保留一条 debug。
+            // This failure point already warned once; subsequent repeats keep only a debug.
             LOG.debug("goety.read." + field + ".repeat", message + "（重复出现）", cause);
         }
         return null;
     }
 
     /**
-     * 材料转换不完整时跳过整条配方。哪怕只剩一个槽位读取失败，也不能用剩余材料定价。
+     * Skips the whole recipe when ingredient conversion is incomplete. Even if only one slot failed to
+     * read, the remaining ingredients must not be used to price.
      */
     @Nullable
     private static RecipeSnapshot skipConversion(String field, ResourceLocation id) {
@@ -233,10 +241,11 @@ public final class GoetyRitualReader {
     }
 
     /**
-     * 把材料列表转换为配方输入。
+     * Converts an ingredient list into recipe inputs.
      *
-     * <p>空槽位或 {@link Ingredient#EMPTY} 表示零成本，直接忽略；非空材料读取失败、
-     * 返回 0 个候选或所有候选都未注册时返回不完整结果，由调用方跳过整条配方。</p>
+     * <p>An empty slot or {@link Ingredient#EMPTY} means zero cost and is ignored; a non-empty ingredient
+     * that fails to read, returns 0 candidates, or whose candidates are all unregistered yields an
+     * incomplete result, and the caller skips the whole recipe.</p>
      */
     private static Conversion convert(@Nullable List<Ingredient> ingredients) {
         if (ingredients == null) {
@@ -285,9 +294,9 @@ public final class GoetyRitualReader {
     }
 
     /**
-     * 转换单个激活物品。
+     * Converts a single activation item.
      *
-     * <p>{@link Ingredient#EMPTY} 是合法零成本；{@code null} 或转换不完整则失败。</p>
+     * <p>{@link Ingredient#EMPTY} is a legitimate zero cost; {@code null} or incomplete conversion fails.</p>
      */
     private static Conversion convertActivation(@Nullable Ingredient activation) {
         if (activation == null) {
@@ -302,10 +311,10 @@ public final class GoetyRitualReader {
     }
 
     /**
-     * 材料转换结果。
+     * Ingredient conversion result.
      *
-     * @param inputs   已解析的输入槽位
-     * @param complete 是否完整；{@code false} 时调用方必须跳过整条配方
+     * @param inputs   resolved input slots
+     * @param complete whether complete; when {@code false} the caller must skip the whole recipe
      */
     private record Conversion(List<RecipeInput> inputs, boolean complete) {
 

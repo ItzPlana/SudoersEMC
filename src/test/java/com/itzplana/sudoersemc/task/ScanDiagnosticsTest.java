@@ -9,10 +9,11 @@ import java.util.Map;
 import org.junit.jupiter.api.Test;
 
 /**
- * {@link ScanDiagnostics} 的阶段累计、报告格式、内存采样与重置验证。
+ * Stage accumulation, report format, memory sampling and reset verification for {@link ScanDiagnostics}.
  *
- * <p>涉及时间的断言留出充足余量：只要两次打点之间真实等待了约 20ms，纳秒累计值就应
- * 明显超过断言下限，避免调度抖动造成偶发失败。</p>
+ * <p>Time-related assertions leave ample margin: as long as roughly 20ms actually elapses between two marks, the
+ * nanosecond accumulation should clearly exceed the assertion lower bound, avoiding sporadic failures from scheduling
+ * jitter.</p>
  */
 class ScanDiagnosticsTest {
 
@@ -136,7 +137,7 @@ class ScanDiagnosticsTest {
     @Test
     void p95TickUsesNearestRankForMultipleSamples() {
         ScanDiagnostics diagnostics = new ScanDiagnostics();
-        // 逆序写入 1..20 ms，验证 P95 先排序再按最近秩取值：ceil(0.95 * 20) = 19 -> 19ms。
+        // Write 1..20 ms in reverse order to verify P95 sorts first then takes the nearest rank: ceil(0.95 * 20) = 19 -> 19ms.
         for (int millis = 20; millis >= 1; millis--) {
             diagnostics.recordTick(millis * 1_000_000L);
         }

@@ -13,131 +13,135 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * 由服务器 tick 驱动的单次扫描状态机。
+ * Single-scan state machine driven by server ticks.
  *
- * <p>一次扫描的生命周期为：请求扫描 → 分片采集快照 → 求解配方 → 应用结果 → 持久化 → 完成。
- * 每次 {@link #tick()} 最多推进一个阶段的一批工作：</p>
+ * <p>A scan's lifecycle is: request scan → sharded snapshot collection → recipe solving → apply results →
+ * persist → complete. Each {@link #tick()} advances at most one batch of work in one phase:</p>
  * <ul>
- *   <li>{@link ScanPhase#COLLECTING_SNAPSHOT}：首次 tick 创建增量采集会话，随后每 tick 用
- *       {@link BatchProcessor#nextBatchSize(long, long)} 决定预算并调用
- *       {@link ScanPipeline.CollectSession#step(int)}；</li>
- *   <li>{@link ScanPhase#SOLVING}：主线程只轮询 {@link Future#isDone()}，不阻塞等待；</li>
- *   <li>{@link ScanPhase#APPLYING}：一次调用应用回调完成安全层与写入；</li>
- *   <li>{@link ScanPhase#SAVING}：保留原有落盘阶段。</li>
+ *   <li>{@link ScanPhase#COLLECTING_SNAPSHOT}: the first tick creates the incremental collection session;
+ *       subsequent ticks use {@link BatchProcessor#nextBatchSize(long, long)} to decide the budget and call
+ *       {@link ScanPipeline.CollectSession#step(int)};</li>
+ *   <li>{@link ScanPhase#SOLVING}: the main thread only polls {@link Future#isDone()} and never blocks waiting;</li>
+ *   <li>{@link ScanPhase#APPLYING}: one call to the apply callback completes the safety layer and writes;</li>
+ *   <li>{@link ScanPhase#SAVING}: keeps the original persistence phase.</li>
  * </ul>
  *
- * <p><strong>线程约定：</strong>快照采集（{@link SnapshotCollector} / {@link PipelineCollector}）
- * 与结果应用（{@link ResultApplier} / {@link PipelineApplier}）必须在服务器线程执行；只有不接触
- * 游戏状态的纯计算可以通过 {@link SolveWorker} 移到工作线程。{@link #tick()} 同样由服务器线程
- * 调用。{@link #progress()} 通过 {@code volatile} 字段发布，其他线程可以安全读取最近一次完整
- * 进度；{@link #cancel()} 也可以从其他线程调用。</p>
+ * <p><strong>Threading:</strong> snapshot collection ({@link SnapshotCollector} / {@link PipelineCollector})
+ * and result application ({@link ResultApplier} / {@link PipelineApplier}) must run on the server thread;
+ * only pure computation that does not touch game state may be moved to a worker thread via
+ * {@link SolveWorker}. {@link #tick()} is also called on the server thread. {@link #progress()} is published
+ * via a {@code volatile} field, so other threads can safely read the latest complete progress;
+ * {@link #cancel()} may also be called from other threads.</p>
  *
- * <p>任何回调抛出的运行时异常都会被捕获并转换为 {@link ScanPhase#FAILED}，异常消息写入进度
- * 细节，绝不允许异常穿透 tick 循环破坏服务器主循环。</p>
+ * <p>Any runtime exception thrown by a callback is caught and converted to {@link ScanPhase#FAILED}, with
+ * the exception message written into the progress detail; an exception is never allowed to pierce the tick
+ * loop and break the server main loop.</p>
  */
 public final class ScanManager {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("sudoersemc/task/ScanManager");
 
     /**
-     * 传统一次性采集回调，必须在服务器线程执行。
+     * Legacy one-shot collection callback; must run on the server thread.
      */
     @FunctionalInterface
     public interface SnapshotCollector {
 
         /**
-         * 采集一次扫描所需的完整快照。
+         * Collects the complete snapshot needed for one scan.
          *
-         * @return 非空快照数据
+         * @return non-null snapshot data
          */
         SnapshotData collect();
     }
 
     /**
-     * 传统应用回调，必须在服务器线程执行。
+     * Legacy apply callback; must run on the server thread.
      */
     @FunctionalInterface
     public interface ResultApplier {
 
         /**
-         * 把求解结果写入实际后端。
+         * Writes the solve result to the actual backend.
          *
-         * @param data 采集阶段产生的快照数据
+         * @param data snapshot data produced by the collection phase
          */
         void apply(SnapshotData data);
     }
 
     /**
-     * 分片采集回调：每次扫描开始时创建新的增量会话。
+     * Sharded collection callback: creates a new incremental session at the start of each scan.
      */
     @FunctionalInterface
     public interface PipelineCollector {
 
         /**
-         * @return 新的增量采集会话；不能为 {@code null}
+         * @return a new incremental collection session; must not be {@code null}
          */
         ScanPipeline.CollectSession begin();
     }
 
     /**
-     * 分片应用回调：在服务器线程应用纯求解结果。
+     * Sharded apply callback: applies the pure solve result on the server thread.
      */
     @FunctionalInterface
     public interface PipelineApplier {
 
         /**
-         * @param snapshot 采集快照
-         * @param outcome  工作线程（或同步）求解结果
-         * @return 实际应用的条目数量，仅用于进度显示
+         * @param snapshot collection snapshot
+         * @param outcome  worker-thread (or synchronous) solve result
+         * @return number of entries actually applied, used only for progress display
          */
         int apply(PipelineSnapshot snapshot, SolveOutcome outcome);
     }
 
     /**
-     * 扫描被取消或失败时的终止回调。
+     * Termination callback when a scan is cancelled or fails.
      *
-     * <p>只会在 {@link ScanPhase#CANCELLED} 与 {@link ScanPhase#FAILED} 时触发，用于在
-     * 管线来不及走完正常应用阶段时写出部分诊断报告。实现方不得抛出异常；即使抛出，本类
-     * 也只记录日志并继续。</p>
+     * <p>Only triggered for {@link ScanPhase#CANCELLED} and {@link ScanPhase#FAILED}, used to write a
+     * partial diagnostic report when the pipeline cannot finish the normal apply phase. Implementations
+     * must not throw; even if they do, this class only logs and continues.</p>
      */
     @FunctionalInterface
     public interface AbortListener {
 
         /**
-         * @param phase       终止阶段，只会是 {@link ScanPhase#CANCELLED} 或 {@link ScanPhase#FAILED}
-         * @param progress    终止时的进度快照
-         * @param diagnostics 本次扫描的耗时与内存采样
+         * @param phase       termination phase, only {@link ScanPhase#CANCELLED} or {@link ScanPhase#FAILED}
+         * @param progress    progress snapshot at termination
+         * @param diagnostics this scan's timing and memory samples
          */
         void onScanAborted(ScanPhase phase, ScanProgress progress, ScanDiagnostics diagnostics);
     }
 
     /**
-     * 当前扫描输入的指纹与 reload 代次提供器，必须在服务器线程执行。
+     * Provider of the current scan input fingerprint and reload generation; must run on the server thread.
      *
-     * <p>实现若可通过 Forge 的 {@code AddReloadListenerEvent}/{@code TagsUpdatedEvent} 等
-     * 廉价来源维护单调递增的 reload 代次，应覆写 {@link #tracksReloadGeneration()} 与
-     * {@link #reloadGeneration()}。此时扫描只在开始时读取一次代次，采集完成、求解完成与
-     * 应用前都用代次比较，不再重复计算全量内容指纹。</p>
+     * <p>If an implementation can maintain a monotonically increasing reload generation from a cheap
+     * source such as Forge's {@code AddReloadListenerEvent}/{@code TagsUpdatedEvent}, it should override
+     * {@link #tracksReloadGeneration()} and {@link #reloadGeneration()}. The scan then reads the generation
+     * once at start and compares generations at collection completion, solve completion and before apply,
+     * without recomputing the full content fingerprint.</p>
      */
     @FunctionalInterface
     public interface FingerprintSupplier {
 
         /**
-         * @return 当前输入的完整指纹，不能为 {@code null}
+         * @return the full fingerprint of current inputs; must not be {@code null}
          */
         ScanFingerprint current();
 
         /**
-         * 廉价、单调递增的 reload 代次。每次 datapack reload（开始与完成）都应递增。
+         * Cheap, monotonically increasing reload generation. Should increment on every datapack reload
+         * (start and completion).
          *
-         * @return 当前代次
+         * @return the current generation
          */
         default long reloadGeneration() {
             return 0L;
         }
 
         /**
-         * @return {@code true} 表示 {@link #reloadGeneration()} 能廉价反映 reload 变化
+         * @return {@code true} if {@link #reloadGeneration()} cheaply reflects reload changes
          */
         default boolean tracksReloadGeneration() {
             return false;
@@ -145,11 +149,11 @@ public final class ScanManager {
     }
 
     /**
-     * 传统回调之间传递的最小数据载体。
+     * Minimal data carrier passed between legacy callbacks.
      *
-     * @param label       快照来源或批次的中文标签
-     * @param itemCount   采集到的物品数量，不得为负
-     * @param recipeCount 待求解的配方数量，不得为负
+     * @param label       Chinese label of the snapshot source or batch
+     * @param itemCount   number of items collected, must not be negative
+     * @param recipeCount number of recipes to solve, must not be negative
      */
     public record SnapshotData(String label, int itemCount, int recipeCount) {
 
@@ -180,14 +184,14 @@ public final class ScanManager {
     @Nullable
     private final SolveWorker solveWorker;
     private final boolean solveOffThread;
-    /** 取消/失败时把部分快照交给管线暂存，供部分诊断报告使用；可为 {@code null}。 */
+    /** On cancel/fail, hands the partial snapshot to the pipeline to stash for partial diagnostic reports; may be {@code null}. */
     @Nullable
     private final Consumer<PipelineSnapshot> partialSnapshotStasher;
-    /** 新扫描开始时清空管线上一轮的报告状态；可为 {@code null}。 */
+    /** Clears the pipeline's previous report state when a new scan starts; may be {@code null}. */
     @Nullable
     private final Runnable scanStartHook;
 
-    /** 可选的输入一致性校验；{@code null} 时保持仅供单元测试使用的跳过语义。 */
+    /** Optional input-consistency check; {@code null} keeps the skip semantics used only by unit tests. */
     @Nullable
     private volatile FingerprintSupplier fingerprintSupplier;
     private boolean reloadTracking;
@@ -198,7 +202,7 @@ public final class ScanManager {
 
     private volatile ScanProgress progress = ScanProgress.idle();
     private final ScanCancellation cancellation;
-    /** 本 tick 执行了内联求解，不能把该耗时当作批量样本。 */
+    /** This tick ran an inline solve; its elapsed time must not be used as a batch sample. */
     private boolean skipBatchSample;
 
     @Nullable
@@ -214,7 +218,8 @@ public final class ScanManager {
     private long lastBatchNanos;
 
     /**
-     * 兼容旧调用点的构造器：使用内部新建的诊断收集器，不注册终止回调。
+     * Compatibility constructor for older callers: uses an internally created diagnostics collector and
+     * registers no termination callback.
      */
     public ScanManager(BatchProcessor batchProcessor,
                        SnapshotCollector collector,
@@ -224,7 +229,7 @@ public final class ScanManager {
     }
 
     /**
-     * 兼容旧调用点的构造器。
+     * Compatibility constructor for older callers.
      */
     public ScanManager(BatchProcessor batchProcessor,
                        SnapshotCollector collector,
@@ -237,7 +242,7 @@ public final class ScanManager {
     }
 
     /**
-     * 使用共享取消令牌创建传统调度器。
+     * Creates a legacy scheduler using a shared cancellation token.
      */
     public ScanManager(BatchProcessor batchProcessor,
                        SnapshotCollector collector,
@@ -251,21 +256,22 @@ public final class ScanManager {
     }
 
     /**
-     * 创建分片调度器。
+     * Creates a sharded scheduler.
      *
-     * <p>{@code solveWorker} 提供纯求解函数；{@code solveOffThread=true} 时在
-     * {@link SolveWorker#THREAD_NAME} 线程执行，{@code false} 时在同一 tick 内同步执行。
-     * 通过旧构造器创建的调度器保持原有一次性采集/应用语义。</p>
+     * <p>{@code solveWorker} provides the pure solve function; with {@code solveOffThread=true} it runs on
+     * the {@link SolveWorker#THREAD_NAME} thread, with {@code false} it runs synchronously within the same
+     * tick. Schedulers created via the old constructors keep the original one-shot collection/apply
+     * semantics.</p>
      *
-     * @param batchProcessor  批量决策器，不能为 {@code null}
-     * @param collector       分片采集回调，不能为 {@code null}
-     * @param applier         应用回调，不能为 {@code null}
-     * @param tickBudgetNanos 每 tick 允许用于扫描的时间预算（纳秒），不得为负
-     * @param diagnostics     耗时与内存采样器；{@code null} 时新建
-     * @param abortListener   取消/失败终止回调，可为 {@code null}
-     * @param cancellation    共享取消令牌，可为 {@code null}
-     * @param solveWorker     纯求解工作线程；分片模式必须提供
-     * @param solveOffThread  是否把纯求解移到工作线程
+     * @param batchProcessor  batch decision component, must not be {@code null}
+     * @param collector       sharded collection callback, must not be {@code null}
+     * @param applier         apply callback, must not be {@code null}
+     * @param tickBudgetNanos time budget allowed for scanning per tick (nanos), must not be negative
+     * @param diagnostics     timing and memory sampler; created when {@code null}
+     * @param abortListener   cancel/fail termination callback, may be {@code null}
+     * @param cancellation    shared cancellation token, may be {@code null}
+     * @param solveWorker     pure solve worker thread; required in sharded mode
+     * @param solveOffThread  whether to move the pure solve to a worker thread
      */
     public ScanManager(BatchProcessor batchProcessor,
                        PipelineCollector collector,
@@ -281,10 +287,10 @@ public final class ScanManager {
     }
 
     /**
-     * 完整分片构造器：额外接入部分快照暂存与扫描开始回调。
+     * Full sharded constructor: additionally wires partial-snapshot stashing and the scan-start callback.
      *
-     * @param partialSnapshotStasher 取消/失败时暂存部分快照的回调，可为 {@code null}
-     * @param scanStartHook          新扫描开始时清空管线报告状态的回调，可为 {@code null}
+     * @param partialSnapshotStasher callback to stash a partial snapshot on cancel/fail, may be {@code null}
+     * @param scanStartHook          callback to clear pipeline report state when a new scan starts, may be {@code null}
      */
     public ScanManager(BatchProcessor batchProcessor,
                        PipelineCollector collector,
@@ -303,7 +309,7 @@ public final class ScanManager {
     }
 
     /**
-     * 便捷分片构造器：使用内部诊断采样器与新建取消令牌。
+     * Convenience sharded constructor: uses an internal diagnostics sampler and a new cancellation token.
      */
     public ScanManager(BatchProcessor batchProcessor,
                        PipelineCollector collector,
@@ -358,32 +364,33 @@ public final class ScanManager {
     }
 
     /**
-     * @return 本次调度器使用的共享取消令牌
+     * @return the shared cancellation token used by this scheduler
      */
     public ScanCancellation cancellation() {
         return cancellation;
     }
 
     /**
-     * @return 本次扫描使用的诊断采样器
+     * @return the diagnostics sampler used by this scan
      */
     public ScanDiagnostics diagnostics() {
         return diagnostics;
     }
 
     /**
-     * 设置扫描输入指纹提供器。生产接线必须提供非 {@code null} 实现；测试可保持默认值。
+     * Sets the scan input fingerprint provider. Production wiring must provide a non-{@code null}
+     * implementation; tests may keep the default.
      *
-     * @param supplier 指纹与 reload 代次提供器，可为 {@code null}
+     * @param supplier fingerprint and reload generation provider, may be {@code null}
      */
     public void setFingerprintSupplier(@Nullable FingerprintSupplier supplier) {
         this.fingerprintSupplier = supplier;
     }
 
     /**
-     * 请求开始一次新扫描。
+     * Requests starting a new scan.
      *
-     * @return 成功开始返回 {@code true}；已有扫描在运行返回 {@code false}
+     * @return {@code true} if started successfully; {@code false} if a scan is already running
      */
     public synchronized boolean requestScan() {
         if (isRunning()) {
@@ -409,28 +416,28 @@ public final class ScanManager {
     }
 
     /**
-     * 请求取消当前扫描。
+     * Requests cancelling the current scan.
      */
     public void cancel() {
         cancellation.request();
     }
 
     /**
-     * @return 最近一次发布的进度快照，可安全地从其他线程读取
+     * @return the most recently published progress snapshot, safe to read from other threads
      */
     public ScanProgress progress() {
         return progress;
     }
 
     /**
-     * @return 当前阶段是否属于活动扫描
+     * @return whether the current phase belongs to an active scan
      */
     public boolean isRunning() {
         return progress.phase().isActive();
     }
 
     /**
-     * @return 是否已经请求取消但尚未被 tick 观察
+     * @return whether cancellation has been requested but not yet observed by a tick
      */
     public boolean isCancelRequested() {
         return cancellation.isRequested();
@@ -441,7 +448,7 @@ public final class ScanManager {
     }
 
     /**
-     * 推进一次扫描状态机。
+     * Advances the scan state machine once.
      */
     public void tick() {
         ScanProgress current = progress;
@@ -465,9 +472,9 @@ public final class ScanManager {
                 abortedPhase = ScanPhase.CANCELLED;
             } else {
                 batch = batchProcessor.nextBatchSize(lastBatchNanos, tickBudgetNanos);
-                // 只有真正消耗批量预算的采集/求解阶段才更新自适应批量；APPLYING/SAVING
-                // 的落盘与回调耗时不能持久缩小下一轮采集批量。分片求解阶段只轮询 future，
-                // 也不应产生批量样本。
+                // Only collection/solve phases that actually consume the batch budget update the adaptive batch;
+                // APPLYING/SAVING persistence and callback elapsed time must not persistently shrink the next collection batch.
+                // The sharded solve phase only polls the future and should not produce a batch sample either.
                 ScanPhase phase = current.phase();
                 batchRecorded = phase == ScanPhase.COLLECTING_SNAPSHOT
                         || (phase == ScanPhase.SOLVING && !pipelineMode());
@@ -495,7 +502,7 @@ public final class ScanManager {
                     }
                     case SAVING -> saveStep();
                     default -> {
-                        // 防御性分支：isRunning() 已经排除了所有终止阶段。
+                        // Defensive branch: isRunning() has already excluded all terminal phases.
                     }
                 }
             }
@@ -549,10 +556,12 @@ public final class ScanManager {
     }
 
     /**
-     * 取消发生在采集阶段时，先完成会话以取得已采集的部分快照，再交给管线暂存。
+     * When cancellation occurs during collection, first finish the session to obtain the partial snapshot
+     * already collected, then hand it to the pipeline to stash.
      *
-     * <p>共享取消令牌此时仍处于请求状态，{@link ScanPipeline.CollectSession#finish()} 会在
-     * 下一个批次边界看到取消并立即返回部分快照，因此不会把剩余注册表全部扫完。</p>
+     * <p>The shared cancellation token is still requested at this point;
+     * {@link ScanPipeline.CollectSession#finish()} sees the cancellation at the next batch boundary and
+     * returns the partial snapshot immediately, so it does not scan the entire remaining registry.</p>
      */
     private void capturePartialCollectionForAbort() {
         ScanPipeline.CollectSession session = collectSession;
@@ -582,7 +591,7 @@ public final class ScanManager {
     }
 
     /**
-     * 把状态机恢复到空闲，并清除取消标志、快照与计时样本。
+     * Restores the state machine to idle and clears the cancellation flag, snapshots and timing samples.
      */
     public synchronized void reset() {
         cancelOutstandingFuture();
@@ -600,7 +609,8 @@ public final class ScanManager {
     }
 
     /**
-     * 在首次采集前捕获输入基线：优先使用廉价 reload 代次，否则退化为完整指纹。
+     * Captures the input baseline before the first collection: prefers the cheap reload generation,
+     * otherwise falls back to the full fingerprint.
      */
     private void captureInputsIfNeeded() {
         if (inputSnapshotCaptured) {
@@ -621,9 +631,9 @@ public final class ScanManager {
     }
 
     /**
-     * 校验扫描输入在采集/求解/应用期间没有变化。
+     * Verifies the scan inputs did not change during collection/solve/apply.
      *
-     * @param message 失败时写入扫描进度的中文原因
+     * @param message Chinese reason written into scan progress on failure
      */
     private void verifyInputsUnchanged(String message) {
         FingerprintSupplier supplier = fingerprintSupplier;
@@ -646,7 +656,7 @@ public final class ScanManager {
     }
 
     // ---------------------------------------------------------------------
-    // 传统一次性路径
+    // Legacy one-shot path
     // ---------------------------------------------------------------------
 
     private void collectStep(int batch) {
@@ -715,7 +725,7 @@ public final class ScanManager {
     }
 
     // ---------------------------------------------------------------------
-    // 分片采集 / 工作线程求解路径
+    // Sharded collection / worker-thread solve path
     // ---------------------------------------------------------------------
 
     private void collectPipelineStep(int batch) {
@@ -784,7 +794,7 @@ public final class ScanManager {
         }
         pipelineSnapshot = collected;
         collectSession = null;
-        // 即使随后在求解/应用中失败，部分诊断报告也能拿到本轮采集的完整统计。
+        // Even if solving/applying later fails, the partial diagnostic report can still get this round's complete collection statistics.
         stashPartialSnapshot(collected);
         verifyInputsUnchanged("快照采集完成时扫描输入发生变化");
 
@@ -795,7 +805,7 @@ public final class ScanManager {
             solveFuture = solveWorker.submit(collected);
             progress = progress.advance(ScanPhase.SOLVING, 0, 0, "求解中（工作线程）");
         } else {
-            // 内联求解与采集发生在同一 tick，其耗时不能作为下一轮采集批量的自适应样本。
+            // Inline solve and collection happen in the same tick; its elapsed time must not be an adaptive sample for the next collection batch.
             skipBatchSample = true;
             solveOutcome = solveWorker.solveNow(collected);
             if (solveOutcome == null) {

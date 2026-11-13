@@ -9,7 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import org.junit.jupiter.api.Test;
 
 /**
- * {@link ScanProgress} 的夹取、比例、阶段语义与时间戳验证。
+ * Clamping, fraction, phase semantics and timestamp verification for {@link ScanProgress}.
  */
 class ScanProgressTest {
 

@@ -15,10 +15,11 @@ import net.minecraft.world.item.Rarity;
 import org.junit.jupiter.api.Test;
 
 /**
- * 兜底定价链优先级测试。
+ * Fallback pricing chain priority tests.
  *
- * <p>必须严格遵循 {@code EXISTING → 排除检查 → EXTERNAL_BASELINE → TAG → TIER → RARITY → FALLBACK}。
- * 层级排除先于所有定价；纯倍率层级规则返回空，因此不会阻断后续的稀有度与通用兜底值。</p>
+ * <p>Must strictly follow {@code EXISTING → exclusion check → EXTERNAL_BASELINE → TAG → TIER → RARITY → FALLBACK}.
+ * Tier exclusion precedes all pricing; a pure-multiplier tier rule returns empty, so it does not block subsequent
+ * rarity and generic fallback values.</p>
  */
 class FallbackPricingTest {
 
@@ -85,7 +86,7 @@ class FallbackPricingTest {
     void rarityAlwaysProducesAValueWhenEnabled() {
         FallbackPricing pricing = pricing(new PricingSettings(false, true, true, false, 1L));
 
-        // 该物品不匹配任何层级规则，因此落到稀有度定价
+        // This item matches no tier rule, so it falls through to rarity pricing
         FallbackPricing.PricedValue value = pricing.price(new FallbackPricing.PricingRequest(
                 item("minecraft_air_like"), List.of(), Rarity.COMMON, 0L, 0L)).orElseThrow();
 
@@ -98,7 +99,7 @@ class FallbackPricingTest {
                 tagPricing(), RarityPricing.defaults(), TierPricing.defaults(),
                 new PricingSettings(true, false, true, true, 1L));
 
-        // 默认规则把 spawn_egg 标记为排除；排除返回 0，定价链应终止而不是产出 0 价
+        // Default rules mark spawn_egg as excluded; exclusion returns 0, so the chain should terminate rather than produce a 0 price
         Optional<FallbackPricing.PricedValue> value = pricing.price(new FallbackPricing.PricingRequest(
                 item("pig_spawn_egg"), List.of(), Rarity.COMMON, 0L, 0L));
 
@@ -107,7 +108,7 @@ class FallbackPricingTest {
 
     @Test
     void tierExclusionTerminatesTheChainInsteadOfFallingBack() {
-        // 打开通用兜底值，验证“明确排除”不会被通用兜底值覆盖
+        // Enable the generic fallback value to verify an "explicit exclusion" is not overridden by the generic fallback
         FallbackPricing pricing = new FallbackPricing(
                 tagPricing(), RarityPricing.defaults(), TierPricing.defaults(),
                 new PricingSettings(true, false, true, true, 99L));
@@ -183,7 +184,7 @@ class FallbackPricingTest {
     void withDefaultsFactoryProducesAWorkingChain() {
         FallbackPricing pricing = FallbackPricing.withDefaults(PricingSettings.defaults());
 
-        // 空标签表 → 跳过 TAG；稀有度默认 COMMON 16
+        // Empty tag list → skip TAG; rarity defaults to COMMON 16
         FallbackPricing.PricedValue value = pricing.price(new FallbackPricing.PricingRequest(
                 item("plain"), List.of(), Rarity.COMMON, 0L, 0L)).orElseThrow();
 

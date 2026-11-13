@@ -16,14 +16,15 @@ import net.minecraft.server.Bootstrap;
 import org.junit.jupiter.api.Test;
 
 /**
- * {@link VariantNormalizer} 的单元测试。
+ * Unit tests for {@link VariantNormalizer}.
  *
- * <p>Forge 未启动，所有标签都直接构造；测试只验证 NBT 清洗与规范化行为。</p>
+ * <p>Forge is not started; all tags are constructed directly. Tests only verify NBT cleaning and normalisation
+ * behaviour.</p>
  */
 class VariantNormalizerTest {
 
     static {
-        // keyFor 通过 BuiltInRegistries 查找物品，测试前必须先完成原版注册表引导。
+        // keyFor looks up items via BuiltInRegistries, so vanilla registry bootstrap must complete before the test.
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
     }
@@ -177,8 +178,8 @@ private static final ResourceLocation SUDOERSEMC_TOKEN =
 
         CompoundTag parsed = TagParser.parseTag(VariantNormalizer.normalize(tag));
 
-        // 根级 StoredEMC/stored_emc 仍由 ProjectE 处理；容器内容物的 StoredEMC 必须保留，
-        // 否则真实容器的精确 ItemInfo 查找会 miss。
+        // Root-level StoredEMC/stored_emc is still handled by ProjectE; the contents' StoredEMC must be preserved,
+        // otherwise a real container's exact ItemInfo lookup would miss.
         assertFalse(parsed.contains("StoredEMC"));
         assertFalse(parsed.contains("stored_emc"));
         CompoundTag parsedContentTag = parsed.getCompound("BlockEntityTag")
@@ -328,9 +329,9 @@ private static final ResourceLocation SUDOERSEMC_TOKEN =
         CompoundTag tag = new CompoundTag();
         tag.putInt("Damage", 17);
         tag.put("Enchantments", sharpnessFive());
-        // 有意限制：实际 Damage>0 的精确 ItemInfo 是 {Damage:17,...}，与这里生成的
-        // {Damage:0,...} 不匹配；ProjectE 会回退到基础价 + DamageProcessor，不会误用变体价。
-        // 端到端断言见 GeneratedEmcMapperKeyTest#damagedVariantKeyIsIntentionallyNotExactProjectEInfo。
+        // Intentional limitation: the exact ItemInfo for actual Damage>0 is {Damage:17,...}, which does not match
+        // the {Damage:0,...} generated here; ProjectE falls back to base price + DamageProcessor and does not misuse the variant price.
+        // See the end-to-end assertion in GeneratedEmcMapperKeyTest#damagedVariantKeyIsIntentionallyNotExactProjectEInfo.
 
         assertEquals(ItemKey.of(DIAMOND_SWORD_ID,
                         "{Damage:0,Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}"),

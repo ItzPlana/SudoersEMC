@@ -7,10 +7,10 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import org.junit.jupiter.api.Test;
 
 /**
- * {@link BatchProcessor} 的批量决策验证。
+ * Batch decision verification for {@link BatchProcessor}.
  *
- * <p>覆盖固定模式、自适应扩容、自适应缩容、上下界夹取、区间保持、记账与非法构造参数。
- * 所有断言都使用整数结果，避免浮点误差。</p>
+ * <p>Covers fixed mode, adaptive growth, adaptive shrink, upper/lower clamping, interval hold, bookkeeping and invalid
+ * constructor arguments. All assertions use integer results to avoid floating-point error.</p>
  */
 class BatchProcessorTest {
 
@@ -34,7 +34,7 @@ class BatchProcessorTest {
 
         // 20 * 5 / 4 = 25
         assertEquals(25, processor.nextBatchSize(100L, 1_000L));
-        // 恰好 50% 仍属于“不超过一半”，继续扩容。
+        // Exactly 50% still counts as "not more than half", so keep growing.
         assertEquals(25, processor.nextBatchSize(500L, 1_000L));
 
         processor.recordBatch(40, 100L);
@@ -45,7 +45,7 @@ class BatchProcessorTest {
     void adaptiveGrowthFromSizeOneAlwaysIncreases() {
         BatchProcessor processor = new BatchProcessor(1, true);
 
-        // 1 * 5 / 4 == 1；必须至少 +1，否则自适应批量永远卡在 1。
+        // 1 * 5 / 4 == 1; must add at least +1, otherwise the adaptive batch would be stuck at 1 forever.
         assertEquals(2, processor.nextBatchSize(100L, 1_000L));
 
         processor.recordBatch(2, 100L);
@@ -68,7 +68,7 @@ class BatchProcessorTest {
         BatchProcessor processor = new BatchProcessor(10, true);
         processor.recordBatch(80, 10L);
 
-        // 80 * 5 / 4 = 100，应夹到上限 10 * 8 = 80。
+        // 80 * 5 / 4 = 100, should be clamped to the upper bound 10 * 8 = 80.
         assertEquals(80, processor.nextBatchSize(1L, 1_000L));
     }
 
@@ -77,7 +77,7 @@ class BatchProcessorTest {
         BatchProcessor processor = new BatchProcessor(10, true);
         processor.recordBatch(1, 10L);
 
-        // 1 / 2 = 0，应夹到下限 1。
+        // 1 / 2 = 0, should be clamped to the lower bound 1.
         assertEquals(1, processor.nextBatchSize(10_000L, 1_000L));
     }
 

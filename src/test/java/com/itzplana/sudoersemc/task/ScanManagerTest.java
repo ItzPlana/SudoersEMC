@@ -22,18 +22,19 @@ import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 
 /**
- * {@link ScanManager} 状态机与回调异常处理验证。
+ * {@link ScanManager} state machine and callback exception handling verification.
  *
- * <p>所有用例都使用固定批量 1（需要快速完成时使用较大批量），以便准确观察每个 tick 的
- * 阶段推进。完整流程由 {@link #awaitScanFinished(ScanManager)} 驱动：每次 tick 之间短暂
- * 让出 CPU，并设置截止时间，避免依赖 runner 速度，也避免状态机卡死时测试无限运行。</p>
+ * <p>All cases use a fixed batch of 1 (a larger batch when fast completion is needed) to accurately observe each tick's
+ * phase advance. The full flow is driven by {@link #awaitScanFinished(ScanManager)}: briefly yielding the CPU between
+ * ticks and setting a deadline, avoiding dependence on runner speed and avoiding infinite test runs when the state machine
+ * stalls.</p>
  */
 class ScanManagerTest {
 
     private static final long TICK_BUDGET_NANOS = 1_000_000L;
-    /** 等待扫描结束的默认超时，避免慢 runner 上无限等待。 */
+    /** Default timeout for waiting for the scan to finish, avoiding infinite waits on a slow runner. */
     private static final long SCAN_TIMEOUT_SECONDS = 10L;
-    /** tick 之间的让渡时间，给 SolveWorker 等异步线程留出调度机会。 */
+    /** Yield time between ticks, giving async threads such as SolveWorker a chance to be scheduled. */
     private static final long TICK_PAUSE_MILLIS = 2L;
 
     private static ScanManager.SnapshotData data(int itemCount, int recipeCount) {
@@ -350,7 +351,7 @@ class ScanManagerTest {
                 "管线内部请求的取消信号应在下一次 tick 被调度器观察");
     }
     // ------------------------------------------------------------------
-    // Phase 27：分片采集 + 工作线程求解
+    // Phase 27: sharded collection + worker-thread solving
     // ------------------------------------------------------------------
 
     @Test
@@ -919,25 +920,25 @@ class ScanManagerTest {
     }
 
     /**
-     * 反复 tick 直到扫描结束，并在每次 tick 之间短暂让出 CPU。
+     * Repeatedly ticks until the scan finishes, briefly yielding the CPU between ticks.
      *
-     * <p>tick 本身不会等待工作线程：连续空转时慢 runner 上可能跑满 tick 上限而扫描仍处于
-     * {@link ScanPhase#SOLVING}。这里使用截止时间而不是固定 tick 数，确保异步求解有时间把
-     * 结果交回，同时避免状态机卡死时测试无限运行。</p>
+     * <p>A tick itself does not wait for the worker thread: when spinning continuously, a slow runner may exhaust the tick
+     * cap while the scan is still {@link ScanPhase#SOLVING}. A deadline is used here instead of a fixed tick count, ensuring
+     * the async solve has time to hand back its result while avoiding infinite test runs when the state machine stalls.</p>
      *
-     * @param manager 待驱动的扫描调度器
-     * @return 实际调用的 tick 次数
+     * @param manager the scan scheduler to drive
+     * @return the number of ticks actually invoked
      */
     private static int awaitScanFinished(ScanManager manager) {
         return awaitScanFinished(manager, () -> { });
     }
 
     /**
-     * 反复 tick 直到扫描结束，每次 tick 后执行观察回调。
+     * Repeatedly ticks until the scan finishes, running the observation callback after each tick.
      *
-     * @param manager   待驱动的扫描调度器
-     * @param afterTick 每次 tick 后的观察动作，可为空
-     * @return 实际调用的 tick 次数
+     * @param manager   the scan scheduler to drive
+     * @param afterTick observation action after each tick, may be empty
+     * @return the number of ticks actually invoked
      */
     private static int awaitScanFinished(ScanManager manager, Runnable afterTick) {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(SCAN_TIMEOUT_SECONDS);
@@ -957,7 +958,7 @@ class ScanManagerTest {
     }
 
     /**
-     * 短暂让出 CPU，使工作线程有机会完成 {@code Future} 并让下一次 tick 观察到结果。
+     * Briefly yields the CPU so the worker thread can complete the {@code Future} and the next tick can observe the result.
      */
     private static void pauseForWorker() {
         try {

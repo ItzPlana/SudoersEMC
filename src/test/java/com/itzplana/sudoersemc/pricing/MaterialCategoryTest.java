@@ -5,10 +5,10 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import org.junit.jupiter.api.Test;
 
 /**
- * 材料类别识别测试。
+ * Material category recognition tests.
  *
- * <p>标签解析必须同时支持带命名空间和不带命名空间、单数与复数形式，无法识别时返回
- * {@link MaterialCategory#UNKNOWN} 而不是抛异常。</p>
+ * <p>Tag parsing must support both namespaced and non-namespaced, singular and plural forms, returning
+ * {@link MaterialCategory#UNKNOWN} rather than throwing when unrecognised.</p>
  */
 class MaterialCategoryTest {
 
@@ -71,7 +71,7 @@ class MaterialCategoryTest {
 
     @Test
     void categoryCountIsStable() {
-        // 类别是相对价格的锚点，数量变化会影响配置兼容性；此处锁定当前设计。
+        // Categories are anchors for relative prices; a count change would affect config compatibility, so the current design is locked here.
         assertEquals(10, MaterialCategory.values().length);
         assertEquals(MaterialCategory.UNKNOWN, MaterialCategory.values()[MaterialCategory.values().length - 1]);
     }

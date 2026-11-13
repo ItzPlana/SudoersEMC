@@ -18,7 +18,7 @@ import net.minecraft.world.item.Items;
 import org.junit.jupiter.api.Test;
 
 /**
- * {@link VariantScanner} 的单元测试，覆盖去重、过滤、上限与排序。
+ * Unit tests for {@link VariantScanner}, covering deduplication, filtering, capping and ordering.
  */
 class VariantScannerTest {
 
@@ -29,7 +29,7 @@ class VariantScannerTest {
     private static final ItemStack DAMAGEABLE_STACK;
 
     static {
-        // Forge 的 ItemStack 静态初始化需要 BuiltInRegistries，因此测试前必须先完成引导。
+        // Forge's ItemStack static initialisation needs BuiltInRegistries, so bootstrap must complete before the test.
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
         BASE_STACK = new ItemStack(Items.STONE);
@@ -120,7 +120,7 @@ class VariantScannerTest {
                 containerTag("projecte:klein_star_omega", 100L),
                 containerTag("projecte:klein_star_omega", 200L)), 10);
 
-        // 不同存储量对应不同容器价值，必须保留为不同变体；数量仍受 scan limit 约束。
+        // Different stored amounts mean different container values and must be kept as distinct variants; the count is still bounded by the scan limit.
         assertEquals(2, keys.size());
         assertTrue(keys.get(0).variantHash().contains("StoredEMC"));
         assertTrue(keys.get(1).variantHash().contains("StoredEMC"));
@@ -175,7 +175,7 @@ class VariantScannerTest {
         assertTrue(scanner.scan(DAMAGEABLE_STACK, List.of(tag), 10).isEmpty(),
                 "可损坏物品的默认伤害标签不是经济变体");
 
-        // 宽松策略：非可损坏物品不存在伤害语义，{Damage:0} 同样按无变体处理。
+        // Lenient policy: non-damageable items have no damage semantics, so {Damage:0} is likewise treated as no variant.
         assertTrue(scanner.scan(BASE_STACK, List.of(tag), 10).isEmpty(),
                 "非可损坏物品的 {Damage:0} 也按无变体处理");
     }

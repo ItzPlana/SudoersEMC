@@ -3,59 +3,61 @@ package com.itzplana.sudoersemc.pricing;
 import java.util.Locale;
 
 /**
- * 物品的材料类别。
+ * Material category of an item.
  *
- * <p>标签只表示“材料关系”，并不表示两种物品的价值相同。例如 {@code forge:ingots/iron}
- * 与 {@code forge:ingots/gold} 都属于 {@link #INGOT}，但它们的实际价值差异很大。
- * 因此类别只是相对价格的锚点，具体数值由 {@link TagPricing} 的配置决定。</p>
+ * <p>A tag only expresses a "material relationship", not that two items have equal value. For example
+ * {@code forge:ingots/iron} and {@code forge:ingots/gold} are both {@link #INGOT}, yet their real values
+ * differ greatly. The category is therefore only an anchor for relative price; the concrete number is
+ * decided by {@link TagPricing}'s configuration.</p>
  *
- * <p>本枚举是纯计算类型，不读取 Minecraft 的标签注册表；标签路径由调用方解析后传入。</p>
+ * <p>This enum is a pure calculation type and does not read Minecraft's tag registry; tag paths are
+ * resolved by the caller and passed in.</p>
  */
 public enum MaterialCategory {
 
-    /** 锭类材料，例如 {@code forge:ingots/iron}。 */
+    /** Ingot materials, e.g. {@code forge:ingots/iron}. */
     INGOT,
 
-    /** 粒类材料，例如 {@code forge:nuggets/iron}。 */
+    /** Nugget materials, e.g. {@code forge:nuggets/iron}. */
     NUGGET,
 
-    /** 宝石类材料，例如 {@code forge:gems/diamond}。 */
+    /** Gem materials, e.g. {@code forge:gems/diamond}. */
     GEM,
 
-    /** 粉类材料，例如 {@code forge:dusts/redstone}。 */
+    /** Dust materials, e.g. {@code forge:dusts/redstone}. */
     DUST,
 
-    /** 粗矿类材料，例如 {@code forge:raw_materials/iron}。 */
+    /** Raw material ores, e.g. {@code forge:raw_materials/iron}. */
     RAW_MATERIAL,
 
-    /** 储存块类材料，例如 {@code forge:storage_blocks/iron}。 */
+    /** Storage block materials, e.g. {@code forge:storage_blocks/iron}. */
     STORAGE_BLOCK,
 
-    /** 板材类材料，例如 {@code forge:plates/iron}。 */
+    /** Plate materials, e.g. {@code forge:plates/iron}. */
     PLATE,
 
-    /** 棒材类材料，例如 {@code forge:rods/iron}。 */
+    /** Rod materials, e.g. {@code forge:rods/iron}. */
     ROD,
 
-    /** 矿石类材料，例如 {@code forge:ores/iron}。 */
+    /** Ore materials, e.g. {@code forge:ores/iron}. */
     ORE,
 
-    /** 无法识别的材料类别。 */
+    /** Unrecognised material category. */
     UNKNOWN;
 
     /**
-     * 从标签路径推断材料类别。
+     * Infers the material category from a tag path.
      *
-     * <p>支持带命名空间（{@code forge:ingots/iron}、{@code create:plates/iron}）和不带命名空间
-     * （{@code ingots/iron}）两种写法，并同时接受单数与复数形式（例如 {@code ingot} 与
-     * {@code ingots}）。无法识别、空白或 {@code null} 的路径统一返回 {@link #UNKNOWN}，
-     * 本方法不会抛出异常。</p>
+     * <p>Supports both namespaced ({@code forge:ingots/iron}, {@code create:plates/iron}) and
+     * non-namespaced ({@code ingots/iron}) forms, and accepts singular and plural (e.g. {@code ingot} and
+     * {@code ingots}). Unrecognised, blank or {@code null} paths all return {@link #UNKNOWN}; this method
+     * never throws.</p>
      *
-     * <p>只读取命名空间之后的第一段路径作为类别名，因此 {@code forge:ores/iron/deepslate}
-     * 这类更深的标签同样会被识别为 {@link #ORE}。</p>
+     * <p>Only the first path segment after the namespace is read as the category name, so deeper tags such
+     * as {@code forge:ores/iron/deepslate} are also recognised as {@link #ORE}.</p>
      *
-     * @param tagPath 标签路径，例如 {@code forge:storage_blocks/iron}
-     * @return 对应的材料类别，无法识别时返回 {@link #UNKNOWN}
+     * @param tagPath tag path, e.g. {@code forge:storage_blocks/iron}
+     * @return the corresponding material category; {@link #UNKNOWN} when unrecognised
      */
     public static MaterialCategory fromTagPath(String tagPath) {
         if (tagPath == null) {

@@ -6,10 +6,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import org.junit.jupiter.api.Test;
 
 /**
- * {@link AutoScanPolicy} 的启动自动扫描判定测试。
+ * Startup auto-scan decision tests for {@link AutoScanPolicy}.
  *
- * <p>覆盖总开关、强制重扫、从未扫描、空存储与已有缓存五类状态，确保服务器启动时不会
- * 重复扫描，也不会在缺少缓存时静默跳过。</p>
+ * <p>Covers five states — master switch, forced rescan, never scanned, empty store and existing cache — ensuring the
+ * server does not rescan redundantly at startup, nor silently skip when the cache is missing.</p>
  */
 class AutoScanPolicyTest {
 

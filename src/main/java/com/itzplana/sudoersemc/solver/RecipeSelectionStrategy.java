@@ -3,31 +3,34 @@ package com.itzplana.sudoersemc.solver;
 import org.jetbrains.annotations.Nullable;
 
 /**
- * 同一物品存在多条可行配方时的取舍策略。
+ * Tie-break strategy when several viable recipes exist for one item.
  *
- * <p><strong>经济安全：</strong>所有策略都以成本为第一排序键，只改变“成本相同时”的
- * 选择顺序。因此任何策略都不会让求解器接受高于最低可行成本的配方。</p>
+ * <p><strong>Economic safety:</strong> every strategy uses cost as the primary sort key and only changes
+ * the order "when costs are equal". No strategy ever lets the solver accept a recipe above the lowest
+ * viable cost.</p>
  *
  * <ul>
- *   <li>{@link #LOWEST_COST}：成本相同时按配方 id 字典序，行为与 Phase 22 及更早版本一致，
- *       也是默认值；</li>
- *   <li>{@link #PREFER_SIMPLE}：成本相同时优先输入槽更少、输出更少、容器返还更少且非催化剂的
- *       配方，最后仍以配方 id 兜底，便于管理员偏好简单配方；</li>
- *   <li>{@link #STABLE_ID}：成本相同时显式按配方 id 字典序选择，保证跨运行与跨版本的稳定性。</li>
+ *   <li>{@link #LOWEST_COST}: on equal cost, lexicographic recipe id; matches Phase 22 and earlier, and
+ *       is the default;</li>
+ *   <li>{@link #PREFER_SIMPLE}: on equal cost, prefers fewer input slots, fewer outputs, fewer container
+ *       remainders and non-catalyst recipes, finally falling back to recipe id, so admins can prefer
+ *       simple recipes;</li>
+ *   <li>{@link #STABLE_ID}: on equal cost, explicitly selects by lexicographic recipe id for stability
+ *       across runs and versions.</li>
  * </ul>
  */
 public enum RecipeSelectionStrategy {
 
-    /** 最低成本，成本相同时按配方 id 字典序（默认）。 */
+    /** Lowest cost; on equal cost, lexicographic recipe id (default). */
     LOWEST_COST("lowest_cost"),
 
-    /** 最低成本，成本相同时优先更简单的配方，最后按配方 id 字典序。 */
+    /** Lowest cost; on equal cost, prefer simpler recipes, finally lexicographic recipe id. */
     PREFER_SIMPLE("prefer_simple"),
 
-    /** 最低成本，成本相同时显式按配方 id 字典序。 */
+    /** Lowest cost; on equal cost, explicitly lexicographic recipe id. */
     STABLE_ID("stable_id");
 
-    /** 默认策略，保持 Phase 22 的行为。 */
+    /** Default strategy, preserving Phase 22 behaviour. */
     public static final RecipeSelectionStrategy DEFAULT = LOWEST_COST;
 
     private final String configValue;
@@ -37,17 +40,17 @@ public enum RecipeSelectionStrategy {
     }
 
     /**
-     * @return 配置文件使用的稳定小写名称
+     * @return the stable lowercase name used in the config file
      */
     public String configValue() {
         return configValue;
     }
 
     /**
-     * 解析配置值。比较时忽略首尾空白与大小写。
+     * Parses a config value, ignoring leading/trailing whitespace and case.
      *
-     * @param rawValue 原始配置值，可为 {@code null}
-     * @return 解析后的策略；无法识别时返回 {@code null}，由调用方决定回退与告警
+     * @param rawValue raw config value, may be {@code null}
+     * @return the parsed strategy; {@code null} when unrecognised, leaving fallback and warning to the caller
      */
     @Nullable
     public static RecipeSelectionStrategy parse(@Nullable String rawValue) {
@@ -64,8 +67,8 @@ public enum RecipeSelectionStrategy {
     }
 
     /**
-     * @param rawValue 原始配置值
-     * @return 是否为可识别的策略名称（忽略大小写与首尾空白）
+     * @param rawValue raw config value
+     * @return whether it is a recognisable strategy name (ignoring case and leading/trailing whitespace)
      */
     public static boolean isValid(@Nullable String rawValue) {
         return parse(rawValue) != null;

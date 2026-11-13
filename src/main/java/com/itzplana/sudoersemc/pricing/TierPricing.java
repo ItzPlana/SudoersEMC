@@ -7,39 +7,40 @@ import java.util.Objects;
 import java.util.Optional;
 
 /**
- * 基于层级规则的兜底定价。
+ * Tier-rule-based fallback pricing.
  *
- * <p>规则严格按照注册顺序求值，第一个匹配且真正生效的规则决定结果：</p>
+ * <p>Rules are evaluated strictly in registration order; the first matching rule that actually takes
+ * effect decides the result:</p>
  * <ol>
- *   <li>{@code exclude == true}：返回 {@code Optional.of(0L)}，表示“明确排除，不要定价”；</li>
- *   <li>{@code fixedValue != null}：返回该固定值，即使同一条规则同时配置了倍率；</li>
- *   <li>{@code multiplier != 1.0}：{@link #price} 返回空，调用方应通过 {@link #multiplierFor}
- *       取得倍率并缩放自己的基准值。</li>
+ *   <li>{@code exclude == true}: returns {@code Optional.of(0L)}, meaning "explicitly excluded, do not price";</li>
+ *   <li>{@code fixedValue != null}: returns that fixed value, even if the same rule also configures a multiplier;</li>
+ *   <li>{@code multiplier != 1.0}: {@link #price} returns empty; the caller should obtain the multiplier
+ *       via {@link #multiplierFor} and scale its own base value.</li>
  * </ol>
  *
- * <p>引擎不得内置大型模组物品清单。{@link #defaults()} 只包含少量与原版机制相关的通用规则，
- * 其余内容应由配置提供。</p>
+ * <p>The engine must not embed large mod item lists. {@link #defaults()} contains only a few generic
+ * rules tied to vanilla mechanics; everything else should come from configuration.</p>
  */
 public final class TierPricing {
 
-    /** 规则匹配方式。 */
+    /** How a rule matches. */
     public enum Type {
-        /** 按命名空间匹配，例如 {@code minecraft}。 */
+        /** Match by namespace, e.g. {@code minecraft}. */
         NAMESPACE,
-        /** 按完整物品 id 匹配，例如 {@code minecraft:iron_ingot}。 */
+        /** Match by full item id, e.g. {@code minecraft:iron_ingot}. */
         EXACT_ID,
-        /** 按物品路径包含的子串匹配，例如 {@code _ore}。 */
+        /** Match by a substring contained in the item path, e.g. {@code _ore}. */
         PATH_CONTAINS
     }
 
     /**
-     * 一条层级规则。
+     * One tier rule.
      *
-     * @param type       匹配方式
-     * @param pattern    匹配模式，构造时会去除首尾空白并转为小写
-     * @param multiplier 倍率，仅在未配置固定值且未排除时通过 {@link #multiplierFor} 暴露
-     * @param fixedValue 固定价格；为 {@code null} 表示不指定固定价格
-     * @param exclude    是否明确排除该物品
+     * @param type       match mode
+     * @param pattern    match pattern; trimmed and lowercased at construction
+     * @param multiplier multiplier, exposed via {@link #multiplierFor} only when no fixed value is set and not excluded
+     * @param fixedValue fixed price; {@code null} means no fixed price specified
+     * @param exclude    whether to explicitly exclude the item
      */
     public record TierRule(Type type, String pattern, double multiplier, Long fixedValue, boolean exclude) {
 
@@ -63,7 +64,7 @@ public final class TierPricing {
     private final List<TierRule> rules;
 
     /**
-     * @param rules 按优先级排列的规则列表，允许为空但不可为 {@code null}
+     * @param rules rules in priority order; may be empty but not {@code null}
      */
     public TierPricing(List<TierRule> rules) {
         Objects.requireNonNull(rules, "rules");
@@ -71,14 +72,15 @@ public final class TierPricing {
     }
 
     /**
-     * 按注册顺序计算物品价格。
+     * Computes an item's price in registration order.
      *
-     * <p>排除规则返回 {@code Optional.of(0L)}；固定值规则返回其固定值；纯倍率规则返回空，
-     * 因为倍率必须作用在调用方的基准值上。物品为 {@code null} 或没有规则命中时返回
-     * {@link Optional#empty()}。本方法不会抛出异常。</p>
+     * <p>An exclusion rule returns {@code Optional.of(0L)}; a fixed-value rule returns its fixed value; a
+     * pure-multiplier rule returns empty, because the multiplier must apply to the caller's base value.
+     * Returns {@link Optional#empty()} when the item is {@code null} or no rule matches. This method never
+     * throws.</p>
      *
-     * @param item 待定价物品
-     * @return 固定价格、排除标记（{@code 0L}）或空
+     * @param item the item to price
+     * @return a fixed price, an exclusion marker ({@code 0L}), or empty
      */
     public Optional<Long> price(ItemKey item) {
         if (item == null) {
@@ -102,13 +104,14 @@ public final class TierPricing {
     }
 
     /**
-     * 返回第一个命中的纯倍率规则的倍率，供调用方缩放自己的基准值。
+     * Returns the multiplier of the first matching pure-multiplier rule, for the caller to scale its own
+     * base value.
      *
-     * <p>如果先命中排除规则或固定值规则，则倍率不再有意义，返回 {@code 1.0}。
-     * 没有任何规则命中时同样返回 {@code 1.0}。</p>
+     * <p>If an exclusion rule or fixed-value rule matches first, the multiplier is no longer meaningful
+     * and {@code 1.0} is returned. {@code 1.0} is also returned when no rule matches.</p>
      *
-     * @param item 待查询物品
-     * @return 倍率，默认 {@code 1.0}
+     * @param item the item to query
+     * @return the multiplier, default {@code 1.0}
      */
     public double multiplierFor(ItemKey item) {
         if (item == null) {
@@ -129,20 +132,22 @@ public final class TierPricing {
     }
 
     /**
-     * @return 不可变的规则列表视图
+     * @return immutable view of the rule list
      */
     public List<TierRule> rules() {
         return rules;
     }
 
     /**
-     * 通用默认规则：只排除没有生存获取途径或没有经济意义的原版物品，不包含任何模组专属清单。
+     * Generic default rules: only exclude vanilla items with no survival obtainment path or no economic
+     * meaning; contains no mod-specific list.
      *
-     * <p>这些物品要么只能在创造模式获得（基岩、屏障、命令方块、结构方块、刷怪笼），
-     * 要么根本不存在于正常游戏中（空气、调试棒）。给它们定价会凭空创造 EMC，
-     * 因此必须排除。具体模组的物品清单应由配置提供，引擎不得内置。</p>
+     * <p>These items are either creative-only (bedrock, barrier, command block, structure block, spawner)
+     * or do not exist in normal gameplay at all (air, debug stick). Pricing them would create EMC out of
+     * nothing, so they must be excluded. Mod-specific item lists should come from configuration; the
+     * engine must not embed them.</p>
      *
-     * @return 默认层级定价器
+     * @return the default tier pricer
      */
     public static TierPricing defaults() {
         return new TierPricing(List.of(
@@ -160,12 +165,12 @@ public final class TierPricing {
                 new TierRule(Type.EXACT_ID, "minecraft:repeating_command_block", 1.0D, null, true),
                 new TierRule(Type.EXACT_ID, "minecraft:command_block_minecart", 1.0D, null, true),
                 new TierRule(Type.EXACT_ID, "minecraft:spawner", 1.0D, null, true),
-                // 调试棒与知识之书任何命名空间下都没有经济意义，用路径包含匹配更稳健。
+                // The debug stick and knowledge book have no economic meaning under any namespace; path-contains matching is more robust.
                 new TierRule(Type.PATH_CONTAINS, "debug_stick", 1.0D, null, true),
                 new TierRule(Type.PATH_CONTAINS, "knowledge_book", 1.0D, null, true),
-                // 刷怪蛋没有生存获取途径，给它们定价会让刷怪变成资源来源。
+                // Spawn eggs have no survival obtainment path; pricing them would make mob spawning a resource source.
                 new TierRule(Type.PATH_CONTAINS, "spawn_egg", 1.0D, null, true),
-                // 正在生长的紫水晶簇只能用精准采集获得，无法作为材料流转。
+                // A growing amethyst cluster can only be obtained with Silk Touch and cannot circulate as a material.
                 new TierRule(Type.EXACT_ID, "minecraft:budding_amethyst", 1.0D, null, true)
         ));
     }

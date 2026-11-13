@@ -59,9 +59,6 @@ public record ConfigValidationResult(boolean valid, List<String> errors, List<St
         return new ConfigValidationResult(false, errors, warnings);
     }
 
-    /**
-     * @return 是否至少存在一条警告
-     */
     public boolean hasWarnings() {
         return !warnings.isEmpty();
     }

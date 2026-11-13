@@ -7,19 +7,21 @@ import java.util.Objects;
 import java.util.OptionalLong;
 
 /**
- * 有界的 LRU 变体价格缓存。
+ * Bounded LRU variant-price cache.
  *
- * <p>缓存最多保存 {@code maxEntries} 个 {@link ItemKey}。容量已满时，最久未使用的条目在
- * 容量满时被淘汰。所有访问可变状态的方法都在同一把锁上同步，可从多个线程安全访问；命中与
- * 未命中计数只统计 {@link #get(ItemKey)} 调用，{@link #clear()} 会同时清空计数。</p>
+ * <p>The cache holds at most {@code maxEntries} {@link ItemKey}s. When full, the least-recently-used
+ * entry is evicted. All methods that touch mutable state synchronise on the same lock, so it is safe to
+ * access from multiple threads; hit/miss counters count only {@link #get(ItemKey)} calls, and
+ * {@link #clear()} resets the counters too.</p>
  *
- * <p>容量按条目数计算，不限制单个 {@code variantHash} 的字节长度；调用方仍需为变体哈希
- * 设置长度上限，避免超大容器 NBT 占用过多内存。</p>
+ * <p>Capacity is counted by entries, not by the byte length of an individual {@code variantHash};
+ * callers must still cap variant-hash length so oversized container NBT does not consume too much
+ * memory.</p>
  */
 public final class VariantCache {
 
     /**
-     * 未显式指定容量时使用的默认条目上限。
+     * Default entry limit used when no capacity is specified explicitly.
      */
     public static final int DEFAULT_MAX_ENTRIES = 4096;
 
@@ -29,8 +31,8 @@ public final class VariantCache {
     private long misses;
 
     /**
-     * @param maxEntries 最多缓存的条目数，必须大于等于 1
-     * @throws IllegalArgumentException 当 {@code maxEntries < 1}
+     * @param maxEntries maximum cached entries, must be >= 1
+     * @throws IllegalArgumentException when {@code maxEntries < 1}
      */
     public VariantCache(int maxEntries) {
         if (maxEntries < 1) {
@@ -46,10 +48,10 @@ public final class VariantCache {
     }
 
     /**
-     * 查询缓存并更新命中/未命中计数。
+     * Looks up the cache and updates hit/miss counters.
      *
-     * @param key 物品键
-     * @return 缓存的 EMC；不存在时返回空
+     * @param key item key
+     * @return the cached EMC; empty when absent
      */
     public synchronized OptionalLong get(ItemKey key) {
         Objects.requireNonNull(key, "key");
@@ -63,10 +65,10 @@ public final class VariantCache {
     }
 
     /**
-     * 写入或更新一个条目。
+     * Writes or updates an entry.
      *
-     * @param key   物品键
-     * @param value 非负 EMC
+     * @param key   item key
+     * @param value non-negative EMC
      */
     public synchronized void put(ItemKey key, long value) {
         Objects.requireNonNull(key, "key");
@@ -74,14 +76,14 @@ public final class VariantCache {
     }
 
     /**
-     * @return 当前缓存条目数，永不超过 {@link #maxEntries()}
+     * @return current cached entry count, never above {@link #maxEntries()}
      */
     public synchronized int size() {
         return entries.size();
     }
 
     /**
-     * 清空缓存并把命中/未命中计数归零。
+     * Clears the cache and zeroes the hit/miss counters.
      */
     public synchronized void clear() {
         entries.clear();
@@ -90,21 +92,21 @@ public final class VariantCache {
     }
 
     /**
-     * @return 自上次清空以来成功命中的次数
+     * @return successful hits since the last clear
      */
     public synchronized long hitCount() {
         return hits;
     }
 
     /**
-     * @return 自上次清空以来未命中的次数
+     * @return misses since the last clear
      */
     public synchronized long missCount() {
         return misses;
     }
 
     /**
-     * @return 构造时指定的容量上限
+     * @return the capacity limit given at construction
      */
     public int maxEntries() {
         return maxEntries;

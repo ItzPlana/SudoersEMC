@@ -3,22 +3,24 @@ package com.itzplana.sudoersemc.task;
 import java.util.Objects;
 
 /**
- * 扫描进度的一次不可变快照。
+ * Immutable snapshot of scan progress.
  *
- * <p>{@code processed} 与 {@code total} 描述当前阶段的完成度。{@code total} 为 0 表示总量
- * 尚未知（例如快照尚未采集），此时 {@link #fraction()} 返回 0。{@code startedAtMillis}
- * 在整次扫描期间保持不变，便于调用方显示从请求扫描开始计算的总耗时；
- * {@code lastUpdateMillis} 则随每次 {@link #advance} 更新。</p>
+ * <p>{@code processed} and {@code total} describe the current phase's completion. {@code total} of 0
+ * means the total is not yet known (e.g. the snapshot has not been collected), in which case
+ * {@link #fraction()} returns 0. {@code startedAtMillis} stays constant for the whole scan so callers can
+ * show total elapsed time since the scan was requested; {@code lastUpdateMillis} updates on every
+ * {@link #advance}.</p>
  *
- * <p>本记录本身不可变，但不负责线程安全发布。{@link ScanManager} 通过 {@code volatile}
- * 字段保存最新实例，读取方因此总能看到字段完整的进度对象，而不会观察到写了一半的状态。</p>
+ * <p>This record is itself immutable but does not handle thread-safe publication. {@link ScanManager}
+ * stores the latest instance in a {@code volatile} field, so readers always see a fully-populated
+ * progress object rather than a half-written state.</p>
  *
- * @param phase            当前阶段
- * @param processed        当前阶段已处理数量，构造时会被夹到合法范围
- * @param total            当前阶段总数量；小于等于 0 表示未知
- * @param startedAtMillis  扫描开始时的 {@link System#currentTimeMillis()}，不得为负
- * @param lastUpdateMillis 最近一次进度更新的时间戳，不得为负
- * @param detail           面向用户的中文细节说明；{@code null} 会被归一化为空串
+ * @param phase            current phase
+ * @param processed        processed count in the current phase, clamped to a legal range at construction
+ * @param total            total count in the current phase; <= 0 means unknown
+ * @param startedAtMillis  {@link System#currentTimeMillis()} at scan start, must not be negative
+ * @param lastUpdateMillis timestamp of the most recent progress update, must not be negative
+ * @param detail           user-facing Chinese detail text; {@code null} is normalised to an empty string
  */
 public record ScanProgress(
         ScanPhase phase,
@@ -38,52 +40,52 @@ public record ScanProgress(
             throw new IllegalArgumentException("lastUpdateMillis 必须 >= 0，实际为 " + lastUpdateMillis);
         }
         if (total > 0) {
-            // 已知总量时，已处理数量必须落在 [0, total] 内。
+            // When the total is known, the processed count must lie within [0, total].
             processed = Math.max(0, Math.min(total, processed));
         } else {
-            // 总量未知时仍不允许出现负的完成数量。
+            // Even when the total is unknown, a negative completed count is not allowed.
             processed = Math.max(0, processed);
         }
         detail = detail == null ? "" : detail;
     }
 
     /**
-     * 返回当前阶段完成比例。
+     * Returns the current phase's completion fraction.
      *
-     * @return 总量未知时返回 0.0；否则返回 {@code min(1.0, processed / total)}
+     * @return 0.0 when the total is unknown; otherwise {@code min(1.0, processed / total)}
      */
     public double fraction() {
         return total <= 0 ? 0.0 : Math.min(1.0, processed / (double) total);
     }
 
     /**
-     * 返回从扫描开始到最近一次更新的耗时。
+     * Returns the elapsed time from scan start to the most recent update.
      *
-     * @return 非负毫秒数；若时间戳顺序异常则返回 0
+     * @return non-negative milliseconds; 0 if the timestamp order is anomalous
      */
     public long elapsedMillis() {
         return Math.max(0L, lastUpdateMillis - startedAtMillis);
     }
 
     /**
-     * @return 当前阶段是否仍在推进，等价于 {@link ScanPhase#isActive()}
+     * @return whether the current phase is still in progress, equivalent to {@link ScanPhase#isActive()}
      */
     public boolean isRunning() {
         return phase.isActive();
     }
 
     /**
-     * 基于当前进度生成下一个进度快照。
+     * Produces the next progress snapshot from the current one.
      *
-     * <p>{@code startedAtMillis} 原样保留，{@code lastUpdateMillis} 取当前系统时间。
-     * 新对象的 {@code processed}/{@code total} 会由构造器重新校验并夹取，因此调用方
-     * 可以传入尚未夹取的累计值。</p>
+     * <p>{@code startedAtMillis} is preserved as-is and {@code lastUpdateMillis} takes the current system
+     * time. The new object's {@code processed}/{@code total} are re-validated and clamped by the
+     * constructor, so callers may pass un-clamped accumulated values.</p>
      *
-     * @param phase     下一阶段
-     * @param processed 下一阶段的已处理数量
-     * @param total     下一阶段的总数量
-     * @param detail    中文细节说明，可为 {@code null}
-     * @return 全新的进度实例，绝不修改当前实例
+     * @param phase     the next phase
+     * @param processed processed count for the next phase
+     * @param total     total count for the next phase
+     * @param detail    Chinese detail text, may be {@code null}
+     * @return a brand-new progress instance; never modifies the current instance
      */
     public ScanProgress advance(ScanPhase phase, int processed, int total, String detail) {
         return new ScanProgress(phase, processed, total, startedAtMillis,
@@ -91,9 +93,9 @@ public record ScanProgress(
     }
 
     /**
-     * 创建空闲状态下的初始进度。
+     * Creates the initial progress for the idle state.
      *
-     * @return 阶段为 {@link ScanPhase#IDLE}、进度为零且不具备运行语义的实例
+     * @return an instance with phase {@link ScanPhase#IDLE}, zero progress and no running semantics
      */
     public static ScanProgress idle() {
         return new ScanProgress(ScanPhase.IDLE, 0, 0, 0L, 0L, "");

@@ -12,10 +12,10 @@ import net.minecraft.resources.ResourceLocation;
 import org.junit.jupiter.api.Test;
 
 /**
- * 材料标签定价测试。
+ * Material tag pricing tests.
  *
- * <p>重点是“标签只表示材料关系，不代表价值相同”这一约束：类别基准值只是锚点，
- * 按物品覆盖值优先于类别基准值。</p>
+ * <p>Focuses on the constraint "a tag only expresses a material relationship, not equal value": the category base
+ * value is just an anchor, and a per-item override takes priority over the category base value.</p>
  */
 class TagPricingTest {
 
@@ -54,7 +54,7 @@ class TagPricingTest {
     void firstRecognisedCategoryInListOrderWins() {
         TagPricing pricing = pricing();
 
-        // 同一物品可能同时属于多个标签；按传入顺序取第一个“已配置基准值”的类别
+        // The same item may belong to multiple tags; take the first category with a configured base value in the given order
         long value = pricing.price(item("mixed"), List.of(
                 "forge:miscellaneous/mixed",
                 "forge:storage_blocks/mixed",
@@ -78,7 +78,7 @@ class TagPricingTest {
     void categoryWithoutConfiguredBaseValueIsSkipped() {
         TagPricing pricing = pricing();
 
-        // PLATE 没有配置基准值，应继续寻找下一个可用的类别
+        // PLATE has no configured base value, so keep looking for the next usable category
         long value = pricing.price(item("plate_or_ingot"), List.of(
                 "forge:plates/iron",
                 "forge:ingots/iron")).orElseThrow();
@@ -113,7 +113,7 @@ class TagPricingTest {
 
     @Test
     void unknownCategoryBaseValueIsNeverUsed() {
-        // 即使配置里写了 UNKNOWN，也不应被当作真实类别命中
+        // Even if UNKNOWN is written in the config, it must not be hit as a real category
         TagPricing pricing = new TagPricing(
                 Map.of(MaterialCategory.UNKNOWN, 9_999L, MaterialCategory.INGOT, 256L),
                 Map.of());

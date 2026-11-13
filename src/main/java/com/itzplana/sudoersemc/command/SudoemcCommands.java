@@ -29,7 +29,6 @@ public final class SudoemcCommands {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("sudoersemc/command/SudoemcCommands");
 
-    /** 命令根节点名称。 */
     public static final String ROOT_LITERAL = "sudoemc";
 
     /** 所有子命令要求的最小权限等级：2 代表管理员。 */
@@ -83,9 +82,6 @@ public final class SudoemcCommands {
                         .executes(context -> execute(context.getSource(), CommandService::cancel)));
     }
 
-    /**
-     * 输出命令帮助文本。
-     */
     private static int help(CommandContext<CommandSourceStack> context) {
         CommandSourceStack source = context.getSource();
         send(source, "SudoersEMC 命令:");
@@ -99,17 +95,11 @@ public final class SudoemcCommands {
         return Command.SINGLE_SUCCESS;
     }
 
-    /**
-     * 解析 {@code explain} 的物品参数并委托给命令服务。
-     */
     private static int explain(CommandContext<CommandSourceStack> context) {
         ResourceLocation item = ResourceLocationArgument.getId(context, "item");
         return execute(context.getSource(), commandService -> commandService.explain(item.toString()));
     }
 
-    /**
-     * 解析 {@code approve} 的物品参数并委托给命令服务。
-     */
     private static int approve(CommandContext<CommandSourceStack> context) {
         String item = StringArgumentType.getString(context, "item");
         // 审计要求：记录谁批准了哪条隔离记录；前后值与结果由 CommandService 记录。
@@ -153,7 +143,8 @@ public final class SudoemcCommands {
     }
 
     /**
-     * 向命令来源发送一行反馈文本。
+     * Sends one feedback line to the source only (never broadcast to other admins); a
+     * {@code null} line is sent as empty text so output never throws.
      */
     private static void send(CommandSourceStack source, String line) {
         String safeLine = line == null ? "" : line;

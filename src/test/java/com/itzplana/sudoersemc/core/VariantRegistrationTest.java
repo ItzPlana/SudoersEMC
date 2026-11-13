@@ -9,9 +9,10 @@ import net.minecraft.resources.ResourceLocation;
 import org.junit.jupiter.api.Test;
 
 /**
- * {@link VariantRegistration} 的纯逻辑测试。
+ * Pure-logic tests for {@link VariantRegistration}.
  *
- * <p>不依赖 Minecraft 引导：只验证规范 key、原始 SNBT 的去重、排序与数量封顶。</p>
+ * <p>No Minecraft bootstrap required: only verifies the canonical key, raw-SNBT deduplication, ordering and count
+ * capping.</p>
  */
 class VariantRegistrationTest {
 

@@ -25,10 +25,10 @@ import net.minecraft.world.item.crafting.ShapelessRecipe;
 import org.junit.jupiter.api.Test;
 
 /**
- * {@link RecipeScanner} 输出 SNBT 保留行为的单元测试。
+ * Unit tests for {@link RecipeScanner}'s output SNBT preservation behaviour.
  *
- * <p>测试只覆盖不依赖配方管理器的转换路径，因此不需要启动服务器；Forge 的
- * {@code ItemStack} 静态初始化需要注册表，测试前先完成引导。</p>
+ * <p>Tests only cover conversion paths that do not depend on the recipe manager, so no server startup is needed; Forge's
+ * {@code ItemStack} static initialisation needs registries, so bootstrap completes before the test.</p>
  */
 class RecipeScannerTest {
 
@@ -196,8 +196,8 @@ class RecipeScannerTest {
     }
 
     /**
-     * 复现真实服务器场景：{@code Stream.toList()} 返回不可变列表，直接 sort 会抛
-     * {@link UnsupportedOperationException}。
+     * Reproduces a real server scenario: {@code Stream.toList()} returns an immutable list, and sorting it directly
+     * throws {@link UnsupportedOperationException}.
      */
     private static final class FixedRecipeManager extends RecipeManager {
 

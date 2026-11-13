@@ -52,9 +52,6 @@ public final class DebugLog {
         }
     }
 
-    /**
-     * @return 当前是否开启调试日志
-     */
     public static boolean isEnabled() {
         return enabled;
     }

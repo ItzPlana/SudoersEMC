@@ -23,10 +23,11 @@ import net.minecraft.resources.ResourceLocation;
 import org.junit.jupiter.api.Test;
 
 /**
- * 求解器行为验证。
+ * Solver behaviour verification.
  *
- * <p>覆盖 Plan 第 3 阶段要求的全部场景：多轮收敛、多级链、多输出、取整、缺失输入、循环依赖、
- * 多配方竞争、防抬高、轮数上限、已有值保护与确定性。</p>
+ * <p>Covers all scenarios required by Plan phase 3: multi-pass convergence, multi-stage chains, multi-output, flooring,
+ * missing inputs, cyclic dependencies, competing recipes, anti-inflation, pass cap, existing-value protection and
+ * determinism.</p>
  */
 class RecipeSolverTest {
 
@@ -133,7 +134,7 @@ class RecipeSolverTest {
         SolveResult result = SOLVER.solve(recipes, new SolveContext(Map.of(ore, 100L)), REGISTRY,
                 SolveSettings.defaults());
 
-        // 100 / 3 = 33.33，向下取整为 33
+        // 100 / 3 = 33.33, floored to 33
         assertEquals(Map.of(nugget, 33L), result.values());
     }
 
@@ -184,7 +185,7 @@ class RecipeSolverTest {
         SolveResult result = splitSolver.solve(recipes, new SolveContext(Map.of(input, 100L)), REGISTRY,
                 SolveSettings.defaults());
 
-        // 100 分摊到 1 + 4 = 5 个单位
+        // 100 spread over 1 + 4 = 5 units
         assertEquals(20L, result.values().get(primary));
         assertEquals(20L, result.values().get(byproduct));
     }
@@ -364,15 +365,15 @@ class RecipeSolverTest {
         List<RecipeSnapshot> recipes = List.of(
                 recipe("costs_more", RecipeKind.SHAPED, List.of(in(expensive)), List.of(out(product, 1))));
 
-        // 预置一个较低的生成值，模拟“前一轮已经发布过更低的价”；输入本身必须有值，否则配方无法解析
+        // Seed a lower generated value to simulate "a previous pass already published a lower price"; the input itself must have a value, otherwise the recipe cannot resolve
         SolveContext context = new SolveContext(Map.of(expensive, 50L));
         context.putGenerated(product, 10L, new ResourceLocation("sudoersemc", "seeded"),
                 PriceSource.RECIPE);
 
         SolveResult rejected = SOLVER.solve(recipes, context, REGISTRY, SolveSettings.defaults());
 
-        // SolveResult.values() 是上下文生成值的完整视图，预置的 10 本就存在于其中；
-        // 禁止抬价的关键断言是它没有被改写成 50。
+        // SolveResult.values() is a full view of the context's generated values, so the seeded 10 is already present;
+        // the key anti-inflation assertion is that it was not rewritten to 50.
         assertEquals(10L, rejected.values().get(product), "默认不允许抬价，应保留较低值");
         assertEquals(10L, context.generatedValue(product));
     }
@@ -418,7 +419,7 @@ class RecipeSolverTest {
     void zeroCostRecipeDoesNotPublishValue() {
         ItemKey freeInput = item("free_input");
         ItemKey product = item("free_product");
-        // 输入 EMC 为 1、输出 2 个 → 单位成本 1/2 向下取整为 0，不应发布
+        // Input EMC 1, output 2 → unit cost 1/2 floors to 0, must not be published
         List<RecipeSnapshot> recipes = List.of(
                 recipe("free_recipe", RecipeKind.FURNACE, List.of(in(freeInput)), List.of(out(product, 2))));
 

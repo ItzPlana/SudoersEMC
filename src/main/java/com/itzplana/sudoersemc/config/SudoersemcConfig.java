@@ -643,9 +643,6 @@ public final class SudoersemcConfig {
             Objects.requireNonNull(validation, "validation");
         }
 
-        /**
-         * @return 本次捕获是否产出了可用快照
-         */
         public boolean hasSnapshot() {
             return snapshot != null;
         }

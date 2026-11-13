@@ -15,14 +15,15 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * 通过反射读取 Goety 仪式配方的生产实现。
+ * Production implementation that reads Goety ritual recipes via reflection.
  *
- * <p>Goety 是可选依赖，因此本类不能在编译期引用任何 Goety 类型。四个访问器在首次使用时
- * 按名称解析并缓存；只有全部访问器都解析成功时 {@link #available()} 才返回 {@code true}，
- * 任何一项失败都会让读取器整体降级为不可用，从而避免「少算成本仍定价」。</p>
+ * <p>Goety is an optional dependency, so this class must not reference any Goety type at compile time.
+ * The four accessors are resolved by name on first use and cached; {@link #available()} returns
+ * {@code true} only when all accessors resolved successfully — any single failure degrades the whole
+ * reader to unavailable, avoiding "pricing while under-counting cost".</p>
  *
- * <p>Goety 未安装属于正常路径，只记录一次 debug；Goety 已加载但类或方法缺失则说明集成
- * 损坏，记录一次 warn。</p>
+ * <p>Goety not installed is a normal path and logs a single debug; Goety loaded but a class or method
+ * missing means a broken integration and logs a single warn.</p>
  */
 final class ReflectiveGoetyRitualAccess implements GoetyRitualAccess {
 
@@ -35,7 +36,8 @@ final class ReflectiveGoetyRitualAccess implements GoetyRitualAccess {
     private static final ClassResolver DEFAULT_CLASS_RESOLVER = Class::forName;
 
     /**
-     * 类查找接缝；生产环境使用 {@link Class#forName(String)}，测试可注入自定义实现。
+     * Class-lookup seam; production uses {@link Class#forName(String)}, tests can inject a custom
+     * implementation.
      */
     @FunctionalInterface
     interface ClassResolver {
@@ -44,7 +46,7 @@ final class ReflectiveGoetyRitualAccess implements GoetyRitualAccess {
     }
 
     /**
-     * 生产环境共享实例；解析结果在 JVM 生命周期内缓存。
+     * Shared production instance; resolution results are cached for the JVM lifetime.
      */
     static final ReflectiveGoetyRitualAccess INSTANCE = new ReflectiveGoetyRitualAccess();
 
@@ -106,7 +108,7 @@ final class ReflectiveGoetyRitualAccess implements GoetyRitualAccess {
         if (value instanceof Ingredient ingredient) {
             return FieldRead.ok(ingredient);
         }
-        // 防御性适配：若未来版本把激活物品改为直接返回 ItemStack，仍能给出正确成本。
+        // Defensive adaptation: if a future version changes the activation item to return ItemStack directly, the correct cost is still produced.
         if (value instanceof ItemStack stack) {
             return FieldRead.ok(stack.isEmpty() ? Ingredient.EMPTY : Ingredient.of(stack));
         }
@@ -144,7 +146,7 @@ final class ReflectiveGoetyRitualAccess implements GoetyRitualAccess {
         }
         Object value;
         try {
-            // 1.20.1 中 getResultItem(RegistryAccess) 只返回预构造的堆叠，传 null 是安全的。
+            // In 1.20.1 getResultItem(RegistryAccess) only returns a pre-built stack, so passing null is safe.
             value = method.invoke(recipe, (Object) null);
         } catch (Throwable failure) {
             return FieldRead.failed(unwrap(failure));
@@ -174,7 +176,7 @@ final class ReflectiveGoetyRitualAccess implements GoetyRitualAccess {
     }
 
     /**
-     * 解析 Goety 类与四个访问器。只有全部成功时才标记为可用。
+     * Resolves the Goety class and the four accessors. Marked available only when all succeed.
      */
     private Resolved resolveAccessors() {
         boolean loaded;
@@ -195,10 +197,11 @@ final class ReflectiveGoetyRitualAccess implements GoetyRitualAccess {
     }
 
     /**
-     * 包级测试钩子：跳过 Forge 模块探测，用指定类查找器解析 Goety 配方类与访问器。
+     * Package-level test hook: skips Forge mod probing and resolves the Goety recipe class and accessors
+     * with the given class resolver.
      *
-     * <p>生产环境由 {@link #resolveAccessors()} 先确认 Goety 已加载；该入口用于覆盖
-     * 类缺失、类初始化失败与方法签名漂移等边界。</p>
+     * <p>In production {@link #resolveAccessors()} first confirms Goety is loaded; this entry point covers
+     * boundaries such as missing class, class-initialisation failure and method-signature drift.</p>
      */
     static Resolved resolveAccessors(ClassResolver classResolver) {
         Class<?> ritualClass;
@@ -213,10 +216,11 @@ final class ReflectiveGoetyRitualAccess implements GoetyRitualAccess {
     }
 
     /**
-     * 解析指定配方类的四个访问器；任一解析失败都整体降级为不可用。
+     * Resolves the four accessors of the given recipe class; any resolution failure degrades the whole to
+     * unavailable.
      *
-     * <p>{@link RuntimeException} 与 {@link LinkageError}（例如方法签名引用的可选类型缺失）
-     * 都只让 Goety 集成降级，不能穿透到整轮扫描。</p>
+     * <p>{@link RuntimeException} and {@link LinkageError} (e.g. an optional type referenced by a method
+     * signature is missing) only degrade the Goety integration and must not pierce the whole scan.</p>
      */
     static Resolved resolveAccessors(Class<?> ritualClass) {
         Objects.requireNonNull(ritualClass, "ritualClass");
@@ -246,10 +250,11 @@ final class ReflectiveGoetyRitualAccess implements GoetyRitualAccess {
     }
 
     /**
-     * 解析单个访问器。
+     * Resolves a single accessor.
      *
-     * <p>先尝试 {@link Class#getMethod(String, Class[])}（public 方法），失败后沿类层次查找
-     * 声明方法并尝试 {@code setAccessible(true)}。返回值类型不符合预期时按不可用处理。</p>
+     * <p>First tries {@link Class#getMethod(String, Class[])} (public method); on failure walks the class
+     * hierarchy for a declared method and tries {@code setAccessible(true)}. A return type that does not
+     * match expectations is treated as unavailable.</p>
      */
     @Nullable
     private static Method findAccessor(Class<?> owner, String name, String field,
@@ -306,7 +311,8 @@ final class ReflectiveGoetyRitualAccess implements GoetyRitualAccess {
     }
 
     /**
-     * 访问器返回值类型必须与业务层期望一致，否则视为签名漂移。
+     * The accessor return type must match what the business layer expects, otherwise it is treated as
+     * signature drift.
      */
     private static boolean compatibleReturnType(String field, Class<?> returnType) {
         return switch (field) {
@@ -323,7 +329,7 @@ final class ReflectiveGoetyRitualAccess implements GoetyRitualAccess {
     }
 
     /**
-     * 去掉反射包装，保留真正的业务异常用于日志。
+     * Strips reflection wrappers, keeping the real business exception for logging.
      */
     private static Throwable unwrap(Throwable failure) {
         Throwable current = failure;
@@ -334,7 +340,7 @@ final class ReflectiveGoetyRitualAccess implements GoetyRitualAccess {
     }
 
     /**
-     * 反射解析结果；不可用时四个方法均为 {@code null}。
+     * Reflection resolution result; when unavailable all four methods are {@code null}.
      */
     record Resolved(boolean available,
                     @Nullable Method ingredients,

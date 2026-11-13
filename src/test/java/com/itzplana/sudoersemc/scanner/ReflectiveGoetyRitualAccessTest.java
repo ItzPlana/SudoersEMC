@@ -11,10 +11,10 @@ import net.minecraft.world.item.crafting.Ingredient;
 import org.junit.jupiter.api.Test;
 
 /**
- * {@link ReflectiveGoetyRitualAccess} 的解析失败语义测试。
+ * Resolution-failure semantics tests for {@link ReflectiveGoetyRitualAccess}.
  *
- * <p>通过包级 {@link ReflectiveGoetyRitualAccess.ClassResolver} 接缝与静态解析入口，
- * 在没有 Goety 的纯 JVM 中覆盖类缺失、类链接失败、方法缺失与返回类型漂移。</p>
+ * <p>Via the package-level {@link ReflectiveGoetyRitualAccess.ClassResolver} seam and the static resolution entry point,
+ * covers missing class, class linkage failure, missing method and return-type drift in a pure JVM without Goety.</p>
  */
 class ReflectiveGoetyRitualAccessTest {
 
@@ -48,13 +48,13 @@ class ReflectiveGoetyRitualAccessTest {
     }
 
     /**
-     * 四个访问器全部缺失的配方类。
+     * Recipe class with all four accessors missing.
      */
     public static final class NoAccessors {
     }
 
     /**
-     * {@code getIngredients} 返回类型漂移的配方类。
+     * Recipe class whose {@code getIngredients} return type has drifted.
      */
     public static final class ReturnTypeDrift {
 
@@ -76,7 +76,7 @@ class ReflectiveGoetyRitualAccessTest {
     }
 
     /**
-     * 与 Goety 2.5.60.6 签名一致的配方类。
+     * Recipe class matching the Goety 2.5.60.6 signatures.
      */
     public static final class ValidRitual {
 

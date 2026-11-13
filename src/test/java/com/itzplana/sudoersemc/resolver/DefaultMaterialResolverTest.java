@@ -17,12 +17,12 @@ import net.minecraft.world.item.Items;
 import org.junit.jupiter.api.Test;
 
 /**
- * {@link DefaultMaterialResolver} 的单元测试，覆盖容器内容、数量与耐久折价规则。
+ * Unit tests for {@link DefaultMaterialResolver}, covering container contents, count and durability discount rules.
  */
 class DefaultMaterialResolverTest {
 
     static {
-        // Forge 的 ItemStack 静态初始化需要 BuiltInRegistries，因此测试前必须先完成引导。
+        // Forge's ItemStack static initialisation needs BuiltInRegistries, so bootstrap must complete before the test.
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
     }
@@ -172,7 +172,7 @@ class DefaultMaterialResolverTest {
     }
 
     private static DefaultMaterialResolver storedEmcResolver(ToLongFunction<ItemKey> lookup) {
-        // 测试用：显式接受任意内容物为 EMC holder，以便用原版物品验证叠加/饱和逻辑。
+        // For tests: explicitly accept any contents as an EMC holder so vanilla items can verify the stacking/saturation logic.
         return new DefaultMaterialResolver(lookup, stack -> true);
     }
 

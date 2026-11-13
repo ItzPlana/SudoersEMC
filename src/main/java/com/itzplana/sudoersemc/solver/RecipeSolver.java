@@ -26,60 +26,71 @@ import java.util.function.BooleanSupplier;
 import net.minecraft.resources.ResourceLocation;
 
 /**
- * 递归配方求解器：反复扫描配方，把已知 EMC 传播给尚未定价的物品，直到数值不再变化或达到轮数上限。
+ * Iterative recipe solver: repeatedly scans recipes, propagating known EMC to unpriced items until
+ * values stop changing or the pass limit is reached.
  *
- * <h2>轮次与快照语义</h2>
- * <p>每一轮开始时，所有配方都基于<strong>本轮开始前</strong>的状态求值，本轮产生的候选值在全部配方
- * 评估完成后才统一写入。因此下游配方只能看到上一轮的结果：{@code A → B → C} 这样的链条每轮前进
- * 一环，结果与配方提交顺序无关。配方始终按 id 的字符串形式升序评估，保证同输入必然得到同输出。</p>
+ * <h2>Pass and snapshot semantics</h2>
+ * <p>Within a pass every recipe is evaluated against the state <strong>as of the start of that
+ * pass</strong>; candidates produced during the pass are published only after all recipes have been
+ * evaluated. Downstream recipes therefore only see the previous pass's results: a chain
+ * {@code A → B → C} advances one link per pass, independent of recipe submission order. Recipes are
+ * always evaluated in ascending order of their id's string form, so identical input yields identical
+ * output.</p>
  *
- * <h2>多配方竞争</h2>
- * <p>同一轮中，多条配方可能产出同一个物品。求解器收集该物品的全部有效正值成本，始终选择成本
- * 最低者；成本相同时按 {@link SolveSettings#selectionStrategy()} 决定取舍（默认按 id 字典序，
- * 也可优先简单配方或显式稳定 id）。其余不同成本写入 {@link SolveTrace#alternativeCosts()}，
- * 按升序排列并受 {@link SolveSettings#maxAlternativeCostsPerItem()} 限制。</p>
+ * <h2>Competing recipes</h2>
+ * <p>Several recipes may produce the same item in one pass. The solver collects every valid positive
+ * cost for that item and always picks the lowest; ties are broken by
+ * {@link SolveSettings#selectionStrategy()} (default: lexicographic id; optionally prefer simpler
+ * recipes or an explicit stable id). The remaining distinct costs are recorded in
+ * {@link SolveTrace#alternativeCosts()}, sorted ascending and capped by
+ * {@link SolveSettings#maxAlternativeCostsPerItem()}.</p>
  *
- * <h2>评估缓存</h2>
- * <p>单条配方的评估结果按“配方内容 + 评估策略 + 输入值快照 + 评估器注册表”缓存。缓存使用
- * 有界 LRU，默认容量 {@value #DEFAULT_EVALUATION_CACHE_CAPACITY}，输入值变化会自然产生新的键，
- * 因此跨轮次与跨扫描复用不会返回陈旧结果，也不会无界增长。</p>
+ * <h2>Evaluation cache</h2>
+ * <p>A single recipe's evaluation is cached by "recipe content + evaluation policy + input-value
+ * snapshot + evaluator registry". The cache is a bounded LRU with default capacity
+ * {@value #DEFAULT_EVALUATION_CACHE_CAPACITY}; changed input values naturally produce a new key, so
+ * reuse across passes and across scans never returns stale results and never grows unbounded.</p>
  *
- * <h2>不抬价规则（精确语义）</h2>
+ * <h2>No-price-increase rule (exact semantics)</h2>
  * <ul>
- *   <li>运行开始前已有 EMC 的物品永远不发布新值，种子值完全胜出。</li>
- *   <li>已有种子值的物品：永远胜出，不发布生成值。</li>
- *   <li>{@link SolveContext#isDenied(ItemKey)} 为 {@code true} 的物品：不发布生成值，且其数值
- *       不会作为下游配方的输入。</li>
- *   <li>本次运行中尚未生成值的物品：直接发布本轮最低有效成本。</li>
- *   <li>本次运行中已经生成值的物品：更低成本总是替换旧值；相同成本不产生变化；
- *       更高成本仅在 {@link SolveSettings#allowValueIncrease()} 为 {@code true} 时替换，
- *       否则保留旧值。因此默认配置下本轮值只会下降或保持不变。</li>
+ *   <li>Items that already had EMC before the run never receive a new value; the seed wins outright.</li>
+ *   <li>Items with a seed value: always win, no generated value is published.</li>
+ *   <li>Items for which {@link SolveContext#isDenied(ItemKey)} is {@code true}: no generated value is
+ *       published, and their value is never used as a downstream recipe input.</li>
+ *   <li>Items with no generated value yet this run: publish this pass's lowest valid cost directly.</li>
+ *   <li>Items already generated this run: a lower cost always replaces the old value; an equal cost
+ *       changes nothing; a higher cost replaces only when
+ *       {@link SolveSettings#allowValueIncrease()} is {@code true}, otherwise the old value is kept.
+ *       Under the default configuration a value can only drop or stay the same within a run.</li>
  * </ul>
  *
- * <h2>零值与循环</h2>
- * <p>成本 {@code <= 0} 的配方不会产生可支付的值：该物品不会写入，若没有其它正值配方，则进入
- * {@link SolveResult#unresolvedItems()} 并让对应配方进入未解析列表。轮次结束后使用迭代式
- * Kosaraju 算法（无递归）在“未定价物品”依赖图上检测强连通分量，成环物品会写入
- * {@link SolveResult#cyclicItems()}，不会无限重试。</p>
+ * <h2>Zero values and cycles</h2>
+ * <p>A recipe whose cost is {@code <= 0} produces no payable value: the item is not written, and if no
+ * other positive-cost recipe exists it enters {@link SolveResult#unresolvedItems()} and the recipe
+ * enters the unresolved list. After the passes, an iterative (non-recursive) Kosaraju algorithm
+ * detects strongly connected components in the "unpriced item" dependency graph; items on a cycle are
+ * written to {@link SolveResult#cyclicItems()} rather than retried forever.</p>
  *
- * <p>求解器对单条配方抛出的 {@link RuntimeException} 做隔离：计数后继续处理其余配方，绝不因一条
- * 坏配方中断整轮求解。</p>
+ * <p>A {@link RuntimeException} thrown by a single recipe is isolated: it is counted and the remaining
+ * recipes continue; one bad recipe never aborts the whole solve.</p>
  *
- * <p>{@link SolveContext} 表示一次运行的工作状态，调用方应为每次求解创建新实例；求解器不会清理
- * 其中已有的生成值。</p>
+ * <p>{@link SolveContext} is the working state of one run; callers should create a fresh instance per
+ * solve. The solver does not clear generated values already present in it.</p>
  */
 public final class RecipeSolver {
 
     /**
-     * 单次求解器实例的默认缓存容量。
+     * Default cache capacity for a single solver instance.
      *
-     * <p>缓存使用访问序 {@link LinkedHashMap} 实现的有界 LRU，超过容量后自动淘汰最久未使用的条目。
-     * 键包含配方内容、评估策略、评估器注册表与输入值快照，因此输入变化天然失效；有界容量保证
-     * 跨扫描复用不会无界增长。默认容量 8192 足以覆盖常见整合包的单轮配方图。</p>
+     * <p>The cache is a bounded LRU backed by an access-ordered {@link LinkedHashMap}; once capacity is
+     * exceeded the least-recently-used entry is evicted. The key includes recipe content, evaluation
+     * policy, evaluator registry and the input-value snapshot, so input changes invalidate naturally;
+     * the bound guarantees reuse across scans cannot grow without limit. 8192 covers a typical
+     * modpack's single-pass recipe graph.</p>
      */
     public static final int DEFAULT_EVALUATION_CACHE_CAPACITY = 8_192;
 
-    /** 每处理多少个配方检查一次取消信号。 */
+    /** How many recipes are processed between cooperative cancellation checks. */
     static final int CANCEL_CHECK_INTERVAL = 64;
 
     private final EvaluationPolicy basePolicy;
@@ -89,30 +100,31 @@ public final class RecipeSolver {
     private final AtomicLong cacheMisses = new AtomicLong();
 
     /**
-     * 使用 {@link EvaluationPolicy#defaults()} 作为基础策略创建求解器。
+     * Creates a solver using {@link EvaluationPolicy#defaults()} as the base policy.
      */
     public RecipeSolver() {
         this(EvaluationPolicy.defaults(), DEFAULT_EVALUATION_CACHE_CAPACITY);
     }
 
     /**
-     * 使用自定义基础策略创建求解器。
+     * Creates a solver with a custom base policy.
      *
-     * <p>基础策略控制是否抵扣容器残留、是否给副产物定价；{@link SolveSettings#minimumEmc()} 会在每次
-     * 求解时覆盖基础策略中的最小值。多输出配方在 {@code priceSecondaryOutputs == true} 时会把同一个
-     * 单位值发布给所有输出物品，否则只发布主输出。</p>
+     * <p>The base policy controls whether container remainders are credited and whether byproducts are
+     * priced; {@link SolveSettings#minimumEmc()} overrides the policy's minimum on every solve. With
+     * {@code priceSecondaryOutputs == true} a multi-output recipe publishes the same unit value to every
+     * output item; otherwise only the primary output is published.</p>
      *
-     * @param basePolicy 基础评估策略，不能为 {@code null}
+     * @param basePolicy base evaluation policy, must not be {@code null}
      */
     public RecipeSolver(EvaluationPolicy basePolicy) {
         this(basePolicy, DEFAULT_EVALUATION_CACHE_CAPACITY);
     }
 
     /**
-     * 测试/嵌入式构造函数：允许指定评估缓存容量。
+     * Test/embedded constructor: allows specifying the evaluation cache capacity.
      *
-     * @param basePolicy           基础评估策略，不能为 {@code null}
-     * @param evaluationCacheCapacity 缓存容量，必须 {@code >= 0}；0 表示禁用缓存
+     * @param basePolicy           base evaluation policy, must not be {@code null}
+     * @param evaluationCacheCapacity cache capacity, must be {@code >= 0}; 0 disables the cache
      */
     public RecipeSolver(EvaluationPolicy basePolicy, int evaluationCacheCapacity) {
         this.basePolicy = Objects.requireNonNull(basePolicy, "basePolicy");
@@ -132,21 +144,21 @@ public final class RecipeSolver {
     }
 
     /**
-     * @return 累计缓存命中次数（跨求解调用累计）
+     * @return cumulative cache hits (accumulated across solve calls)
      */
     public long cacheHits() {
         return cacheHits.get();
     }
 
     /**
-     * @return 累计缓存未命中次数（跨求解调用累计）
+     * @return cumulative cache misses (accumulated across solve calls)
      */
     public long cacheMisses() {
         return cacheMisses.get();
     }
 
     /**
-     * @return 当前缓存条目数量，不会超过构造时指定的容量
+     * @return current number of cached entries, never above the capacity given at construction
      */
     public int cacheSize() {
         synchronized (evaluationCache) {
@@ -155,7 +167,8 @@ public final class RecipeSolver {
     }
 
     /**
-     * 清空评估缓存。计数器不会重置，便于调用方按扫描统计命中率。
+     * Clears the evaluation cache. Hit/miss counters are not reset, so callers can compute per-scan
+     * hit rates.
      */
     public void clearEvaluationCache() {
         synchronized (evaluationCache) {
@@ -164,16 +177,16 @@ public final class RecipeSolver {
     }
 
     /**
-     * 执行一次完整的配方求解。
+     * Runs a complete recipe solve.
      *
-     * <p>方法本身不修改传入的配方列表；所有写入都发生在 {@code context} 中。返回结果中的值、轨迹和
-     * 诊断集合都是不可变副本。</p>
+     * <p>This method does not modify the supplied recipe list; all writes go into {@code context}. The
+     * values, traces and diagnostic sets in the returned result are immutable copies.</p>
      *
-     * @param recipes  待评估配方；允许为空，{@code null} 元素会被忽略
-     * @param context  本次运行的工作状态，已有 EMC 从这里读取，生成值写入这里
-     * @param registry 评估器注册表
-     * @param settings 收敛与诊断参数
-     * @return 不可变的求解结果；即使所有配方都失败也会正常返回
+     * @param recipes  recipes to evaluate; may be empty, {@code null} elements are ignored
+     * @param context  working state for this run; existing EMC is read from it and generated values written to it
+     * @param registry evaluator registry
+     * @param settings convergence and diagnostic parameters
+     * @return immutable solve result; returns normally even if every recipe fails
      */
     public SolveResult solve(List<RecipeSnapshot> recipes, SolveContext context,
                              EvaluatorRegistry registry, SolveSettings settings) {
@@ -181,18 +194,19 @@ public final class RecipeSolver {
     }
 
     /**
-     * 带协作式取消检查的求解入口。
+     * Solve entry point with a cooperative cancellation check.
      *
-     * <p>取消检查每 {@value #CANCEL_CHECK_INTERVAL} 个配方执行一次，开销远低于单次配方评估。
-     * 取消时停止当前轮剩余配方并返回已经产生的部分结果；调用方应丢弃该结果（管线不会再写入
-     * 存储），只把它用于部分诊断报告。</p>
+     * <p>The check runs every {@value #CANCEL_CHECK_INTERVAL} recipes, far cheaper than a single recipe
+     * evaluation. On cancellation the remaining recipes of the current pass are skipped and the partial
+     * result produced so far is returned; callers should discard that result (the pipeline will not write
+     * it to the store) and use it only for a partial diagnostic report.</p>
      *
-     * @param recipes      待评估配方；允许为空，{@code null} 元素会被忽略
-     * @param context      本次运行的工作状态
-     * @param registry     评估器注册表
-     * @param settings     收敛与诊断参数
-     * @param cancellation 取消检查；返回 {@code true} 时尽快停止
-     * @return 不可变的求解结果；取消时 {@code converged=false} 且只包含已处理部分
+     * @param recipes      recipes to evaluate; may be empty, {@code null} elements are ignored
+     * @param context      working state for this run
+     * @param registry     evaluator registry
+     * @param settings     convergence and diagnostic parameters
+     * @param cancellation cancellation check; stop as soon as it returns {@code true}
+     * @return immutable solve result; on cancellation {@code converged=false} and only the processed part is included
      */
     public SolveResult solve(List<RecipeSnapshot> recipes, SolveContext context,
                              EvaluatorRegistry registry, SolveSettings settings,
@@ -220,11 +234,11 @@ public final class RecipeSolver {
         boolean converged = false;
         boolean cancelled = false;
 
-        // 整个运行期间观察到的未解析输入，最终会过滤掉后来被定价的物品。
+        // Unresolved inputs observed across the whole run; items priced later are filtered out at the end.
         Set<ItemKey> observedUnresolvedInputs = new TreeSet<>();
-        // 有效但成本为 0 的输出，只有最终仍无正值时才进入未解析诊断。
+        // Valid but zero-cost outputs; only reported as unresolved if they still have no positive value at the end.
         Set<ItemKey> zeroCostItems = new TreeSet<>();
-        // 最后一轮的“配方 -> 未解析输入”，供循环检测使用。
+        // Last pass's "recipe -> unresolved inputs" map, used for cycle detection.
         Map<ResourceLocation, List<ItemKey>> lastUnresolvedInputs = new LinkedHashMap<>();
 
         for (int pass = 1; pass <= settings.maxPasses(); pass++) {
@@ -256,7 +270,7 @@ public final class RecipeSolver {
                     try {
                         evaluation = registry.evaluate(recipe, context, policy);
                     } catch (RuntimeException exception) {
-                        // 评估器已经做了同样的隔离，这里再兜底一次，保证求解循环绝不中断。
+                        // The registry already isolates evaluator failures; this is a second safety net so the solve loop never aborts.
                         evaluation = RecipeEvaluation.invalid(
                                 "solver-evaluator-error:" + exception.getClass().getSimpleName());
                     }
@@ -275,7 +289,7 @@ public final class RecipeSolver {
                                     .add(new CostCandidate(unitValue, recipe.id(), recipe));
                         }
                     } else {
-                        // 免费配方不产生可支付的值，先记录，最终仍无正值时再报告。
+                        // A free recipe yields no payable value; record it and only report if no positive value appears by the end.
                         zeroCostItems.addAll(targets);
                     }
                 } else if (!evaluation.unresolvedInputs().isEmpty()) {
@@ -286,20 +300,20 @@ public final class RecipeSolver {
             }
 
             if (cancelled) {
-                // 不发布部分轮次的候选，避免把只评估了一半的配方图当成有效中间状态。
+                // Do not publish a partially evaluated pass; a half-evaluated recipe graph is not a valid intermediate state.
                 break;
             }
 
-            // 本轮所有配方都评估完成后统一写入，确保同一轮内互不可见。
+            // Publish only after every recipe in this pass is evaluated, so results are invisible within the same pass.
             Comparator<CostCandidate> candidateOrder = candidateOrder(settings.selectionStrategy());
             for (Map.Entry<ItemKey, List<CostCandidate>> entry : candidatesByItem.entrySet()) {
                 ItemKey item = entry.getKey();
                 if (context.hasSeedValue(item)) {
-                    // 已有 EMC 永远胜出，连轨迹都不生成。
+                    // A pre-existing EMC seed always wins; not even a trace is generated.
                     continue;
                 }
                 if (context.isDenied(item)) {
-                    // 安全层禁止定价的物品不发布，也不会成为下游配方的输入。
+                    // Safety-denied items are never published and never become downstream recipe inputs.
                     continue;
                 }
                 List<CostCandidate> candidates = entry.getValue();
@@ -322,7 +336,7 @@ public final class RecipeSolver {
             }
 
             if (!valueChanged) {
-                // 完整的一轮没有任何数值变化，说明已经到达不动点。
+                // A full pass with no value change means a fixed point has been reached.
                 converged = true;
                 break;
             }
@@ -356,7 +370,7 @@ public final class RecipeSolver {
             }
         }
 
-        // 迭代式循环检测：只分析最终仍未定价的物品，单独记录真正成环的物品。
+        // Iterative cycle detection: only analyse items still unpriced at the end, recording those truly on a cycle.
         NavigableMap<ItemKey, NavigableSet<ItemKey>> dependencyGraph =
                 buildDependencyGraph(orderedRecipes, policy, context, lastUnresolvedInputs);
         Set<ItemKey> cyclicItems = findCyclicItems(unresolvedItems, dependencyGraph);
@@ -374,7 +388,7 @@ public final class RecipeSolver {
     }
 
     /**
-     * 读取评估缓存；容量为 0 时永远视为未命中。
+     * Reads the evaluation cache; a capacity of 0 is always treated as a miss.
      */
     private RecipeEvaluation cacheGet(EvaluationCacheKey key) {
         if (evaluationCacheCapacity == 0) {
@@ -386,8 +400,8 @@ public final class RecipeSolver {
     }
 
     /**
-     * 写入评估缓存；容量为 0 时直接丢弃。访问序 LRU 由构造时的
-     * {@code removeEldestEntry} 维护，因此跨扫描复用也不会无界增长。
+     * Writes the evaluation cache; a capacity of 0 discards the entry. The access-ordered LRU is
+     * maintained by {@code removeEldestEntry} from construction, so reuse across scans cannot grow unbounded.
      */
     private void cachePut(EvaluationCacheKey key, RecipeEvaluation evaluation) {
         if (evaluationCacheCapacity == 0) {
@@ -399,10 +413,11 @@ public final class RecipeSolver {
     }
 
     /**
-     * 构造“配方中所有可能被评估器读取的输入值”的稳定快照。
+     * Builds a stable snapshot of "every input value an evaluator might read for this recipe".
      *
-     * <p>键覆盖所有输入槽候选与容器返还物品，值来自当前 {@link SolveContext}（生成值优先）。
-     * 任一输入值变化都会改变缓存键，从而自然失效；未解析候选以 {@code 0} 参与快照。</p>
+     * <p>Keys cover all input-slot candidates and container-remainder items; values come from the current
+     * {@link SolveContext} (generated values first). Any input-value change alters the cache key and thus
+     * invalidates naturally; unresolved candidates participate as {@code 0}.</p>
      */
     private static List<String> inputValueSnapshot(RecipeSnapshot recipe, SolveContext context) {
         NavigableMap<String, Long> values = new TreeMap<>();
@@ -420,7 +435,8 @@ public final class RecipeSolver {
     }
 
     /**
-     * 按选择策略构造候选顺序。所有策略都以成本为第一键，绝不牺牲最低成本语义。
+     * Builds the candidate ordering for a selection strategy. Every strategy uses cost as the primary
+     * key, never sacrificing the lowest-cost semantics.
      */
     private static Comparator<CostCandidate> candidateOrder(RecipeSelectionStrategy strategy) {
         Comparator<CostCandidate> byId =
@@ -438,9 +454,10 @@ public final class RecipeSolver {
     }
 
     /**
-     * 计算一条配方需要发布值的输出物品。
+     * Computes the output items a recipe must publish a value for.
      *
-     * <p>默认策略只给主输出定价；显式开启副产物定价时，所有不同输出物品都会收到同一个单位值。</p>
+     * <p>The default policy prices only the primary output; when byproduct pricing is explicitly enabled,
+     * every distinct output item receives the same unit value.</p>
      */
     public static List<ItemKey> publicationTargets(RecipeSnapshot recipe, EvaluationPolicy policy) {
         Objects.requireNonNull(recipe, "recipe");
@@ -459,7 +476,8 @@ public final class RecipeSolver {
     }
 
     /**
-     * 收集除最低成本以外的不同有效成本，升序截断到配置上限。
+     * Collects the distinct valid costs other than the lowest, sorted ascending and truncated to the
+     * configured limit.
      */
     private static List<Long> alternativeCosts(List<CostCandidate> sortedCandidates,
                                                SolveSettings settings) {
@@ -485,7 +503,8 @@ public final class RecipeSolver {
     }
 
     /**
-     * 构建“输出物品 -> 无法满足的输入物品”的依赖图。只保留最终仍未定价的节点。
+     * Builds the "output item -> unsatisfiable input items" dependency graph, keeping only nodes still
+     * unpriced at the end.
      */
     private static NavigableMap<ItemKey, NavigableSet<ItemKey>> buildDependencyGraph(
             List<RecipeSnapshot> recipes,
@@ -516,11 +535,12 @@ public final class RecipeSolver {
     }
 
     /**
-     * 使用迭代式 Kosaraju 算法找出所有处于循环中的物品，避免递归深度受配方链长度影响。
+     * Finds every item on a cycle using an iterative Kosaraju algorithm, so recursion depth is not
+     * bounded by recipe-chain length.
      *
-     * @param nodes     参与分析的物品（最终仍未定价）
-     * @param adjacency 输出物品到阻塞输入的边
-     * @return 位于大小大于 1 的强连通分量中，或存在自依赖的物品
+     * @param nodes     items to analyse (still unpriced at the end)
+     * @param adjacency edges from output items to their blocking inputs
+     * @return items in a strongly connected component of size greater than 1, or with a self-dependency
      */
     private static Set<ItemKey> findCyclicItems(
             Set<ItemKey> nodes, Map<ItemKey, ? extends Set<ItemKey>> adjacency) {
@@ -540,7 +560,7 @@ public final class RecipeSolver {
             }
         }
 
-        // 第一次遍历：按完成顺序记录节点。
+        // First traversal: record nodes in finish order.
         List<ItemKey> finishOrder = new ArrayList<>(nodes.size());
         Set<ItemKey> visited = new HashSet<>();
         for (ItemKey start : nodes) {
@@ -566,7 +586,7 @@ public final class RecipeSolver {
             }
         }
 
-        // 第二次遍历：在反向图上收集强连通分量。
+        // Second traversal: collect strongly connected components on the reversed graph.
         Set<ItemKey> cyclic = new TreeSet<>();
         Set<ItemKey> assigned = new HashSet<>();
         for (int index = finishOrder.size() - 1; index >= 0; index--) {
@@ -595,7 +615,7 @@ public final class RecipeSolver {
         return cyclic;
     }
     /**
-     * 读取依赖边，缺失节点视为没有出边。
+     * Reads dependency edges; a missing node is treated as having no outgoing edges.
      */
     private static Set<ItemKey> dependenciesOf(
             Map<ItemKey, ? extends Set<ItemKey>> adjacency, ItemKey node) {
@@ -608,19 +628,22 @@ public final class RecipeSolver {
     }
 
     /**
-     * 一轮内某条配方对某个输出物品给出的单位成本。
+     * The unit cost one recipe gives for one output item within a pass.
      *
-     * <p>{@code recipe} 仅用于按选择策略比较配方复杂度，不参与经济计算。</p>
+     * <p>{@code recipe} is only used to compare recipe complexity under the selection strategy; it takes
+     * no part in the economic calculation.</p>
      */
     private record CostCandidate(long cost, ResourceLocation recipeId, RecipeSnapshot recipe) {
     }
 
     /**
-     * 评估缓存键。
+     * Evaluation cache key.
      *
-     * <p>配方记录本身按值比较（包含 id、类型、输入、输出、返还物、催化剂与属性），加上评估策略、
-     * 输入值快照和评估器注册表身份，保证任何影响单条配方评估结果的输入变化都会导致未命中。
-     * 注册表使用对象身份比较，避免不同评估器组合错误复用结果。</p>
+     * <p>The recipe record is compared by value (id, kind, inputs, outputs, remainders, catalyst and
+     * attributes), together with the evaluation policy, the input-value snapshot and the evaluator
+     * registry identity, so any input change that affects a single recipe's evaluation causes a miss.
+     * The registry is compared by object identity to avoid wrongly reusing results across different
+     * evaluator combinations.</p>
      */
     private record EvaluationCacheKey(
             RecipeSnapshot recipe,
