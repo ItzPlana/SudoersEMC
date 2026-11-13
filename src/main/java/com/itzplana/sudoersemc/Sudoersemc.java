@@ -98,6 +98,12 @@ public final class Sudoersemc {
     private static volatile boolean pendingReload;
     private static volatile ReloadDecision lastReloadDecision = ReloadDecision.REJECT;
 
+    /**
+     * 跨配置重载共享的重映射确认状态。ScanPipeline 会随配置重建，但“上次重映射失败”
+     * 或“仍在途”的保护不能丢，否则新管线首轮可能把写入前的旧值误判为外部修改。
+     */
+    private static final ScanPipeline.RemapTracker REMAP_TRACKER = new ScanPipeline.RemapTracker();
+
     public Sudoersemc() {
         IEventBus modEventBus = FMLJavaModLoadingContext.get().getModEventBus();
         modEventBus.addListener(this::onCommonSetup);
@@ -455,6 +461,7 @@ public final class Sudoersemc {
                 newOverflowPipeline,
                 newFallbackPricing,
                 newSolveSettings);
+        pipeline.setRemapTracker(REMAP_TRACKER);
         pipeline.setEmcProvider(OptionalIntegrationManager.provider().orElse(null));
         pipeline.setQuarantinedDropsStore(quarantineStore);
         pipeline.setConfigFingerprintSupplier(SudoersemcConfig::scanFingerprintEntries);
@@ -934,6 +941,8 @@ public final class Sudoersemc {
             resetLog.save();
         }
         pendingReload = false;
+        // 服务器会话结束：清空在途 future 与失败标记，避免跨世界泄漏保护状态。
+        REMAP_TRACKER.reset();
         // 不保留指向旧世界的命令服务；下一次 ServerStartedEvent 会重新注入。
         SudoemcCommands.setService(null);
     }

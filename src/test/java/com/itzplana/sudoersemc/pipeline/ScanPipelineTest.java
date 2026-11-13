@@ -896,39 +896,201 @@ class ScanPipelineTest {
         ItemSnapshot variantSnapshot =
                 ItemSnapshot.of(variant, false, 0L, List.of(), Rarity.COMMON);
 
+        // 复现 ProjectE 的 getExactValue 语义：只有 NBT 精确映射才返回非零。
         ItemSnapshot enriched = ScanPipeline.readVariantExistingValue(variantSnapshot,
                 new ItemScanner.EmcQuery() {
                     @Override
                     public boolean hasValue(ItemStack stack) {
-                        return stack.is(Items.STONE)
-                                && stack.getTag() != null
-                                && stack.getTag().getInt("Damage") == 5;
+                        return getValue(stack) > 0L;
                     }
 
                     @Override
                     public long getValue(ItemStack stack) {
-                        return 33L;
+                        // 模拟 ProjectE 回退到基础物品后的值；不能用于变体既有值。
+                        return stack.is(Items.STONE) ? 99L : 0L;
+                    }
+
+                    @Override
+                    public long getExactValue(ItemStack stack) {
+                        return stack.is(Items.STONE) ? 33L : 0L;
                     }
                 });
 
         assertTrue(enriched.hasExistingEmc(), "变体必须单独向后端回读既有值");
-        assertEquals(33L, enriched.existingValue());
+        assertEquals(33L, enriched.existingValue(), "必须采用精确 NBT 映射值而非基础回退值");
         assertEquals(variant, enriched.key());
         assertEquals("{Damage:5}", enriched.key().variantHash());
+    }
 
-        ItemSnapshot absent = ScanPipeline.readVariantExistingValue(variantSnapshot,
+    @Test
+    void variantWithOnlyInheritedBaseValueIsNotTreatedAsExisting() {
+        ItemKey variant = ItemKey.of(STONE_ID, "{Damage:5}");
+        ItemSnapshot variantSnapshot =
+                ItemSnapshot.of(variant, false, 0L, List.of(), Rarity.COMMON);
+
+        // ProjectE: hasValue == getValue > 0；未命中精确映射时 getValue 回退基础物品值。
+        ItemSnapshot inherited = ScanPipeline.readVariantExistingValue(variantSnapshot,
                 new ItemScanner.EmcQuery() {
                     @Override
                     public boolean hasValue(ItemStack stack) {
-                        return false;
+                        return getValue(stack) > 0L;
                     }
 
                     @Override
                     public long getValue(ItemStack stack) {
+                        return stack.is(Items.STONE) ? 64L : 0L;
+                    }
+
+                    @Override
+                    public long getExactValue(ItemStack stack) {
                         return 0L;
                     }
                 });
-        assertFalse(absent.hasExistingEmc(), "后端没有该变体值时保持无既有值");
+
+        assertFalse(inherited.hasExistingEmc(),
+                "基础物品有值不等于该 NBT 变体自身有值，否则变体永远不会发布新价");
+        assertEquals(0L, inherited.existingValue());
+        assertEquals(variant, inherited.key());
+    }
+
+    @Test
+    void collectSnapshotDataIgnoresInheritedBaseValueForVariants() {
+        ItemSnapshot stoneBase = ItemSnapshot.of(STONE, true, 64L);
+        RecipeSnapshot recipe = recipeWithNbt(STONE, "{Damage:3}");
+        ItemScanner.EmcQuery query = new ItemScanner.EmcQuery() {
+            @Override
+            public boolean hasValue(ItemStack stack) {
+                return getValue(stack) > 0L;
+            }
+
+            @Override
+            public long getValue(ItemStack stack) {
+                return stack.is(Items.STONE) ? 64L : 0L;
+            }
+
+            @Override
+            public long getExactValue(ItemStack stack) {
+                // 变体没有精确 NBT 映射，即使基础物品有值也必须返回 0。
+                return 0L;
+            }
+        };
+        ScanPipeline pipeline = pipeline(null, null, null, null, null, null, disabledFallback());
+
+        PipelineSnapshot snapshot = pipeline.collectSnapshotData(
+                List.of(stoneBase), new RecipeScanner.ScanResult(List.of(recipe), 0, 0, 0), query);
+
+        ItemKey variantKey = ItemKey.of(STONE_ID, "{Damage:3}");
+        ItemSnapshot variant = snapshot.items().stream()
+                .filter(item -> item.key().equals(variantKey))
+                .findFirst()
+                .orElseThrow();
+        assertFalse(variant.hasExistingEmc(), "变体快照不得继承基础物品的回退值");
+        assertFalse(snapshot.existingValues().containsKey(variantKey),
+                "回退值不得写入既有值映射，否则 RecipeSolver 永不发布该变体价格");
+        assertEquals(64L, snapshot.existingValues().get(STONE), "基础物品自身既有值仍应保留");
+    }
+
+    @Test
+    void snapshotKeepsRemapGenerationCapturedAtCollectStart() {
+        ScanPipeline pipeline = pipeline(null, null, null, null, null, null, disabledFallback());
+        ScanPipeline.RemapTracker tracker = new ScanPipeline.RemapTracker();
+        pipeline.setRemapTracker(tracker);
+        CompletableFuture<Void> remap = new CompletableFuture<>();
+        tracker.track(remap);
+        long before = tracker.generation();
+
+        ItemScanner.EmcQuery query = new ItemScanner.EmcQuery() {
+            @Override
+            public boolean hasValue(ItemStack stack) {
+                return false;
+            }
+
+            @Override
+            public long getValue(ItemStack stack) {
+                return 0L;
+            }
+
+            @Override
+            public long getExactValue(ItemStack stack) {
+                // 模拟重映射在采集过程中完成。
+                remap.complete(null);
+                return 0L;
+            }
+        };
+
+        PipelineSnapshot snapshot = pipeline.collectSnapshotData(
+                List.of(ItemSnapshot.of(STONE, false, 0L)),
+                new RecipeScanner.ScanResult(
+                        List.of(recipeWithNbt(STONE, "{Damage:3}")), 0, 0, 0),
+                query);
+
+        assertEquals(before, snapshot.remapGeneration(),
+                "快照必须记录采集开始时的代次，而不是读取完成后的代次");
+        assertEquals(before + 1L, tracker.generation(),
+                "采集期间完成的重映射必须推进代次");
+    }
+
+    @Test
+    void remapCompletedBetweenCollectAndApplySkipsStaleDriftDetection() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_remap_between_collect_and_apply.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 5L, PriceSource.RECIPE, null, true, 0L));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null, genericFallback(3L));
+
+        CompletableFuture<Void> remap = new CompletableFuture<>();
+        pipeline.trackRemapCompletion(remap);
+
+        PipelineSnapshot collected = pipeline.collectSnapshotData(
+                List.of(item(RESULT, 7L)),
+                new RecipeScanner.ScanResult(List.of(), 0, 0, 0),
+                null);
+        remap.complete(null);
+
+        PipelineResult result = pipeline.solveAndApply(collected);
+
+        assertEquals(0L, result.extraCounter("ownershipExternalModifications", -1L),
+                "重映射在 collect 结束后完成时，observed 值已经过期，本轮必须跳过漂移检测");
+        GeneratedEmcEntry kept = store.snapshotAll().get(RESULT);
+        assertNotNull(kept);
+        assertTrue(kept.owned(), "跳过漂移检测时不得释放所有权");
+
+        PipelineSnapshot next = pipeline.collectSnapshotData(
+                List.of(item(RESULT, 7L)),
+                new RecipeScanner.ScanResult(List.of(), 0, 0, 0),
+                null);
+        PipelineResult recovered = pipeline.solveAndApply(next);
+
+        assertEquals(1L, recovered.extraCounter("ownershipExternalModifications", -1L),
+                "下一轮快照携带新代次后必须恢复真实漂移检测");
+        assertFalse(store.snapshotAll().get(RESULT).owned());
+    }
+
+    @Test
+    void sharedRemapTrackerKeepsFailureProtectionAcrossPipelineRebuild() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_shared_remap_tracker.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 5L, PriceSource.RECIPE, null, true, 0L));
+        ScanPipeline.RemapTracker tracker = new ScanPipeline.RemapTracker();
+
+        ScanPipeline original = pipeline(
+                store, null, null, null, null, null, genericFallback(3L));
+        original.setRemapTracker(tracker);
+        original.trackRemapCompletion(CompletableFuture.failedFuture(
+                new IllegalStateException("remap failed")));
+
+        ScanPipeline rebuilt = pipeline(
+                store, null, null, null, null, null, genericFallback(3L));
+        rebuilt.setRemapTracker(tracker);
+
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(RESULT, 7L)), List.of(), Map.of(RESULT, 7L));
+        PipelineResult result = rebuilt.solveAndApply(snapshot);
+
+        assertEquals(0L, result.extraCounter("ownershipExternalModifications", -1L),
+                "配置重载重建管线后，失败重映射的保护必须继续生效");
+        assertTrue(store.snapshotAll().get(RESULT).owned(),
+                "新管线首轮不得因写入前的旧值误释放所有权");
     }
 
     @Test

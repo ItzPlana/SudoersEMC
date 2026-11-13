@@ -51,6 +51,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.function.Predicate;
@@ -157,10 +158,11 @@ public final class ScanPipeline {
     private volatile int lastSolverCacheMisses;
     private volatile int lastOwnershipExternalModifications;
     private volatile int lastOwnershipReleased;
-    /** 最近一次请求的后端重映射完成信号；非空表示写入可能尚未反映到后端。 */
-    private final AtomicReference<CompletableFuture<?>> remapInFlight = new AtomicReference<>();
-    /** 最近一次重映射失败后保持保守：在下一次确认成功前跳过外部修改释放。 */
-    private volatile boolean remapUnconfirmed;
+    /**
+     * 跨实例共享的重映射确认状态。配置重载会重建整个管线，失败保护不能随旧实例丢失；
+     * 生产环境由 {@code Sudoersemc} 注入同一个 tracker，测试默认使用独立实例。
+     */
+    private volatile RemapTracker remapTracker = new RemapTracker();
 
     private volatile EmcProvider emcProvider;
     private volatile OverflowScope overflowScope = OverflowScope.OWNED_ONLY;
@@ -323,6 +325,16 @@ public final class ScanPipeline {
     }
 
     /**
+     * 注入共享的重映射确认状态。配置重载重建管线时必须复用同一个实例，
+     * 否则一次失败的重映射保护会在新管线的首轮丢失。
+     *
+     * @param tracker 共享 tracker，允许为 {@code null}（恢复为独立实例）
+     */
+    public void setRemapTracker(@Nullable RemapTracker tracker) {
+        this.remapTracker = tracker == null ? new RemapTracker() : tracker;
+    }
+
+    /**
      * 记录一次已请求的后端 EMC 重映射，并在完成后解除“外部修改检测暂停”状态。
      *
      * <p>重映射是异步的：完成前后端仍可能返回 SudoersEMC 写入前的旧值。如果此时把旧值
@@ -334,29 +346,17 @@ public final class ScanPipeline {
      * @param completion 重映射完成信号，允许为 {@code null}
      */
     public void trackRemapCompletion(@Nullable CompletableFuture<?> completion) {
-        if (completion == null) {
-            return;
-        }
-        remapInFlight.set(completion);
-        completion.whenComplete((ignored, failure) -> {
-            if (!remapInFlight.compareAndSet(completion, null)) {
-                // 已被更新的重映射请求取代，旧结果不得改变当前状态。
-                return;
-            }
-            if (failure == null) {
-                remapUnconfirmed = false;
-            } else {
-                remapUnconfirmed = true;
-                LOGGER.warn("SudoersEMC 的 ProjectE 重映射未成功完成，下一轮继续跳过外部修改释放", failure);
-            }
-        });
+        remapTracker.track(completion);
     }
 
     /**
      * @return 是否存在尚未确认完成的后端重映射
      */
-    private boolean remapConfirmationPending() {
-        return remapInFlight.get() != null || remapUnconfirmed;
+    private boolean remapConfirmationPending(PipelineSnapshot snapshot) {
+        long generation = snapshot == null
+                ? PipelineSnapshot.UNKNOWN_REMAP_GENERATION
+                : snapshot.remapGeneration();
+        return remapTracker.confirmationPending(generation);
     }
 
     /**
@@ -672,6 +672,8 @@ String detail = "扫描采集失败：服务器尚未就绪";
         }
 
         try {
+            // 在读取任何后端值之前记录代次：采集期间完成的重映射会让本快照的 observed 值过期。
+            long collectedRemapGeneration = remapTracker.generation();
             ItemScanner.EmcQuery query = new ItemScanner.EmcQuery() {
                 @Override
                 public boolean hasValue(ItemStack stack) {
@@ -724,7 +726,7 @@ String detail = "扫描采集失败：服务器尚未就绪";
 
             List<ItemSnapshot> items = new ItemScanner(query, Set.of(), Set.of()).scan(this::isCancelled);
             if (isCancelled()) {
-                return partialSnapshot(items, List.of());
+                return partialSnapshot(items, List.of(), collectedRemapGeneration);
             }
 
             RecipeScanner recipeScanner = RecipeScanner.withGoety(scanContainerRemainders)
@@ -733,10 +735,11 @@ String detail = "扫描采集失败：服务器尚未就绪";
             RecipeScanner.ScanResult scanResult =
                     recipeScanner.scan(server.getRecipeManager(), this::isCancelled);
             if (isCancelled()) {
-                return partialSnapshot(items, scanResult.recipes());
+                return partialSnapshot(items, scanResult.recipes(), collectedRemapGeneration);
             }
 
-            PipelineSnapshot snapshot = collectSnapshotData(items, scanResult, query);
+            PipelineSnapshot snapshot = collectSnapshotData(items, scanResult, query,
+                    collectedRemapGeneration);
             // 成功采集必须清除上一次失败原因，否则下一次 applyStashed 会误丢新快照。
             lastCollectFailure = null;
             return snapshot;
@@ -749,10 +752,13 @@ String detail = "扫描采集失败：服务器尚未就绪";
     }
 
     /**
-     * 为单个 NBT 变体补读后端当前值。
+     * 为单个 NBT 变体补读后端的精确既有值。
      *
      * <p>{@link ItemScanner} 只查询无 NBT 的默认堆叠，变体快照默认没有既有值。若不补读，
      * owned 变体的外部修改永远不会进入外部修改检测，非自有变体的后端值也会被配方定价覆盖。
+     * 查询必须使用 {@link ItemScanner.EmcQuery#getExactValue} 口径：ProjectE 的
+     * {@code hasValue/getValue} 会在 NBT 未命中时回退基础物品值并叠加 Damage / Enchantment /
+     * StoredEMC 等处理器，不能作为“该变体自身已有值”的依据；返回 {@code 0} 视为无既有值。
      * 后端不可用、无法还原变体或查询失败时原样返回。</p>
      *
      * @param snapshot 变体快照
@@ -768,10 +774,13 @@ String detail = "扫描采集失败：服务器尚未就绪";
             return snapshot;
         }
         try {
-            if (!query.hasValue(stack)) {
+            // ProjectE 的 hasValue/getValue 在 NBT 未命中时会回退基础物品值并叠加
+            // Damage/Enchantment/StoredEMC 等处理器，不能据此认定该变体自身已有值；
+            // 只有精确 NBT 映射才与 store 写入值同口径。
+            long value = Math.max(0L, query.getExactValue(stack));
+            if (value <= 0L) {
                 return snapshot;
             }
-            long value = Math.max(0L, query.getValue(stack));
             return ItemSnapshot.of(snapshot.key(), true, value,
                     snapshot.tagPaths(), snapshot.rarity());
         } catch (RuntimeException failure) {
@@ -817,6 +826,17 @@ String detail = "扫描采集失败：服务器尚未就绪";
     PipelineSnapshot collectSnapshotData(List<ItemSnapshot> items,
                                          RecipeScanner.ScanResult scanResult,
                                          @Nullable ItemScanner.EmcQuery emcQuery) {
+        return collectSnapshotData(items, scanResult, emcQuery, remapTracker.generation());
+    }
+
+    /**
+     * 带采集代次的组装入口：代次必须在读取任何后端值之前捕获，
+     * 才能在 apply 阶段识别“采集结束后、应用开始前完成的重映射”。
+     */
+    PipelineSnapshot collectSnapshotData(List<ItemSnapshot> items,
+                                         RecipeScanner.ScanResult scanResult,
+                                         @Nullable ItemScanner.EmcQuery emcQuery,
+                                         long remapGeneration) {
         Objects.requireNonNull(items, "items");
         Objects.requireNonNull(scanResult, "scanResult");
         List<ItemSnapshot> variantItems = collectVariantSnapshots(
@@ -835,7 +855,7 @@ String detail = "扫描采集失败：服务器尚未就绪";
         int inspected = 0;
         for (ItemSnapshot item : allItems) {
             if (inspected++ % EXISTING_VALUE_CANCEL_CHECK_INTERVAL == 0 && isCancelled()) {
-                return partialSnapshot(allItems, scanResult.recipes());
+                return partialSnapshot(allItems, scanResult.recipes(), remapGeneration);
             }
             // 基础扫描只查询无 NBT 的默认堆叠；变体必须单独回读后端值，
             // 否则 owned 变体的外部修改永远不会进入外部修改检测。
@@ -857,21 +877,24 @@ String detail = "扫描采集失败：服务器尚未就绪";
                 scanResult.invalid(),
                 scanResult.failed(),
                 scanResult.enumerationFailed(),
-                scanResult.failedRecipeDetails());
+                scanResult.failedRecipeDetails(),
+                remapGeneration);
     }
 
     /**
      * 构造取消时的部分快照：物品/配方保持已采集部分，既有值只从当前物品列表重新推导。
      */
     private static PipelineSnapshot partialSnapshot(List<ItemSnapshot> items,
-                                                    List<RecipeSnapshot> recipes) {
+                                                    List<RecipeSnapshot> recipes,
+                                                    long remapGeneration) {
         Map<ItemKey, Long> existingValues = new TreeMap<>();
         for (ItemSnapshot item : items) {
             if (item.hasExistingEmc()) {
                 existingValues.put(item.key(), item.existingValue());
             }
         }
-        return new PipelineSnapshot(items, recipes, existingValues, 0, 0, 0, false, List.of());
+        return new PipelineSnapshot(items, recipes, existingValues, 0, 0, 0, false, List.of(),
+                remapGeneration);
     }
 
     /**
@@ -1275,7 +1298,8 @@ int totalBudget = VariantScanner.HARD_TOTAL_VARIANT_CEILING;
                 snapshot.invalidRecipes(),
                 snapshot.failedRecipes(),
                 snapshot.recipeEnumerationFailed(),
-                snapshot.failedRecipeDetails());
+                snapshot.failedRecipeDetails(),
+                snapshot.remapGeneration());
         return new OwnershipApplication(updated, detection.detected(), detection.released(),
                 detection.protectedItems(), separation.refreshedOwned());
     }
@@ -1326,7 +1350,7 @@ int totalBudget = VariantScanner.HARD_TOTAL_VARIANT_CEILING;
 
         OwnershipManager manager = new OwnershipManager(store, new MapEmcValueReader(observed));
         List<ItemKey> drifted;
-        if (remapConfirmationPending()) {
+        if (remapConfirmationPending(snapshot)) {
             // 重映射尚未确认完成时，后端可能仍返回我们写入前的旧值；
             // 此时比较漂移会误释放所有权，因此只保留手工值检测。
             LOGGER.debug("SudoersEMC 的后端重映射尚未确认完成，本轮跳过 owned 条目的漂移检测");
@@ -2754,6 +2778,88 @@ public void writePendingReport() {
         Candidate(ItemKey item, long value, PriceSource source,
                   @Nullable ResourceLocation recipeId) {
             this(item, value, source, recipeId, List.of());
+        }
+    }
+
+    /**
+     * 跨 {@link ScanPipeline} 实例共享的重映射确认状态。
+     *
+     * <p>配置重载会重建管线；若状态留在管线实例上，一次失败的重映射保护会在新管线的
+     * 首轮丢失。把状态抽到可注入的 tracker 后，生产环境在重建之间复用同一实例，
+     * 而单元测试仍可使用独立实例，避免测试间相互污染。</p>
+     *
+     * <p>代次在每次重映射完成（无论成功或失败）时推进，并与采集快照一起带入 apply。
+     * 只要采集开始后发生过重映射完成，本轮 observed 值就可能来自写入前，必须跳过漂移检测。</p>
+     */
+    public static final class RemapTracker {
+
+        private final AtomicReference<CompletableFuture<?>> inFlight = new AtomicReference<>();
+        private final AtomicLong generation = new AtomicLong();
+        private final Object stateLock = new Object();
+        private boolean unconfirmed;
+
+        /**
+         * 记录一次重映射请求；完成时推进代次并更新确认状态。
+         *
+         * @param completion 完成信号，允许为 {@code null}（无法确认时不改变状态）
+         */
+        public void track(@Nullable CompletableFuture<?> completion) {
+            if (completion == null) {
+                return;
+            }
+            synchronized (stateLock) {
+                inFlight.set(completion);
+            }
+            completion.whenComplete((ignored, failure) -> {
+                synchronized (stateLock) {
+                    if (inFlight.get() != completion) {
+                        // 已被更新的重映射请求取代，旧结果不得改变当前状态。
+                        return;
+                    }
+                    // 先推进代次再清除在途标记：任何在此前采集的快照都会被视为过期。
+                    generation.incrementAndGet();
+                    inFlight.set(null);
+                    unconfirmed = failure != null;
+                    if (failure != null) {
+                        LOGGER.warn("SudoersEMC 的 ProjectE 重映射未成功完成，下一轮继续跳过外部修改释放",
+                                failure);
+                    }
+                }
+            });
+        }
+
+        /**
+         * @return 当前重映射代次
+         */
+        public long generation() {
+            return generation.get();
+        }
+
+        /**
+         * 判断某次采集的快照是否必须跳过漂移检测。
+         *
+         * @param snapshotGeneration 采集开始时记录到的代次；未知代次传
+         *                           {@link PipelineSnapshot#UNKNOWN_REMAP_GENERATION}
+         * @return 仍有在途重映射、上次重映射失败，或采集后发生过重映射完成时返回 {@code true}
+         */
+        public boolean confirmationPending(long snapshotGeneration) {
+            synchronized (stateLock) {
+                if (inFlight.get() != null || unconfirmed) {
+                    return true;
+                }
+                return snapshotGeneration >= 0L && snapshotGeneration != generation.get();
+            }
+        }
+
+        /**
+         * 清空跨服务器会话的重映射状态。
+         */
+        public void reset() {
+            synchronized (stateLock) {
+                inFlight.set(null);
+                unconfirmed = false;
+                generation.incrementAndGet();
+            }
         }
     }
 }
