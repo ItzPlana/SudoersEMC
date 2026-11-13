@@ -41,6 +41,7 @@ public final class CommandService {
     private final @Nullable ScanStateStore scanStateStore;
     private final @Nullable ReloadAction reloadAction;
     private final @Nullable BooleanSupplier scanRequestAction;
+    private final @Nullable QuarantineApprovalAction quarantineApprovalAction;
 
     /**
      * 创建不执行真实配置重载的命令服务。
@@ -57,7 +58,7 @@ public final class CommandService {
                           @Nullable ReportManager reportManager,
                           @Nullable GeneratedEntryStore entryStore,
                           @Nullable ScanStateStore scanStateStore) {
-        this(scanManager, reportManager, entryStore, scanStateStore, null, null);
+        this(scanManager, reportManager, entryStore, scanStateStore, null, null, null);
     }
 
     /**
@@ -72,29 +73,50 @@ public final class CommandService {
                           @Nullable GeneratedEntryStore entryStore,
                           @Nullable ScanStateStore scanStateStore,
                           @Nullable ReloadAction reloadAction) {
-        this(scanManager, reportManager, entryStore, scanStateStore, reloadAction, null);
+        this(scanManager, reportManager, entryStore, scanStateStore, reloadAction, null, null);
     }
 
     /**
-     * @param scanManager       扫描状态机，可为 {@code null}
-     * @param reportManager     诊断报告管理器，可为 {@code null}
-     * @param entryStore        已生成条目的存储，可为 {@code null}
-     * @param scanStateStore    上一次扫描状态的存储，可为 {@code null}
-     * @param reloadAction      真实配置重载动作，可为 {@code null}（视为不可用）
-     * @param scanRequestAction 扫描请求动作；生产接线传入与重建共享运行时锁的入口，
-     *                          {@code null} 时退回直接调用 {@code scanManager.requestScan()}
+     * @param scanManager              扫描状态机，可为 {@code null}
+     * @param reportManager            诊断报告管理器，可为 {@code null}
+     * @param entryStore               已生成条目的存储，可为 {@code null}
+     * @param scanStateStore           上一次扫描状态的存储，可为 {@code null}
+     * @param reloadAction             真实配置重载动作，可为 {@code null}（视为不可用）
+     * @param quarantineApprovalAction 隔离降价审批动作，可为 {@code null}（视为不可用）
      */
     public CommandService(@Nullable ScanManager scanManager,
                           @Nullable ReportManager reportManager,
                           @Nullable GeneratedEntryStore entryStore,
                           @Nullable ScanStateStore scanStateStore,
                           @Nullable ReloadAction reloadAction,
+                          @Nullable QuarantineApprovalAction quarantineApprovalAction) {
+        this(scanManager, reportManager, entryStore, scanStateStore, reloadAction,
+                quarantineApprovalAction, null);
+    }
+
+    /**
+     * @param scanManager              扫描状态机，可为 {@code null}
+     * @param reportManager            诊断报告管理器，可为 {@code null}
+     * @param entryStore               已生成条目的存储，可为 {@code null}
+     * @param scanStateStore           上一次扫描状态的存储，可为 {@code null}
+     * @param reloadAction             真实配置重载动作，可为 {@code null}（视为不可用）
+     * @param quarantineApprovalAction 隔离降价审批动作，可为 {@code null}（视为不可用）
+     * @param scanRequestAction        扫描请求动作；生产接线传入与重建共享运行时锁的入口，
+     *                                 {@code null} 时退回直接调用 {@code scanManager.requestScan()}
+     */
+    public CommandService(@Nullable ScanManager scanManager,
+                          @Nullable ReportManager reportManager,
+                          @Nullable GeneratedEntryStore entryStore,
+                          @Nullable ScanStateStore scanStateStore,
+                          @Nullable ReloadAction reloadAction,
+                          @Nullable QuarantineApprovalAction quarantineApprovalAction,
                           @Nullable BooleanSupplier scanRequestAction) {
         this.scanManager = scanManager;
         this.reportManager = reportManager;
         this.entryStore = entryStore;
         this.scanStateStore = scanStateStore;
         this.reloadAction = reloadAction;
+        this.quarantineApprovalAction = quarantineApprovalAction;
         this.scanRequestAction = scanRequestAction;
     }
 
@@ -252,6 +274,32 @@ public final class CommandService {
                     List.of(),
                     "无");
             return CommandResult.ok(splitLines(explanation.formatText()));
+        } catch (RuntimeException e) {
+            return unexpectedFailure(e);
+        }
+    }
+
+    /**
+     * 批准并应用某个物品当前的隔离降价。
+     *
+     * <p>这是“隔离 → 审批 → 应用/回读”闭环的生产入口；具体动作由模组入口注入。缺少审批动作
+     * 或动作抛出异常时返回中文失败提示，绝不向命令调度器传播异常。</p>
+     *
+     * @param itemId 物品 id 原文，例如 {@code minecraft:stone}
+     * @return 审批回执；永不抛出异常
+     */
+    public CommandResult approveQuarantine(String itemId) {
+        try {
+            if (quarantineApprovalAction == null) {
+                return CommandResult.failure("隔离审批服务不可用");
+            }
+            if (itemId == null || itemId.isBlank()) {
+                return CommandResult.failure("请提供物品 id，例如 minecraft:stone");
+            }
+            CommandResult result = quarantineApprovalAction.approve(itemId.trim());
+            return result == null
+                    ? CommandResult.failure("隔离审批失败: NullPointerException")
+                    : result;
         } catch (RuntimeException e) {
             return unexpectedFailure(e);
         }

@@ -126,6 +126,18 @@ public final class FallbackPricing {
     }
 
     /**
+     * 返回定价链使用的层级规则。
+     *
+     * <p>扫描管线需要复用 {@link TierPricing#price} 的排除语义（{@code Optional.of(0L)}），
+     * 以便在被排除物品存在配方时也能提前拒绝定价，而不是只能依赖兜底链。</p>
+     *
+     * @return 当前实例使用的层级定价器，永不为 {@code null}
+     */
+    public TierPricing tierPricing() {
+        return tierPricing;
+    }
+
+    /**
      * 按 {@code EXISTING → 排除检查 → EXTERNAL_BASELINE → TAG → TIER → RARITY → FALLBACK}
      * 的顺序定价。
      *

@@ -1,5 +1,6 @@
 package com.itzplana.sudoersemc;
 
+import com.itzplana.sudoersemc.command.CommandResult;
 import com.itzplana.sudoersemc.command.CommandService;
 import com.itzplana.sudoersemc.command.SudoemcCommands;
 import com.itzplana.sudoersemc.config.ConfigValidationResult;
@@ -7,10 +8,15 @@ import com.itzplana.sudoersemc.config.ConfigWatcher;
 import com.itzplana.sudoersemc.config.ReloadDecision;
 import com.itzplana.sudoersemc.config.RuntimeConfigSnapshot;
 import com.itzplana.sudoersemc.config.SudoersemcConfig;
+import com.itzplana.sudoersemc.core.GeneratedEmcEntry;
+import com.itzplana.sudoersemc.core.ItemKey;
+import com.itzplana.sudoersemc.core.PriceSource;
+import com.itzplana.sudoersemc.core.OwnedEntrySink;
 import com.itzplana.sudoersemc.diagnostic.ReportManager;
 import com.itzplana.sudoersemc.diagnostic.SmokeTestHook;
 import com.itzplana.sudoersemc.integration.GeneratedEmcMapper;
 import com.itzplana.sudoersemc.integration.OptionalIntegrationManager;
+import com.itzplana.sudoersemc.integration.ProjectEManualValues;
 import com.itzplana.sudoersemc.pipeline.PipelineSnapshot;
 import com.itzplana.sudoersemc.pipeline.ScanPipeline;
 import com.itzplana.sudoersemc.pricing.FallbackPricing;
@@ -22,15 +28,35 @@ import com.itzplana.sudoersemc.safety.OverflowProtection;
 import com.itzplana.sudoersemc.solver.SolveSettings;
 import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
 import com.itzplana.sudoersemc.storage.OverflowResetLog;
+import com.itzplana.sudoersemc.storage.QuarantinedDropsStore;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
 import com.itzplana.sudoersemc.task.AutoScanPolicy;
 import com.itzplana.sudoersemc.task.BatchProcessor;
+import com.itzplana.sudoersemc.task.ScanFingerprint;
 import com.itzplana.sudoersemc.task.ScanManager;
 import com.mojang.logging.LogUtils;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.BooleanSupplier;
+import java.util.Collections;
+import java.util.Optional;
+import java.util.function.Function;
+import java.util.stream.Stream;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.tags.TagKey;
+import net.minecraft.world.item.Item;
+import net.minecraft.core.NonNullList;
+import net.minecraft.core.Registry;
+import net.minecraft.core.RegistryAccess;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.crafting.Ingredient;
+import net.minecraft.world.item.crafting.Recipe;
+import net.minecraft.world.item.crafting.RecipeManager;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.RegisterCommandsEvent;
 import net.minecraftforge.event.TickEvent;
@@ -42,6 +68,11 @@ import net.minecraftforge.fml.event.config.ModConfigEvent;
 import net.minecraftforge.fml.event.lifecycle.FMLCommonSetupEvent;
 import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
 import net.minecraftforge.server.ServerLifecycleHooks;
+import net.minecraftforge.fml.ModList;
+import net.minecraftforge.forgespi.language.IModInfo;
+import net.minecraftforge.registries.ForgeRegistries;
+import net.minecraftforge.registries.tags.ITag;
+import net.minecraftforge.registries.tags.ITagManager;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 
@@ -66,6 +97,7 @@ public final class Sudoersemc {
     private static volatile ScanPipeline scanPipeline;
     private static volatile OverflowResetLog overflowResetLog;
     private static volatile ReportManager reportManager;
+    private static volatile QuarantinedDropsStore quarantinedDropsStore;
     private static volatile CommandService commandService;
 
     /**
@@ -84,6 +116,8 @@ public final class Sudoersemc {
         CONFIG_WATCHER.register(result -> scheduleRuntimeRebuild("config-event"));
     }
 
+    /** 当前服务器实例；服务器停止时清空，供后续扩展与状态观测使用。 */
+    private static volatile MinecraftServer currentServer;
     private static volatile boolean pendingReload;
     private static volatile boolean pendingReloadFromCommand;
 
@@ -120,8 +154,11 @@ public final class Sudoersemc {
             ScanStateStore stateStore = new ScanStateStore();
             stateStore.load();
             scanStateStore = stateStore;
-            OverflowResetLog overflowLog = new OverflowResetLog();
-            overflowResetLog = overflowLog;
+            OverflowResetLog resetLog = new OverflowResetLog();
+            overflowResetLog = resetLog;
+            QuarantinedDropsStore dropsStore = new QuarantinedDropsStore();
+            dropsStore.load();
+            quarantinedDropsStore = dropsStore;
 
             // 落盘文件必须就绪，集成管理器才能创建 provider。
             OptionalIntegrationManager.setSink(store);
@@ -147,29 +184,32 @@ public final class Sudoersemc {
     }
 
     /**
-     * 创建真实扫描管线。
+     * 创建真实扫描管线与配套调度器、命令服务。
      *
-     * <p>所有安全层与定价策略都从配置构造；任意配置读取失败都会退回该组件的安全默认值，绝不阻止
-     * 模组启动。ProjectE 后端通过 {@link OptionalIntegrationManager} 探测，未安装时管线仍然可以
-     * 仅依靠配方与兜底定价工作。</p>
+     * <p>所有安全层与定价策略都从同一份已校验的不可变快照构造；任意组件构建失败都由调用方
+     * 保留旧组件。ProjectE 后端通过 {@link OptionalIntegrationManager} 探测，未安装时管线仍然
+     * 可以仅依靠配方与兜底定价工作。</p>
      *
-     * @param store         生成值存储
-     * @param stateStore    扫描状态存储
-     * @param reportManager 诊断报告管理器
-     * @param overflowLog   溢出审计日志；{@code null} 时新建一个仅本次使用的实例
-     * @return 可直接交给扫描调度器使用的管线
+     * @param store       生成值存储
+     * @param stateStore  扫描状态存储
+     * @param reports     诊断报告管理器
+     * @param overflowLog 溢出审计日志；{@code null} 时新建一个仅本次使用的实例
+     * @param dropsStore  隔离记录存储；{@code null} 时不持久化隔离记录
+     * @param snapshot    已通过 ConfigValidator 校验的同一份配置快照
+     * @return 一组尚未发布的运行时组件
      */
     private static RuntimeComponents createRuntimeComponents(GeneratedEntryStore store,
                                                               ScanStateStore stateStore,
                                                               ReportManager reports,
                                                               @Nullable OverflowResetLog overflowLog,
+                                                              @Nullable QuarantinedDropsStore dropsStore,
                                                               RuntimeConfigSnapshot snapshot) {
         OverflowResetLog auditLog = overflowLog == null ? new OverflowResetLog() : overflowLog;
         OverflowPipeline overflowPipeline = new OverflowPipeline(
                 new OverflowProtection(snapshot.overflowSettings()),
                 auditLog);
         LargeDropProtection dropProtection =
-                new LargeDropProtection(snapshot.dropProtectionSettings());
+                new LargeDropProtection(snapshot.dropProtectionSettings(), dropsStore);
         CreativeItemProtection creativeProtection =
                 new CreativeItemProtection(snapshot.creativeProtectionSettings());
         FallbackPricing fallbackPricing = FallbackPricing.withDefaults(snapshot.pricingSettings());
@@ -184,6 +224,8 @@ public final class Sudoersemc {
                 fallbackPricing,
                 snapshot.solveSettings());
         pipeline.setEmcProvider(OptionalIntegrationManager.provider().orElse(null));
+        pipeline.setInputFingerprintSupplier(Sudoersemc::currentScanFingerprint);
+        applyPipelineConfig(pipeline);
 
         applyOverflowSettings(pipeline, snapshot.overflowSettings());
         applyRuntimeSwitches(pipeline, snapshot.solveRecipes(), snapshot.generateReports());
@@ -202,6 +244,7 @@ public final class Sudoersemc {
                 store,
                 stateStore,
                 Sudoersemc::reloadConfig,
+                Sudoersemc::approveQuarantined,
                 Sudoersemc::requestScanSynchronized);
         return new RuntimeComponents(pipeline, manager, service);
     }
@@ -251,6 +294,49 @@ public final class Sudoersemc {
     }
 
     /**
+     * 把快照未覆盖的管线配置开关（ProjectE 集成基线）应用到刚构造的实例。
+     *
+     * <p>配方求解与诊断报告两个开关由 {@link #applyRuntimeSwitches(ScanPipeline, boolean, boolean)}
+     * 从已校验快照设置；本方法只补足尚未纳入快照的基线开关，读取失败时只记录警告并保留管线
+     * 自身安全默认值，绝不阻止启动。</p>
+     */
+    private static void applyPipelineConfig(ScanPipeline pipeline) {
+        try {
+            pipeline.setUseProjectEIntegrationBaselines(
+                    SudoersemcConfig.FALLBACK_USE_PROJECTE_INTEGRATION_BASELINES.get());
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法读取 ProjectE 基线开关，使用管线默认值", e);
+        }
+    }
+
+    /**
+     * 创建创造物品保护。
+     *
+     * <p>{@code safety.creativeItemExclusions} / {@code creativeItemSpecialValues} /
+     * {@code creativeNamespaces} 三个列表键由 {@link CreativeItemProtection#parseSettings}
+     * 容错解析：非法条目会被跳过并汇总为一条警告，不会阻止模组启动。</p>
+     */
+    private static CreativeItemProtection createCreativeProtection() {
+        try {
+            boolean enabled = SudoersemcConfig.SAFETY_PROTECT_CREATIVE_ONLY_ITEMS.get();
+            CreativeItemProtection.ParsedSettings parsed = CreativeItemProtection.parseSettings(
+                    enabled,
+                    List.copyOf(SudoersemcConfig.SAFETY_CREATIVE_ITEM_EXCLUSIONS.get()),
+                    List.copyOf(SudoersemcConfig.SAFETY_CREATIVE_ITEM_SPECIAL_VALUES.get()),
+                    List.copyOf(SudoersemcConfig.SAFETY_CREATIVE_NAMESPACES.get()));
+            if (!parsed.skippedEntries().isEmpty()) {
+                LOGGER.warn("SudoersEMC 创造物品保护配置有 {} 条无效条目已被忽略：{}",
+                        parsed.skippedEntries().size(), parsed.skippedEntries());
+            }
+            return new CreativeItemProtection(parsed.settings());
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法读取创造物品保护配置，默认启用保护", e);
+            return new CreativeItemProtection(new CreativeItemProtection.Settings(
+                    true, Set.of(), Map.of(), Set.of()));
+        }
+    }
+
+    /**
      * 把配置中的最大允许降幅夹到 {@link LargeDropProtection.Settings} 接受的 {@code (0.0, 1.0]} 区间。
      *
      * <p>配置边界已经拒绝 0.0，但旧配置文件、手工编辑或未来迁移仍可能绕过边界检查。这里再做一次
@@ -283,45 +369,140 @@ public final class Sudoersemc {
                                                  int itemsPerTick,
                                                  boolean adaptive) {
         BatchProcessor processor = new BatchProcessor(Math.max(1, itemsPerTick), adaptive);
+        ScanManager.ResultApplier applier = pipeline == null
+                ? data -> LOGGER.debug("SudoersEMC 占位调度器收到应用回调：{}", data.label())
+                : new PipelineApplier(pipeline);
         return new ScanManager(
                 processor,
-                () -> ScanManager.oneShot(collectSnapshot(pipeline)).begin(),
-                data -> applySnapshot(pipeline),
-                TICK_BUDGET_NANOS);
+                pipeline == null ? emptyCollector() : () -> {
+                    MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
+                    if (server == null) {
+                        LOGGER.warn("SudoersEMC 扫描请求到达时服务器尚未就绪，本次扫描失败");
+                        throw new IllegalStateException("扫描采集失败：服务器尚未就绪");
+                    }
+                    return pipeline.beginCollection(server);
+                },
+                applier,
+                TICK_BUDGET_NANOS,
+                pipeline == null ? null : Sudoersemc::currentScanFingerprint);
     }
 
     /**
-     * 采集阶段回调：读取当前服务器并生成不可变快照。
+     * 占位采集器：立即报告完成且不访问任何游戏状态。
      *
-     * <p>服务器或管线尚未就绪时抛出 {@link IllegalStateException}，由 {@link ScanManager} 转为
-     * {@code FAILED}；绝不在失败时暂存空快照，避免调度器把失败扫描记录为成功的空扫描。</p>
+     * <p>只用于服务器启动前或配置重载后给命令层提供可查询的空闲状态机；真实采集由
+     * {@link #createScanManager(ScanPipeline)} 注入的管线会话完成。</p>
      */
-    private static ScanManager.SnapshotData collectSnapshot(ScanPipeline pipeline) {
-        if (pipeline == null) {
-            throw new IllegalStateException("扫描采集失败：扫描管线未初始化");
-        }
-        MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
-        if (server == null) {
-            LOGGER.warn("SudoersEMC 扫描请求到达时服务器尚未就绪，本次扫描失败");
-            throw new IllegalStateException("扫描采集失败：服务器尚未就绪");
-        }
+    private static ScanManager.SnapshotCollector emptyCollector() {
+        return () -> new ScanManager.CollectSession() {
 
-        PipelineSnapshot snapshot = pipeline.collect(server);
-        pipeline.stash(snapshot);
-        return new ScanManager.SnapshotData(
-                "真实扫描管线", snapshot.itemCount(), snapshot.recipeCount());
+            @Override
+            public int itemCount() {
+                return 0;
+            }
+
+            @Override
+            public int recipeCount() {
+                return 0;
+            }
+
+            @Override
+            public int processedItems() {
+                return 0;
+            }
+
+            @Override
+            public int processedRecipes() {
+                return 0;
+            }
+
+            @Override
+            public boolean isDone() {
+                return true;
+            }
+
+            @Override
+            public ScanManager.StepResult step(int maxItems) {
+                return new ScanManager.StepResult(0, true);
+            }
+
+            @Override
+            public ScanManager.SnapshotData finish() {
+                return new ScanManager.SnapshotData("待接入真实扫描", 0, 0);
+            }
+        };
     }
 
     /**
-     * 应用阶段回调：求解暂存快照、请求 ProjectE 重映射并落盘。
+     * 应用阶段协调器：在服务器线程启动异步求解、轮询完成，然后重新回到服务器线程做重映射与落盘。
      *
-     * <p>所有步骤都在服务器线程执行。重映射失败只记录警告，不会阻止已经生成的条目写入磁盘。</p>
+     * <p>求解本身只读取不可变快照与定价规则，不接触注册表、RecipeManager、ProjectE API 或文件
+     * 系统；{@link ScanPipeline#applyCompletedSolve()} 负责安全判定、存储写入与报告落盘。</p>
      */
-    private static void applySnapshot(ScanPipeline pipeline) {
-        if (pipeline != null) {
-            pipeline.applyStashed();
+    static final class PipelineApplier implements ScanManager.ResultApplier {
+
+        @Nullable
+        private final ScanPipeline pipeline;
+
+        private boolean started;
+        private boolean finished;
+
+        PipelineApplier(@Nullable ScanPipeline pipeline) {
+            this.pipeline = pipeline;
         }
 
+        @Override
+        public void apply(ScanManager.SnapshotData data) {
+            if (finished) {
+                return;
+            }
+            if (pipeline == null) {
+                throw new IllegalStateException("扫描应用失败：扫描管线未初始化");
+            }
+            if (!started) {
+                started = true;
+                if (!pipeline.startStashedSolve()) {
+                    throw new IllegalStateException("扫描应用失败：没有可用的暂存快照");
+                }
+                return;
+            }
+            if (!pipeline.isSolveComplete()) {
+                return;
+            }
+            pipeline.applyCompletedSolve();
+            flushRuntimeStoresAndRemap();
+            finished = true;
+        }
+
+        @Override
+        public boolean isComplete(ScanManager.SnapshotData data) {
+            return finished;
+        }
+
+        @Override
+        public boolean usesAsyncSolve() {
+            return true;
+        }
+
+        @Override
+        public boolean isReadyToApply(ScanManager.SnapshotData data) {
+            return pipeline != null && pipeline.isSolveComplete();
+        }
+
+        @Override
+        public void reset() {
+            if (pipeline != null) {
+                pipeline.cancelPendingSolve();
+            }
+            started = false;
+            finished = false;
+        }
+    }
+
+    /**
+     * 请求 ProjectE 重映射并刷新所有运行时存储。必须在服务器线程调用。
+     */
+    private static void flushRuntimeStoresAndRemap() {
         MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
         if (server != null) {
             try {
@@ -331,7 +512,16 @@ public final class Sudoersemc {
                 LOGGER.warn("SudoersEMC 请求 ProjectE 重映射失败，已生成条目仍会保存", e);
             }
         }
+        flushRuntimeStoresOnServerThread();
+    }
 
+    /**
+     * 在服务器线程刷新所有运行时存储。
+     *
+     * <p>存储自身保证失败时不抛出、保留脏标记等待下次重试；这里仍然按组件逐个隔离，避免
+     * 一个存储的意外问题阻止其它存储落盘。</p>
+     */
+    private static void flushRuntimeStoresOnServerThread() {
         GeneratedEntryStore store = entryStore;
         if (store != null) {
             store.saveIfDirty();
@@ -340,6 +530,117 @@ public final class Sudoersemc {
         if (stateStore != null) {
             stateStore.saveIfDirty();
         }
+        OverflowResetLog resetLog = overflowResetLog;
+        if (resetLog != null) {
+            resetLog.saveIfDirty();
+        }
+        QuarantinedDropsStore dropsStore = quarantinedDropsStore;
+        if (dropsStore != null) {
+            dropsStore.saveIfDirty();
+        }
+    }
+
+    /**
+     * 批准并应用某个物品的隔离降价。
+     *
+     * <p>生产闭环：读取 {@link QuarantinedDropsStore} 中的持久化记录 → 设置 {@code approved}
+     * → 调用 {@link ScanPipeline#approveQuarantined(ItemKey)} 清理内存隔离列表 → 把记录中的
+     * {@code proposedValue} 写入 {@link GeneratedEntryStore} → 落盘并请求 ProjectE 重映射。
+     * 因此 {@code QuarantinedDropsStore.approve} 与 {@code LargeDropProtection.approve} 都有
+     * 生产调用方；即使服务器重启后内存隔离列表为空，也能根据磁盘记录完成审批。</p>
+     *
+     * @param itemId 物品 id 原文
+     * @return 命令回执
+     */
+    private static CommandResult approveQuarantined(String itemId) {
+        return approveQuarantined(
+                itemId,
+                entryStore,
+                quarantinedDropsStore,
+                scanPipeline,
+                Sudoersemc::flushRuntimeStoresAndRemap);
+    }
+
+    /**
+     * 审批闭环的可注入实现，生产入口与端到端测试共用同一段逻辑。
+     *
+     * <p>顺序固定：读取持久化记录 → 校验现有条目归属 → 持久化 {@code approved} → 清理内存隔离
+     * → 以 {@link PriceSource#APPROVED} 暂存新值 → 执行落盘/重映射回调。{@code stage} 失败时
+     * 已经写入的 {@code approved} 会保留并落盘，命令返回失败；管理员可以再次执行同一审批命令
+     * 完成幂等重试，不会因为第一次失败而重新隔离或丢失待应用值。</p>
+     *
+     * @param itemId     物品 id 原文
+     * @param store      生成值存储；{@code null} 时只批准记录、不应用数值
+     * @param dropsStore 隔离记录存储，不能为 {@code null}
+     * @param pipeline   扫描管线，用于清理内存隔离列表；可为 {@code null}
+     * @param flush      应用成功后的落盘/重映射动作，不能为 {@code null}
+     * @return 命令回执
+     */
+    static CommandResult approveQuarantined(String itemId,
+                                            @Nullable OwnedEntrySink store,
+                                            @Nullable QuarantinedDropsStore dropsStore,
+                                            @Nullable ScanPipeline pipeline,
+                                            Runnable flush) {
+        if (itemId == null || itemId.isBlank()) {
+            return CommandResult.failure("请提供物品 id，例如 minecraft:stone");
+        }
+        ResourceLocation itemIdValue = ResourceLocation.tryParse(itemId.trim());
+        if (itemIdValue == null) {
+            return CommandResult.failure("无效的物品 id: " + itemId);
+        }
+        ItemKey key = ItemKey.of(itemIdValue);
+
+        if (dropsStore == null) {
+            return CommandResult.failure("隔离记录服务不可用");
+        }
+        QuarantinedDropsStore.QuarantinedDrop drop = null;
+        for (QuarantinedDropsStore.QuarantinedDrop candidate : dropsStore.entries()) {
+            if (candidate.key().equals(key)) {
+                drop = candidate;
+                break;
+            }
+        }
+        if (drop == null) {
+            return CommandResult.failure("未找到 " + itemIdValue + " 的隔离记录");
+        }
+
+        if (store != null) {
+            GeneratedEmcEntry existing = store.snapshotAll().get(key);
+            if (existing != null && !existing.owned()) {
+                return CommandResult.failure(
+                        "无法应用 " + itemIdValue + "：现有条目不属于 SudoersEMC");
+            }
+        }
+        if (!dropsStore.approve(key)) {
+            return CommandResult.failure("批准隔离记录失败: " + itemIdValue);
+        }
+
+        int removedFromMemory = pipeline == null ? 0 : pipeline.approveQuarantined(key).size();
+
+        if (store == null) {
+            dropsStore.saveIfDirty();
+            return CommandResult.ok(
+                    "已批准 " + itemIdValue + " 的隔离记录",
+                    "生成值存储不可用，本次未应用数值");
+        }
+        boolean staged = store.stage(new GeneratedEmcEntry(
+                key,
+                drop.proposedValue(),
+                PriceSource.APPROVED,
+                null,
+                true,
+                System.currentTimeMillis()));
+        if (!staged) {
+            // approved 已在 stage 前持久化：保留记录并落盘，允许管理员再次执行同一命令重试。
+            dropsStore.saveIfDirty();
+            return CommandResult.failure("无法写入已批准的数值: " + itemIdValue);
+        }
+
+        flush.run();
+        return CommandResult.ok(
+                "已批准 " + itemIdValue + " 的隔离降价",
+                "旧值: " + drop.previousValue() + " -> 新值: " + drop.proposedValue(),
+                "已从内存隔离列表移除 " + removedFromMemory + " 条记录");
     }
 
     /**
@@ -456,6 +757,31 @@ public final class Sudoersemc {
     }
 
     /**
+     * 判断启动缓存是否可以复用。
+     *
+     * <p>只有“已记录成功扫描时间 + 存在生成条目 + 当前完整输入指纹与持久化指纹一致”三个条件
+     * 同时满足时才允许跳过启动扫描。指纹覆盖物品 id、配方 id 与内容、标签名称与成员、影响定价的
+     * 全部配置通道，以及 ProjectE 手工值/模组与数据包基线，因此模组、配方、标签或配置变化后
+     * 不会误用旧缓存。</p>
+     *
+     * @param stateStore 扫描状态存储，可为 {@code null}
+     * @param store      生成值存储，可为 {@code null}
+     * @param fingerprint 当前输入指纹，无法计算时为 {@code null}
+     * @return 可以复用缓存时返回 {@code true}
+     */
+    static boolean hasReusableScanCache(@Nullable ScanStateStore stateStore,
+                                        @Nullable GeneratedEntryStore store,
+                                        @Nullable ScanFingerprint fingerprint) {
+        if (stateStore == null || store == null || fingerprint == null) {
+            return false;
+        }
+        if (store.size() <= 0 || stateStore.lastScanEpochMillis() <= 0L) {
+            return false;
+        }
+        return stateStore.matches(fingerprint);
+    }
+
+    /**
      * 服务器启动后按 {@code [general] alwaysRescan} 请求扫描。
      *
      * <p>只有扫描调度器存在（即 {@code [general] enabled = true}）时才会真正提交请求；
@@ -479,6 +805,323 @@ public final class Sudoersemc {
         } else {
             LOGGER.info("SudoersEMC [general] alwaysRescan = true，但已有扫描在进行中，跳过启动扫描");
         }
+    }
+
+    /**
+     * 计算当前服务器世界可观察到的完整扫描输入指纹。
+     *
+     * <p>必须在服务器线程调用。指纹由五个通道组成：物品 id；配方 id 与内容（类型、序列化器、
+     * 输入候选、输出）；标签名称与成员；影响定价的全部配置值；ProjectE 手工值内容、模组版本、
+     * 已选数据包与外部基线接线状态。任何一个通道变化都会让启动缓存与采集一致性校验失败，
+     * 从而触发重新扫描或拒绝过期结果。服务器未就绪时抛出异常，由调用方选择保守路径。</p>
+     *
+     * @return 当前输入指纹
+     * @throws IllegalStateException 服务器或配方管理器尚未就绪时抛出
+     */
+    static ScanFingerprint currentScanFingerprint() {
+        MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
+        if (server == null) {
+            throw new IllegalStateException("服务器尚未就绪，无法计算扫描指纹");
+        }
+        if (server.getRecipeManager() == null) {
+            throw new IllegalStateException("配方管理器尚未就绪，无法计算扫描指纹");
+        }
+        return captureScanFingerprint(server);
+    }
+
+    /**
+     * 从给定服务器实例捕获输入指纹。
+     *
+     * <p>物品来自注册表；配方通道包含 id 与影响定价的内容；标签通道包含名称与成员；基线通道
+     * 还记录已选数据包。单个配方或标签读取失败时写入稳定的错误标记而不是静默省略；配方 id
+     * 枚举失败代表整个输入不可读取，直接抛出异常让调用方保守重扫。</p>
+     */
+    static ScanFingerprint captureScanFingerprint(@Nullable MinecraftServer server) {
+        List<String> itemIds = new ArrayList<>();
+        for (ResourceLocation id : BuiltInRegistries.ITEM.keySet()) {
+            itemIds.add(id.toString());
+        }
+
+        RecipeManager recipeManager = server == null ? null : server.getRecipeManager();
+        RegistryAccess registries = server == null ? null : server.registryAccess();
+
+        List<String> baselineValues = new ArrayList<>(baselineFingerprintValues());
+        if (server != null) {
+            try {
+                List<String> selectedPacks = new ArrayList<>(server.getPackRepository().getSelectedIds());
+                Collections.sort(selectedPacks);
+                baselineValues.add("datapacks=" + String.join(",", selectedPacks));
+            } catch (RuntimeException failure) {
+                baselineValues.add("datapacks-unavailable");
+            }
+        }
+
+        return ScanFingerprint.of(
+                itemIds,
+                recipeContentEntries(recipeManager, registries),
+                tagContentEntries(),
+                configFingerprintValues(),
+                baselineValues);
+    }
+
+    /**
+     * 配方内容通道：每个配方条目包含 id、类型、序列化器、特殊标记、输入候选与输出。
+     *
+     * <p>同一配方 id 在数据包或模组更新后内容变化时，条目随之变化，从而让启动缓存与
+     * 采集前后校验失效。配方 id 枚举失败属于整体输入不可读取，抛出异常而不是返回空列表。</p>
+     *
+     * @param manager    配方管理器，可为 {@code null}
+     * @param registries 注册表访问，用于解析配方输出；可为 {@code null}
+     * @return 每个配方一条稳定字符串
+     */
+    static List<String> recipeContentEntries(@Nullable RecipeManager manager,
+                                             @Nullable RegistryAccess registries) {
+        if (manager == null) {
+            return List.of();
+        }
+        List<ResourceLocation> ids;
+        try {
+            ids = manager.getRecipeIds().sorted().toList();
+        } catch (RuntimeException failure) {
+            throw new IllegalStateException("无法枚举配方 id 以计算扫描指纹", failure);
+        }
+
+        List<String> entries = new ArrayList<>(ids.size());
+        for (ResourceLocation id : ids) {
+            entries.add(recipeContentEntry(manager, id, registries));
+        }
+        return List.copyOf(entries);
+    }
+
+    private static String recipeContentEntry(RecipeManager manager, ResourceLocation id,
+                                             @Nullable RegistryAccess registries) {
+        try {
+            Optional<? extends Recipe<?>> maybeRecipe = manager.byKey(id);
+            if (maybeRecipe.isEmpty()) {
+                return id + "|missing";
+            }
+            Recipe<?> recipe = maybeRecipe.get();
+            StringBuilder entry = new StringBuilder(192);
+            entry.append(id).append('|')
+                    .append(registryKey(BuiltInRegistries.RECIPE_TYPE, recipe.getType())).append('|')
+                    .append(registryKey(BuiltInRegistries.RECIPE_SERIALIZER, recipe.getSerializer())).append('|')
+                    .append(recipe.isSpecial() ? "special" : "normal").append('|');
+            NonNullList<Ingredient> ingredients = recipe.getIngredients();
+            for (int i = 0; i < ingredients.size(); i++) {
+                if (i > 0) {
+                    entry.append(';');
+                }
+                entry.append(ingredientContent(ingredients.get(i)));
+            }
+            entry.append("=>").append(stackContent(recipe.getResultItem(registries)));
+            return entry.toString();
+        } catch (RuntimeException failure) {
+            // 单条配方读取失败时扫描器同样会跳过它；稳定错误标记仍能在内容恢复时触发重扫。
+            return id + "|error:" + failure.getClass().getName();
+        }
+    }
+
+    private static <T> String registryKey(Registry<T> registry, @Nullable T value) {
+        if (value == null) {
+            return "null";
+        }
+        ResourceLocation id = registry.getKey(value);
+        return id == null ? value.getClass().getName() : id.toString();
+    }
+
+    private static String ingredientContent(@Nullable Ingredient ingredient) {
+        if (ingredient == null || ingredient.isEmpty()) {
+            return "empty";
+        }
+        ItemStack[] stacks;
+        try {
+            stacks = ingredient.getItems();
+        } catch (RuntimeException failure) {
+            return "error:" + failure.getClass().getName();
+        }
+        List<String> options = new ArrayList<>();
+        if (stacks != null) {
+            for (ItemStack stack : stacks) {
+                if (stack != null && !stack.isEmpty()) {
+                    options.add(stackContent(stack));
+                }
+            }
+        }
+        if (options.isEmpty()) {
+            return "empty";
+        }
+        Collections.sort(options);
+        return String.join("/", options);
+    }
+
+    private static String stackContent(@Nullable ItemStack stack) {
+        if (stack == null || stack.isEmpty()) {
+            return "empty";
+        }
+        ResourceLocation id = BuiltInRegistries.ITEM.getKey(stack.getItem());
+        String itemId = id == null ? stack.getItem().getClass().getName() : id.toString();
+        CompoundTag tag = stack.getTag();
+        return itemId + "x" + stack.getCount() + (tag == null ? "" : tag.toString());
+    }
+
+    /**
+     * 生产标签内容通道：标签名称 + 已绑定成员排序后的列表；未绑定标签使用固定标记。
+     */
+    static List<String> tagContentEntries() {
+        ITagManager<Item> tagManager;
+        try {
+            if (ForgeRegistries.ITEMS == null) {
+                return List.of("tags-unavailable");
+            }
+            tagManager = ForgeRegistries.ITEMS.tags();
+        } catch (RuntimeException | LinkageError failure) {
+            return List.of("tags-unavailable");
+        }
+        if (tagManager == null) {
+            return List.of("tags-unavailable");
+        }
+        ITagManager<Item> manager = tagManager;
+        return tagContentEntries(BuiltInRegistries.ITEM.getTagNames(), tagKey -> {
+            ITag<Item> tag = manager.getTag(tagKey);
+            return tag == null || !tag.isBound() ? null : tag;
+        });
+    }
+
+    /**
+     * 标签内容通道的可测试实现。
+     *
+     * @param tagNames 标签名称流
+     * @param members  按标签返回成员；返回 {@code null} 表示标签未绑定
+     * @return 每个标签一条稳定字符串
+     */
+    static List<String> tagContentEntries(Stream<TagKey<Item>> tagNames,
+                                          Function<TagKey<Item>, ? extends Iterable<Item>> members) {
+        List<String> entries = new ArrayList<>();
+        for (TagKey<Item> tagKey : tagNames.toList()) {
+            Iterable<Item> tagMembers;
+            try {
+                tagMembers = members.apply(tagKey);
+            } catch (RuntimeException failure) {
+                entries.add(tagKey.location() + "|lookup-error:" + failure.getClass().getName());
+                continue;
+            }
+            entries.add(tagContentEntry(tagKey, tagMembers));
+        }
+        return List.copyOf(entries);
+    }
+
+    private static String tagContentEntry(TagKey<Item> tagKey, @Nullable Iterable<Item> members) {
+        if (members == null) {
+            return tagKey.location() + "|unbound";
+        }
+        List<String> ids = new ArrayList<>();
+        try {
+            for (Item item : members) {
+                if (item == null) {
+                    continue;
+                }
+                ResourceLocation id = BuiltInRegistries.ITEM.getKey(item);
+                if (id != null) {
+                    ids.add(id.toString());
+                }
+            }
+        } catch (RuntimeException failure) {
+            return tagKey.location() + "|error:" + failure.getClass().getName();
+        }
+        Collections.sort(ids);
+        return tagKey.location() + "|" + String.join(",", ids);
+    }
+
+    /**
+     * 基线通道：ProjectE 手工值文件内容与条目、外部基线接线状态、全部模组版本。
+     *
+     * <p>手工值文件内容摘要覆盖 tag 条目值等无法从 {@code Map} 表示的细节；模组版本确保
+     * 模组更新即使用 id 与配方文本恰好相同也不会复用旧缓存。</p>
+     */
+    static List<String> baselineFingerprintValues() {
+        List<String> values = new ArrayList<>();
+        values.add("baseline-schema=phase-12-content-v2");
+        values.add("external-baseline=phase-12-not-wired");
+        try {
+            ProjectEManualValues manualValues = OptionalIntegrationManager.manualValues();
+            values.add("projecte-manual-content=" + manualValues.contentFingerprint());
+            for (Map.Entry<ItemKey, Long> entry : manualValues.manualValues().entrySet()) {
+                values.add("projecte-manual-item=" + entry.getKey() + "=" + entry.getValue());
+            }
+            for (ResourceLocation tagId : manualValues.manualTagIds()) {
+                values.add("projecte-manual-tag=#" + tagId);
+            }
+        } catch (RuntimeException failure) {
+            values.add("projecte-manual-unavailable");
+        }
+        try {
+            values.add("projecte-provider=" + OptionalIntegrationManager.provider()
+                    .filter(provider -> provider.isAvailable())
+                    .map(provider -> provider.getClass().getName())
+                    .orElse("unavailable"));
+        } catch (RuntimeException failure) {
+            values.add("projecte-provider-unavailable");
+        }
+        values.addAll(modVersionFingerprintValues());
+        return List.copyOf(values);
+    }
+
+    private static List<String> modVersionFingerprintValues() {
+        try {
+            ModList modList = ModList.get();
+            if (modList == null) {
+                return List.of("mods-unavailable");
+            }
+            List<String> mods = new ArrayList<>();
+            for (IModInfo info : modList.getMods()) {
+                mods.add(info.getModId() + "=" + info.getVersion());
+            }
+            Collections.sort(mods);
+            return List.of("mods=" + String.join(",", mods));
+        } catch (RuntimeException | LinkageError failure) {
+            return List.of("mods-unavailable");
+        }
+    }
+
+    /**
+     * 收集影响定价结果的配置值。读取失败时返回固定降级标记，绝不把空配置误判为“未变化”。
+     */
+    private static List<String> configFingerprintValues() {
+        List<String> values = new ArrayList<>();
+        try {
+            values.add("general.enabled=" + SudoersemcConfig.GENERAL_ENABLED.get());
+            values.add("general.alwaysRescan=" + SudoersemcConfig.GENERAL_ALWAYS_RESCAN.get());
+            values.add("recipe.solveRecipes=" + SudoersemcConfig.RECIPE_SOLVE_RECIPES.get());
+            values.add("recipe.maxPasses=" + SudoersemcConfig.RECIPE_MAX_RECIPE_PASSES.get());
+            values.add("recipe.allowIncrease=" + SudoersemcConfig.RECIPE_ALLOW_RECIPE_VALUE_INCREASE.get());
+            values.add("fallback.unsolvable=" + SudoersemcConfig.FALLBACK_USE_FALLBACK_FOR_UNSOLVABLE.get());
+            values.add("fallback.tag=" + SudoersemcConfig.FALLBACK_USE_TAG_PRICING.get());
+            values.add("fallback.rarity=" + SudoersemcConfig.FALLBACK_USE_RARITY_PRICING.get());
+            values.add("fallback.baselines=" + SudoersemcConfig.FALLBACK_USE_PROJECTE_INTEGRATION_BASELINES.get());
+            values.add("safety.largeDrop=" + SudoersemcConfig.SAFETY_LARGE_DROP_PROTECTION.get());
+            values.add("safety.maxDropRatio=" + SudoersemcConfig.SAFETY_MAX_ALLOWED_DROP_RATIO.get());
+            values.add("safety.creative=" + SudoersemcConfig.SAFETY_PROTECT_CREATIVE_ONLY_ITEMS.get());
+            values.add("safety.creativeExclusions=" + SudoersemcConfig.SAFETY_CREATIVE_ITEM_EXCLUSIONS.get());
+            values.add("safety.creativeSpecialValues="
+                    + SudoersemcConfig.SAFETY_CREATIVE_ITEM_SPECIAL_VALUES.get());
+            values.add("safety.creativeNamespaces=" + SudoersemcConfig.SAFETY_CREATIVE_NAMESPACES.get());
+            values.add("overflow.enabled=" + SudoersemcConfig.OVERFLOW_ENABLED.get());
+            values.add("overflow.threshold=" + SudoersemcConfig.OVERFLOW_THRESHOLD.get());
+            values.add("overflow.resetMin=" + SudoersemcConfig.OVERFLOW_RESET_MIN.get());
+            values.add("overflow.resetMax=" + SudoersemcConfig.OVERFLOW_RESET_MAX.get());
+            values.add("overflow.scope=" + SudoersemcConfig.OVERFLOW_OVERWRITE_SCOPE.get());
+            values.add("overflow.bucketCount=" + SudoersemcConfig.OVERFLOW_BUCKET_COUNT.get());
+            values.add("overflow.weightCap=" + SudoersemcConfig.OVERFLOW_WEIGHT_CAP.get());
+            values.add("overflow.randomSeed=" + SudoersemcConfig.OVERFLOW_RANDOM_SEED.get());
+            values.add("overflow.allowProjecteFileRewrite="
+                    + SudoersemcConfig.OVERFLOW_ALLOW_PROJECTE_FILE_REWRITE.get());
+            values.add("nbt.variants=" + SudoersemcConfig.NBT_SCAN_NBT_VARIANTS.get());
+            values.add("nbt.maxVariants=" + SudoersemcConfig.NBT_MAX_NBT_VARIANTS_PER_ITEM.get());
+        } catch (RuntimeException failure) {
+            LOGGER.warn("SudoersEMC 读取配置指纹失败，使用降级标记", failure);
+            values.add("config-unavailable");
+        }
+        return List.copyOf(values);
     }
 
     /**
@@ -555,7 +1198,7 @@ public final class Sudoersemc {
         RuntimeComponents components;
         try {
             components = createRuntimeComponents(
-                    store, stateStore, reports, overflowResetLog, snapshot);
+                    store, stateStore, reports, overflowResetLog, quarantinedDropsStore, snapshot);
         } catch (RuntimeException failure) {
             LOGGER.warn("SudoersEMC 构建运行时组件失败（{}），保留旧组件", label, failure);
             lastReloadDecision = ReloadDecision.REJECT;
@@ -724,6 +1367,26 @@ public final class Sudoersemc {
     private record ResolvedSnapshot(RuntimeConfigSnapshot snapshot, boolean valid) {
     }
 
+    /**
+     * 用当前运行时组件重新创建命令服务并重新注入命令树。
+     *
+     * <p>服务器启动、配置重载与 common setup 都会替换 {@link ScanManager}，命令服务必须跟着
+     * 重建，否则 {@code /sudoemc status} 等命令会继续读取旧调度器。审批回调必须与新调度器
+     * 一起注入，保证隔离审批闭环不因重载而失效。</p>
+     */
+    private static void refreshCommandService() {
+        CommandService service = new CommandService(
+                scanManager,
+                reportManager,
+                entryStore,
+                scanStateStore,
+                Sudoersemc::reloadConfig,
+                Sudoersemc::approveQuarantined,
+                Sudoersemc::requestScanSynchronized);
+        commandService = service;
+        SudoemcCommands.setService(service);
+    }
+
     private void onRegisterCommands(RegisterCommandsEvent event) {
         event.getDispatcher().register(SudoemcCommands.register());
         LOGGER.debug("SudoersEMC registered /sudoemc command tree");
@@ -746,6 +1409,7 @@ public final class Sudoersemc {
     }
 
     private void onServerStarted(ServerStartedEvent event) {
+        currentServer = event.getServer();
         // 配置事件可能早于服务器就绪；先应用挂起重载，再用新组件决定是否自动扫描。
         if (pendingReload) {
             processPendingReload();
@@ -798,19 +1462,15 @@ public final class Sudoersemc {
     }
 
     private void onServerStopping(ServerStoppingEvent event) {
-        resetScanManager(scanManager);
-        GeneratedEntryStore store = entryStore;
-        if (store != null) {
-            store.saveIfDirty();
+        ScanManager manager = scanManager;
+        if (manager != null) {
+            manager.cancel();
+            manager.reset();
         }
-        ScanStateStore stateStore = scanStateStore;
-        if (stateStore != null) {
-            stateStore.saveIfDirty();
-        }
-        OverflowResetLog resetLog = overflowResetLog;
-        if (resetLog != null) {
-            resetLog.save();
-        }
+        scanManager = null;
+        scanPipeline = null;
+        currentServer = null;
+        flushRuntimeStoresOnServerThread();
         pendingReload = false;
         pendingReloadFromCommand = false;
         // 不保留指向旧世界的命令服务；下一次 ServerStartedEvent 会重新注入。
