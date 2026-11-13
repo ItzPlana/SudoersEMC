@@ -3,6 +3,7 @@ package com.itzplana.sudoersemc.scanner;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import java.util.List;
 import java.util.Set;
@@ -48,6 +49,31 @@ class ItemScannerTest {
         ItemScanner scanner = new ItemScanner(noEmc(), namespaces, Set.of());
 
         assertTrue(scanner.scan().isEmpty());
+    }
+
+    @Test
+    void chunkedScanHonoursBatchAndCollectsEveryItem() {
+        ItemScanner scanner = new ItemScanner(noEmc(), Set.of(), Set.of(DIRT));
+        ItemScanner.ScanSession session = scanner.beginScan();
+
+        assertTrue(session.totalItems() > 0);
+        int previousProcessed = 0;
+        int steps = 0;
+        while (!session.isDone() && steps++ < 10_000) {
+            int processed = session.step(7);
+            assertTrue(processed <= 7, "单批不得超出请求上限");
+            assertTrue(session.processedItems() >= previousProcessed,
+                    "已处理数量必须单调递增");
+            previousProcessed = session.processedItems();
+            assertTrue(processed > 0 || session.isDone(),
+                    "未完成的批次必须实际处理工作");
+        }
+
+        assertTrue(session.isDone(), "分片会话必须在有限步数内完成");
+        assertEquals(session.totalItems(), session.processedItems());
+        assertFalse(session.snapshots().isEmpty());
+        assertTrue(session.snapshots().stream().noneMatch(snapshot -> snapshot.registryId().equals(AIR)));
+        assertTrue(session.snapshots().stream().noneMatch(snapshot -> snapshot.registryId().equals(DIRT)));
     }
 
     @Test
@@ -119,6 +145,45 @@ class ItemScannerTest {
 
         assertTrue(dirt.tagPaths().isEmpty(), "采集失败时必须退化为空标签，不能中断整次扫描");
         assertEquals(Rarity.COMMON, dirt.rarity(), "采集失败时稀有度必须退化为 COMMON");
+    }
+
+    @Test
+    void sessionHonoursStepBudgetAndProducesFullScan() {
+        ItemScanner scanner = new ItemScanner(noEmc(), Set.of(), Set.of());
+        ItemScanner.ItemScanSession session = scanner.beginSession();
+
+        assertTrue(session.total() > 10, "vanilla registry should contain more than 10 items");
+        assertEquals(0, session.processed());
+        assertFalse(session.isDone());
+
+        int first = session.step(3);
+        assertEquals(3, first, "one step must not inspect more than the requested budget");
+        assertEquals(3, session.processed());
+        assertFalse(session.isDone());
+
+        int guard = 0;
+        while (!session.isDone() && guard++ < 10_000) {
+            int actual = session.step(7);
+            assertTrue(actual > 0 && actual <= 7, "step must stay inside the requested budget");
+        }
+        assertTrue(session.isDone());
+        assertEquals(session.total(), session.processed());
+
+        List<ResourceLocation> sessionIds = session.snapshots().stream()
+                .map(ItemSnapshot::registryId)
+                .toList();
+        List<ResourceLocation> fullScanIds = scanner.scan().stream()
+                .map(ItemSnapshot::registryId)
+                .toList();
+        assertEquals(fullScanIds, sessionIds,
+                "分片会话必须产生与一次性 scan 相同顺序的物品快照");
+    }
+
+    @Test
+    void sessionStepRejectsNonPositiveBudget() {
+        ItemScanner scanner = new ItemScanner(noEmc(), Set.of(), Set.of());
+
+        assertThrows(IllegalArgumentException.class, () -> scanner.beginSession().step(0));
     }
 
     private static ItemSnapshot find(List<ItemSnapshot> snapshots, ResourceLocation id) {

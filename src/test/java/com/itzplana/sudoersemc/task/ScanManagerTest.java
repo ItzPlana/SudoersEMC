@@ -11,6 +11,7 @@ import java.util.List;
 import java.util.function.Supplier;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
@@ -435,6 +436,36 @@ class ScanManagerTest {
     }
 
     @Test
+    void asyncApplierKeepsManagerInApplyingUntilComplete() {
+        AtomicInteger applyCalls = new AtomicInteger();
+        AtomicInteger completionPolls = new AtomicInteger();
+        ScanManager.ResultApplier applier = new ScanManager.ResultApplier() {
+            @Override
+            public void apply(ScanManager.SnapshotData data) {
+                applyCalls.incrementAndGet();
+            }
+
+            @Override
+            public boolean isComplete(ScanManager.SnapshotData data) {
+                return completionPolls.incrementAndGet() >= 3;
+            }
+        };
+        ScanManager manager = manager(new BatchProcessor(10, false),
+                collector(data(1, 1)), applier);
+
+        assertTrue(manager.requestScan());
+        int ticks = 0;
+        while (manager.isRunning() && ticks++ < TICK_GUARD) {
+            manager.tick();
+        }
+
+        assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
+        assertTrue(applyCalls.get() >= 3,
+                "异步应用必须跨多个 tick 轮询，而不是一次调用就进入 SAVING");
+        assertTrue(completionPolls.get() >= 3);
+    }
+
+    @Test
     void zeroWorkStillCompletes() {
         ScanManager manager = manager(new BatchProcessor(1, false),
                 collector(data(0, 0)), snapshot -> { });
@@ -451,7 +482,7 @@ class ScanManagerTest {
     }
 
     @Test
-    void adaptiveSamplesAreOnlyRecordedForCollectingAndSolving() {
+    void adaptiveSamplesAreOnlyRecordedForCollection() {
         BatchProcessor processor = new BatchProcessor(10, true);
         ScanManager manager = manager(processor, collector(data(1, 1)), snapshot -> { });
 
@@ -463,8 +494,8 @@ class ScanManagerTest {
         }
         assertEquals(ScanPhase.APPLYING, manager.progress().phase());
         long batchesBeforeApply = processor.batchesProcessed();
-        assertEquals(3L, batchesBeforeApply,
-                "2 个采集批次（物品 + 配方）和 1 个求解批次应计入自适应样本");
+        assertEquals(2L, batchesBeforeApply,
+                "只有 2 个真实采集批次（物品 + 配方）应计入自适应样本；求解空转不得记账");
 
         while (manager.isRunning() && ticks++ < TICK_GUARD) {
             manager.tick();
@@ -727,6 +758,26 @@ class ScanManagerTest {
     }
 
     @Test
+    void saveHandlerRunsOnceInSavingStage() {
+        AtomicInteger saves = new AtomicInteger();
+        ScanManager manager = new ScanManager(
+                new BatchProcessor(10, false),
+                collector(data(1, 1)),
+                snapshot -> { },
+                TICK_BUDGET_NANOS,
+                () -> fingerprint("minecraft:dirt"),
+                saves::incrementAndGet);
+
+        assertTrue(manager.requestScan());
+        for (int tick = 0; tick < TICK_GUARD && manager.isRunning(); tick++) {
+            manager.tick();
+        }
+
+        assertEquals(1, saves.get(), "save handler must run exactly once");
+        assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
+    }
+
+    @Test
     void cancelInvokesAbortListener() {
         AtomicReference<ScanPhase> observedPhase = new AtomicReference<>();
         AtomicReference<ScanDiagnostics> observedTelemetry = new AtomicReference<>();
@@ -826,5 +877,502 @@ class ScanManagerTest {
         manager.tick();
         assertEquals(ScanPhase.CANCELLED, manager.progress().phase(),
                 "管线内部请求的取消信号应在下一次 tick 被调度器观察");
+    }
+
+    @Test
+    void requestScanInvokesScanStartListenerOnlyWhenAccepted() {
+        AtomicInteger starts = new AtomicInteger();
+        ScanManager manager = new ScanManager(new BatchProcessor(1, false),
+                ScanManager.oneShot(data(1, 1)), snapshot -> { }, TICK_BUDGET_NANOS,
+                new ScanDiagnostics(), null, null, starts::incrementAndGet);
+
+        assertTrue(manager.requestScan());
+        assertEquals(1, starts.get(), "每次成功开始扫描都必须重置跨扫描状态");
+        assertFalse(manager.requestScan(), "活动扫描期间不得重复开始");
+        assertEquals(1, starts.get(), "被拒绝的请求不得重置跨扫描状态");
+
+        manager.reset();
+        assertTrue(manager.requestScan());
+        assertEquals(2, starts.get(), "重置后新一轮扫描必须再次触发开始回调");
+    }
+
+    @Test
+    void scanStartListenerExceptionDoesNotEscape() {
+        ScanManager manager = new ScanManager(new BatchProcessor(1, false),
+                ScanManager.oneShot(data(1, 1)), snapshot -> { }, TICK_BUDGET_NANOS,
+                new ScanDiagnostics(), null, null, () -> {
+                    throw new IllegalStateException("开始回调爆炸");
+                });
+
+        assertDoesNotThrow(manager::requestScan);
+        assertTrue(manager.isRunning());
+    }
+
+    @Test
+    void saveHandlerFailureTurnsScanIntoFailed() {
+        ScanManager manager = new ScanManager(
+                new BatchProcessor(10, false),
+                collector(data(1, 1)),
+                snapshot -> { },
+                TICK_BUDGET_NANOS,
+                () -> fingerprint("minecraft:dirt"),
+                () -> {
+                    throw new IllegalStateException("disk full");
+                });
+
+        assertTrue(manager.requestScan());
+        for (int tick = 0; tick < TICK_GUARD && manager.isRunning(); tick++) {
+            manager.tick();
+        }
+
+        assertEquals(ScanPhase.FAILED, manager.progress().phase());
+        assertTrue(manager.progress().detail().contains("disk full"));
+    }
+
+    @Test
+    void solveIdleDoesNotGrowAdaptiveBatch() {
+        BatchProcessor processor = new BatchProcessor(10, true);
+        ScanManager.ApplyTask neverSolved = new ScanManager.ApplyTask() {
+            @Override
+            public boolean isSolveComplete() {
+                return false;
+            }
+
+            @Override
+            public void advanceSolve(long deadlineNanos) {
+            }
+
+            @Override
+            public int stage(int maxItems, long deadlineNanos) {
+                return 0;
+            }
+
+            @Override
+            public boolean isDone() {
+                return false;
+            }
+
+            @Override
+            public int solvedCount() {
+                return 0;
+            }
+
+            @Override
+            public int unresolvedCount() {
+                return 0;
+            }
+        };
+        ScanManager manager = ScanManager.staged(processor, collector(data(0, 0)),
+                snapshot -> neverSolved, TICK_BUDGET_NANOS, null, null);
+
+        manager.requestScan();
+        manager.tick();
+        assertEquals(ScanPhase.SOLVING, manager.progress().phase());
+        long samplesBefore = processor.batchesProcessed();
+        int batchBefore = processor.currentBatchSize();
+
+        for (int tick = 0; tick < 50 && manager.progress().phase() == ScanPhase.SOLVING; tick++) {
+            manager.tick();
+        }
+
+        assertEquals(ScanPhase.SOLVING, manager.progress().phase());
+        assertEquals(samplesBefore, processor.batchesProcessed(),
+                "求解空转 tick 不得写入自适应样本");
+        assertEquals(batchBefore, processor.currentBatchSize(),
+                "求解空转不得把自适应批量推到上限");
+
+        manager.cancel();
+        manager.tick();
+        assertEquals(ScanPhase.CANCELLED, manager.progress().phase());
+    }
+
+    @Test
+    void stagedApplyIsShardedAcrossTicks() {
+        AtomicInteger stagedTotal = new AtomicInteger();
+        AtomicInteger maxStep = new AtomicInteger();
+        ScanManager.ApplyTask task = new ScanManager.ApplyTask() {
+            private boolean done;
+
+            @Override
+            public boolean isSolveComplete() {
+                return true;
+            }
+
+            @Override
+            public void advanceSolve(long deadlineNanos) {
+            }
+
+            @Override
+            public int stage(int maxItems, long deadlineNanos) {
+                int take = Math.min(maxItems, 10 - stagedTotal.get());
+                maxStep.accumulateAndGet(take, Math::max);
+                stagedTotal.addAndGet(take);
+                if (stagedTotal.get() >= 10) {
+                    done = true;
+                }
+                return take;
+            }
+
+            @Override
+            public boolean isDone() {
+                return done;
+            }
+
+            @Override
+            public int solvedCount() {
+                return 10;
+            }
+
+            @Override
+            public int unresolvedCount() {
+                return 0;
+            }
+        };
+        ScanManager manager = ScanManager.staged(new BatchProcessor(3, false),
+                collector(data(0, 0)), snapshot -> task, TICK_BUDGET_NANOS, null, null);
+
+        manager.requestScan();
+        manager.tick();
+        assertEquals(ScanPhase.SOLVING, manager.progress().phase());
+        manager.tick();
+        assertEquals(ScanPhase.APPLYING, manager.progress().phase());
+
+        manager.tick();
+        assertEquals(3, stagedTotal.get(), "单 tick 只能写入一个批次");
+        assertEquals(ScanPhase.APPLYING, manager.progress().phase());
+
+        int ticks = 0;
+        while (manager.isRunning() && ticks++ < TICK_GUARD) {
+            manager.tick();
+        }
+
+        assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
+        assertEquals(10, stagedTotal.get());
+        assertTrue(maxStep.get() <= 3, "每个 tick 的 staging 不得超过批量上限");
+    }
+
+    @Test
+    void stagedSaveIsPolledAcrossTicks() {
+        AtomicInteger advances = new AtomicInteger();
+        ScanManager.SaveTask save = deadlineNanos -> advances.incrementAndGet() >= 3;
+        ScanManager manager = ScanManager.staged(new BatchProcessor(10, false),
+                collector(data(0, 0)),
+                snapshot -> ScanManager.ApplyTask.completed(0, 0),
+                TICK_BUDGET_NANOS, null, () -> save);
+
+        manager.requestScan();
+        int ticks = 0;
+        while (manager.isRunning() && ticks++ < TICK_GUARD) {
+            manager.tick();
+        }
+
+        assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
+        assertEquals(3, advances.get(), "SAVING 阶段每 tick 只轮询一次，完成前保持 SAVING");
+    }
+
+    @Test
+    void collectionStepReceivesDeadline() {
+        AtomicReference<Long> seenDeadline = new AtomicReference<>();
+        ScanManager.CollectSession session = new ScanManager.CollectSession() {
+            private int processed;
+
+            @Override
+            public int itemCount() {
+                return 10;
+            }
+
+            @Override
+            public int recipeCount() {
+                return 0;
+            }
+
+            @Override
+            public int processedItems() {
+                return processed;
+            }
+
+            @Override
+            public int processedRecipes() {
+                return 0;
+            }
+
+            @Override
+            public boolean isDone() {
+                return false;
+            }
+
+            @Override
+            public ScanManager.StepResult step(int maxItems) {
+                return step(maxItems, Long.MAX_VALUE);
+            }
+
+            @Override
+            public ScanManager.StepResult step(int maxItems, long deadlineNanos) {
+                seenDeadline.set(deadlineNanos);
+                processed++;
+                return new ScanManager.StepResult(1, false);
+            }
+
+            @Override
+            public ScanManager.SnapshotData finish() {
+                return data(10, 0);
+            }
+        };
+        long before = System.nanoTime();
+        ScanManager manager = manager(new BatchProcessor(5, false),
+                () -> session, snapshot -> { });
+
+        manager.requestScan();
+        manager.tick();
+
+        Long deadline = seenDeadline.get();
+        assertTrue(deadline != null && deadline > before,
+                "采集会话必须收到本 tick 的绝对截止时间");
+        assertEquals(1, manager.progress().processed());
+    }
+
+    @Test
+    void reloadDuringCollectionFailsScan() {
+        ReloadTrackingFingerprints fingerprints = new ReloadTrackingFingerprints();
+        ShardedSession session = new ShardedSession(data(4, 0));
+        ScanManager manager = ScanManager.staged(new BatchProcessor(2, false),
+                () -> session,
+                snapshot -> ScanManager.ApplyTask.completed(0, 0),
+                TICK_BUDGET_NANOS, fingerprints, null);
+
+        assertTrue(manager.requestScan());
+        manager.tick();
+        assertEquals(ScanPhase.COLLECTING_SNAPSHOT, manager.progress().phase());
+
+        fingerprints.reload();
+        manager.tick();
+
+        assertEquals(ScanPhase.FAILED, manager.progress().phase());
+        assertTrue(manager.progress().detail().contains("采集期间"));
+    }
+
+    @Test
+    void reloadAfterSolveBeforeFirstStagingTickFailsScan() {
+        ReloadTrackingFingerprints fingerprints = new ReloadTrackingFingerprints();
+        CountingApplyTask task = new CountingApplyTask(10, 3);
+        ScanManager manager = ScanManager.staged(new BatchProcessor(3, false),
+                collector(data(0, 0)), snapshot -> task, TICK_BUDGET_NANOS,
+                fingerprints, null);
+
+        assertTrue(manager.requestScan());
+        manager.tick();
+        assertEquals(ScanPhase.SOLVING, manager.progress().phase());
+        manager.tick();
+        assertEquals(ScanPhase.APPLYING, manager.progress().phase(),
+                "求解完成且代次未变化时应进入 APPLYING");
+
+        fingerprints.reload();
+        manager.tick();
+
+        assertEquals(ScanPhase.FAILED, manager.progress().phase());
+        assertEquals(0, task.stageCalls(), "求解完成后 reload，首个 staging tick 不得写入");
+        assertTrue(task.cancelled(), "失败后必须取消应用任务");
+        assertTrue(manager.progress().detail().contains("重新扫描"));
+    }
+
+    @Test
+    void reloadDuringStagingAbortsRemainingBatches() {
+        ReloadTrackingFingerprints fingerprints = new ReloadTrackingFingerprints();
+        CountingApplyTask task = new CountingApplyTask(9, 3);
+        ScanManager manager = ScanManager.staged(new BatchProcessor(3, false),
+                collector(data(0, 0)), snapshot -> task, TICK_BUDGET_NANOS,
+                fingerprints, null);
+
+        assertTrue(manager.requestScan());
+        manager.tick();
+        manager.tick();
+        manager.tick();
+        assertEquals(ScanPhase.APPLYING, manager.progress().phase());
+        assertEquals(3, task.staged(), "首个 staging 批次应已写入 3 条");
+
+        fingerprints.reload();
+        manager.tick();
+
+        assertEquals(ScanPhase.FAILED, manager.progress().phase());
+        assertEquals(3, task.staged(), "reload 后不得继续写入后续批次");
+        assertTrue(task.cancelled(), "失败后必须取消应用任务并触发回滚");
+    }
+
+    @Test
+    void nonReloadTrackingSupplierVerifiesOncePerStagingBatch() {
+        AtomicInteger fullFingerprintCalls = new AtomicInteger();
+        ScanManager.FingerprintSupplier fingerprints = new ScanManager.FingerprintSupplier() {
+            @Override
+            public ScanFingerprint current() {
+                fullFingerprintCalls.incrementAndGet();
+                return fingerprint("minecraft:stone");
+            }
+        };
+        CountingApplyTask task = new CountingApplyTask(9, 3);
+        ScanManager manager = ScanManager.staged(new BatchProcessor(3, false),
+                collector(data(0, 0)), snapshot -> task, TICK_BUDGET_NANOS,
+                fingerprints, null);
+
+        assertTrue(manager.requestScan());
+        manager.tick(); // 采集完成 -> SOLVING
+        manager.tick(); // 求解完成 -> APPLYING
+        assertEquals(ScanPhase.APPLYING, manager.progress().phase());
+        int afterEnteringApplying = fullFingerprintCalls.get();
+
+        manager.tick(); // 第 1 批
+        assertEquals(afterEnteringApplying + 1, fullFingerprintCalls.get(),
+                "非 reloadTracking 的每个 staging 批次只应在开始前校验一次");
+        manager.tick(); // 第 2 批
+        assertEquals(afterEnteringApplying + 2, fullFingerprintCalls.get(),
+                "同一批次前后不得各计算一次完整指纹");
+        manager.tick(); // 第 3 批 + 提交门
+        assertEquals(afterEnteringApplying + 4, fullFingerprintCalls.get(),
+                "最后一批需要批次边界校验一次 + 提交门前校验一次");
+        assertEquals(ScanPhase.SAVING, manager.progress().phase());
+    }
+
+    @Test
+    void reloadTrackingSupplierNeverRecomputesFullFingerprint() {
+        ReloadTrackingFingerprints fingerprints = new ReloadTrackingFingerprints();
+        CountingApplyTask task = new CountingApplyTask(9, 3);
+        ScanManager manager = ScanManager.staged(new BatchProcessor(3, false),
+                collector(data(0, 0)), snapshot -> task, TICK_BUDGET_NANOS,
+                fingerprints, null);
+
+        assertTrue(manager.requestScan());
+        for (int tick = 0; tick < TICK_GUARD && manager.isRunning(); tick++) {
+            manager.tick();
+        }
+
+        assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
+        assertEquals(0, fingerprints.fullCalls(),
+                "支持 reload 代次时不得在采集/求解/应用期间重新计算完整指纹");
+    }
+
+    @Test
+    void stagedSaveFailureTurnsScanIntoFailed() {
+        ScanManager.SaveTask failing = deadlineNanos -> {
+            throw new IllegalStateException("磁盘写入失败");
+        };
+        ScanManager manager = ScanManager.staged(new BatchProcessor(10, false),
+                collector(data(0, 0)),
+                snapshot -> ScanManager.ApplyTask.completed(0, 0),
+                TICK_BUDGET_NANOS, null, () -> failing);
+
+        assertTrue(manager.requestScan());
+        for (int tick = 0; tick < TICK_GUARD && manager.isRunning(); tick++) {
+            manager.tick();
+        }
+
+        assertEquals(ScanPhase.FAILED, manager.progress().phase());
+        assertTrue(manager.progress().detail().contains("磁盘写入失败"));
+    }
+
+    /**
+     * 支持廉价 reload 代次的指纹提供器。{@link #reload()} 模拟一次 {@code /reload}；
+     * {@link #fullCalls()} 用于证明扫描过程中不会重复计算完整指纹。
+     */
+    private static final class ReloadTrackingFingerprints
+            implements ScanManager.FingerprintSupplier {
+
+        private final AtomicLong generation = new AtomicLong();
+        private final AtomicInteger fullCalls = new AtomicInteger();
+
+        @Override
+        public ScanFingerprint current() {
+            fullCalls.incrementAndGet();
+            return fingerprint("minecraft:stone");
+        }
+
+        @Override
+        public long reloadGeneration() {
+            return generation.get();
+        }
+
+        @Override
+        public boolean tracksReloadGeneration() {
+            return true;
+        }
+
+        void reload() {
+            generation.incrementAndGet();
+        }
+
+        int fullCalls() {
+            return fullCalls.get();
+        }
+    }
+
+    /**
+     * 计数用分片应用任务：每次 stage 最多写入 {@code perStage} 条。
+     */
+    private static final class CountingApplyTask implements ScanManager.ApplyTask {
+
+        private final int total;
+        private final int perStage;
+        private int staged;
+        private int stageCalls;
+        private boolean done;
+        private boolean cancelled;
+
+        CountingApplyTask(int total, int perStage) {
+            this.total = total;
+            this.perStage = perStage;
+        }
+
+        @Override
+        public boolean isSolveComplete() {
+            return true;
+        }
+
+        @Override
+        public void advanceSolve(long deadlineNanos) {
+        }
+
+        @Override
+        public int stage(int maxItems, long deadlineNanos) {
+            if (done || cancelled) {
+                return 0;
+            }
+            stageCalls++;
+            int take = Math.min(Math.min(maxItems, perStage), total - staged);
+            staged += take;
+            if (staged >= total) {
+                done = true;
+            }
+            return take;
+        }
+
+        @Override
+        public boolean isDone() {
+            return done;
+        }
+
+        @Override
+        public int solvedCount() {
+            return total;
+        }
+
+        @Override
+        public int unresolvedCount() {
+            return 0;
+        }
+
+        @Override
+        public void cancel() {
+            cancelled = true;
+        }
+
+        int stageCalls() {
+            return stageCalls;
+        }
+
+        int staged() {
+            return staged;
+        }
+
+        boolean cancelled() {
+            return cancelled;
+        }
     }
 }
