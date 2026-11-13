@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Consumer;
 import net.minecraft.core.NonNullList;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
@@ -56,57 +57,201 @@ public final class RecipeScanner {
      * @return every recipe this build can describe, plus counters for what it skipped
      */
     public ScanResult scan(RecipeManager manager) {
-        Objects.requireNonNull(manager, "manager");
-        List<RecipeSnapshot> snapshots = new ArrayList<>();
-        int unsupported = 0;
-        int invalid = 0;
-        int failed = 0;
+        RecipeScanSession session = beginSession(manager);
+        while (!session.isDone()) {
+            session.step(Integer.MAX_VALUE);
+        }
+        return session.result();
+    }
 
-        // getRecipeIds()/byKey() is the only 1.20.1 API that pairs an id with its recipe without
-        // touching private state.
+    /**
+     * 开始一次可分片推进的配方扫描。
+     *
+     * <p>会话在构造时只枚举配方 id，不读取或转换任何配方；每次
+     * {@link RecipeScanSession#step(int)} 最多描述 {@code maxItems} 条配方。
+     * 这样 {@code ScanManager} 可以把配方扫描分散到多个服务器 tick，同时保持与
+     * {@link #scan(RecipeManager)} 完全相同的排除/失败计数语义。</p>
+     *
+     * @param manager 当前配方管理器
+     * @return 新的配方扫描游标
+     */
+    public RecipeScanSession beginSession(RecipeManager manager) {
+        return beginSession(manager, null);
+    }
+
+    /**
+     * 开始一次可分片推进的配方扫描，并在每条配方成功描述后回调。
+     *
+     * <p>回调在生产接线中用于增量累积配方内容指纹：配方快照一产生就转换为稳定字符串，
+     * 不再等到采集结束再全量遍历。回调在服务器线程、配方扫描批次内执行，必须保持轻量；
+     * 抛出的运行时异常会让本次扫描失败。</p>
+     *
+     * @param manager    当前配方管理器
+     * @param onSnapshot 每条可用配方的回调，允许为 {@code null}
+     * @return 新的配方扫描游标
+     */
+    public RecipeScanSession beginSession(RecipeManager manager,
+                                          Consumer<RecipeSnapshot> onSnapshot) {
+        Objects.requireNonNull(manager, "manager");
         List<ResourceLocation> ids;
         try {
+            // getRecipeIds()/byKey() is the only 1.20.1 API that pairs an id with its recipe without
+            // touching private state.
             ids = manager.getRecipeIds().toList();
         } catch (RuntimeException e) {
             LOGGER.warn("Could not enumerate recipe ids", e);
-            return new ScanResult(List.of(), 0, 0, 0);
+            ids = List.of();
+        }
+        return new RecipeScanSession(this, manager, ids, onSnapshot);
+    }
+
+    /**
+     * 持有配方 id 游标的扫描会话。
+     */
+    public static final class RecipeScanSession {
+
+        private final RecipeScanner scanner;
+        private final RecipeManager manager;
+        private final List<ResourceLocation> ids;
+        private final Consumer<RecipeSnapshot> onSnapshot;
+        private final List<RecipeSnapshot> snapshots = new ArrayList<>();
+
+        private int index;
+        private int unsupported;
+        private int invalid;
+        private int failed;
+        private boolean summaryLogged;
+
+        private RecipeScanSession(RecipeScanner scanner,
+                                  RecipeManager manager,
+                                  List<ResourceLocation> ids,
+                                  Consumer<RecipeSnapshot> onSnapshot) {
+            this.scanner = scanner;
+            this.manager = manager;
+            this.ids = List.copyOf(ids);
+            this.onSnapshot = onSnapshot;
         }
 
-        for (ResourceLocation id : ids) {
+        /**
+         * @return 计划处理的配方总数
+         */
+        public int total() {
+            return ids.size();
+        }
+
+        /**
+         * @return 已经检查过的配方数
+         */
+        public int processed() {
+            return index;
+        }
+
+        /**
+         * @return 是否已经处理完全部配方 id
+         */
+        public boolean isDone() {
+            return index >= ids.size();
+        }
+
+        /**
+         * 检查最多 {@code maxItems} 条配方。
+         *
+         * @param maxItems 本次允许处理的最大配方数，必须大于等于 1
+         * @return 本次实际检查的配方数；全部处理完时返回 0
+         */
+        public int step(int maxItems) {
+            return step(maxItems, Long.MAX_VALUE);
+        }
+
+        /**
+         * 检查最多 {@code maxItems} 条配方，并在每条配方之间检查截止时间。
+         *
+         * <p>单条配方的描述无法被抢占，因此截止时间是最佳努力：本方法会在当前配方处理完后
+         * 立即返回，而不会中断正在进行的转换。</p>
+         *
+         * @param maxItems      本次允许处理的最大配方数，必须大于等于 1
+         * @param deadlineNanos {@link System#nanoTime()} 截止时间；{@link Long#MAX_VALUE} 表示不限
+         * @return 本次实际检查的配方数；全部处理完时返回 0
+         */
+        public int step(int maxItems, long deadlineNanos) {
+            if (maxItems < 1) {
+                throw new IllegalArgumentException("maxItems 必须 >= 1，实际为 " + maxItems);
+            }
+            int work = 0;
+            while (work < maxItems && index < ids.size()) {
+                if (deadlineReached(deadlineNanos)) {
+                    break;
+                }
+                ResourceLocation id = ids.get(index++);
+                work++;
+                scanOne(id);
+            }
+            if (isDone()) {
+                logSummary();
+            }
+            return work;
+        }
+
+        private static boolean deadlineReached(long deadlineNanos) {
+            return deadlineNanos != Long.MAX_VALUE && System.nanoTime() >= deadlineNanos;
+        }
+
+        /**
+         * @return 到目前为止的结果；未完成时包含已扫描到的配方与实时计数
+         */
+        public ScanResult result() {
+            if (isDone()) {
+                logSummary();
+            }
+            return new ScanResult(List.copyOf(snapshots), unsupported, invalid, failed);
+        }
+
+        private void scanOne(ResourceLocation id) {
             Optional<? extends Recipe<?>> maybeRecipe;
             try {
                 maybeRecipe = manager.byKey(id);
             } catch (RuntimeException e) {
                 failed++;
-                continue;
+                return;
             }
             if (maybeRecipe.isEmpty()) {
                 invalid++;
-                continue;
+                return;
             }
             Recipe<?> recipe = maybeRecipe.get();
+            RecipeSnapshot snapshot;
             try {
-                RecipeSnapshot snapshot = describe(recipe, id);
+                snapshot = scanner.describe(recipe, id);
                 if (snapshot == null) {
                     unsupported++;
-                    continue;
+                    return;
                 }
                 if (!snapshot.hasOutputs()) {
                     invalid++;
-                    continue;
+                    return;
                 }
-                snapshots.add(snapshot);
             } catch (RuntimeException e) {
                 failed++;
                 LOGGER.debug("Failed to describe recipe {}; skipping it", id, e);
+                return;
+            }
+            snapshots.add(snapshot);
+            if (onSnapshot != null) {
+                // 指纹回调失败必须让本次扫描失败，不能在结果集中留下未进入指纹的配方。
+                onSnapshot.accept(snapshot);
             }
         }
 
-        if (unsupported > 0 || invalid > 0 || failed > 0) {
-            LOGGER.debug("Recipe scan: {} usable, {} unsupported, {} invalid, {} failed",
-                    snapshots.size(), unsupported, invalid, failed);
+        private void logSummary() {
+            if (summaryLogged) {
+                return;
+            }
+            summaryLogged = true;
+            if (unsupported > 0 || invalid > 0 || failed > 0) {
+                LOGGER.debug("Recipe scan: {} usable, {} unsupported, {} invalid, {} failed",
+                        snapshots.size(), unsupported, invalid, failed);
+            }
         }
-        return new ScanResult(List.copyOf(snapshots), unsupported, invalid, failed);
     }
 
     /**

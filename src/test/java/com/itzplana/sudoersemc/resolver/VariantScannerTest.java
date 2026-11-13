@@ -1,6 +1,7 @@
 package com.itzplana.sudoersemc.resolver;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -9,6 +10,7 @@ import java.util.ArrayList;
 import java.util.List;
 import net.minecraft.SharedConstants;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.world.item.ItemStack;
@@ -21,6 +23,8 @@ import org.junit.jupiter.api.Test;
 class VariantScannerTest {
 
     private static final ResourceLocation STONE_ID = new ResourceLocation("minecraft", "stone");
+    private static final ResourceLocation DIAMOND_SWORD_ID =
+            new ResourceLocation("minecraft", "diamond_sword");
     private static final ItemStack BASE_STACK;
     private static final ItemStack DAMAGEABLE_STACK;
 
@@ -101,6 +105,41 @@ class VariantScannerTest {
     }
 
     @Test
+    void damageValuesCollapseForDamageableVariants() {
+        List<ItemKey> keys = scanner.scan(DAMAGEABLE_STACK,
+                List.of(enchantedSwordTag(3), enchantedSwordTag(900)), 10);
+
+        assertEquals(List.of(ItemKey.of(DIAMOND_SWORD_ID,
+                "{Damage:0,Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}")), keys);
+    }
+
+    @Test
+    void containerContentStoredEmcProducesDistinctBoundedVariants() {
+        ItemStack shulker = new ItemStack(Items.SHULKER_BOX);
+        List<ItemKey> keys = scanner.scan(shulker, List.of(
+                containerTag("projecte:klein_star_omega", 100L),
+                containerTag("projecte:klein_star_omega", 200L)), 10);
+
+        // 不同存储量对应不同容器价值，必须保留为不同变体；数量仍受 scan limit 约束。
+        assertEquals(2, keys.size());
+        assertTrue(keys.get(0).variantHash().contains("StoredEMC"));
+        assertTrue(keys.get(1).variantHash().contains("StoredEMC"));
+        assertNotEquals(keys.get(0), keys.get(1));
+    }
+
+    private static CompoundTag enchantedSwordTag(int damage) {
+        CompoundTag enchantment = new CompoundTag();
+        enchantment.putString("id", "minecraft:sharpness");
+        enchantment.putShort("lvl", (short) 5);
+        ListTag enchantments = new ListTag();
+        enchantments.add(enchantment);
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", damage);
+        tag.put("Enchantments", enchantments);
+        return tag;
+    }
+
+    @Test
     void resultIsSortedDeterministically() {
         List<ItemKey> keys = scanner.scan(BASE_STACK,
                 List.of(damageTag(9), damageTag(1), damageTag(5)), 10);
@@ -138,5 +177,21 @@ class VariantScannerTest {
         CompoundTag tag = new CompoundTag();
         tag.putInt("Marker", marker);
         return tag;
+    }
+
+    private static CompoundTag containerTag(String itemId, long storedEmc) {
+        CompoundTag contentTag = new CompoundTag();
+        contentTag.putLong("StoredEMC", storedEmc);
+        CompoundTag entry = new CompoundTag();
+        entry.putString("id", itemId);
+        entry.putByte("Count", (byte) 1);
+        entry.put("tag", contentTag);
+        ListTag items = new ListTag();
+        items.add(entry);
+        CompoundTag blockEntity = new CompoundTag();
+        blockEntity.put("Items", items);
+        CompoundTag root = new CompoundTag();
+        root.put("BlockEntityTag", blockEntity);
+        return root;
     }
 }

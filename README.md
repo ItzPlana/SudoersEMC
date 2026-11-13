@@ -24,14 +24,14 @@ SudoersEMC 是一个**独立实现**的 Minecraft Forge 1.20.1 模组。它扫�
 
 ### 核心原则
 
-| 原则             | 说明                                                                                                                                                                      |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **不覆盖手动值** | `config/ProjectE/custom_emc.json` 中由管理员配置的条目永远不会被改写                                                                                                      |
-| **归属可追踪**   | 每个生成值都记录来源（配方 / 标签 / 稀有度 / 层级 / 兜底）、配方 ID 与时间戳                                                                                              |
-| **计算可解释**   | 已生成的普通条目可用 `/sudoemc explain` 查看来源、配方 ID 与归属；NBT 变体与 ProjectE 原生值尚不支持                                                                      |
-| **安全优先**     | 大幅降价会被隔离；超出上限的数值会被重置到受控区间                                                                                                                        |
-| **主线程边界**   | 扫描由服务器 tick 驱动，状态机按批推进；`tickBudgetNanos` 只影响进度步长与自适应批量，**不约束**采集器/应用器的实际耗时。真实管线接线时必须另行保证重计算不占用服务器线程 |
-| **可选依赖**     | 未安装 ProjectE 时模组正常加载，只是不生成任何值                                                                                                                          |
+| 原则             | 说明                                                                                                                                                      |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **不覆盖手动值** | `config/ProjectE/custom_emc.json` 中由管理员配置的条目永远不会被改写                                                                                      |
+| **归属可追踪**   | 每个生成值都记录来源（配方 / 标签 / 稀有度 / 层级 / 兜底）、配方 ID 与时间戳                                                                              |
+| **计算可解释**   | 已生成的普通条目可用 `/sudoemc explain` 查看来源、配方 ID 与归属；NBT 变体与 ProjectE 原生值尚不支持                                                      |
+| **安全优先**     | 大幅降价会被隔离；超出上限的数值会被重置到受控区间                                                                                                        |
+| **主线程边界**   | 扫描由服务器 tick 驱动，状态机按批推进；求解与文件写入在后台守护线程执行。`tickBudgetNanos` 只影响进度步长与自适应批量，**不约束**单批采集/应用的实际耗时 |
+| **可选依赖**     | 未安装 ProjectE 时模组正常加载，只是不生成任何值                                                                                                          |
 
 ---
 
@@ -44,9 +44,9 @@ SudoersEMC 是一个**独立实现**的 Minecraft Forge 1.20.1 模组。它扫�
 | Phase 0    | Forge 1.20.1 工程骨架、ProjectE 1.0.1 集成调研                   | ✅ 完成                       |
 | Phase 1    | ProjectE 查询/写入、归属持久化、溢出保护数学、配置、单元测试     | ✅ 完成                       |
 | Phase 2–10 | 扫描、配方求解、兜底定价、NBT 变体、批处理、安全保护、诊断、命令 | ✅ 组件实现，单元测试通过     |
-| Phase 11   | 模组入口接线与发布验收                                           | 🚧 部分完成（见下方已知限制） |
+| Phase 11   | 模组入口接线与发布验收                                           | 🚧 入口接线完成，实机验收待补 |
 
-**已知限制（Phase 11）**：`Sudoersemc.createScanManager()` 的采集/应用回调仍是占位实现（`"待接入真实扫描", 0, 0`），真实扫描管线尚未组装。因此当前构建**不会生成任何 EMC 值**：`/sudoemc rescan-all` 只会跑完一个空状态机，`last_report.txt` 也不会自动生成。验收标准第 4 项（未知物品能获得生成值）与第 12 项（诊断日志解释定价决策）尚未完全达成（完整 13 项验收表见 PR #10 §三，该表为提交 9f72df5 的时点快照）；命令、调度、持久化、安全与定价组件仅通过单元测试，尚未完成端到端实机验证。
+**已知限制（Phase 11）**：真实扫描管线已在服务器启动时接线（`ScanCollectionPipeline` + 分片 `ScanManager`），但尚未在大型整合包与专用服务器完成端到端实机验证；`KnownItemsStore` / `QuarantinedDropsStore` 组件尚未接入扫描管线；`last_report.txt` 尚未由扫描流程自动写入；`entire_custom_emc` 文件改写未实现；ProjectE Integration 的映射优先级尚未在运行期验证。命令、调度、持久化、安全与定价组件已通过单元/组件测试。
 
 Phase 1 已在专用服务器上验证：写入生效、重启后自动恢复、手动值不被覆盖、缺少 ProjectE 时优雅降级。
 
@@ -212,11 +212,10 @@ generateReports = true
 > `SolveSettings.DEFAULT_MINIMUM_EMC = 1`（与 `EvaluationPolicy.DEFAULT_MINIMUM_EMC` 相同）。
 > 配置化该值属于后续阶段；此前的 README 把它列为配置项是错误的，已移除。
 
-> **接线状态（Phase 11）**：`[general]` 与 `[performance]` 已接入运行时；`[overflow]` 仅接入校验与快照构建
-> （`OverflowProtection` / `OverflowPipeline` 尚未实例化）；`[recipe].solveRecipes` / `allowRecipeValueIncrease`、
-> `[fallback].*`、`[safety].largeDropProtection` / `protectCreativeOnlyItems`、`[nbt].scanNbtVariants`、
-> `[diagnostic].*` 目前只有配置定义，尚无运行时读取点；`recipe.maxRecipePasses`、`nbt.maxNbtVariantsPerItem`、
-> `safety.maxAllowedDropRatio` 仅参与 `ConfigValidator` 校验。
+> **接线状态（Phase 11）**：`[general]`、`[performance]` 以及扫描管线使用的 `[recipe]`、`[fallback]`、
+> `[safety]`、`[nbt]`、`[overflow]` 配置均已接入运行时；`[diagnostic].*` 会参与扫描指纹与配置快照，
+> 但报告自动落盘仍待后续阶段接线。`[overflow].allowProjectEFileRewrite` 与 `entire_custom_emc`
+> 文件改写仍未实现，运行时行为等同 `owned_only`。
 
 ### 校验矩阵
 
@@ -286,15 +285,15 @@ generateReports = true
 
 ## 数据文件
 
-| 路径                                       | 说明                                                                                   |
-| ------------------------------------------ | -------------------------------------------------------------------------------------- |
-| `config/sudoersemc/generated_entries.json` | 生成值、来源、配方、归属与时间戳                                                       |
-| `config/sudoersemc/known_items.json`       | 已扫描物品目录；组件已实现，当前扫描管线未接线，通常不会生成                           |
-| `config/sudoersemc/quarantined_drops.json` | 危险降价隔离记录；组件已实现，当前扫描管线未接线，通常不会生成                         |
-| `config/sudoersemc/overflow_resets.json`   | 溢出重置审计记录；组件已实现，当前扫描管线未接线，通常不会生成                         |
-| `config/ProjectE/custom_emc.json`          | ProjectE 手动配置；本模组只读，`entire_custom_emc` 文件改写尚未实现                    |
-| `config/sudoersemc/scan_state.json`        | 上次扫描指纹/耗时/计数；启动时加载、停服时按需保存（当前扫描管线未接线，通常不会生成） |
-| `config/sudoersemc/last_report.txt`        | 最近一次诊断报告；当前扫描管线未接线，不会自动生成                                     |
+| 路径                                       | 说明                                                                       |
+| ------------------------------------------ | -------------------------------------------------------------------------- |
+| `config/sudoersemc/generated_entries.json` | 生成值、来源、配方、归属与时间戳                                           |
+| `config/sudoersemc/known_items.json`       | 已扫描物品目录；组件已实现，当前扫描管线未接线，通常不会生成               |
+| `config/sudoersemc/quarantined_drops.json` | 危险降价隔离记录；组件已实现，当前扫描管线未接线，通常不会生成             |
+| `config/sudoersemc/overflow_resets.json`   | 溢出重置审计记录；扫描管线触发溢出保护时追加写入                           |
+| `config/ProjectE/custom_emc.json`          | ProjectE 手动配置；本模组只读，`entire_custom_emc` 文件改写尚未实现        |
+| `config/sudoersemc/scan_state.json`        | 上次扫描指纹/耗时/计数；扫描管线启动时加载、成功后原子写入，停服时也会保存 |
+| `config/sudoersemc/last_report.txt`        | 最近一次诊断报告；`ReportManager` 支持原子写入，但扫描流程尚未自动调用     |
 
 所有写入采用「临时文件 + 原子替换」，加载失败只告警不崩溃，遇到更高版本 schema 时拒绝覆盖。
 
@@ -302,7 +301,7 @@ generateReports = true
 
 ## 工作原理
 
-> 以下是完整目标链路。当前 Phase 11 只接入了调度骨架、命令与持久化加载；下列第 1–5 步的组件已实现并有单元测试，但**尚未组装进运行时**（采集器仍返回 `"待接入真实扫描", 0, 0`），因此当前构建不会产生任何生成值。
+> 下列链路已在 Phase 11 接线：服务器启动时构建扫描管线，分片采集由服务器 tick 驱动，求解与文件写入在后台守护线程执行；`tickBudgetNanos` 只影响进度步长与自适应批量，不会硬中断单批工作。
 
 1. **查询** — 通过 `IEMCProxy` 判断物品是否已有 EMC。
 2. **计算** — 从配方、标签、稀有度、层级规则推导候选值；同一物品有多个配方时取最低的有效确定性成本。
@@ -323,9 +322,9 @@ generateReports = true
 ./gradlew test
 ```
 
-测试覆盖：加权采样分布与权重重置、阈值边界、幂等性、持久化往返、损坏文件容错、schema 版本保护、命令层、扫描状态机、General 开关降级与停服清理。
+测试覆盖：加权采样分布与权重重置、阈值边界、幂等性、持久化往返、损坏文件容错、schema 版本保护、分片扫描管线、命令层、扫描状态机、General 开关降级与停服清理。
 
-当前测试均为单元/组件测试；扫描管线尚未接线，没有端到端测试。
+当前共 **554** 个单元/组件测试，0 failure / 0 error；尚未加入专用服务器端到端测试。
 
 ---
 
