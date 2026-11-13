@@ -427,4 +427,3 @@ This project is licensed under **Creative Commons Attribution-NonCommercial-Shar
 - Permitted: sharing and adaptation, with attribution, for non-commercial purposes, and distributed under the same license.
 - The full terms are in [LICENSE](LICENSE).
 - Copyright holder: **ItzPlana**
-- Copyright (c) 2026 ItzPlana.
