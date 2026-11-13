@@ -29,6 +29,7 @@ public final class SmokeTestHook {
 
     private static final String MARKER = "sudoersemc.smokeTest";
     private static final String QUERY_MARKER = "sudoersemc.smokeQuery";
+    private static final String PIPELINE_MARKER = "sudoersemc.pipelineScan";
     private static final ResourceLocation TEST_ITEM = new ResourceLocation("minecraft", "bedrock");
     private static final long TEST_VALUE = 12_345L;
     private static final int CHECK_DELAY_TICKS = 60;
@@ -38,7 +39,18 @@ public final class SmokeTestHook {
     private static int ticks;
     private static boolean logged;
 
+    /** 管线扫描探针状态。 */
+    private static boolean pipelineScanActive;
+    private static int pipelineTicks;
+    /** 管线探针最长等待 tick 数（约 60 秒）。 */
+    private static final int PIPELINE_TIMEOUT_TICKS = 1200;
+
     public static void onServerStarted(ServerStartedEvent event) {
+        boolean pipelineMode = System.getProperty(PIPELINE_MARKER, "false").equalsIgnoreCase("true");
+        if (pipelineMode) {
+            onPipelineScanStarted();
+            return;
+        }
         boolean writeMode = System.getProperty(MARKER, "false").equalsIgnoreCase("true");
         boolean queryMode = System.getProperty(QUERY_MARKER, "false").equalsIgnoreCase("true");
         if (!writeMode && !queryMode) {
@@ -76,8 +88,11 @@ public final class SmokeTestHook {
             emc.requestRemap(server);
         });
     }
-
     public static void onServerTick(TickEvent.ServerTickEvent event) {
+        if (pipelineScanActive) {
+            tickPipelineScan();
+            return;
+        }
         if (!enabled || !staged || logged) {
             return;
         }
@@ -101,6 +116,56 @@ public final class SmokeTestHook {
                     after == TEST_VALUE ? "WRITE VERIFIED" : "WRITE FAILED");
             GeneratedEntryStoreAccess.save();
             LOGGER.info("[smoke] probe finished");
+        }
+    }
+
+    /**
+     * 全量扫描探针：请求一次真实的管线扫描，并在完成或超时后记录结果。
+     *
+     * <p>由 {@code -Dsudoersemc.pipelineScan=true} 启用。这是唯一能验证「扫描 → 求解 → 定价 →
+     * 写入 ProjectE」端到端链路的开发手段，默认关闭。</p>
+     */
+    private static void onPipelineScanStarted() {
+        var manager = Sudoersemc.scanManager();
+        if (manager == null) {
+            LOGGER.warn("[pipeline] 扫描管理器不可用，跳过探针");
+            return;
+        }
+        boolean accepted = manager.requestScan();
+        LOGGER.info("[pipeline] requestScan accepted={}", accepted);
+        pipelineScanActive = accepted;
+        pipelineTicks = 0;
+    }
+
+    /**
+     * 推进扫描探针。每 40 tick 记录一次进度，完成后打印结果摘要。
+     */
+    private static void tickPipelineScan() {
+        var manager = Sudoersemc.scanManager();
+        if (manager == null) {
+            pipelineScanActive = false;
+            return;
+        }
+        pipelineTicks++;
+        if (pipelineTicks % 40 == 0) {
+            var progress = manager.progress();
+            LOGGER.info("[pipeline] 阶段={} 进度={}/{}",
+                    progress.phase().label(), progress.processed(), progress.total());
+        }
+        if (!manager.isRunning()) {
+            pipelineScanActive = false;
+            var pipeline = Sudoersemc.scanPipeline();
+            if (pipeline != null) {
+                LOGGER.info("[pipeline] 完成：已定价 {} 项，未解析 {} 项，耗时 {} ms",
+                        pipeline.lastSolvedCount(), pipeline.lastUnresolvedCount(),
+                        pipeline.lastDurationMillis());
+            }
+            var store = Sudoersemc.entryStore();
+            LOGGER.info("[pipeline] 存储条目总数={}", store == null ? -1 : store.size());
+        }
+        if (pipelineTicks > PIPELINE_TIMEOUT_TICKS) {
+            pipelineScanActive = false;
+            LOGGER.warn("[pipeline] 探针超时，扫描可能仍未结束");
         }
     }
 

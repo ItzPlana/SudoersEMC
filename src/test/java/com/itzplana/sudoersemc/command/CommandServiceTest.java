@@ -17,11 +17,11 @@ import com.itzplana.sudoersemc.storage.ScanStateStore;
 import com.itzplana.sudoersemc.task.BatchProcessor;
 import com.itzplana.sudoersemc.task.ScanFingerprint;
 import com.itzplana.sudoersemc.task.ScanManager;
-import com.itzplana.sudoersemc.task.TestCollectSessions;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import net.minecraft.resources.ResourceLocation;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -43,7 +43,7 @@ class CommandServiceTest {
     private static ScanManager idleManager() {
         return new ScanManager(
                 new BatchProcessor(1, false),
-                TestCollectSessions.completed("主世界", 0, 0),
+                ScanManager.oneShot(new ScanManager.SnapshotData("主世界", 0, 0)),
                 snapshot -> { },
                 1_000_000L);
     }
@@ -207,6 +207,33 @@ class CommandServiceTest {
 
         assertFalse(result.success());
         assertEquals(List.of("配置校验失败，已保留上一份有效配置"), result.lines());
+    }
+
+    @Test
+    void approveQuarantineWithoutActionFails() {
+        CommandService service = new CommandService(null, null, null, null);
+
+        CommandResult result = service.approveQuarantine("minecraft:stone");
+
+        assertFalse(result.success());
+        assertEquals(List.of("隔离审批服务不可用"), result.lines());
+    }
+
+    @Test
+    void approveQuarantineInvokesInjectedActionWithTrimmedId() {
+        AtomicReference<String> seen = new AtomicReference<>();
+        CommandService service = new CommandService(
+                null, null, null, null, null,
+                item -> {
+                    seen.set(item);
+                    return CommandResult.ok("已批准 " + item);
+                });
+
+        CommandResult result = service.approveQuarantine("  minecraft:stone  ");
+
+        assertTrue(result.success());
+        assertEquals("minecraft:stone", seen.get());
+        assertEquals(List.of("已批准 minecraft:stone"), result.lines());
     }
 
     @Test

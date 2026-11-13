@@ -436,6 +436,36 @@ class ScanManagerTest {
     }
 
     @Test
+    void asyncApplierKeepsManagerInApplyingUntilComplete() {
+        AtomicInteger applyCalls = new AtomicInteger();
+        AtomicInteger completionPolls = new AtomicInteger();
+        ScanManager.ResultApplier applier = new ScanManager.ResultApplier() {
+            @Override
+            public void apply(ScanManager.SnapshotData data) {
+                applyCalls.incrementAndGet();
+            }
+
+            @Override
+            public boolean isComplete(ScanManager.SnapshotData data) {
+                return completionPolls.incrementAndGet() >= 3;
+            }
+        };
+        ScanManager manager = manager(new BatchProcessor(10, false),
+                collector(data(1, 1)), applier);
+
+        assertTrue(manager.requestScan());
+        int ticks = 0;
+        while (manager.isRunning() && ticks++ < TICK_GUARD) {
+            manager.tick();
+        }
+
+        assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
+        assertTrue(applyCalls.get() >= 3,
+                "异步应用必须跨多个 tick 轮询，而不是一次调用就进入 SAVING");
+        assertTrue(completionPolls.get() >= 3);
+    }
+
+    @Test
     void zeroWorkStillCompletes() {
         ScanManager manager = manager(new BatchProcessor(1, false),
                 collector(data(0, 0)), snapshot -> { });

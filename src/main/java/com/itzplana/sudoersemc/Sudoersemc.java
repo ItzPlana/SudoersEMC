@@ -1,27 +1,61 @@
 package com.itzplana.sudoersemc;
 
+import com.itzplana.sudoersemc.command.CommandResult;
 import com.itzplana.sudoersemc.command.CommandService;
 import com.itzplana.sudoersemc.command.SudoemcCommands;
 import com.itzplana.sudoersemc.config.ConfigValidationResult;
 import com.itzplana.sudoersemc.config.ReloadDecision;
 import com.itzplana.sudoersemc.config.SudoersemcConfig;
+import com.itzplana.sudoersemc.core.GeneratedEmcEntry;
+import com.itzplana.sudoersemc.core.ItemKey;
+import com.itzplana.sudoersemc.core.PriceSource;
+import com.itzplana.sudoersemc.core.OwnedEntrySink;
 import com.itzplana.sudoersemc.diagnostic.ReportManager;
 import com.itzplana.sudoersemc.diagnostic.SmokeTestHook;
 import com.itzplana.sudoersemc.integration.GeneratedEmcMapper;
 import com.itzplana.sudoersemc.integration.OptionalIntegrationManager;
-import com.itzplana.sudoersemc.pipeline.ScanCollectionPipeline;
+import com.itzplana.sudoersemc.integration.ProjectEManualValues;
+import com.itzplana.sudoersemc.pipeline.PipelineSnapshot;
+import com.itzplana.sudoersemc.pipeline.ScanPipeline;
+import com.itzplana.sudoersemc.pricing.FallbackPricing;
+import com.itzplana.sudoersemc.pricing.PricingSettings;
+import com.itzplana.sudoersemc.safety.CreativeItemProtection;
+import com.itzplana.sudoersemc.safety.LargeDropProtection;
+import com.itzplana.sudoersemc.safety.OverflowPipeline;
+import com.itzplana.sudoersemc.safety.OverflowProtection;
+import com.itzplana.sudoersemc.solver.SolveSettings;
 import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
+import com.itzplana.sudoersemc.storage.OverflowResetLog;
+import com.itzplana.sudoersemc.storage.QuarantinedDropsStore;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
 import com.itzplana.sudoersemc.task.BatchProcessor;
+import com.itzplana.sudoersemc.task.ScanFingerprint;
 import com.itzplana.sudoersemc.task.ScanManager;
 import com.mojang.logging.LogUtils;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.function.BooleanSupplier;
+import java.util.Collections;
+import java.util.Optional;
+import java.util.function.Function;
+import java.util.stream.Stream;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
-import net.minecraftforge.common.ForgeConfigSpec;
+import net.minecraft.tags.TagKey;
+import net.minecraft.world.item.Item;
+import net.minecraft.core.NonNullList;
+import net.minecraft.core.Registry;
+import net.minecraft.core.RegistryAccess;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.crafting.Ingredient;
+import net.minecraft.world.item.crafting.Recipe;
+import net.minecraft.world.item.crafting.RecipeManager;
 import net.minecraftforge.common.MinecraftForge;
-import net.minecraftforge.event.AddReloadListenerEvent;
 import net.minecraftforge.event.RegisterCommandsEvent;
-import net.minecraftforge.event.TagsUpdatedEvent;
 import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.event.server.ServerStartedEvent;
 import net.minecraftforge.event.server.ServerStoppingEvent;
@@ -29,22 +63,20 @@ import net.minecraftforge.eventbus.api.IEventBus;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.event.lifecycle.FMLCommonSetupEvent;
 import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
+import net.minecraftforge.server.ServerLifecycleHooks;
+import net.minecraftforge.fml.ModList;
+import net.minecraftforge.forgespi.language.IModInfo;
+import net.minecraftforge.registries.ForgeRegistries;
+import net.minecraftforge.registries.tags.ITag;
+import net.minecraftforge.registries.tags.ITagManager;
+import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 
 /**
  * SudoersEMC 模组入口。
  *
- * <p>负责组装各层：配置注册、持久化加载、ProjectE 集成探测、扫描调度器、诊断与命令服务。
+ * <p>负责组装各层：配置注册、持久化加载、ProjectE 集成探测、扫描调度器与命令服务。
  * 具体的扫描、求解与定价逻辑分散在各自包中，本类只做接线，不含业务规则。</p>
- *
- * <p><strong>扫描接线：</strong>服务器启动时构建 {@link ScanCollectionPipeline}，把分片采集器、
- * 生产指纹提供器、跨 tick 结果应用器与异步持久化回调注入 {@link ScanManager}；服务器 tick
- * 驱动 {@link ScanManager#tick()}，纯求解与文件写入在管线 worker 上执行。
- * {@link AddReloadListenerEvent} 与 {@link TagsUpdatedEvent} 会递增管线的 reload 代次，
- * 避免把基于旧配方的价格写入 EMC。</p>
- *
- * <p><strong>命令接线：</strong>{@link CommandService} 绑定当前扫描调度器与存储；服务器启动或
- * 配置重载后重新注入，停服时清空，防止命令继续持有旧世界的组件。</p>
  */
 @Mod(Sudoersemc.MODID)
 public final class Sudoersemc {
@@ -57,9 +89,11 @@ public final class Sudoersemc {
 
     private static volatile GeneratedEntryStore entryStore;
     private static volatile ScanStateStore scanStateStore;
-    private static volatile ScanCollectionPipeline scanPipeline;
     private static volatile ScanManager scanManager;
+    private static volatile ScanPipeline scanPipeline;
     private static volatile ReportManager reportManager;
+    private static volatile OverflowResetLog overflowResetLog;
+    private static volatile QuarantinedDropsStore quarantinedDropsStore;
     private static volatile CommandService commandService;
     private static volatile MinecraftServer currentServer;
     private static volatile boolean pendingReload;
@@ -72,8 +106,6 @@ public final class Sudoersemc {
         MinecraftForge.EVENT_BUS.addListener(this::onServerTick);
         MinecraftForge.EVENT_BUS.addListener(this::onServerStarted);
         MinecraftForge.EVENT_BUS.addListener(this::onServerStopping);
-        MinecraftForge.EVENT_BUS.addListener(this::onAddReloadListener);
-        MinecraftForge.EVENT_BUS.addListener(this::onTagsUpdated);
         MinecraftForge.EVENT_BUS.addListener(SmokeTestHook::onServerTick);
 
         // 必须在构造阶段注册，Forge 之后才会加载配置。
@@ -92,6 +124,12 @@ public final class Sudoersemc {
             stateStore.load();
             scanStateStore = stateStore;
 
+            OverflowResetLog resetLog = new OverflowResetLog();
+            overflowResetLog = resetLog;
+            QuarantinedDropsStore dropsStore = new QuarantinedDropsStore();
+            dropsStore.load();
+            quarantinedDropsStore = dropsStore;
+
             // 落盘文件必须就绪，集成管理器才能创建 provider。
             OptionalIntegrationManager.setSink(store);
             OptionalIntegrationManager.init();
@@ -105,9 +143,11 @@ public final class Sudoersemc {
             }
 
             reportManager = new ReportManager();
-            // 服务器尚未启动，先创建占位调度器，让命令层在 common setup 后即可查询状态。
-            // 服务器启动时 startScanRuntime 会把它替换为完整的采集/求解/落盘管线。
-            scanManager = createScanManagerIfEnabled(SudoersemcConfig.GENERAL_ENABLED::get);
+            ScanPipeline pipeline = createScanPipeline(store, stateStore, reportManager,
+                    resetLog, dropsStore);
+            scanPipeline = pipeline;
+
+            scanManager = createScanManagerIfEnabled(pipeline, SudoersemcConfig.GENERAL_ENABLED::get);
             refreshCommandService();
 
             LOGGER.info("SudoersEMC common setup complete ({} generated entries loaded)", store.size());
@@ -115,13 +155,166 @@ public final class Sudoersemc {
     }
 
     /**
-     * 创建不依赖服务器状态的占位扫描调度器。
+     * 创建真实扫描管线。
      *
-     * <p>真实管线需要服务器实例，只有在 {@link ServerStartedEvent} 才能构建；common setup
-     * 阶段先提供空闲调度器，保证命令层始终有可查询的状态机。生产扫描由
-     * {@link #startScanRuntime(MinecraftServer)} 替换。</p>
+     * <p>所有安全层与定价策略都从配置构造；任意配置读取失败都会退回该组件的安全默认值，绝不阻止
+     * 模组启动。ProjectE 后端通过 {@link OptionalIntegrationManager} 探测，未安装时管线仍然可以
+     * 仅依靠配方与兜底定价工作。</p>
+     *
+     * @param store                生成值存储
+     * @param stateStore           扫描状态存储
+     * @param reportManager        诊断报告管理器
+     * @param resetLog             溢出审计日志；{@code null} 时新建一个仅本次使用的实例
+     * @param dropsStore           隔离记录存储；{@code null} 时新建一个仅本次使用的实例
+     * @return 可直接交给扫描调度器使用的管线
      */
-    private static ScanManager createScanManager() {
+    private static ScanPipeline createScanPipeline(GeneratedEntryStore store,
+                                                   ScanStateStore stateStore,
+                                                   ReportManager reportManager,
+                                                   @Nullable OverflowResetLog resetLog,
+                                                   @Nullable QuarantinedDropsStore dropsStore) {
+        OverflowProtection.Settings overflowSettings;
+        try {
+            overflowSettings = SudoersemcConfig.overflowSettings();
+        } catch (RuntimeException e) {
+            // 配置尚未加载或跨字段校验失败时，使用自带默认值。
+            LOGGER.warn("SudoersEMC 无法读取溢出保护配置，使用默认值", e);
+            overflowSettings = new OverflowProtection.Settings();
+        }
+        OverflowResetLog auditLog = resetLog == null ? new OverflowResetLog() : resetLog;
+        OverflowPipeline overflowPipeline = new OverflowPipeline(
+                new OverflowProtection(overflowSettings), auditLog);
+
+        LargeDropProtection.Settings dropSettings;
+        try {
+            dropSettings = new LargeDropProtection.Settings(
+                    SudoersemcConfig.SAFETY_LARGE_DROP_PROTECTION.get(),
+                    sanitizeMaxAllowedDropRatio(
+                            SudoersemcConfig.SAFETY_MAX_ALLOWED_DROP_RATIO.get()),
+                    Set.of(),
+                    Set.of());
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法读取大幅降价保护配置，使用默认值", e);
+            dropSettings = LargeDropProtection.Settings.defaults();
+        }
+        LargeDropProtection dropProtection = new LargeDropProtection(dropSettings, dropsStore);
+
+        CreativeItemProtection creativeProtection = createCreativeProtection();
+
+        PricingSettings pricingSettings;
+        try {
+            pricingSettings = new PricingSettings(
+                    SudoersemcConfig.FALLBACK_USE_TAG_PRICING.get(),
+                    SudoersemcConfig.FALLBACK_USE_RARITY_PRICING.get(),
+                    true,
+                    SudoersemcConfig.FALLBACK_USE_FALLBACK_FOR_UNSOLVABLE.get(),
+                    PricingSettings.DEFAULT_GENERIC_FALLBACK_VALUE);
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法读取兜底定价配置，使用默认值", e);
+            pricingSettings = PricingSettings.defaults();
+        }
+        FallbackPricing fallbackPricing = FallbackPricing.withDefaults(pricingSettings);
+
+        SolveSettings solveSettings;
+        try {
+            solveSettings = new SolveSettings(
+                    Math.max(1, SudoersemcConfig.RECIPE_MAX_RECIPE_PASSES.get()),
+                    SudoersemcConfig.RECIPE_ALLOW_RECIPE_VALUE_INCREASE.get(),
+                    SolveSettings.DEFAULT_MINIMUM_EMC,
+                    SolveSettings.DEFAULT_MAX_ALTERNATIVE_COSTS);
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法读取配方求解配置，使用默认值", e);
+            solveSettings = SolveSettings.defaults();
+        }
+
+        ScanPipeline pipeline = new ScanPipeline(
+                store,
+                stateStore,
+                reportManager,
+                dropProtection,
+                creativeProtection,
+                overflowPipeline,
+                fallbackPricing,
+                solveSettings);
+        pipeline.setEmcProvider(OptionalIntegrationManager.provider().orElse(null));
+        pipeline.setInputFingerprintSupplier(Sudoersemc::currentScanFingerprint);
+        applyPipelineConfig(pipeline);
+        return pipeline;
+    }
+
+    /**
+     * 把管线相关配置开关应用到刚构造的实例。
+     *
+     * <p>任一开关读取失败都只记录警告，不阻止启动；管线保留自身安全默认值。</p>
+     */
+    private static void applyPipelineConfig(ScanPipeline pipeline) {
+        try {
+            pipeline.setSolveRecipesEnabled(SudoersemcConfig.RECIPE_SOLVE_RECIPES.get());
+            pipeline.setGenerateReportsEnabled(SudoersemcConfig.DIAGNOSTIC_GENERATE_REPORTS.get());
+            pipeline.setUseProjectEIntegrationBaselines(
+                    SudoersemcConfig.FALLBACK_USE_PROJECTE_INTEGRATION_BASELINES.get());
+            pipeline.setOverflowScope(SudoersemcConfig.parseOverflowScope(
+                    SudoersemcConfig.OVERFLOW_OVERWRITE_SCOPE.get()));
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法读取管线配置开关，使用管线默认值", e);
+        }
+    }
+
+    /**
+     * 创建创造物品保护。
+     *
+     * <p>{@code safety.creativeItemExclusions} / {@code creativeItemSpecialValues} /
+     * {@code creativeNamespaces} 三个列表键由 {@link CreativeItemProtection#parseSettings}
+     * 容错解析：非法条目会被跳过并汇总为一条警告，不会阻止模组启动。</p>
+     */
+    private static CreativeItemProtection createCreativeProtection() {
+        try {
+            boolean enabled = SudoersemcConfig.SAFETY_PROTECT_CREATIVE_ONLY_ITEMS.get();
+            CreativeItemProtection.ParsedSettings parsed = CreativeItemProtection.parseSettings(
+                    enabled,
+                    List.copyOf(SudoersemcConfig.SAFETY_CREATIVE_ITEM_EXCLUSIONS.get()),
+                    List.copyOf(SudoersemcConfig.SAFETY_CREATIVE_ITEM_SPECIAL_VALUES.get()),
+                    List.copyOf(SudoersemcConfig.SAFETY_CREATIVE_NAMESPACES.get()));
+            if (!parsed.skippedEntries().isEmpty()) {
+                LOGGER.warn("SudoersEMC 创造物品保护配置有 {} 条无效条目已被忽略：{}",
+                        parsed.skippedEntries().size(), parsed.skippedEntries());
+            }
+            return new CreativeItemProtection(parsed.settings());
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法读取创造物品保护配置，默认启用保护", e);
+            return new CreativeItemProtection(new CreativeItemProtection.Settings(
+                    true, Set.of(), Map.of(), Set.of()));
+        }
+    }
+
+    /**
+     * 把配置中的最大允许降幅夹到 {@link LargeDropProtection.Settings} 接受的 {@code (0.0, 1.0]} 区间。
+     *
+     * <p>配置边界已经拒绝 0.0，但旧配置文件、手工编辑或未来迁移仍可能绕过边界检查。这里再做一次
+     * 防御：任何非有限、非正或大于 1 的值都按 {@link Double#MIN_VALUE} 处理，语义是“任何正降幅
+     * 都隔离”。绝不静默退回默认的 0.5，避免管理员以为关闭了降价却被允许 50% 降价。</p>
+     *
+     * @param configured 配置读取到的最大允许降幅
+     * @return 位于 {@code (0.0, 1.0]} 的可用值
+     */
+    static double sanitizeMaxAllowedDropRatio(double configured) {
+        if (!Double.isFinite(configured) || configured <= 0.0D || configured > 1.0D) {
+            return Double.MIN_VALUE;
+        }
+        return configured;
+    }
+
+    /**
+     * 创建扫描调度器并接入真实管线。
+     *
+     * <p>接线采用“采集暂存、应用取出”的方式：采集回调在服务器线程完成注册表与配方读取后把
+     * {@link PipelineSnapshot} 暂存到管线中，应用回调再取出求解并写入存储。这样既满足
+     * {@link ScanManager} 跨 tick 的阶段划分，也避免闭包数组带来的隐式状态。</p>
+     *
+     * @param pipeline 真实扫描管线
+     * @return 已接线的扫描调度器
+     */
+    private static ScanManager createScanManager(ScanPipeline pipeline) {
         int itemsPerTick;
         boolean adaptive;
         try {
@@ -134,18 +327,29 @@ public final class Sudoersemc {
             adaptive = true;
         }
         BatchProcessor processor = new BatchProcessor(Math.max(1, itemsPerTick), adaptive);
+        ScanManager.ResultApplier applier = pipeline == null
+                ? data -> LOGGER.debug("SudoersEMC 占位调度器收到应用回调：{}", data.label())
+                : new PipelineApplier(pipeline);
         return new ScanManager(
                 processor,
-                emptyCollector(),
-                data -> LOGGER.debug("SudoersEMC 扫描应用阶段：{}", data.label()),
-                TICK_BUDGET_NANOS);
+                pipeline == null ? emptyCollector() : () -> {
+                    MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
+                    if (server == null) {
+                        LOGGER.warn("SudoersEMC 扫描请求到达时服务器尚未就绪，本次扫描失败");
+                        throw new IllegalStateException("扫描采集失败：服务器尚未就绪");
+                    }
+                    return pipeline.beginCollection(server);
+                },
+                applier,
+                TICK_BUDGET_NANOS,
+                pipeline == null ? null : Sudoersemc::currentScanFingerprint);
     }
 
     /**
      * 占位采集器：立即报告完成且不访问任何游戏状态。
      *
-     * <p>只用于服务器启动前给命令层提供可查询的空闲状态机；真实采集由
-     * {@link #startScanRuntime(MinecraftServer)} 注入。</p>
+     * <p>只用于服务器启动前或配置重载后给命令层提供可查询的空闲状态机；真实采集由
+     * {@link #createScanManager(ScanPipeline)} 注入的管线会话完成。</p>
      */
     private static ScanManager.SnapshotCollector emptyCollector() {
         return () -> new ScanManager.CollectSession() {
@@ -188,15 +392,236 @@ public final class Sudoersemc {
     }
 
     /**
+     * 应用阶段协调器：在服务器线程启动异步求解、轮询完成，然后重新回到服务器线程做重映射与落盘。
+     *
+     * <p>求解本身只读取不可变快照与定价规则，不接触注册表、RecipeManager、ProjectE API 或文件
+     * 系统；{@link ScanPipeline#applyCompletedSolve()} 负责安全判定、存储写入与报告落盘。</p>
+     */
+    static final class PipelineApplier implements ScanManager.ResultApplier {
+
+        @Nullable
+        private final ScanPipeline pipeline;
+
+        private boolean started;
+        private boolean finished;
+
+        PipelineApplier(@Nullable ScanPipeline pipeline) {
+            this.pipeline = pipeline;
+        }
+
+        @Override
+        public void apply(ScanManager.SnapshotData data) {
+            if (finished) {
+                return;
+            }
+            if (pipeline == null) {
+                throw new IllegalStateException("扫描应用失败：扫描管线未初始化");
+            }
+            if (!started) {
+                started = true;
+                if (!pipeline.startStashedSolve()) {
+                    throw new IllegalStateException("扫描应用失败：没有可用的暂存快照");
+                }
+                return;
+            }
+            if (!pipeline.isSolveComplete()) {
+                return;
+            }
+            pipeline.applyCompletedSolve();
+            flushRuntimeStoresAndRemap();
+            finished = true;
+        }
+
+        @Override
+        public boolean isComplete(ScanManager.SnapshotData data) {
+            return finished;
+        }
+
+        @Override
+        public boolean usesAsyncSolve() {
+            return true;
+        }
+
+        @Override
+        public boolean isReadyToApply(ScanManager.SnapshotData data) {
+            return pipeline != null && pipeline.isSolveComplete();
+        }
+
+        @Override
+        public void reset() {
+            if (pipeline != null) {
+                pipeline.cancelPendingSolve();
+            }
+            started = false;
+            finished = false;
+        }
+    }
+
+    /**
+     * 请求 ProjectE 重映射并刷新所有运行时存储。必须在服务器线程调用。
+     */
+    private static void flushRuntimeStoresAndRemap() {
+        MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
+        if (server != null) {
+            try {
+                OptionalIntegrationManager.provider()
+                        .ifPresent(provider -> provider.requestRemap(server));
+            } catch (RuntimeException e) {
+                LOGGER.warn("SudoersEMC 请求 ProjectE 重映射失败，已生成条目仍会保存", e);
+            }
+        }
+        flushRuntimeStoresOnServerThread();
+    }
+
+    /**
+     * 在服务器线程刷新所有运行时存储。
+     *
+     * <p>存储自身保证失败时不抛出、保留脏标记等待下次重试；这里仍然按组件逐个隔离，避免
+     * 一个存储的意外问题阻止其它存储落盘。</p>
+     */
+    private static void flushRuntimeStoresOnServerThread() {
+        GeneratedEntryStore store = entryStore;
+        if (store != null) {
+            store.saveIfDirty();
+        }
+        ScanStateStore stateStore = scanStateStore;
+        if (stateStore != null) {
+            stateStore.saveIfDirty();
+        }
+        OverflowResetLog resetLog = overflowResetLog;
+        if (resetLog != null) {
+            resetLog.save();
+        }
+        QuarantinedDropsStore dropsStore = quarantinedDropsStore;
+        if (dropsStore != null) {
+            dropsStore.saveIfDirty();
+        }
+    }
+
+    /**
+     * 批准并应用某个物品的隔离降价。
+     *
+     * <p>生产闭环：读取 {@link QuarantinedDropsStore} 中的持久化记录 → 设置 {@code approved}
+     * → 调用 {@link ScanPipeline#approveQuarantined(ItemKey)} 清理内存隔离列表 → 把记录中的
+     * {@code proposedValue} 写入 {@link GeneratedEntryStore} → 落盘并请求 ProjectE 重映射。
+     * 因此 {@code QuarantinedDropsStore.approve} 与 {@code LargeDropProtection.approve} 都有
+     * 生产调用方；即使服务器重启后内存隔离列表为空，也能根据磁盘记录完成审批。</p>
+     *
+     * @param itemId 物品 id 原文
+     * @return 命令回执
+     */
+    private static CommandResult approveQuarantined(String itemId) {
+        return approveQuarantined(
+                itemId,
+                entryStore,
+                quarantinedDropsStore,
+                scanPipeline,
+                Sudoersemc::flushRuntimeStoresAndRemap);
+    }
+
+    /**
+     * 审批闭环的可注入实现，生产入口与端到端测试共用同一段逻辑。
+     *
+     * <p>顺序固定：读取持久化记录 → 校验现有条目归属 → 持久化 {@code approved} → 清理内存隔离
+     * → 以 {@link PriceSource#APPROVED} 暂存新值 → 执行落盘/重映射回调。{@code stage} 失败时
+     * 已经写入的 {@code approved} 会保留并落盘，命令返回失败；管理员可以再次执行同一审批命令
+     * 完成幂等重试，不会因为第一次失败而重新隔离或丢失待应用值。</p>
+     *
+     * @param itemId     物品 id 原文
+     * @param store      生成值存储；{@code null} 时只批准记录、不应用数值
+     * @param dropsStore 隔离记录存储，不能为 {@code null}
+     * @param pipeline   扫描管线，用于清理内存隔离列表；可为 {@code null}
+     * @param flush      应用成功后的落盘/重映射动作，不能为 {@code null}
+     * @return 命令回执
+     */
+    static CommandResult approveQuarantined(String itemId,
+                                            @Nullable OwnedEntrySink store,
+                                            @Nullable QuarantinedDropsStore dropsStore,
+                                            @Nullable ScanPipeline pipeline,
+                                            Runnable flush) {
+        if (itemId == null || itemId.isBlank()) {
+            return CommandResult.failure("请提供物品 id，例如 minecraft:stone");
+        }
+        ResourceLocation itemIdValue = ResourceLocation.tryParse(itemId.trim());
+        if (itemIdValue == null) {
+            return CommandResult.failure("无效的物品 id: " + itemId);
+        }
+        ItemKey key = ItemKey.of(itemIdValue);
+
+        if (dropsStore == null) {
+            return CommandResult.failure("隔离记录服务不可用");
+        }
+        QuarantinedDropsStore.QuarantinedDrop drop = null;
+        for (QuarantinedDropsStore.QuarantinedDrop candidate : dropsStore.entries()) {
+            if (candidate.key().equals(key)) {
+                drop = candidate;
+                break;
+            }
+        }
+        if (drop == null) {
+            return CommandResult.failure("未找到 " + itemIdValue + " 的隔离记录");
+        }
+
+        if (store != null) {
+            GeneratedEmcEntry existing = store.snapshotAll().get(key);
+            if (existing != null && !existing.owned()) {
+                return CommandResult.failure(
+                        "无法应用 " + itemIdValue + "：现有条目不属于 SudoersEMC");
+            }
+        }
+        if (!dropsStore.approve(key)) {
+            return CommandResult.failure("批准隔离记录失败: " + itemIdValue);
+        }
+
+        int removedFromMemory = pipeline == null ? 0 : pipeline.approveQuarantined(key).size();
+
+        if (store == null) {
+            dropsStore.saveIfDirty();
+            return CommandResult.ok(
+                    "已批准 " + itemIdValue + " 的隔离记录",
+                    "生成值存储不可用，本次未应用数值");
+        }
+        boolean staged = store.stage(new GeneratedEmcEntry(
+                key,
+                drop.proposedValue(),
+                PriceSource.APPROVED,
+                null,
+                true,
+                System.currentTimeMillis()));
+        if (!staged) {
+            // approved 已在 stage 前持久化：保留记录并落盘，允许管理员再次执行同一命令重试。
+            dropsStore.saveIfDirty();
+            return CommandResult.failure("无法写入已批准的数值: " + itemIdValue);
+        }
+
+        flush.run();
+        return CommandResult.ok(
+                "已批准 " + itemIdValue + " 的隔离降价",
+                "旧值: " + drop.previousValue() + " -> 新值: " + drop.proposedValue(),
+                "已从内存隔离列表移除 " + removedFromMemory + " 条记录");
+    }
+
+    /**
      * 按 {@code [general] enabled} 决定是否创建扫描调度器。
      *
-     * <p>配置尚未加载或读取失败时沿用与 {@link #createScanManager()} 相同的容错策略：
+     * <p>配置尚未加载或读取失败时沿用与 {@link #createScanManager(ScanPipeline)} 相同的容错策略：
      * 记录警告并按启用处理，绝不因为读取开关失败而让模组失去扫描能力。</p>
      *
      * @param enabledSupplier 开关读取器；测试可注入固定值
      * @return 启用时返回新的调度器，关闭时返回 {@code null}
      */
     static ScanManager createScanManagerIfEnabled(BooleanSupplier enabledSupplier) {
+        return createScanManagerIfEnabled(null, enabledSupplier);
+    }
+
+    /**
+     * 按 {@code [general] enabled} 决定是否用给定管线创建扫描调度器。
+     *
+     * @param pipeline        真实扫描管线，可为 {@code null}（测试用调度器）
+     * @param enabledSupplier 开关读取器；测试可注入固定值
+     * @return 启用时返回新的调度器，关闭时返回 {@code null}
+     */
+    static ScanManager createScanManagerIfEnabled(ScanPipeline pipeline, BooleanSupplier enabledSupplier) {
         boolean enabled = true;
         try {
             enabled = enabledSupplier.getAsBoolean();
@@ -207,7 +632,7 @@ public final class Sudoersemc {
             LOGGER.info("SudoersEMC [general] enabled = false：不创建扫描调度器，自动扫描已关闭");
             return null;
         }
-        return createScanManager();
+        return createScanManager(pipeline);
     }
 
     /**
@@ -240,6 +665,390 @@ public final class Sudoersemc {
     }
 
     /**
+     * 服务器启动后按 {@code [general] alwaysRescan} 与缓存状态请求扫描。
+     *
+     * <p>判定顺序：{@code alwaysRescan=true} 时无条件重扫；否则上次扫描时刻或已生成条目
+     * 任一缺失时仍然请求扫描；两者都存在时视为已有可用缓存并跳过，避免每次启动重复全量
+     * 求解。只有扫描调度器存在（即 {@code [general] enabled = true}）时才会真正提交请求。</p>
+     */
+    private void requestStartupScanIfConfigured() {
+        boolean alwaysRescan = shouldRequestScanOnStart(SudoersemcConfig.GENERAL_ALWAYS_RESCAN::get);
+        ScanManager manager = scanManager;
+        if (manager == null) {
+            if (alwaysRescan) {
+                LOGGER.info("SudoersEMC [general] alwaysRescan = true，但扫描调度器未启用，跳过启动扫描");
+            }
+            return;
+        }
+
+        ScanStateStore stateStore = scanStateStore;
+        GeneratedEntryStore store = entryStore;
+        long lastScanEpochMillis = stateStore == null ? 0L : stateStore.lastScanEpochMillis();
+        int generatedEntryCount = store == null ? 0 : store.size();
+        ScanFingerprint currentFingerprint;
+        try {
+            currentFingerprint = currentScanFingerprint();
+        } catch (RuntimeException failure) {
+            LOGGER.warn("SudoersEMC 无法计算当前扫描输入指纹，启动扫描将保守执行", failure);
+            currentFingerprint = null;
+        }
+        if (!alwaysRescan && hasReusableScanCache(stateStore, store, currentFingerprint)) {
+            LOGGER.info("SudoersEMC 已有可用扫描缓存（上次扫描={}，已生成条目={}，指纹匹配），跳过启动扫描",
+                    lastScanEpochMillis, generatedEntryCount);
+            return;
+        }
+
+        if (manager.requestScan()) {
+            LOGGER.info("SudoersEMC 已请求启动扫描（alwaysRescan={}，上次扫描={}，已生成条目={}）",
+                    alwaysRescan, lastScanEpochMillis, generatedEntryCount);
+        } else {
+            LOGGER.info("SudoersEMC 已有扫描在进行中，跳过启动扫描");
+        }
+    }
+
+    /**
+     * 判断启动缓存是否可以复用。
+     *
+     * <p>只有“已记录成功扫描时间 + 存在生成条目 + 当前完整输入指纹与持久化指纹一致”三个条件
+     * 同时满足时才允许跳过启动扫描。指纹覆盖物品 id、配方 id 与内容、标签名称与成员、影响定价的
+     * 全部配置通道，以及 ProjectE 手工值/模组与数据包基线，因此模组、配方、标签或配置变化后
+     * 不会误用旧缓存。</p>
+     *
+     * @param stateStore 扫描状态存储，可为 {@code null}
+     * @param store      生成值存储，可为 {@code null}
+     * @param fingerprint 当前输入指纹，无法计算时为 {@code null}
+     * @return 可以复用缓存时返回 {@code true}
+     */
+    static boolean hasReusableScanCache(@Nullable ScanStateStore stateStore,
+                                        @Nullable GeneratedEntryStore store,
+                                        @Nullable ScanFingerprint fingerprint) {
+        if (stateStore == null || store == null || fingerprint == null) {
+            return false;
+        }
+        if (store.size() <= 0 || stateStore.lastScanEpochMillis() <= 0L) {
+            return false;
+        }
+        return stateStore.matches(fingerprint);
+    }
+
+    /**
+     * 计算当前服务器世界可观察到的完整扫描输入指纹。
+     *
+     * <p>必须在服务器线程调用。指纹由五个通道组成：物品 id；配方 id 与内容（类型、序列化器、
+     * 输入候选、输出）；标签名称与成员；影响定价的全部配置值；ProjectE 手工值内容、模组版本、
+     * 已选数据包与外部基线接线状态。任何一个通道变化都会让启动缓存与采集一致性校验失败，
+     * 从而触发重新扫描或拒绝过期结果。服务器未就绪时抛出异常，由调用方选择保守路径。</p>
+     *
+     * @return 当前输入指纹
+     * @throws IllegalStateException 服务器或配方管理器尚未就绪时抛出
+     */
+    static ScanFingerprint currentScanFingerprint() {
+        MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
+        if (server == null) {
+            throw new IllegalStateException("服务器尚未就绪，无法计算扫描指纹");
+        }
+        if (server.getRecipeManager() == null) {
+            throw new IllegalStateException("配方管理器尚未就绪，无法计算扫描指纹");
+        }
+        return captureScanFingerprint(server);
+    }
+
+    /**
+     * 从给定服务器实例捕获输入指纹。
+     *
+     * <p>物品来自注册表；配方通道包含 id 与影响定价的内容；标签通道包含名称与成员；基线通道
+     * 还记录已选数据包。单个配方或标签读取失败时写入稳定的错误标记而不是静默省略；配方 id
+     * 枚举失败代表整个输入不可读取，直接抛出异常让调用方保守重扫。</p>
+     */
+    static ScanFingerprint captureScanFingerprint(@Nullable MinecraftServer server) {
+        List<String> itemIds = new ArrayList<>();
+        for (ResourceLocation id : BuiltInRegistries.ITEM.keySet()) {
+            itemIds.add(id.toString());
+        }
+
+        RecipeManager recipeManager = server == null ? null : server.getRecipeManager();
+        RegistryAccess registries = server == null ? null : server.registryAccess();
+
+        List<String> baselineValues = new ArrayList<>(baselineFingerprintValues());
+        if (server != null) {
+            try {
+                List<String> selectedPacks = new ArrayList<>(server.getPackRepository().getSelectedIds());
+                Collections.sort(selectedPacks);
+                baselineValues.add("datapacks=" + String.join(",", selectedPacks));
+            } catch (RuntimeException failure) {
+                baselineValues.add("datapacks-unavailable");
+            }
+        }
+
+        return ScanFingerprint.of(
+                itemIds,
+                recipeContentEntries(recipeManager, registries),
+                tagContentEntries(),
+                configFingerprintValues(),
+                baselineValues);
+    }
+
+    /**
+     * 配方内容通道：每个配方条目包含 id、类型、序列化器、特殊标记、输入候选与输出。
+     *
+     * <p>同一配方 id 在数据包或模组更新后内容变化时，条目随之变化，从而让启动缓存与
+     * 采集前后校验失效。配方 id 枚举失败属于整体输入不可读取，抛出异常而不是返回空列表。</p>
+     *
+     * @param manager    配方管理器，可为 {@code null}
+     * @param registries 注册表访问，用于解析配方输出；可为 {@code null}
+     * @return 每个配方一条稳定字符串
+     */
+    static List<String> recipeContentEntries(@Nullable RecipeManager manager,
+                                             @Nullable RegistryAccess registries) {
+        if (manager == null) {
+            return List.of();
+        }
+        List<ResourceLocation> ids;
+        try {
+            ids = manager.getRecipeIds().sorted().toList();
+        } catch (RuntimeException failure) {
+            throw new IllegalStateException("无法枚举配方 id 以计算扫描指纹", failure);
+        }
+
+        List<String> entries = new ArrayList<>(ids.size());
+        for (ResourceLocation id : ids) {
+            entries.add(recipeContentEntry(manager, id, registries));
+        }
+        return List.copyOf(entries);
+    }
+
+    private static String recipeContentEntry(RecipeManager manager, ResourceLocation id,
+                                             @Nullable RegistryAccess registries) {
+        try {
+            Optional<? extends Recipe<?>> maybeRecipe = manager.byKey(id);
+            if (maybeRecipe.isEmpty()) {
+                return id + "|missing";
+            }
+            Recipe<?> recipe = maybeRecipe.get();
+            StringBuilder entry = new StringBuilder(192);
+            entry.append(id).append('|')
+                    .append(registryKey(BuiltInRegistries.RECIPE_TYPE, recipe.getType())).append('|')
+                    .append(registryKey(BuiltInRegistries.RECIPE_SERIALIZER, recipe.getSerializer())).append('|')
+                    .append(recipe.isSpecial() ? "special" : "normal").append('|');
+            NonNullList<Ingredient> ingredients = recipe.getIngredients();
+            for (int i = 0; i < ingredients.size(); i++) {
+                if (i > 0) {
+                    entry.append(';');
+                }
+                entry.append(ingredientContent(ingredients.get(i)));
+            }
+            entry.append("=>").append(stackContent(recipe.getResultItem(registries)));
+            return entry.toString();
+        } catch (RuntimeException failure) {
+            // 单条配方读取失败时扫描器同样会跳过它；稳定错误标记仍能在内容恢复时触发重扫。
+            return id + "|error:" + failure.getClass().getName();
+        }
+    }
+
+    private static <T> String registryKey(Registry<T> registry, @Nullable T value) {
+        if (value == null) {
+            return "null";
+        }
+        ResourceLocation id = registry.getKey(value);
+        return id == null ? value.getClass().getName() : id.toString();
+    }
+
+    private static String ingredientContent(@Nullable Ingredient ingredient) {
+        if (ingredient == null || ingredient.isEmpty()) {
+            return "empty";
+        }
+        ItemStack[] stacks;
+        try {
+            stacks = ingredient.getItems();
+        } catch (RuntimeException failure) {
+            return "error:" + failure.getClass().getName();
+        }
+        List<String> options = new ArrayList<>();
+        if (stacks != null) {
+            for (ItemStack stack : stacks) {
+                if (stack != null && !stack.isEmpty()) {
+                    options.add(stackContent(stack));
+                }
+            }
+        }
+        if (options.isEmpty()) {
+            return "empty";
+        }
+        Collections.sort(options);
+        return String.join("/", options);
+    }
+
+    private static String stackContent(@Nullable ItemStack stack) {
+        if (stack == null || stack.isEmpty()) {
+            return "empty";
+        }
+        ResourceLocation id = BuiltInRegistries.ITEM.getKey(stack.getItem());
+        String itemId = id == null ? stack.getItem().getClass().getName() : id.toString();
+        CompoundTag tag = stack.getTag();
+        return itemId + "x" + stack.getCount() + (tag == null ? "" : tag.toString());
+    }
+
+    /**
+     * 生产标签内容通道：标签名称 + 已绑定成员排序后的列表；未绑定标签使用固定标记。
+     */
+    static List<String> tagContentEntries() {
+        ITagManager<Item> tagManager;
+        try {
+            if (ForgeRegistries.ITEMS == null) {
+                return List.of("tags-unavailable");
+            }
+            tagManager = ForgeRegistries.ITEMS.tags();
+        } catch (RuntimeException | LinkageError failure) {
+            return List.of("tags-unavailable");
+        }
+        if (tagManager == null) {
+            return List.of("tags-unavailable");
+        }
+        ITagManager<Item> manager = tagManager;
+        return tagContentEntries(BuiltInRegistries.ITEM.getTagNames(), tagKey -> {
+            ITag<Item> tag = manager.getTag(tagKey);
+            return tag == null || !tag.isBound() ? null : tag;
+        });
+    }
+
+    /**
+     * 标签内容通道的可测试实现。
+     *
+     * @param tagNames 标签名称流
+     * @param members  按标签返回成员；返回 {@code null} 表示标签未绑定
+     * @return 每个标签一条稳定字符串
+     */
+    static List<String> tagContentEntries(Stream<TagKey<Item>> tagNames,
+                                          Function<TagKey<Item>, ? extends Iterable<Item>> members) {
+        List<String> entries = new ArrayList<>();
+        for (TagKey<Item> tagKey : tagNames.toList()) {
+            Iterable<Item> tagMembers;
+            try {
+                tagMembers = members.apply(tagKey);
+            } catch (RuntimeException failure) {
+                entries.add(tagKey.location() + "|lookup-error:" + failure.getClass().getName());
+                continue;
+            }
+            entries.add(tagContentEntry(tagKey, tagMembers));
+        }
+        return List.copyOf(entries);
+    }
+
+    private static String tagContentEntry(TagKey<Item> tagKey, @Nullable Iterable<Item> members) {
+        if (members == null) {
+            return tagKey.location() + "|unbound";
+        }
+        List<String> ids = new ArrayList<>();
+        try {
+            for (Item item : members) {
+                if (item == null) {
+                    continue;
+                }
+                ResourceLocation id = BuiltInRegistries.ITEM.getKey(item);
+                if (id != null) {
+                    ids.add(id.toString());
+                }
+            }
+        } catch (RuntimeException failure) {
+            return tagKey.location() + "|error:" + failure.getClass().getName();
+        }
+        Collections.sort(ids);
+        return tagKey.location() + "|" + String.join(",", ids);
+    }
+
+    /**
+     * 基线通道：ProjectE 手工值文件内容与条目、外部基线接线状态、全部模组版本。
+     *
+     * <p>手工值文件内容摘要覆盖 tag 条目值等无法从 {@code Map} 表示的细节；模组版本确保
+     * 模组更新即使用 id 与配方文本恰好相同也不会复用旧缓存。</p>
+     */
+    static List<String> baselineFingerprintValues() {
+        List<String> values = new ArrayList<>();
+        values.add("baseline-schema=phase-12-content-v2");
+        values.add("external-baseline=phase-12-not-wired");
+        try {
+            ProjectEManualValues manualValues = OptionalIntegrationManager.manualValues();
+            values.add("projecte-manual-content=" + manualValues.contentFingerprint());
+            for (Map.Entry<ItemKey, Long> entry : manualValues.manualValues().entrySet()) {
+                values.add("projecte-manual-item=" + entry.getKey() + "=" + entry.getValue());
+            }
+            for (ResourceLocation tagId : manualValues.manualTagIds()) {
+                values.add("projecte-manual-tag=#" + tagId);
+            }
+        } catch (RuntimeException failure) {
+            values.add("projecte-manual-unavailable");
+        }
+        try {
+            values.add("projecte-provider=" + OptionalIntegrationManager.provider()
+                    .filter(provider -> provider.isAvailable())
+                    .map(provider -> provider.getClass().getName())
+                    .orElse("unavailable"));
+        } catch (RuntimeException failure) {
+            values.add("projecte-provider-unavailable");
+        }
+        values.addAll(modVersionFingerprintValues());
+        return List.copyOf(values);
+    }
+
+    private static List<String> modVersionFingerprintValues() {
+        try {
+            ModList modList = ModList.get();
+            if (modList == null) {
+                return List.of("mods-unavailable");
+            }
+            List<String> mods = new ArrayList<>();
+            for (IModInfo info : modList.getMods()) {
+                mods.add(info.getModId() + "=" + info.getVersion());
+            }
+            Collections.sort(mods);
+            return List.of("mods=" + String.join(",", mods));
+        } catch (RuntimeException | LinkageError failure) {
+            return List.of("mods-unavailable");
+        }
+    }
+
+    /**
+     * 收集影响定价结果的配置值。读取失败时返回固定降级标记，绝不把空配置误判为“未变化”。
+     */
+    private static List<String> configFingerprintValues() {
+        List<String> values = new ArrayList<>();
+        try {
+            values.add("general.enabled=" + SudoersemcConfig.GENERAL_ENABLED.get());
+            values.add("general.alwaysRescan=" + SudoersemcConfig.GENERAL_ALWAYS_RESCAN.get());
+            values.add("recipe.solveRecipes=" + SudoersemcConfig.RECIPE_SOLVE_RECIPES.get());
+            values.add("recipe.maxPasses=" + SudoersemcConfig.RECIPE_MAX_RECIPE_PASSES.get());
+            values.add("recipe.allowIncrease=" + SudoersemcConfig.RECIPE_ALLOW_RECIPE_VALUE_INCREASE.get());
+            values.add("fallback.unsolvable=" + SudoersemcConfig.FALLBACK_USE_FALLBACK_FOR_UNSOLVABLE.get());
+            values.add("fallback.tag=" + SudoersemcConfig.FALLBACK_USE_TAG_PRICING.get());
+            values.add("fallback.rarity=" + SudoersemcConfig.FALLBACK_USE_RARITY_PRICING.get());
+            values.add("fallback.baselines=" + SudoersemcConfig.FALLBACK_USE_PROJECTE_INTEGRATION_BASELINES.get());
+            values.add("safety.largeDrop=" + SudoersemcConfig.SAFETY_LARGE_DROP_PROTECTION.get());
+            values.add("safety.maxDropRatio=" + SudoersemcConfig.SAFETY_MAX_ALLOWED_DROP_RATIO.get());
+            values.add("safety.creative=" + SudoersemcConfig.SAFETY_PROTECT_CREATIVE_ONLY_ITEMS.get());
+            values.add("safety.creativeExclusions=" + SudoersemcConfig.SAFETY_CREATIVE_ITEM_EXCLUSIONS.get());
+            values.add("safety.creativeSpecialValues="
+                    + SudoersemcConfig.SAFETY_CREATIVE_ITEM_SPECIAL_VALUES.get());
+            values.add("safety.creativeNamespaces=" + SudoersemcConfig.SAFETY_CREATIVE_NAMESPACES.get());
+            values.add("overflow.enabled=" + SudoersemcConfig.OVERFLOW_ENABLED.get());
+            values.add("overflow.threshold=" + SudoersemcConfig.OVERFLOW_THRESHOLD.get());
+            values.add("overflow.resetMin=" + SudoersemcConfig.OVERFLOW_RESET_MIN.get());
+            values.add("overflow.resetMax=" + SudoersemcConfig.OVERFLOW_RESET_MAX.get());
+            values.add("overflow.scope=" + SudoersemcConfig.OVERFLOW_OVERWRITE_SCOPE.get());
+            values.add("overflow.bucketCount=" + SudoersemcConfig.OVERFLOW_BUCKET_COUNT.get());
+            values.add("overflow.weightCap=" + SudoersemcConfig.OVERFLOW_WEIGHT_CAP.get());
+            values.add("overflow.randomSeed=" + SudoersemcConfig.OVERFLOW_RANDOM_SEED.get());
+            values.add("overflow.allowProjecteFileRewrite="
+                    + SudoersemcConfig.OVERFLOW_ALLOW_PROJECTE_FILE_REWRITE.get());
+            values.add("nbt.variants=" + SudoersemcConfig.NBT_SCAN_NBT_VARIANTS.get());
+            values.add("nbt.maxVariants=" + SudoersemcConfig.NBT_MAX_NBT_VARIANTS_PER_ITEM.get());
+        } catch (RuntimeException failure) {
+            LOGGER.warn("SudoersEMC 读取配置指纹失败，使用降级标记", failure);
+            values.add("config-unavailable");
+        }
+        return List.copyOf(values);
+    }
+
+    /**
      * 处理 {@code /sudoemc reload}：重读配置文件并重建受配置影响的运行时组件。
      *
      * <p>扫描进行中时不读取文件，只登记延迟重载；扫描结束后由服务器 tick 调用
@@ -259,11 +1068,11 @@ public final class Sudoersemc {
     }
 
     /**
-     * 从磁盘重读配置，校验通过后重建扫描调度器与命令服务。
+     * 从磁盘重读配置，校验通过后重建扫描管线、调度器与命令服务。
      *
      * <p>配置读取或跨字段校验失败时不会替换任何运行时组件，返回
-     * {@link ReloadDecision#REJECT}；成功时按当前是否处于服务器运行期重建完整扫描管线或
-     * 占位调度器，并重新注入 {@link CommandService}，同时清理旧调度器，避免残留取消标志。</p>
+     * {@link ReloadDecision#REJECT}；成功时使用新配置重建 {@link ScanPipeline}、{@link ScanManager}
+     * 并重新注入 {@link CommandService}，同时清理旧调度器，避免残留取消标志。</p>
      */
     private static synchronized ReloadDecision applyConfigReload() {
         pendingReload = false;
@@ -274,19 +1083,18 @@ public final class Sudoersemc {
         }
 
         try {
-            MinecraftServer server = currentServer;
-            if (server != null) {
-                // 服务器运行中：重建完整扫描管线，避免把生产调度器降级成占位实现。
-                startScanRuntime(server);
-            } else {
-                ScanManager previous = scanManager;
-                scanManager = createScanManagerIfEnabled(SudoersemcConfig.GENERAL_ENABLED::get);
-                if (previous != null) {
-                    previous.cancel();
-                    previous.reset();
-                }
-            }
+            ScanPipeline rebuiltPipeline = createScanPipeline(
+                    entryStore, scanStateStore, reportManager, overflowResetLog, quarantinedDropsStore);
+            ScanManager rebuilt = createScanManagerIfEnabled(
+                    rebuiltPipeline, SudoersemcConfig.GENERAL_ENABLED::get);
+            ScanManager previous = scanManager;
+            scanPipeline = rebuiltPipeline;
+            scanManager = rebuilt;
             refreshCommandService();
+            if (previous != null) {
+                previous.cancel();
+                previous.reset();
+            }
             LOGGER.info("SudoersEMC 配置已重新加载并生效");
             return ReloadDecision.APPLY_NOW;
         } catch (RuntimeException failure) {
@@ -298,8 +1106,9 @@ public final class Sudoersemc {
     /**
      * 用当前运行时组件重新创建命令服务并重新注入命令树。
      *
-     * <p>服务器启动和配置重载都会替换 {@link ScanManager}，命令服务必须跟着重建，
-     * 否则 {@code /sudoemc status} 等命令会继续读取旧调度器。</p>
+     * <p>服务器启动、配置重载与 common setup 都会替换 {@link ScanManager}，命令服务必须跟着
+     * 重建，否则 {@code /sudoemc status} 等命令会继续读取旧调度器。审批回调必须与新调度器
+     * 一起注入，保证隔离审批闭环不因重载而失效。</p>
      */
     private static void refreshCommandService() {
         CommandService service = new CommandService(
@@ -307,7 +1116,8 @@ public final class Sudoersemc {
                 reportManager,
                 entryStore,
                 scanStateStore,
-                Sudoersemc::reloadConfig);
+                Sudoersemc::reloadConfig,
+                Sudoersemc::approveQuarantined);
         commandService = service;
         SudoemcCommands.setService(service);
     }
@@ -317,29 +1127,12 @@ public final class Sudoersemc {
         LOGGER.debug("SudoersEMC registered /sudoemc command tree");
     }
 
-    private void onServerStarted(ServerStartedEvent event) {
-        currentServer = event.getServer();
-        // 服务器启动后构建真实扫描管线；它会按 general.enabled 决定是否启用，并按
-        // general.alwaysRescan / 输入指纹决定是否立即请求扫描。
-        startScanRuntime(event.getServer());
-        // 集成服务器停止后会清空命令服务；新世界启动时必须绑定新的调度器重新注入。
-        refreshCommandService();
-
-        GeneratedEntryStore store = entryStore;
-        if (store != null) {
-            LOGGER.info("SudoersEMC active: {} generated entries, ProjectE {}",
-                    store.size(),
-                    OptionalIntegrationManager.isProjectEAvailable() ? "detected" : "absent");
-        }
-        SmokeTestHook.onServerStarted(event);
-    }
-
     private void onServerTick(TickEvent.ServerTickEvent event) {
         if (event.phase != TickEvent.Phase.END) {
             return;
         }
         ScanManager manager = scanManager;
-        if (manager != null) {
+        if (manager != null && manager.isRunning()) {
             manager.tick();
         }
         if (pendingReload) {
@@ -350,151 +1143,38 @@ public final class Sudoersemc {
         }
     }
 
+    private void onServerStarted(ServerStartedEvent event) {
+        currentServer = event.getServer();
+        ScanManager manager = scanManager;
+        if (manager != null) {
+            manager.reset();
+        }
+        // 集成服务器停止后会清空命令服务；新世界启动时必须重新注入。
+        SudoemcCommands.setService(commandService);
+
+        GeneratedEntryStore store = entryStore;
+        if (store != null) {
+            LOGGER.info("SudoersEMC active: {} generated entries, ProjectE {}",
+                    store.size(),
+                    OptionalIntegrationManager.isProjectEAvailable() ? "detected" : "absent");
+        }
+        SmokeTestHook.onServerStarted(event);
+        requestStartupScanIfConfigured();
+    }
+
     private void onServerStopping(ServerStoppingEvent event) {
         ScanManager manager = scanManager;
         if (manager != null) {
             manager.cancel();
             manager.reset();
         }
-        ScanCollectionPipeline pipeline = scanPipeline;
-        if (pipeline != null) {
-            pipeline.persist();
-        }
         scanManager = null;
         scanPipeline = null;
         currentServer = null;
-
-        GeneratedEntryStore store = entryStore;
-        if (store != null) {
-            store.saveIfDirty();
-        }
-        ScanStateStore stateStore = scanStateStore;
-        if (stateStore != null) {
-            stateStore.saveIfDirty();
-        }
-
+        flushRuntimeStoresOnServerThread();
         pendingReload = false;
         // 不保留指向旧世界的命令服务；下一次 ServerStartedEvent 会重新注入。
         SudoemcCommands.setService(null);
-    }
-
-    /**
-     * datapack/reload 开始：递增扫描管线的 reload 代次，使正在 APPLYING 的扫描立即停止
-     * 使用旧配方价格。该事件可能在资源加载线程触发，管线内部使用原子计数，线程安全。
-     */
-    private void onAddReloadListener(AddReloadListenerEvent event) {
-        recordDatapackReload();
-    }
-
-    /**
-     * 资源重载完成（服务端数据加载）：再次递增代次，覆盖“扫描在 reload 进行中开始”的窗口。
-     * 只处理服务端数据加载，忽略客户端同步包触发的事件。
-     */
-    private void onTagsUpdated(TagsUpdatedEvent event) {
-        if (event.getUpdateCause() == TagsUpdatedEvent.UpdateCause.SERVER_DATA_LOAD) {
-            recordDatapackReload();
-        }
-    }
-
-    private static void recordDatapackReload() {
-        ScanCollectionPipeline pipeline = scanPipeline;
-        if (pipeline != null) {
-            pipeline.onDatapackReload();
-        }
-    }
-
-    /**
-     * 构建并启动 Phase 7 扫描运行时。
-     *
-     * <p>读取 {@code performance.itemsPerTick} 与
-     * {@code performance.adaptiveBatchSizing} 构造 {@link BatchProcessor}；把真实分片扫描器、
-     * 生产指纹提供器、结果应用器与持久化回调注入 {@link ScanManager}。服务器启动时按
-     * {@code general.alwaysRescan} 或指纹变化决定是否立即扫描。</p>
-     */
-    private static synchronized void startScanRuntime(MinecraftServer server) {
-        ScanManager previous = scanManager;
-        if (previous != null) {
-            previous.cancel();
-            previous.reset();
-        }
-        scanManager = null;
-        scanPipeline = null;
-
-        GeneratedEntryStore store = entryStore;
-        if (store == null) {
-            LOGGER.warn("SudoersEMC scan runtime not started: generated entry store is not ready");
-            return;
-        }
-
-        boolean enabled = readBoolean(SudoersemcConfig.GENERAL_ENABLED, true);
-        if (!enabled) {
-            LOGGER.info("SudoersEMC [general] enabled = false: scan runtime disabled");
-            return;
-        }
-
-        int itemsPerTick = readInt(SudoersemcConfig.PERFORMANCE_ITEMS_PER_TICK, 100);
-        boolean adaptive = readBoolean(SudoersemcConfig.PERFORMANCE_ADAPTIVE_BATCH_SIZING, true);
-        boolean alwaysRescan = shouldRequestScanOnStart(SudoersemcConfig.GENERAL_ALWAYS_RESCAN::get);
-
-        ScanCollectionPipeline pipeline = new ScanCollectionPipeline(
-                store, () -> requestProjectERemap(server));
-        ScanManager manager = ScanManager.staged(
-                new BatchProcessor(Math.max(1, itemsPerTick), adaptive),
-                pipeline.collector(server),
-                pipeline.stagedApplier(),
-                TICK_BUDGET_NANOS,
-                pipeline.fingerprintSupplier(server),
-                pipeline.stagedSaveHandler());
-
-        scanPipeline = pipeline;
-        scanManager = manager;
-        LOGGER.info("SudoersEMC scan runtime wired: itemsPerTick={}, adaptive={}",
-                itemsPerTick, adaptive);
-
-        if (pipeline.shouldScan(server, alwaysRescan)) {
-            if (manager.requestScan()) {
-                LOGGER.info("SudoersEMC startup scan requested");
-            } else {
-                LOGGER.info("SudoersEMC startup scan not requested: another scan is already active");
-            }
-        } else {
-            LOGGER.info("SudoersEMC scan inputs unchanged since the last successful scan; "
-                    + "skipping startup scan (set general.alwaysRescan=true to force)");
-        }
-    }
-
-    /**
-     * 在全部生成值 staging 完成后请求 EMC 后端重映射。
-     *
-     * <p>生成值此时已经写入 {@link GeneratedEntryStore}；重映射失败只记录警告，已经暂存的
-     * 值仍会在下一次 remap 或重启后生效。该回调由扫描管线在服务器线程的 APPLYING 阶段末尾
-     * 调用，不在文件写入或求解工作线程上执行。</p>
-     */
-    private static void requestProjectERemap(MinecraftServer server) {
-        try {
-            OptionalIntegrationManager.provider()
-                    .ifPresent(provider -> provider.requestRemap(server));
-        } catch (RuntimeException e) {
-            LOGGER.warn("SudoersEMC 请求 ProjectE 重映射失败，已生成条目仍会保存", e);
-        }
-    }
-
-    private static int readInt(ForgeConfigSpec.IntValue value, int fallback) {
-        try {
-            return value.get();
-        } catch (RuntimeException e) {
-            LOGGER.warn("SudoersEMC could not read an integer performance config; using {}", fallback, e);
-            return fallback;
-        }
-    }
-
-    private static boolean readBoolean(ForgeConfigSpec.BooleanValue value, boolean fallback) {
-        try {
-            return value.get();
-        } catch (RuntimeException e) {
-            LOGGER.warn("SudoersEMC could not read a boolean config; using {}", fallback, e);
-            return fallback;
-        }
     }
 
     /**
@@ -512,16 +1192,16 @@ public final class Sudoersemc {
     }
 
     /**
-     * @return 当前生效的扫描调度器；服务器启动前是占位调度器，停服后为 {@code null}
+     * @return 扫描调度器，common setup 完成前为 {@code null}
      */
     public static ScanManager scanManager() {
         return scanManager;
     }
 
     /**
-     * @return 当前生效的扫描管线，服务器启动前/停服后为 {@code null}
+     * @return 真实扫描管线，common setup 完成前为 {@code null}
      */
-    public static ScanCollectionPipeline scanPipeline() {
+    public static ScanPipeline scanPipeline() {
         return scanPipeline;
     }
 }

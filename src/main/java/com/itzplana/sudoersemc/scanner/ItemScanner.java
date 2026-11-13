@@ -11,6 +11,7 @@ import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.item.Rarity;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -19,6 +20,13 @@ import org.slf4j.LoggerFactory;
  *
  * <p>Runs on the server thread because it touches the item registry. The output is a list of
  * immutable {@link ItemSnapshot}s that the rest of the pipeline can process off-thread.</p>
+ *
+ * <p>生产管线使用 {@link #beginSession()} 获取可跨 tick 推进的 {@link ItemScanSession}，每个
+ * tick 只处理有限数量的注册表条目并检查截止时间；{@link #beginScan()} 保留 phase-12 的
+ * {@link ScanSession} 视图，{@link #scan()} 保留给测试与一次性调用。</p>
+ *
+ * <p>每个快照同时携带标签路径与稀有度，供 {@code TagPricing} 锚点与兜底定价使用；读取标签
+ * 或稀有度失败时按空标签与 {@link Rarity#COMMON} 处理，单个物品失败绝不终止整次扫描。</p>
  */
 public final class ItemScanner {
 
@@ -40,6 +48,28 @@ public final class ItemScanner {
     }
 
     /**
+     * 创建一个分片扫描会话（phase-12 视图）。
+     *
+     * @return 新的扫描会话
+     */
+    public ScanSession beginScan() {
+        return new ScanSession(beginSession());
+    }
+
+    /**
+     * 开始一次可分片推进的物品扫描（phase-11 生产接线）。
+     *
+     * <p>会话在构造时只固定注册表总量与迭代器，不执行逐物品查询；每次
+     * {@link ItemScanSession#step(int)} 最多检查 {@code maxItems} 个注册表条目。调用方
+     * （{@code ScanManager}）因此可以把大型整合包的物品扫描分散到多个服务器 tick。</p>
+     *
+     * @return 新的物品扫描游标
+     */
+    public ItemScanSession beginSession() {
+        return new ItemScanSession(emcQuery, ignoredNamespaces, ignoredItems);
+    }
+
+    /**
      * Scans every registered item in one call. Kept for tests and callers that do not need
      * cross-tick chunking; {@code ScanCollectionPipeline} uses {@link #beginSession()} instead.
      *
@@ -53,17 +83,18 @@ public final class ItemScanner {
         return session.snapshots();
     }
 
+    private static boolean isIgnored(Set<String> ignoredNamespaces,
+                                     Set<ResourceLocation> ignoredItems,
+                                     ResourceLocation id) {
+        return ignoredItems.contains(id) || ignoredNamespaces.contains(id.getNamespace());
+    }
+
     /**
-     * 开始一次可分片推进的物品扫描。
-     *
-     * <p>会话在构造时只固定注册表总量与迭代器，不执行逐物品查询；每次
-     * {@link ItemScanSession#step(int)} 最多检查 {@code maxItems} 个注册表条目。调用方
-     * （{@code ScanManager}）因此可以把大型整合包的物品扫描分散到多个服务器 tick。</p>
-     *
-     * @return 新的物品扫描游标
+     * Builds the canonical "no NBT" stack for an item. Damageable items are left at their default
+     * state so the value applies to the plain item rather than a specific damage value.
      */
-    public ItemScanSession beginSession() {
-        return new ItemScanSession(emcQuery, ignoredNamespaces, ignoredItems);
+    private static ItemStack defaultStack(Item item) {
+        return new ItemStack(item);
     }
 
     /**
@@ -178,7 +209,7 @@ public final class ItemScanner {
                 skippedUnregistered++;
                 return;
             }
-            if (isIgnored(id)) {
+            if (isIgnored(ignoredNamespaces, ignoredItems, id)) {
                 skippedIgnored++;
                 return;
             }
@@ -199,11 +230,22 @@ public final class ItemScanner {
                 hasEmc = false;
                 value = 0L;
             }
-            snapshots.add(new ItemSnapshot(key, id, id.getNamespace(), id.getPath(), hasEmc, value));
-        }
-
-        private boolean isIgnored(ResourceLocation id) {
-            return ignoredItems.contains(id) || ignoredNamespaces.contains(id.getNamespace());
+            List<String> tagPaths;
+            Rarity rarity;
+            try {
+                tagPaths = stack.getTags()
+                        .map(tag -> tag.location().toString())
+                        .distinct()
+                        .sorted()
+                        .toList();
+                rarity = stack.getRarity();
+            } catch (RuntimeException e) {
+                // Tag/rarity lookup is best-effort: a single item must not abort the whole scan.
+                LOGGER.warn("读取物品 {} 的标签或稀有度失败，按空标签与 COMMON 处理", id, e);
+                tagPaths = List.of();
+                rarity = Rarity.COMMON;
+            }
+            snapshots.add(ItemSnapshot.of(key, hasEmc, value, tagPaths, rarity));
         }
 
         private void logSkipSummary() {
@@ -216,13 +258,59 @@ public final class ItemScanner {
                         skippedIgnored, skippedEmpty, skippedUnregistered, snapshots.size());
             }
         }
+    }
+
+    /**
+     * phase-12 的分片物品扫描视图，委托给 {@link ItemScanSession}。
+     *
+     * <p>保留 {@link #totalItems()} / {@link #processedItems()} / {@link #step(int)} 的旧契约，
+     * 供 {@code ScanPipeline} 与既有测试使用；生产接线应优先使用
+     * {@link ItemScanner#beginSession()} 以获得截止时间支持。</p>
+     */
+    public static final class ScanSession {
+
+        private final ItemScanSession delegate;
+
+        private ScanSession(ItemScanSession delegate) {
+            this.delegate = Objects.requireNonNull(delegate, "delegate");
+        }
 
         /**
-         * Builds the canonical "no NBT" stack for an item. Damageable items are left at their default
-         * state so the value applies to the plain item rather than a specific damage value.
+         * @return 计划检查的注册表条目总数；未知时为 0
          */
-        private static ItemStack defaultStack(Item item) {
-            return new ItemStack(item);
+        public int totalItems() {
+            return delegate.total();
+        }
+
+        /**
+         * @return 已经访问的注册表条目数量
+         */
+        public int processedItems() {
+            return delegate.processed();
+        }
+
+        /**
+         * @return 是否已经遍历完注册表
+         */
+        public boolean isDone() {
+            return delegate.isDone();
+        }
+
+        /**
+         * 推进最多 {@code maxItems} 个注册表条目。
+         *
+         * @param maxItems 本次允许访问的最大条目数，必须大于等于 1
+         * @return 本批实际访问的条目数量
+         */
+        public int step(int maxItems) {
+            return delegate.step(maxItems);
+        }
+
+        /**
+         * @return 已采集物品快照的不可变副本，保持注册表顺序
+         */
+        public List<ItemSnapshot> snapshots() {
+            return delegate.snapshots();
         }
     }
 

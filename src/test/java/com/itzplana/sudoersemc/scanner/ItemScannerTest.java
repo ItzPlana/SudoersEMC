@@ -51,6 +51,31 @@ class ItemScannerTest {
     }
 
     @Test
+    void chunkedScanHonoursBatchAndCollectsEveryItem() {
+        ItemScanner scanner = new ItemScanner(noEmc(), Set.of(), Set.of(DIRT));
+        ItemScanner.ScanSession session = scanner.beginScan();
+
+        assertTrue(session.totalItems() > 0);
+        int previousProcessed = 0;
+        int steps = 0;
+        while (!session.isDone() && steps++ < 10_000) {
+            int processed = session.step(7);
+            assertTrue(processed <= 7, "单批不得超出请求上限");
+            assertTrue(session.processedItems() >= previousProcessed,
+                    "已处理数量必须单调递增");
+            previousProcessed = session.processedItems();
+            assertTrue(processed > 0 || session.isDone(),
+                    "未完成的批次必须实际处理工作");
+        }
+
+        assertTrue(session.isDone(), "分片会话必须在有限步数内完成");
+        assertEquals(session.totalItems(), session.processedItems());
+        assertFalse(session.snapshots().isEmpty());
+        assertTrue(session.snapshots().stream().noneMatch(snapshot -> snapshot.registryId().equals(AIR)));
+        assertTrue(session.snapshots().stream().noneMatch(snapshot -> snapshot.registryId().equals(DIRT)));
+    }
+
+    @Test
     void existingEmcValuesAreCaptured() {
         ItemScanner.EmcQuery dirtOnly = new ItemScanner.EmcQuery() {
             @Override

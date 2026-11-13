@@ -136,15 +136,37 @@ public final class TierPricing {
     }
 
     /**
-     * 通用默认规则：只排除没有经济意义的原版物品，不包含任何模组专属清单。
+     * 通用默认规则：只排除没有生存获取途径或没有经济意义的原版物品，不包含任何模组专属清单。
+     *
+     * <p>这些物品要么只能在创造模式获得（基岩、屏障、命令方块、结构方块、刷怪笼），
+     * 要么根本不存在于正常游戏中（空气、调试棒）。给它们定价会凭空创造 EMC，
+     * 因此必须排除。具体模组的物品清单应由配置提供，引擎不得内置。</p>
      *
      * @return 默认层级定价器
      */
     public static TierPricing defaults() {
         return new TierPricing(List.of(
                 new TierRule(Type.EXACT_ID, "minecraft:air", 1.0D, null, true),
+                new TierRule(Type.EXACT_ID, "minecraft:cave_air", 1.0D, null, true),
+                new TierRule(Type.EXACT_ID, "minecraft:void_air", 1.0D, null, true),
+                new TierRule(Type.EXACT_ID, "minecraft:bedrock", 1.0D, null, true),
+                new TierRule(Type.EXACT_ID, "minecraft:barrier", 1.0D, null, true),
+                new TierRule(Type.EXACT_ID, "minecraft:light", 1.0D, null, true),
+                new TierRule(Type.EXACT_ID, "minecraft:structure_void", 1.0D, null, true),
+                new TierRule(Type.EXACT_ID, "minecraft:structure_block", 1.0D, null, true),
+                new TierRule(Type.EXACT_ID, "minecraft:jigsaw", 1.0D, null, true),
+                new TierRule(Type.EXACT_ID, "minecraft:command_block", 1.0D, null, true),
+                new TierRule(Type.EXACT_ID, "minecraft:chain_command_block", 1.0D, null, true),
+                new TierRule(Type.EXACT_ID, "minecraft:repeating_command_block", 1.0D, null, true),
+                new TierRule(Type.EXACT_ID, "minecraft:command_block_minecart", 1.0D, null, true),
+                new TierRule(Type.EXACT_ID, "minecraft:spawner", 1.0D, null, true),
+                // 调试棒与知识之书任何命名空间下都没有经济意义，用路径包含匹配更稳健。
+                new TierRule(Type.PATH_CONTAINS, "debug_stick", 1.0D, null, true),
+                new TierRule(Type.PATH_CONTAINS, "knowledge_book", 1.0D, null, true),
+                // 刷怪蛋没有生存获取途径，给它们定价会让刷怪变成资源来源。
                 new TierRule(Type.PATH_CONTAINS, "spawn_egg", 1.0D, null, true),
-                new TierRule(Type.PATH_CONTAINS, "debug_stick", 1.0D, null, true)
+                // 正在生长的紫水晶簇只能用精准采集获得，无法作为材料流转。
+                new TierRule(Type.EXACT_ID, "minecraft:budding_amethyst", 1.0D, null, true)
         ));
     }
 

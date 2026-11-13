@@ -28,7 +28,9 @@ import org.slf4j.LoggerFactory;
  * Converts live Minecraft recipes into immutable {@link RecipeSnapshot}s.
  *
  * <p>Must run on the server thread. Every recipe is handled defensively: one broken or unsupported
- * recipe increments a counter instead of aborting the scan.</p>
+ * recipe increments a counter instead of aborting the scan. Failure to enumerate the recipe id
+ * collection itself is different: it aborts the scan with {@link IllegalStateException} because an
+ * empty id list would otherwise be indistinguishable from a successful empty scan.</p>
  *
  * <p><strong>Contract:</strong> {@link RecipeSnapshot#inputs()} contains only items that are
  * actually consumed. A recipe's station, tool or altar is never listed, so evaluators can sum every
@@ -65,6 +67,21 @@ public final class RecipeScanner {
     }
 
     /**
+     * 创建 phase-12 的分片配方扫描视图。
+     *
+     * <p>保留 {@link ScanSession#totalRecipes()} / {@link ScanSession#processedRecipes()} /
+     * {@link ScanSession#step(int)} 的旧契约，内部委托给 {@link RecipeScanSession}；
+     * 生产接线应优先使用 {@link #beginSession(RecipeManager)} 以获得截止时间与增量回调支持。</p>
+     *
+     * @param manager the active recipe manager
+     * @return 新的分片扫描会话
+     * @throws IllegalStateException 无法枚举配方 id 时抛出
+     */
+    public ScanSession beginScan(RecipeManager manager) {
+        return new ScanSession(beginSession(manager));
+    }
+
+    /**
      * 开始一次可分片推进的配方扫描。
      *
      * <p>会话在构造时只枚举配方 id，不读取或转换任何配方；每次
@@ -74,6 +91,7 @@ public final class RecipeScanner {
      *
      * @param manager 当前配方管理器
      * @return 新的配方扫描游标
+     * @throws IllegalStateException 无法枚举配方 id 时抛出
      */
     public RecipeScanSession beginSession(RecipeManager manager) {
         return beginSession(manager, null);
@@ -86,27 +104,36 @@ public final class RecipeScanner {
      * 不再等到采集结束再全量遍历。回调在服务器线程、配方扫描批次内执行，必须保持轻量；
      * 抛出的运行时异常会让本次扫描失败。</p>
      *
+     * <p><strong>失败语义：</strong>配方 id 枚举失败代表整个配方输入不可读取，必须让本次采集
+     * 失败而不是返回空列表；否则 {@code ScanManager} 会以 0 配方完成扫描并写入空配方指纹。
+     * 单条配方在 {@link RecipeScanSession#scanOne(ResourceLocation)} 中失败仍然只增加
+     * {@code failed} 计数，不影响其余配方。</p>
+     *
      * @param manager    当前配方管理器
      * @param onSnapshot 每条可用配方的回调，允许为 {@code null}
      * @return 新的配方扫描游标
+     * @throws IllegalStateException 无法枚举配方 id 时抛出
      */
     public RecipeScanSession beginSession(RecipeManager manager,
                                           Consumer<RecipeSnapshot> onSnapshot) {
         Objects.requireNonNull(manager, "manager");
+        // getRecipeIds()/byKey() is the only 1.20.1 API that pairs an id with its recipe without
+        // touching private state.
         List<ResourceLocation> ids;
         try {
-            // getRecipeIds()/byKey() is the only 1.20.1 API that pairs an id with its recipe without
-            // touching private state.
             ids = manager.getRecipeIds().toList();
         } catch (RuntimeException e) {
-            LOGGER.warn("Could not enumerate recipe ids", e);
-            ids = List.of();
+            LOGGER.error("Could not enumerate recipe ids", e);
+            throw new IllegalStateException("扫描采集失败：无法枚举配方 id", e);
         }
         return new RecipeScanSession(this, manager, ids, onSnapshot);
     }
 
     /**
      * 持有配方 id 游标的扫描会话。
+     *
+     * <p>配方 id 在会话开始时一次性枚举，单条配方的描述工作按 {@link #step(int)} 的预算推进，
+     * 并在每条配方之间检查截止时间。会话只能在服务器线程使用。</p>
      */
     public static final class RecipeScanSession {
 
@@ -126,9 +153,9 @@ public final class RecipeScanner {
                                   RecipeManager manager,
                                   List<ResourceLocation> ids,
                                   Consumer<RecipeSnapshot> onSnapshot) {
-            this.scanner = scanner;
-            this.manager = manager;
-            this.ids = List.copyOf(ids);
+            this.scanner = Objects.requireNonNull(scanner, "scanner");
+            this.manager = Objects.requireNonNull(manager, "manager");
+            this.ids = List.copyOf(Objects.requireNonNull(ids, "ids"));
             this.onSnapshot = onSnapshot;
         }
 
@@ -204,6 +231,13 @@ public final class RecipeScanner {
                 logSummary();
             }
             return new ScanResult(List.copyOf(snapshots), unsupported, invalid, failed);
+        }
+
+        /**
+         * @return 到目前为止采集到的配方快照的不可变副本
+         */
+        public List<RecipeSnapshot> snapshots() {
+            return List.copyOf(snapshots);
         }
 
         private void scanOne(ResourceLocation id) {
@@ -427,6 +461,59 @@ public final class RecipeScanner {
             return null;
         }
         return new RecipeOutput(ItemKey.of(id), Math.max(1, stack.getCount()));
+    }
+
+    /**
+     * phase-12 的分片配方扫描视图，委托给 {@link RecipeScanSession}。
+     *
+     * <p>保留 {@link #totalRecipes()} / {@link #processedRecipes()} / {@link #step(int)} 的旧契约，
+     * 供 {@code ScanPipeline} 与既有测试使用。</p>
+     */
+    public static final class ScanSession {
+
+        private final RecipeScanSession delegate;
+
+        private ScanSession(RecipeScanSession delegate) {
+            this.delegate = Objects.requireNonNull(delegate, "delegate");
+        }
+
+        /**
+         * @return 计划描述的配方数量
+         */
+        public int totalRecipes() {
+            return delegate.total();
+        }
+
+        /**
+         * @return 已经处理的配方数量
+         */
+        public int processedRecipes() {
+            return delegate.processed();
+        }
+
+        /**
+         * @return 是否已经处理完所有配方 id
+         */
+        public boolean isDone() {
+            return delegate.isDone();
+        }
+
+        /**
+         * 推进最多 {@code maxItems} 条配方。
+         *
+         * @param maxItems 本次允许处理的最大配方数，必须大于等于 1
+         * @return 本批实际处理的配方数量
+         */
+        public int step(int maxItems) {
+            return delegate.step(maxItems);
+        }
+
+        /**
+         * @return 本会话的扫描结果；可在未完成时调用，返回当前已处理的条目
+         */
+        public ScanResult result() {
+            return delegate.result();
+        }
     }
 
     /**

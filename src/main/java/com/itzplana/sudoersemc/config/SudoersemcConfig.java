@@ -57,6 +57,12 @@ public final class SudoersemcConfig {
     public static final ForgeConfigSpec.BooleanValue SAFETY_LARGE_DROP_PROTECTION;
     public static final ForgeConfigSpec.DoubleValue SAFETY_MAX_ALLOWED_DROP_RATIO;
     public static final ForgeConfigSpec.BooleanValue SAFETY_PROTECT_CREATIVE_ONLY_ITEMS;
+    public static final ForgeConfigSpec.ConfigValue<List<? extends String>>
+            SAFETY_CREATIVE_ITEM_EXCLUSIONS;
+    public static final ForgeConfigSpec.ConfigValue<List<? extends String>>
+            SAFETY_CREATIVE_ITEM_SPECIAL_VALUES;
+    public static final ForgeConfigSpec.ConfigValue<List<? extends String>>
+            SAFETY_CREATIVE_NAMESPACES;
 
     public static final ForgeConfigSpec.BooleanValue OVERFLOW_ENABLED;
     public static final ForgeConfigSpec.LongValue OVERFLOW_THRESHOLD;
@@ -119,7 +125,9 @@ public final class SudoersemcConfig {
         FALLBACK_USE_RARITY_PRICING = BUILDER.comment("Derive values from item rarity.")
                 .define("useRarityPricing", true);
         FALLBACK_USE_PROJECTE_INTEGRATION_BASELINES = BUILDER.comment(
-                        "Use ProjectE integration baselines when available.")
+                        "Use ProjectE integration baselines when available.",
+                        "Phase 12 records this switch but has no baseline data source yet; the",
+                        "baseline reader is wired in Phase 25. False explicitly passes 0.")
                 .define("useProjectEIntegrationBaselines", true);
         BUILDER.pop();
 
@@ -135,6 +143,18 @@ public final class SudoersemcConfig {
         SAFETY_PROTECT_CREATIVE_ONLY_ITEMS = BUILDER.comment(
                         "Do not generate survival-obtainable values for creative-only items.")
                 .define("protectCreativeOnlyItems", true);
+        SAFETY_CREATIVE_ITEM_EXCLUSIONS = BUILDER.comment(
+                        "Exact item ids that must never be auto-priced (format: namespace:path).")
+                .defineListAllowEmpty("creativeItemExclusions", List.of(),
+                        entry -> entry instanceof String);
+        SAFETY_CREATIVE_ITEM_SPECIAL_VALUES = BUILDER.comment(
+                        "Fixed EMC values that override normal solving (format: namespace:path=positive long).")
+                .defineListAllowEmpty("creativeItemSpecialValues", List.of(),
+                        entry -> entry instanceof String);
+        SAFETY_CREATIVE_NAMESPACES = BUILDER.comment(
+                        "Namespaces whose items are treated as creative-only and never auto-priced.")
+                .defineListAllowEmpty("creativeNamespaces", List.of(),
+                        entry -> entry instanceof String);
         BUILDER.pop();
 
         // [overflow]
