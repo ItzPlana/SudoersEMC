@@ -32,6 +32,7 @@ import com.itzplana.sudoersemc.storage.QuarantinedDropsStore;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
 import com.itzplana.sudoersemc.task.AutoScanPolicy;
 import com.itzplana.sudoersemc.task.BatchProcessor;
+import com.itzplana.sudoersemc.task.ScanCancellation;
 import com.itzplana.sudoersemc.task.ScanDiagnostics;
 import com.itzplana.sudoersemc.task.ScanFingerprint;
 import com.itzplana.sudoersemc.task.ScanManager;
@@ -65,12 +66,12 @@ import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.event.server.ServerStartedEvent;
 import net.minecraftforge.event.server.ServerStoppingEvent;
 import net.minecraftforge.eventbus.api.IEventBus;
+import net.minecraftforge.fml.ModList;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.event.config.ModConfigEvent;
 import net.minecraftforge.fml.event.lifecycle.FMLCommonSetupEvent;
 import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
 import net.minecraftforge.server.ServerLifecycleHooks;
-import net.minecraftforge.fml.ModList;
 import net.minecraftforge.forgespi.language.IModInfo;
 import net.minecraftforge.registries.ForgeRegistries;
 import net.minecraftforge.registries.tags.ITag;
@@ -232,6 +233,10 @@ public final class Sudoersemc {
                 snapshot.solveSettings());
         pipeline.setEmcProvider(OptionalIntegrationManager.provider().orElse(null));
         pipeline.setInputFingerprintSupplier(Sudoersemc::currentScanFingerprint);
+        // Phase 23：配置与外部基线（ProjectE 手动值/版本）必须进入同一条指纹链，
+        // 否则仅修改配置或升级 ProjectE 时不会触发重新求解。
+        pipeline.setConfigFingerprintSupplier(SudoersemcConfig::scanFingerprintEntries);
+        pipeline.setBaselineFingerprintSupplier(Sudoersemc::baselineFingerprintEntries);
         applyPipelineConfig(pipeline);
 
         applyOverflowSettings(pipeline, snapshot.overflowSettings());
@@ -384,8 +389,11 @@ public final class Sudoersemc {
                                                  boolean adaptive) {
         BatchProcessor processor = new BatchProcessor(Math.max(1, itemsPerTick), adaptive);
         ScanDiagnostics diagnostics = new ScanDiagnostics();
+        ScanCancellation cancellation = new ScanCancellation();
         if (pipeline != null) {
             pipeline.setDiagnostics(diagnostics);
+            // 调度器与管线共享同一个取消令牌：cancel() 后采集/求解/应用循环都能在检查点提前退出。
+            pipeline.setCancellationCheck(cancellation::isRequested);
         }
         // 每次 requestScan() 成功后重置管线的跨扫描报告状态：上一轮成功写出的完整报告
         // 不得让本轮采集失败/采集阶段取消时的 scanFailed/scanCancelled 部分报告被跳过。
@@ -426,8 +434,56 @@ public final class Sudoersemc {
                         pipeline.writeFailedReport(progress.detail(), telemetry);
                     }
                 },
+                cancellation,
                 pipeline == null ? null : Sudoersemc::currentScanFingerprint,
                 scanStartListener);
+    }
+
+    /**
+     * 构造外部基线的指纹条目：ProjectE 手动 EMC 物品值、手动标签与 ProjectE 版本。
+     *
+     * <p>ProjectE 原生 EMC 是求解种子的一部分：即使物品/配方/标签与手动配置都没有变化，
+     * 升级 ProjectE 也可能改变基线。这里把版本纳入基线通道；无法确定版本时使用固定标记。</p>
+     *
+     * <p>文件缺失或未安装 ProjectE 时仍会输出 {@code projecte=false}；读取失败返回固定的
+     * {@code fingerprint-error:baseline}，与“确实没有手动值”区分开，让指纹必然变化。</p>
+     */
+    private static List<String> baselineFingerprintEntries() {
+        try {
+            List<String> entries = new ArrayList<>();
+            var manualValues = OptionalIntegrationManager.manualValues();
+            for (Map.Entry<com.itzplana.sudoersemc.core.ItemKey, Long> entry
+                    : manualValues.manualValues().entrySet()) {
+                entries.add("item:" + entry.getKey() + "=" + entry.getValue());
+            }
+            for (var tagId : manualValues.manualTagIds()) {
+                entries.add("tag:#" + tagId);
+            }
+            entries.add("projecte=" + OptionalIntegrationManager.isProjectEAvailable());
+            entries.add("projecte.version=" + projecteVersion());
+            return entries;
+        } catch (RuntimeException failure) {
+            LOGGER.warn("SudoersEMC 读取外部基线指纹失败，使用固定错误标记", failure);
+            return List.of("fingerprint-error:baseline");
+        }
+    }
+
+    /**
+     * 读取 ProjectE 模组版本；模组列表不可用或读取失败时返回固定标记。
+     */
+    private static String projecteVersion() {
+        try {
+            ModList modList = ModList.get();
+            if (modList == null) {
+                return "unavailable";
+            }
+            return modList.getModContainerById("projecte")
+                    .map(container -> container.getModInfo().getVersion().toString())
+                    .orElse("absent");
+        } catch (RuntimeException | LinkageError failure) {
+            LOGGER.debug("SudoersEMC 无法读取 ProjectE 版本，使用固定标记", failure);
+            return "unknown";
+        }
     }
 
     /**
@@ -1494,20 +1550,41 @@ public final class Sudoersemc {
         long lastScanEpochMillis = stateStore == null ? 0L : stateStore.lastScanEpochMillis();
         int generatedEntryCount = countOwnedGeneratedEntries(store);
 
+        boolean fingerprintsMatch = false;
+        if (enabled && !alwaysRescan && lastScanEpochMillis > 0L && generatedEntryCount > 0
+                && stateStore != null && scanPipeline != null) {
+            ScanFingerprint current = null;
+            try {
+                current = scanPipeline.collectFingerprint(event.getServer());
+            } catch (RuntimeException failure) {
+                // 指纹计算失败一律退化为“需要扫描”，绝不阻止服务器启动。
+                LOGGER.warn("SudoersEMC 启动指纹计算异常，退化为需要扫描", failure);
+            }
+            if (current != null) {
+                ScanStateStore.FingerprintComparison comparison = stateStore.compare(current);
+                fingerprintsMatch = comparison.matches();
+                if (!fingerprintsMatch) {
+                    LOGGER.info("SudoersEMC 扫描输入已变化，通道={}",
+                            comparison.changedChannels());
+                }
+            }
+        }
+
         if (!enabled) {
             LOGGER.info("SudoersEMC 自动扫描已禁用（general.enabled=false）");
         } else if (AutoScanPolicy.shouldScan(
-                enabled, alwaysRescan, lastScanEpochMillis, generatedEntryCount)) {
+                enabled, alwaysRescan, lastScanEpochMillis, generatedEntryCount, fingerprintsMatch)) {
+            // 复用上方已解析的 manager 快照
             if (manager == null) {
                 LOGGER.warn("SudoersEMC 自动扫描已请求，但扫描调度器尚未就绪（common setup 未完成）");
             } else if (requestScanSynchronized()) {
-                LOGGER.info("SudoersEMC 自动扫描已请求（alwaysRescan={}，上次扫描={}，已生成条目={}）",
-                        alwaysRescan, lastScanEpochMillis, generatedEntryCount);
+                LOGGER.info("SudoersEMC 自动扫描已请求（alwaysRescan={}，上次扫描={}，已生成条目={}，指纹一致={}）",
+                        alwaysRescan, lastScanEpochMillis, generatedEntryCount, fingerprintsMatch);
             } else {
                 LOGGER.info("SudoersEMC 自动扫描被拒绝：已有扫描正在运行");
             }
         } else {
-            LOGGER.info("SudoersEMC 自动扫描被拒绝（已有缓存状态：上次扫描={}，已生成条目={}）",
+            LOGGER.info("SudoersEMC 自动扫描被拒绝（输入指纹未变化且已有缓存：上次扫描={}，已生成条目={}）",
                     lastScanEpochMillis, generatedEntryCount);
         }
 

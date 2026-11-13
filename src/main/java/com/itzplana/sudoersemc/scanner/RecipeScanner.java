@@ -6,6 +6,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import net.minecraft.core.NonNullList;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -59,27 +60,94 @@ public final class RecipeScanner {
         this.goetyReader = Objects.requireNonNull(goetyReader, "goetyReader");
     }
 
+    /** 每扫描多少条配方检查一次取消信号。 */
+    public static final int CANCELLATION_CHECK_INTERVAL = 256;
+
     /**
      * @param manager the active recipe manager
      * @return every recipe this build can describe, plus counters for what it skipped
      */
     public ScanResult scan(RecipeManager manager) {
+        return scan(manager, () -> false);
+    }
+
+    /**
+     * Scans recipes with a cooperative cancellation checkpoint.
+     *
+     * <p>每 {@value #CANCELLATION_CHECK_INTERVAL} 条配方检查一次取消信号。取消时返回已经描述的
+     * 部分配方与对应计数器；列表不可变，可用于部分诊断报告。</p>
+     *
+     * @param manager      the active recipe manager
+     * @param cancellation 取消检查；返回 {@code true} 时停止继续扫描
+     * @return every processed recipe this build can describe, plus counters for what it skipped
+     */
+    public ScanResult scan(RecipeManager manager, BooleanSupplier cancellation) {
         Objects.requireNonNull(manager, "manager");
-        RecipeScanSession session;
+        Objects.requireNonNull(cancellation, "cancellation");
+        List<RecipeSnapshot> snapshots = new ArrayList<>();
+        List<String> failedDetails = new ArrayList<>();
+        int unsupported = 0;
+        int invalid = 0;
+        int failed = 0;
+
+        // getRecipeIds()/byKey() is the only 1.20.1 API that pairs an id with its recipe without
+        // touching private state.
+        List<ResourceLocation> ids;
         try {
-            session = beginSession(manager);
-        } catch (IllegalStateException e) {
+            ids = manager.getRecipeIds().toList();
+        } catch (RuntimeException e) {
             // phase-22 诊断语义：配方 id 枚举失败时必须返回带独立标志的结果，
             // 不能把“0 条配方”当成真实统计；调用方应先检查 enumerationFailed()。
-            Throwable cause = e.getCause() == null ? e : e.getCause();
-            LOGGER.warn("Could not enumerate recipe ids", cause);
+            LOGGER.warn("Could not enumerate recipe ids", e);
             return new ScanResult(List.of(), 0, 0, 0, true,
-                    List.of("recipe-manager: " + failureText(cause)));
+                    List.of("recipe-manager: " + failureText(e)));
         }
-        while (!session.isDone()) {
-            session.step(Integer.MAX_VALUE);
+
+        int processed = 0;
+        for (ResourceLocation id : ids) {
+            if (processed % CANCELLATION_CHECK_INTERVAL == 0 && cancellation.getAsBoolean()) {
+                break;
+            }
+            processed++;
+            Optional<? extends Recipe<?>> maybeRecipe;
+            try {
+                maybeRecipe = manager.byKey(id);
+            } catch (RuntimeException | LinkageError e) {
+                failed++;
+                addFailureDetail(failedDetails, id, e);
+                continue;
+            }
+            if (maybeRecipe.isEmpty()) {
+                invalid++;
+                continue;
+            }
+            Recipe<?> recipe = maybeRecipe.get();
+            try {
+                RecipeSnapshot snapshot = describe(recipe, id);
+                if (snapshot == null) {
+                    unsupported++;
+                    continue;
+                }
+                if (!snapshot.hasOutputs()) {
+                    invalid++;
+                    continue;
+                }
+                snapshots.add(snapshot);
+            } catch (RuntimeException | LinkageError e) {
+                // 可选模组的配方类可能在加载/链接阶段失败（NoClassDefFoundError 等）；
+                // 只跳过该条配方，不能让整轮扫描失去全部数据。
+                failed++;
+                addFailureDetail(failedDetails, id, e);
+                LOGGER.debug("Failed to describe recipe {}; skipping it", id, e);
+            }
         }
-        return session.result();
+
+        if (unsupported > 0 || invalid > 0 || failed > 0) {
+            LOGGER.debug("Recipe scan: {} usable, {} unsupported, {} invalid, {} failed",
+                    snapshots.size(), unsupported, invalid, failed);
+        }
+        return new ScanResult(List.copyOf(snapshots), unsupported, invalid, failed,
+                List.copyOf(failedDetails));
     }
 
     /**

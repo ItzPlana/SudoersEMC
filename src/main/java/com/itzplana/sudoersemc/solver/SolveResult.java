@@ -23,7 +23,7 @@ import net.minecraft.resources.ResourceLocation;
  * @param passesUsed         实际执行的轮数；空配方列表时为 0
  * @param converged          是否在达到轮数上限前观察到“没有任何值变化”的完整一轮
  * @param elapsedMillis      求解耗时，单位毫秒
- * @param recipesEvaluated   评估器调用总次数（跨轮次累计，包含失败调用）
+ * @param recipesEvaluated   处理配方次数（跨轮次累计，包含缓存命中与失败调用）
  * @param cyclicItems        结束时仍没有 EMC 且位于循环依赖中的物品，按物品升序；没有环时为空
  */
 public record SolveResult(

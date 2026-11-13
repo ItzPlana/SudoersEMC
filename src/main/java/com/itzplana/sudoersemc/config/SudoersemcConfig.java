@@ -8,11 +8,15 @@ import com.itzplana.sudoersemc.pricing.PricingSettings;
 import com.itzplana.sudoersemc.safety.CreativeItemProtection;
 import com.itzplana.sudoersemc.safety.LargeDropProtection;
 import com.itzplana.sudoersemc.safety.OverflowProtection;
-import com.itzplana.sudoersemc.solver.SolveSettings;
+import com.itzplana.sudoersemc.solver.RecipeSelectionStrategy;
 import com.mojang.logging.LogUtils;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.atomic.AtomicBoolean;
+import com.itzplana.sudoersemc.solver.SolveSettings;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -42,7 +46,18 @@ public final class SudoersemcConfig {
 
     private static final Logger LOGGER = LogUtils.getLogger();
 
+    /**
+     * 扫描指纹/定价语义版本。
+     *
+     * <p>任何会改变生成价格的算法、解析或缓存格式变更都必须递增该值；它参与配置通道指纹，
+     * 确保升级后即使注册表与配置未变，也不会静默复用旧算法生成的价格。</p>
+     */
+    public static final int SCAN_FINGERPRINT_VERSION = 1;
+
     private static final ForgeConfigSpec.Builder BUILDER = new ForgeConfigSpec.Builder();
+
+    /** 非法配方选择策略只警告一次，避免热重载时刷屏。 */
+    private static final AtomicBoolean RECIPE_SELECTION_STRATEGY_WARNED = new AtomicBoolean(false);
 
     // Field declarations. Values are defined in the static initializer below so that the TOML
     // sections are emitted in the documented order.
@@ -55,6 +70,7 @@ public final class SudoersemcConfig {
     public static final ForgeConfigSpec.BooleanValue RECIPE_SOLVE_RECIPES;
     public static final ForgeConfigSpec.IntValue RECIPE_MAX_RECIPE_PASSES;
     public static final ForgeConfigSpec.BooleanValue RECIPE_ALLOW_RECIPE_VALUE_INCREASE;
+    public static final ForgeConfigSpec.ConfigValue<String> RECIPE_SELECTION_STRATEGY;
 
     public static final ForgeConfigSpec.BooleanValue FALLBACK_USE_FALLBACK_FOR_UNSOLVABLE;
     public static final ForgeConfigSpec.BooleanValue FALLBACK_USE_TAG_PRICING;
@@ -124,6 +140,13 @@ public final class SudoersemcConfig {
         RECIPE_ALLOW_RECIPE_VALUE_INCREASE = BUILDER.comment(
                         "Allow a recipe-derived value to be higher than the sum of its inputs.")
                 .define("allowRecipeValueIncrease", false);
+        RECIPE_SELECTION_STRATEGY = BUILDER.comment(
+                        "Recipe selection strategy when multiple recipes produce the same item.",
+                        "lowest_cost: lowest cost, ties broken by recipe id (default)",
+                        "prefer_simple: lowest cost, ties broken by fewer inputs/outputs/remainders",
+                        "stable_id: lowest cost, ties explicitly broken by recipe id",
+                        "Unknown values fall back to lowest_cost with one warning.")
+                .define("selectionStrategy", "lowest_cost");
         BUILDER.pop();
 
         // [fallback]
@@ -293,7 +316,7 @@ public final class SudoersemcConfig {
             return;
         }
         registered = true;
-        // Forge parses the TOML after registerConfig(); migrate legacy schema before that.
+        // 在 Forge 解析 TOML 之前执行 v1 -> v2 迁移；失败时保留原文件。
         ConfigFileMigration.migrate(commonConfigPath());
         ModLoadingContext.get().registerConfig(ModConfig.Type.COMMON, SPEC);
 
@@ -515,7 +538,8 @@ public final class SudoersemcConfig {
                 SAFETY_MAX_ALLOWED_DROP_RATIO.get(),
                 List.copyOf(SAFETY_CREATIVE_ITEM_EXCLUSIONS.get()),
                 List.copyOf(SAFETY_CREATIVE_ITEM_SPECIAL_VALUES.get()),
-                List.copyOf(SAFETY_CREATIVE_NAMESPACES.get()));
+                List.copyOf(SAFETY_CREATIVE_NAMESPACES.get()),
+                RECIPE_SELECTION_STRATEGY.get());
     }
 
     /**
@@ -680,6 +704,95 @@ public final class SudoersemcConfig {
         return OverflowScope.OWNED_ONLY;
     }
 
+    /**
+     * Parses the {@code recipe.selectionStrategy} string.
+     *
+     * <p>未知值回退到 {@link RecipeSelectionStrategy#DEFAULT}，并在整个进程内只记录一次警告。</p>
+     *
+     * @param rawValue 原始配置值，可为 {@code null}
+     * @return 解析后的策略，永不为 {@code null}
+     */
+    public static RecipeSelectionStrategy parseRecipeSelectionStrategy(String rawValue) {
+        RecipeSelectionStrategy parsed = RecipeSelectionStrategy.parse(rawValue);
+        if (parsed != null) {
+            return parsed;
+        }
+        if (RECIPE_SELECTION_STRATEGY_WARNED.compareAndSet(false, true)) {
+            LOGGER.warn(
+                    "[recipe] Unknown selectionStrategy '{}'; expected 'lowest_cost', 'prefer_simple' "
+                            + "or 'stable_id'. Falling back to '{}'.",
+                    rawValue, RecipeSelectionStrategy.DEFAULT.configValue());
+        }
+        return RecipeSelectionStrategy.DEFAULT;
+    }
+
+    /**
+     * 构造影响扫描结果的配置指纹条目。
+     *
+     * <p>条目为 {@code key=value} 形式；列表值按字符串排序后逐个展开。读取失败时返回单个固定
+     * 标记，调用方会把它当成“配置指纹变化”，从而退化为需要扫描，而不是阻止启动。</p>
+     *
+     * @return 稳定、已排序的配置条目；配置未加载时返回固定标记
+     */
+    public static List<String> scanFingerprintEntries() {
+        List<String> entries = new ArrayList<>();
+        try {
+            // 指纹/定价语义版本的显式盐：算法或格式变化必须递增该常量，
+            // 否则升级后会复用旧算法生成的价格。
+            addEntry(entries, "fingerprint.version", SCAN_FINGERPRINT_VERSION);
+            addEntry(entries, "recipe.solveRecipes", RECIPE_SOLVE_RECIPES.get());
+            addEntry(entries, "recipe.maxRecipePasses", RECIPE_MAX_RECIPE_PASSES.get());
+            addEntry(entries, "recipe.allowRecipeValueIncrease", RECIPE_ALLOW_RECIPE_VALUE_INCREASE.get());
+            addEntry(entries, "recipe.selectionStrategy", RECIPE_SELECTION_STRATEGY.get());
+            addEntry(entries, "fallback.useFallbackForUnsolvable",
+                    FALLBACK_USE_FALLBACK_FOR_UNSOLVABLE.get());
+            addEntry(entries, "fallback.useTagPricing", FALLBACK_USE_TAG_PRICING.get());
+            addEntry(entries, "fallback.useRarityPricing", FALLBACK_USE_RARITY_PRICING.get());
+            addEntry(entries, "fallback.useProjectEIntegrationBaselines",
+                    FALLBACK_USE_PROJECTE_INTEGRATION_BASELINES.get());
+            addEntry(entries, "fallback.minEmc", FALLBACK_MIN_EMC.get());
+            addEntry(entries, "safety.largeDropProtection", SAFETY_LARGE_DROP_PROTECTION.get());
+            addEntry(entries, "safety.maxAllowedDropRatio", SAFETY_MAX_ALLOWED_DROP_RATIO.get());
+            addEntry(entries, "safety.protectCreativeOnlyItems",
+                    SAFETY_PROTECT_CREATIVE_ONLY_ITEMS.get());
+            addListEntries(entries, "safety.creativeItemExclusions",
+                    SAFETY_CREATIVE_ITEM_EXCLUSIONS.get());
+            addListEntries(entries, "safety.creativeItemSpecialValues",
+                    SAFETY_CREATIVE_ITEM_SPECIAL_VALUES.get());
+            addListEntries(entries, "safety.creativeNamespaces",
+                    SAFETY_CREATIVE_NAMESPACES.get());
+            addEntry(entries, "overflow.enabled", OVERFLOW_ENABLED.get());
+            addEntry(entries, "overflow.threshold", OVERFLOW_THRESHOLD.get());
+            addEntry(entries, "overflow.resetMin", OVERFLOW_RESET_MIN.get());
+            addEntry(entries, "overflow.resetMax", OVERFLOW_RESET_MAX.get());
+            addEntry(entries, "overflow.bucketCount", OVERFLOW_BUCKET_COUNT.get());
+            addEntry(entries, "overflow.weightCap", OVERFLOW_WEIGHT_CAP.get());
+            addEntry(entries, "overflow.overwriteScope", OVERFLOW_OVERWRITE_SCOPE.get());
+            addEntry(entries, "overflow.allowProjectEFileRewrite",
+                    OVERFLOW_ALLOW_PROJECTE_FILE_REWRITE.get());
+            addEntry(entries, "overflow.randomSeed", OVERFLOW_RANDOM_SEED.get());
+            addEntry(entries, "nbt.scanNbtVariants", NBT_SCAN_NBT_VARIANTS.get());
+            addEntry(entries, "nbt.maxNbtVariantsPerItem", NBT_MAX_NBT_VARIANTS_PER_ITEM.get());
+        } catch (RuntimeException failure) {
+            return List.of("config-unavailable");
+        }
+        Collections.sort(entries);
+        return List.copyOf(entries);
+    }
+
+    private static void addEntry(List<String> entries, String key, Object value) {
+        entries.add(key + "=" + value);
+    }
+
+    private static void addListEntries(List<String> entries, String key,
+                                       List<? extends String> values) {
+        List<String> sorted = new ArrayList<>(values == null ? List.of() : values);
+        Collections.sort(sorted);
+        for (String value : sorted) {
+            entries.add(key + "[]=" + value);
+        }
+    }
+
     private static void onConfigLoading(ModConfigEvent.Loading event) {
         if (event.getConfig().getSpec() == SPEC) {
             handleConfigEvent("loading");
@@ -724,4 +837,5 @@ public final class SudoersemcConfig {
     private static Path commonConfigPath() {
         return FMLPaths.CONFIGDIR.get().resolve("sudoersemc-common.toml");
     }
+
 }

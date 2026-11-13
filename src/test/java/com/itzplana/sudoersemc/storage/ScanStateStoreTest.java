@@ -113,6 +113,37 @@ class ScanStateStoreTest {
     }
 
     @Test
+    void invalidateClearsFingerprintAndPersistsUnmatchableState() throws IOException {
+        Path file = tempDir.resolve(ScanStateStore.FILE_NAME);
+        ScanStateStore store = new ScanStateStore(file);
+        ScanFingerprint fingerprint = fingerprint();
+        store.update(fingerprint, 1234L, 100, 5, 3);
+        store.save();
+        assertFalse(store.isDirty());
+        assertEquals(3, store.lastSolverRounds());
+
+        store.invalidate();
+
+        assertTrue(store.isDirty());
+        assertTrue(store.fingerprint().isEmpty());
+        assertFalse(store.matches(fingerprint));
+        assertEquals(0L, store.lastScanEpochMillis());
+        assertEquals(0L, store.lastScanDurationMillis());
+        assertEquals(0, store.lastSolvedCount());
+        assertEquals(0, store.lastUnresolvedCount());
+        assertEquals(0, store.lastSolverRounds(), "失效后求解轮数也必须归零");
+
+        store.saveIfDirty();
+        ScanStateStore reloaded = new ScanStateStore(file);
+        reloaded.load();
+        assertFalse(reloaded.matches(fingerprint), "失效状态落盘后必须让下一次启动重扫");
+        assertTrue(reloaded.fingerprint().isEmpty());
+        assertEquals(0L, reloaded.lastScanEpochMillis());
+        assertEquals(0, reloaded.lastSolvedCount());
+        assertEquals(0, reloaded.lastSolverRounds());
+    }
+
+    @Test
     void corruptJsonYieldsEmptyStateWithoutThrowing() throws IOException {
         Path file = tempDir.resolve(ScanStateStore.FILE_NAME);
         Files.writeString(file, "{ 这不是合法 JSON ][", StandardCharsets.UTF_8);
@@ -173,6 +204,33 @@ class ScanStateStoreTest {
 
         assertFalse(store.isDirty());
         assertTrue(Files.isRegularFile(file));
+    }
+
+    @Test
+    void compareReportsChangedChannels() {
+        Path file = tempDir.resolve(ScanStateStore.FILE_NAME);
+        ScanStateStore store = new ScanStateStore(file);
+        ScanFingerprint stored = fingerprint();
+
+        ScanStateStore.FingerprintComparison empty = store.compare(stored);
+        assertFalse(empty.stored(), "没有保存过指纹时 stored=false");
+        assertFalse(empty.matches());
+
+        store.update(stored, 1L, 1, 0);
+
+        assertTrue(store.compare(stored).matches());
+        assertEquals(List.of(), store.compare(stored).changedChannels());
+
+        ScanFingerprint changed = ScanFingerprint.of(
+                List.of("item-input"),
+                List.of("recipe-input"),
+                List.of("tag-input"),
+                List.of("config-input", "changed"),
+                List.of("baseline-input"));
+        ScanStateStore.FingerprintComparison comparison = store.compare(changed);
+        assertTrue(comparison.stored());
+        assertFalse(comparison.matches());
+        assertEquals(List.of("config"), comparison.changedChannels());
     }
 
     @Test

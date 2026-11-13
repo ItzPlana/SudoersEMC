@@ -44,8 +44,9 @@ import org.slf4j.LoggerFactory;
  * 因此本类没有为这些方法加锁。回调内重入 {@link #tick()} 会被忽略；回调内调用
  * {@link #requestScan()} 返回 {@code false}；回调内调用 {@link #reset()} 会抛出
  * {@link IllegalStateException}。{@link #progress()} 通过 {@code volatile} 字段发布，其他线程
- * 可以安全读取最近一次完整进度；{@link #cancel()} 也可以从其他线程调用，实际取消会在下一次
- * tick 被观察到。</p>
+ * 可以安全读取最近一次完整进度；{@link #cancel()} 也可以从其他线程调用。状态机仍在下一次
+ * tick 转入 {@link ScanPhase#CANCELLED}，但共享 {@link ScanCancellation} 令牌允许管线在
+ * 物品采集、配方扫描、NBT 变体、求解与应用循环内部提前停止重活。</p>
  *
  * <p><strong>持久化：</strong>Phase 12 的异步应用回调在求解完成后回到服务器线程写入
  * {@code GeneratedEntryStore} / {@code ScanStateStore}，再由接线层调用
@@ -585,6 +586,7 @@ public final class ScanManager {
     private final AbortListener abortListener;
     @Nullable
     private final FingerprintSupplier fingerprintSupplier;
+    private final ScanCancellation cancellation;
     @Nullable
     private final ScanStartListener scanStartListener;
     private final SaveHandler saveHandler;
@@ -627,7 +629,7 @@ public final class ScanManager {
                        ResultApplier applier,
                        long tickBudgetNanos) {
         this(batchProcessor, collector, applier, null, tickBudgetNanos,
-                null, null, null, null, null, null);
+                null, null, null, null, null, null, null);
     }
 
     /**
@@ -647,7 +649,29 @@ public final class ScanManager {
                        @Nullable ScanDiagnostics diagnostics,
                        @Nullable AbortListener abortListener) {
         this(batchProcessor, collector, applier, null, tickBudgetNanos,
-                diagnostics, abortListener, null, null, null, null);
+                diagnostics, abortListener, null, null, null, null, null);
+    }
+
+    /**
+     * 使用共享取消令牌创建调度器。
+     *
+     * @param batchProcessor  批量决策器，不能为 {@code null}
+     * @param collector       快照采集回调，不能为 {@code null}
+     * @param applier         结果应用回调，不能为 {@code null}
+     * @param tickBudgetNanos 每 tick 允许用于扫描的时间预算（纳秒），不得为负
+     * @param diagnostics     耗时与内存采样器；{@code null} 时新建一个
+     * @param abortListener   取消/失败终止回调，可为 {@code null}
+     * @param cancellation    共享取消令牌，可为 {@code null}
+     */
+    public ScanManager(BatchProcessor batchProcessor,
+                       SnapshotCollector collector,
+                       ResultApplier applier,
+                       long tickBudgetNanos,
+                       @Nullable ScanDiagnostics diagnostics,
+                       @Nullable AbortListener abortListener,
+                       @Nullable ScanCancellation cancellation) {
+        this(batchProcessor, collector, applier, null, tickBudgetNanos,
+                diagnostics, abortListener, cancellation, null, null, null, null);
     }
 
     /**
@@ -666,7 +690,7 @@ public final class ScanManager {
                        long tickBudgetNanos,
                        @Nullable FingerprintSupplier fingerprintSupplier) {
         this(batchProcessor, collector, applier, null, tickBudgetNanos,
-                null, null, fingerprintSupplier, null, null, null);
+                null, null, null, fingerprintSupplier, null, null, null);
     }
 
     /**
@@ -686,7 +710,7 @@ public final class ScanManager {
                        FingerprintSupplier fingerprintSupplier,
                        SaveHandler saveHandler) {
         this(batchProcessor, collector, applier, null, tickBudgetNanos,
-                null, null, fingerprintSupplier, saveHandler, null, null);
+                null, null, null, fingerprintSupplier, saveHandler, null, null);
     }
 
     /**
@@ -711,7 +735,34 @@ public final class ScanManager {
                        @Nullable FingerprintSupplier fingerprintSupplier,
                        @Nullable ScanStartListener scanStartListener) {
         this(batchProcessor, collector, applier, null, tickBudgetNanos,
-                diagnostics, abortListener, fingerprintSupplier, null, null, scanStartListener);
+                diagnostics, abortListener, null, fingerprintSupplier, null, null, scanStartListener);
+    }
+
+    /**
+     * 创建同时带诊断、终止回调、共享取消令牌、指纹与扫描开始回调的调度器。
+     *
+     * @param batchProcessor      批量决策器，不能为 {@code null}
+     * @param collector           分片采集会话工厂，不能为 {@code null}
+     * @param applier             结果应用回调，不能为 {@code null}
+     * @param tickBudgetNanos     每 tick 的时间预算（纳秒），不得为负
+     * @param diagnostics         耗时与内存采样器；{@code null} 时新建一个
+     * @param abortListener       取消/失败终止回调，可为 {@code null}
+     * @param cancellation        共享取消令牌，可为 {@code null}
+     * @param fingerprintSupplier 输入指纹提供器；{@code null} 表示跳过一致性校验
+     * @param scanStartListener   扫描开始回调；{@code null} 表示跳过
+     */
+    public ScanManager(BatchProcessor batchProcessor,
+                       SnapshotCollector collector,
+                       ResultApplier applier,
+                       long tickBudgetNanos,
+                       @Nullable ScanDiagnostics diagnostics,
+                       @Nullable AbortListener abortListener,
+                       @Nullable ScanCancellation cancellation,
+                       @Nullable FingerprintSupplier fingerprintSupplier,
+                       @Nullable ScanStartListener scanStartListener) {
+        this(batchProcessor, collector, applier, null, tickBudgetNanos,
+                diagnostics, abortListener, cancellation, fingerprintSupplier, null, null,
+                scanStartListener);
     }
 
     private ScanManager(BatchProcessor batchProcessor,
@@ -721,6 +772,7 @@ public final class ScanManager {
                         long tickBudgetNanos,
                         @Nullable ScanDiagnostics diagnostics,
                         @Nullable AbortListener abortListener,
+                        @Nullable ScanCancellation cancellation,
                         @Nullable FingerprintSupplier fingerprintSupplier,
                         SaveHandler saveHandler,
                         StagedSaveHandler stagedSaveHandler,
@@ -738,6 +790,7 @@ public final class ScanManager {
         this.tickBudgetNanos = tickBudgetNanos;
         this.diagnostics = diagnostics == null ? new ScanDiagnostics() : diagnostics;
         this.abortListener = abortListener;
+        this.cancellation = cancellation == null ? new ScanCancellation() : cancellation;
         this.fingerprintSupplier = fingerprintSupplier;
         this.scanStartListener = scanStartListener;
         this.saveHandler = saveHandler;
@@ -765,7 +818,14 @@ public final class ScanManager {
                                      StagedSaveHandler saveHandler) {
         return new ScanManager(batchProcessor, collector, null,
                 Objects.requireNonNull(applier, "applier"),
-                tickBudgetNanos, null, null, fingerprintSupplier, null, saveHandler, null);
+                tickBudgetNanos, null, null, null, fingerprintSupplier, null, saveHandler, null);
+    }
+
+    /**
+     * @return 本次调度器使用的共享取消令牌；管线可以持有同一实例并做协作式检查
+     */
+    public ScanCancellation cancellation() {
+        return cancellation;
     }
 
     /**
@@ -792,6 +852,7 @@ public final class ScanManager {
         if (retired || ticking || isRunning()) {
             return false;
         }
+        cancellation.clear();
         cancelTasks();
         cancelRequested = false;
         snapshot = null;
@@ -820,7 +881,7 @@ public final class ScanManager {
      * 下一次 {@link #requestScan()} 会将其清除。</p>
      */
     public void cancel() {
-        cancelRequested = true;
+        cancellation.request();
     }
 
     /**
@@ -841,7 +902,7 @@ public final class ScanManager {
      * @return 是否已经请求取消但尚未被 tick 观察
      */
     public boolean isCancelRequested() {
-        return cancelRequested;
+        return cancellation.isRequested();
     }
 
     /**
@@ -904,8 +965,8 @@ public final class ScanManager {
         int actualProcessed = 0;
         ScanPhase abortedPhase = null;
         try {
-            if (cancelRequested) {
-                cancelRequested = false;
+            if (cancellation.isRequested()) {
+                cancellation.clear();
                 progress = current.advance(ScanPhase.CANCELLED, current.processed(),
                         current.total(), "扫描已取消");
                 abortedPhase = ScanPhase.CANCELLED;
@@ -1005,6 +1066,7 @@ public final class ScanManager {
         if (ticking) {
             throw new IllegalStateException("不能在 tick 回调中重置 ScanManager");
         }
+        cancellation.clear();
         cancelTasks();
         cancelRequested = false;
         snapshot = null;

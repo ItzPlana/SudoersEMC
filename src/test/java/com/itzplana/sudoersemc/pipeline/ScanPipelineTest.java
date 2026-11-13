@@ -613,10 +613,8 @@ class ScanPipelineTest {
 
         PipelineResult result = pipeline.solveAndApply(snapshot);
 
-        ScanFingerprint expected = ScanFingerprint.of(
-                List.of(INGOT_ID.toString(), RESULT_ID.toString()),
-                List.of(RECIPE_ID.toString()),
-                List.of(), List.of(), List.of());
+        ScanFingerprint expected = ScanPipeline.fingerprintFor(
+                snapshot.items(), snapshot.recipes(), List.of(), List.of());
         assertTrue(stateStore.matches(expected));
         assertEquals(result.applied(), stateStore.lastSolvedCount());
         assertEquals(0, stateStore.lastUnresolvedCount());
@@ -2329,6 +2327,179 @@ class ScanPipelineTest {
         assertEquals(0, result.solvedByRecipe(), "关闭变体扫描后，带 NBT 的配方输出不得绕过采集门禁");
         assertTrue(store.snapshotAll().keySet().stream().noneMatch(ItemKey::hasVariant),
                 "关闭变体扫描后不得写入任何 variantHash 条目");
+    }
+
+    @Test
+    void fingerprintIncludesAllFiveChannels() {
+        ItemSnapshot item = ItemSnapshot.of(INGOT, false, 0L,
+                List.of("forge:ingots"), Rarity.COMMON);
+        RecipeSnapshot recipe = recipe(INGOT, RESULT);
+
+        ScanFingerprint base = ScanPipeline.fingerprintFor(
+                List.of(item), List.of(recipe), List.of("cfg=1"), List.of("base=1"));
+        ScanFingerprint configChanged = ScanPipeline.fingerprintFor(
+                List.of(item), List.of(recipe), List.of("cfg=2"), List.of("base=1"));
+        ScanFingerprint baselineChanged = ScanPipeline.fingerprintFor(
+                List.of(item), List.of(recipe), List.of("cfg=1"), List.of("base=2"));
+        ScanFingerprint tagChanged = ScanPipeline.fingerprintFor(
+                List.of(ItemSnapshot.of(INGOT, false, 0L, List.of("forge:blocks"), Rarity.COMMON)),
+                List.of(recipe), List.of("cfg=1"), List.of("base=1"));
+
+        assertFalse(base.equalsFingerprint(configChanged));
+        assertFalse(base.equalsFingerprint(baselineChanged));
+        assertFalse(base.equalsFingerprint(tagChanged));
+        assertEquals(List.of("config"), base.changedChannels(configChanged));
+        assertEquals(List.of("baseline"), base.changedChannels(baselineChanged));
+        assertEquals(List.of("tag"), base.changedChannels(tagChanged));
+
+        // 两个物品互换标签时并集不变，但 TAG 定价结果会变化；标签通道必须捕获映射关系。
+        ScanFingerprint tagsOnFirst = ScanPipeline.fingerprintFor(
+                List.of(ItemSnapshot.of(INGOT, false, 0L, List.of("forge:one"), Rarity.COMMON),
+                        ItemSnapshot.of(RESULT, false, 0L, List.of("forge:two"), Rarity.COMMON)),
+                List.of(recipe), List.of("cfg=1"), List.of("base=1"));
+        ScanFingerprint tagsOnSecond = ScanPipeline.fingerprintFor(
+                List.of(ItemSnapshot.of(INGOT, false, 0L, List.of("forge:two"), Rarity.COMMON),
+                        ItemSnapshot.of(RESULT, false, 0L, List.of("forge:one"), Rarity.COMMON)),
+                List.of(recipe), List.of("cfg=1"), List.of("base=1"));
+        assertFalse(tagsOnFirst.equalsFingerprint(tagsOnSecond),
+                "物品互换标签必须改变标签通道指纹");
+        assertEquals(List.of("tag"), tagsOnFirst.changedChannels(tagsOnSecond));
+    }
+
+    @Test
+    void cancelledSolveInvalidatesPreviousStateAndWritesPartialReport() throws IOException {
+        ReportManager reportManager = new ReportManager(tempDir.resolve("cancel_reports"));
+        ScanStateStore stateStore = new ScanStateStore(tempDir.resolve("cancel_state.json"));
+        GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("cancel_generated.json"));
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 5L), item(RESULT, 0L)),
+                List.of(recipe(INGOT, RESULT)),
+                Map.of(INGOT, 5L));
+        ScanPipeline pipeline = pipeline(
+                store, stateStore, reportManager, null, null, null, disabledFallback());
+
+        ScanFingerprint previous = ScanFingerprint.of(
+                List.of("item-before"), List.of("recipe-before"), List.of("tag-before"),
+                List.of("config-before"), List.of("baseline-before"));
+        stateStore.update(previous, 123L, 2, 1, 2);
+        stateStore.save();
+        assertFalse(stateStore.isDirty());
+
+        pipeline.setCancellationCheck(() -> true);
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(0, result.applied());
+        assertEquals(0, store.size(), "取消时不得写入任何条目");
+        assertTrue(stateStore.isDirty(), "取消后必须把失效状态标记为待落盘");
+        assertFalse(stateStore.matches(previous), "取消必须让旧扫描指纹失效");
+        assertTrue(stateStore.fingerprint().isEmpty(), "取消后不得保留可匹配的旧指纹");
+        assertEquals(0, stateStore.lastSolvedCount());
+        assertEquals(0, stateStore.lastUnresolvedCount());
+        assertEquals(0, stateStore.lastSolverRounds(), "取消后求解轮数也必须归零");
+        String report = Files.readString(reportManager.reportFile());
+        assertTrue(report.contains("部分报告（扫描已取消）"));
+        assertTrue(report.lines().anyMatch(line -> line.contains("scanCancelled: 1")));
+    }
+
+    @Test
+    void cancelledDuringApplyInvalidatesPreviousState() {
+        Path stateFile = tempDir.resolve("cancel_apply_state.json");
+        ScanStateStore stateStore = new ScanStateStore(stateFile);
+        GeneratedEntryStore store =
+                new GeneratedEntryStore(tempDir.resolve("cancel_apply_generated.json"));
+
+        List<ItemSnapshot> items = new ArrayList<>();
+        for (int index = 0; index < ScanPipeline.APPLY_CANCEL_CHECK_INTERVAL + 6; index++) {
+            ResourceLocation id =
+                    new ResourceLocation("sudoersemc", "cancel_apply_item_" + index);
+            items.add(ItemSnapshot.of(ItemKey.of(id), false, 0L));
+        }
+        PipelineSnapshot snapshot = snapshot(items, List.of(), Map.of());
+        ScanPipeline pipeline = pipeline(
+                store, stateStore, null, null, null, null, genericFallback(7L));
+
+        ScanFingerprint previous = ScanFingerprint.of(
+                List.of("item-before"), List.of("recipe-before"), List.of("tag-before"),
+                List.of("config-before"), List.of("baseline-before"));
+        stateStore.update(previous, 123L, 2, 1);
+        stateStore.save();
+        assertFalse(stateStore.isDirty());
+
+        // 第一个候选写入后触发取消；下一个检查点必须立即停止应用。
+        pipeline.setCancellationCheck(() -> store.size() >= 1);
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(ScanPipeline.APPLY_CANCEL_CHECK_INTERVAL, result.applied(),
+                "应用循环必须在下一个检查点停止");
+        assertEquals(result.applied(), store.size(), "只允许保留检查点之前写入的条目");
+        assertTrue(store.size() > 0 && store.size() < items.size(),
+                "测试需要覆盖“部分条目已 stage”的危险路径");
+        assertTrue(stateStore.isDirty(), "取消后必须把失效状态标记为待落盘");
+        assertFalse(stateStore.matches(previous), "取消必须让旧扫描指纹失效");
+        assertTrue(stateStore.fingerprint().isEmpty(), "取消后不得保留可匹配的旧指纹");
+
+        // 模拟下一次启动：失效状态落盘后加载，仍然不允许跳过扫描。
+        stateStore.saveIfDirty();
+        ScanStateStore reloaded = new ScanStateStore(stateFile);
+        reloaded.load();
+        assertFalse(reloaded.matches(previous), "落盘后的失效状态必须让下一次启动重扫");
+        assertTrue(reloaded.fingerprint().isEmpty());
+    }
+
+    @Test
+    void itemScannerHonorsCancellationCheckpoint() {
+        ItemScanner scanner = new ItemScanner(new ItemScanner.EmcQuery() {
+            @Override
+            public boolean hasValue(net.minecraft.world.item.ItemStack stack) {
+                return false;
+            }
+
+            @Override
+            public long getValue(net.minecraft.world.item.ItemStack stack) {
+                return 0L;
+            }
+        }, Set.of(), Set.of());
+
+        assertTrue(scanner.scan(() -> true).isEmpty(),
+                "取消信号在首个检查点生效，不应继续遍历物品注册表");
+    }
+
+    @Test
+    void collectFingerprintReturnsNullWithoutServer() {
+        ScanPipeline pipeline = pipeline(null, null, null, null, null, null, disabledFallback());
+
+        assertNull(pipeline.collectFingerprint(null));
+    }
+
+    @Test
+    void cancelledVariantCollectionStopsAtCheckpoint() {
+        ItemSnapshot base = ItemSnapshot.of(STONE, false, 0L,
+                List.of("minecraft:stone"), Rarity.COMMON);
+        List<ItemSnapshot> variants = ScanPipeline.collectVariantSnapshots(
+                List.of(base), List.of(recipeWithNbt(STONE, "{Display:{Name:'x'}}")),
+                true, 100, () -> true);
+
+        assertTrue(variants.isEmpty(), "取消后不应继续生成 NBT 变体");
+    }
+
+    @Test
+    void solverCacheCountersAreExposedInResult() {
+        GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("cache_generated.json"));
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 5L), item(RESULT, 0L)),
+                List.of(recipe(INGOT, RESULT)),
+                Map.of(INGOT, 5L));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, null, null, disabledFallback());
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertTrue(result.extraCounters().containsKey("solverCacheHits"));
+        assertTrue(result.extraCounters().containsKey("solverCacheMisses"));
+        assertTrue(result.extraCounters().get("solverCacheMisses") > 0L,
+                "首次扫描至少应有一次真实评估");
     }
 
     /**
