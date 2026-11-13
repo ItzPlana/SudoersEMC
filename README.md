@@ -2,7 +2,7 @@
 
 **English** | [中文](README.zh.md)
 
-> An independent Minecraft Forge mod that generates EMC values for items ProjectE does not price.
+> A Minecraft Forge mod that generates EMC values for items ProjectE does not price.
 
 [![CI](https://github.com/ItzPlana/SudoersEMC/actions/workflows/ci.yml/badge.svg)](https://github.com/ItzPlana/SudoersEMC/actions/workflows/ci.yml)
 [![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
@@ -11,7 +11,7 @@
 
 ## Project Overview
 
-SudoersEMC is an **independently implemented** Minecraft Forge 1.20.1 mod. It scans the items and recipes registered on a server, computes EMC for items that **ProjectE has not priced yet**, and persists the results in its own data files; when ProjectE is installed, those values are injected through official extension points.
+SudoersEMC is a Minecraft Forge 1.20.1 mod. It scans the items and recipes registered on a server, computes EMC for items that **ProjectE has not priced yet**, and persists the results in its own data files; when ProjectE is installed, those values are injected through official extension points.
 
 The mod does not modify ProjectE's source code and does not depend on any non-public API. All injection happens through ProjectE's official mapping extension point.
 
