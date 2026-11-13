@@ -46,7 +46,7 @@ class CommandServiceTest {
     private static ScanManager idleManager() {
         return new ScanManager(
                 new BatchProcessor(1, false),
-                () -> ScanManager.oneShot(new ScanManager.SnapshotData("主世界", 0, 0)).begin(),
+                () -> new ScanManager.SnapshotData("主世界", 0, 0),
                 snapshot -> { },
                 1_000_000L);
     }
@@ -341,6 +341,19 @@ class CommandServiceTest {
 
         assertTrue(result.success());
         assertTrue(result.joinLines().contains("归属: 非 SudoersEMC 所有"));
+    }
+
+    @Test
+    void approveIsRejectedWhileScanRunning() {
+        ScanManager manager = idleManager();
+        assertTrue(manager.requestScan(), "测试前置条件：扫描应进入运行状态");
+        CommandService service = new CommandService(manager, null, null, null);
+
+        CommandResult result = service.approve("minecraft:stone");
+
+        assertFalse(result.success(), "扫描期间审批必须在写入任何条目之前被拒绝");
+        assertTrue(result.joinLines().contains("扫描进行中"),
+                "拒绝原因必须明确说明扫描仍在进行：" + result.joinLines());
     }
 
     @Test

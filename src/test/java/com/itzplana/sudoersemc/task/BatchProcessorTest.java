@@ -42,6 +42,20 @@ class BatchProcessorTest {
     }
 
     @Test
+    void adaptiveGrowthFromSizeOneAlwaysIncreases() {
+        BatchProcessor processor = new BatchProcessor(1, true);
+
+        // 1 * 5 / 4 == 1；必须至少 +1，否则自适应批量永远卡在 1。
+        assertEquals(2, processor.nextBatchSize(100L, 1_000L));
+
+        processor.recordBatch(2, 100L);
+        assertEquals(3, processor.nextBatchSize(100L, 1_000L));
+
+        processor.recordBatch(3, 100L);
+        assertEquals(4, processor.nextBatchSize(100L, 1_000L));
+    }
+
+    @Test
     void adaptiveShrinksByHalfWhenOverBudget() {
         BatchProcessor processor = new BatchProcessor(40, true);
 

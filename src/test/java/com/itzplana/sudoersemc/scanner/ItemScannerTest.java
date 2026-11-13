@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -39,6 +40,19 @@ class ItemScannerTest {
                 "exact ignore entries must be honoured");
         assertTrue(snapshots.stream().anyMatch(snapshot -> snapshot.registryId().equals(
                 new ResourceLocation("minecraft", "stone"))));
+    }
+
+    @Test
+    void orderedItemIdsAreSortedAndExcludeAir() {
+        ItemScanner scanner = new ItemScanner(noEmc(), Set.of(), Set.of());
+
+        List<ResourceLocation> ids = scanner.orderedItemIds();
+
+        assertFalse(ids.isEmpty());
+        assertFalse(ids.contains(AIR), "air 不得进入分片采集顺序");
+        List<ResourceLocation> sorted = new ArrayList<>(ids);
+        sorted.sort(ResourceLocation::compareTo);
+        assertEquals(sorted, ids, "分片游标依赖按 ResourceLocation 自然顺序固化的物品 id");
     }
 
     @Test
