@@ -71,11 +71,12 @@ public final class ReportManager {
      * 旧报告保持不变。</p>
      *
      * @param report 待写入的诊断快照
+     * @return {@code true} 表示报告已成功替换到目标文件；{@code false} 表示被忽略或写入失败
      */
-    public synchronized void writeReport(DiagnosticReport report) {
+    public synchronized boolean writeReport(DiagnosticReport report) {
         if (report == null) {
             LOGGER.warn("拒绝写入 null 诊断报告");
-            return;
+            return false;
         }
         Path target = reportFile();
         Path temp = dataDir.resolve(FILE_NAME + TEMP_SUFFIX);
@@ -96,6 +97,7 @@ public final class ReportManager {
                 Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING);
             }
             cachedReport = text;
+            return true;
         } catch (IOException | RuntimeException e) {
             LOGGER.warn("写入诊断报告 {} 失败", target, e);
             try {
@@ -103,6 +105,7 @@ public final class ReportManager {
             } catch (IOException | RuntimeException ignored) {
                 // 临时文件残留无害，下次写入会覆盖它。
             }
+            return false;
         }
     }
 

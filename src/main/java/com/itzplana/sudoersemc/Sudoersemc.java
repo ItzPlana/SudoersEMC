@@ -32,8 +32,10 @@ import com.itzplana.sudoersemc.storage.QuarantinedDropsStore;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
 import com.itzplana.sudoersemc.task.AutoScanPolicy;
 import com.itzplana.sudoersemc.task.BatchProcessor;
+import com.itzplana.sudoersemc.task.ScanDiagnostics;
 import com.itzplana.sudoersemc.task.ScanFingerprint;
 import com.itzplana.sudoersemc.task.ScanManager;
+import com.itzplana.sudoersemc.task.ScanPhase;
 import com.mojang.logging.LogUtils;
 import java.util.ArrayList;
 import java.util.List;
@@ -381,9 +383,26 @@ public final class Sudoersemc {
                                                  int itemsPerTick,
                                                  boolean adaptive) {
         BatchProcessor processor = new BatchProcessor(Math.max(1, itemsPerTick), adaptive);
-        ScanManager.ResultApplier applier = pipeline == null
-                ? data -> LOGGER.debug("SudoersEMC 占位调度器收到应用回调：{}", data.label())
-                : new PipelineApplier(pipeline);
+        ScanDiagnostics diagnostics = new ScanDiagnostics();
+        if (pipeline != null) {
+            pipeline.setDiagnostics(diagnostics);
+        }
+        // 每次 requestScan() 成功后重置管线的跨扫描报告状态：上一轮成功写出的完整报告
+        // 不得让本轮采集失败/采集阶段取消时的 scanFailed/scanCancelled 部分报告被跳过。
+        ScanManager.ScanStartListener scanStartListener =
+                pipeline == null ? null : pipeline::beginScan;
+        ScanManager.ResultApplier applier;
+        if (pipeline == null) {
+            // 管线尚未初始化（服务器启动前）时保留占位语义：只记录应用回调，不进入失败。
+            applier = new ScanManager.ResultApplier() {
+                @Override
+                public void apply(ScanManager.SnapshotData data) {
+                    LOGGER.debug("SudoersEMC 占位调度器收到应用回调：{}", data.label());
+                }
+            };
+        } else {
+            applier = new PipelineApplier(pipeline);
+        }
         return new ScanManager(
                 processor,
                 pipeline == null ? emptyCollector() : () -> {
@@ -396,7 +415,19 @@ public final class Sudoersemc {
                 },
                 applier,
                 TICK_BUDGET_NANOS,
-                pipeline == null ? null : Sudoersemc::currentScanFingerprint);
+                diagnostics,
+                (phase, progress, telemetry) -> {
+                    if (pipeline == null) {
+                        return;
+                    }
+                    if (phase == ScanPhase.CANCELLED) {
+                        pipeline.writeCancelledReport(telemetry);
+                    } else if (phase == ScanPhase.FAILED) {
+                        pipeline.writeFailedReport(progress.detail(), telemetry);
+                    }
+                },
+                pipeline == null ? null : Sudoersemc::currentScanFingerprint,
+                scanStartListener);
     }
 
     /**
@@ -489,6 +520,14 @@ public final class Sudoersemc {
         @Override
         public boolean isComplete(ScanManager.SnapshotData data) {
             return finished;
+        }
+
+        @Override
+        public void onCompleted() {
+            // 最后一个 tick 的耗时/内存样本已经记录，此时写报告才能包含 APPLYING/SAVING。
+            if (pipeline != null) {
+                pipeline.writePendingReport();
+            }
         }
 
         @Override

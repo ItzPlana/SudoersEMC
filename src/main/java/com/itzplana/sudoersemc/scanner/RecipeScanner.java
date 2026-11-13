@@ -42,6 +42,9 @@ public final class RecipeScanner {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("sudoersemc/scanner/RecipeScanner");
 
+    /** 单个扫描结果最多保留的失败明细条数，避免异常配方数量失控时占用过多内存。 */
+    static final int MAX_FAILED_DETAILS = 50;
+
     private final GoetyRitualReader goetyReader;
 
     public RecipeScanner() {
@@ -61,7 +64,18 @@ public final class RecipeScanner {
      * @return every recipe this build can describe, plus counters for what it skipped
      */
     public ScanResult scan(RecipeManager manager) {
-        RecipeScanSession session = beginSession(manager);
+        Objects.requireNonNull(manager, "manager");
+        RecipeScanSession session;
+        try {
+            session = beginSession(manager);
+        } catch (IllegalStateException e) {
+            // phase-22 诊断语义：配方 id 枚举失败时必须返回带独立标志的结果，
+            // 不能把“0 条配方”当成真实统计；调用方应先检查 enumerationFailed()。
+            Throwable cause = e.getCause() == null ? e : e.getCause();
+            LOGGER.warn("Could not enumerate recipe ids", cause);
+            return new ScanResult(List.of(), 0, 0, 0, true,
+                    List.of("recipe-manager: " + failureText(cause)));
+        }
         while (!session.isDone()) {
             session.step(Integer.MAX_VALUE);
         }
@@ -144,6 +158,7 @@ public final class RecipeScanner {
         private final List<ResourceLocation> ids;
         private final Consumer<RecipeSnapshot> onSnapshot;
         private final List<RecipeSnapshot> snapshots = new ArrayList<>();
+        private final List<String> failedDetails = new ArrayList<>();
 
         private int index;
         private int unsupported;
@@ -232,7 +247,8 @@ public final class RecipeScanner {
             if (isDone()) {
                 logSummary();
             }
-            return new ScanResult(List.copyOf(snapshots), unsupported, invalid, failed);
+            return new ScanResult(List.copyOf(snapshots), unsupported, invalid, failed, false,
+                    List.copyOf(failedDetails));
         }
 
         /**
@@ -248,6 +264,7 @@ public final class RecipeScanner {
                 maybeRecipe = manager.byKey(id);
             } catch (RuntimeException | LinkageError e) {
                 failed++;
+                addFailureDetail(failedDetails, id, e);
                 return;
             }
             if (maybeRecipe.isEmpty()) {
@@ -271,6 +288,7 @@ public final class RecipeScanner {
                 // 可选模组的配方类可能在加载/链接阶段失败（NoClassDefFoundError 等）；
                 // 只跳过该条配方，不能让整轮扫描失去全部数据。
                 failed++;
+                addFailureDetail(failedDetails, id, e);
                 LOGGER.debug("Failed to describe recipe {}; skipping it", id, e);
                 return;
             }
@@ -290,6 +308,34 @@ public final class RecipeScanner {
                         snapshots.size(), unsupported, invalid, failed);
             }
         }
+    }
+
+    /**
+     * 把一条失败配方整理成稳定、可读的单行明细。
+     *
+     * <p>明细数量达到 {@link #MAX_FAILED_DETAILS} 后停止记录，但调用方仍会继续累加失败
+     * 总数，因此报告可以显示“已记录 X / 共 Y 条”。</p>
+     */
+    private static void addFailureDetail(List<String> details, ResourceLocation id,
+                                         Throwable failure) {
+        if (details.size() >= MAX_FAILED_DETAILS) {
+            return;
+        }
+        String recipeId = id == null ? "unknown" : id.toString();
+        details.add(recipeId + ": " + failureText(failure));
+    }
+
+    private static String failureText(Throwable failure) {
+        if (failure == null) {
+            return "未知错误";
+        }
+        String message = failure.getMessage();
+        String type = failure.getClass().getSimpleName();
+        if (message == null || message.isBlank()) {
+            return type;
+        }
+        String singleLine = message.replace('\r', ' ').replace('\n', ' ').trim();
+        return type + ": " + singleLine;
     }
 
     /**
@@ -586,17 +632,42 @@ public final class RecipeScanner {
     /**
      * Outcome of one recipe scan.
      *
-     * @param recipes     every usable snapshot
-     * @param unsupported recipes whose type this build cannot evaluate
-     * @param invalid     recipes missing an id, inputs or outputs
-     * @param failed      recipes that threw while being described
+     * @param recipes             every usable snapshot
+     * @param unsupported         recipes whose type this build cannot evaluate
+     * @param invalid             recipes missing an id, inputs or outputs
+     * @param failed              recipes that threw while being described
+     * @param enumerationFailed   是否在枚举配方 id 时整体失败；为 {@code true} 时总数未知
+     * @param failedRecipeDetails 失败配方的可读明细；最多保留 {@link RecipeScanner#MAX_FAILED_DETAILS} 条
      */
-    public record ScanResult(List<RecipeSnapshot> recipes, int unsupported, int invalid, int failed) {
+    public record ScanResult(List<RecipeSnapshot> recipes, int unsupported, int invalid, int failed,
+                             boolean enumerationFailed, List<String> failedRecipeDetails) {
 
         public ScanResult {
             recipes = List.copyOf(recipes);
+            failedRecipeDetails = failedRecipeDetails == null
+                    ? List.of()
+                    : List.copyOf(failedRecipeDetails);
         }
 
+        /**
+         * 兼容 Phase 22 早期调用点的构造器：不携带枚举失败标志。
+         */
+        public ScanResult(List<RecipeSnapshot> recipes, int unsupported, int invalid, int failed,
+                          List<String> failedRecipeDetails) {
+            this(recipes, unsupported, invalid, failed, false, failedRecipeDetails);
+        }
+
+        /**
+         * 兼容旧调用点的构造器：不携带枚举失败标志与失败明细。
+         */
+        public ScanResult(List<RecipeSnapshot> recipes, int unsupported, int invalid, int failed) {
+            this(recipes, unsupported, invalid, failed, false, List.of());
+        }
+
+        /**
+         * @return 已分类的配方总数；配方枚举失败时返回 0，调用方必须优先检查
+         *         {@link #enumerationFailed()} 而不能把 0 当作“世界中没有配方”
+         */
         public int total() {
             return recipes.size() + unsupported + invalid + failed;
         }

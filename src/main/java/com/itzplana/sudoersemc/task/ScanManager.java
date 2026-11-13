@@ -1,6 +1,7 @@
 package com.itzplana.sudoersemc.task;
 
 import java.util.Objects;
+import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -224,50 +225,96 @@ public final class ScanManager {
         void apply(SnapshotData data);
 
         /**
-         * 应用阶段是否已经完成。
-         *
-         * <p>默认实现表示同步应用：{@link #apply(SnapshotData)} 返回时结果已经落盘。</p>
-         *
-         * @param data 采集阶段产生的快照数据
-         * @return {@code true} 表示可以进入 SAVING
-         */
-        default boolean isComplete(SnapshotData data) {
-            return true;
-        }
-
-        /**
-         * 在新扫描开始、取消或失败时清理未完成的异步状态。默认无操作。
-         */
-        default void reset() {
-        }
-
-        /**
-         * 是否由应用回调在工作线程完成求解。
-         *
-         * <p>返回 {@code true} 时 {@link ScanManager} 跳过仅推进数字的 SOLVING 阶段，直接从
-         * COLLECTING 进入 APPLYING，由异步回调轮询真实求解进度；默认 {@code false} 保持原有
-         * 同步阶段划分。</p>
-         *
-         * @return 是否使用异步求解
-         */
-        default boolean usesAsyncSolve() {
-            return false;
-        }
-
-        /**
-         * 当前 tick 是否已经可以应用结果。
-         *
-         * <p>异步实现可以在后台求解完成前返回 {@code false}，使 {@link ScanManager} 跳过
-         * 应用前的指纹重算；求解完成后再返回 {@code true}，此时才校验输入是否在求解期间变化。
-         * 默认返回 {@code true}，表示同步应用每次调用前都应校验。</p>
-         *
-         * @param data 采集阶段产生的快照数据
-         * @return 可以应用时返回 {@code true}
-         */
-        default boolean isReadyToApply(SnapshotData data) {
-            return true;
-        }
+     * 应用阶段是否已经完成。
+     *
+     * <p>默认实现表示同步应用：{@link #apply(SnapshotData)} 返回时结果已经落盘。</p>
+     *
+     * @param data 采集阶段产生的快照数据
+     * @return {@code true} 表示可以进入 SAVING
+     */
+    default boolean isComplete(SnapshotData data) {
+        return true;
     }
+
+    /**
+     * 在新扫描开始、取消或失败时清理未完成的异步状态。默认无操作。
+     */
+    default void reset() {
+    }
+
+    /**
+     * 是否由应用回调在工作线程完成求解。
+     *
+     * <p>返回 {@code true} 时 {@link ScanManager} 跳过仅推进数字的 SOLVING 阶段，直接从
+     * COLLECTING 进入 APPLYING，由异步回调轮询真实求解进度；默认 {@code false} 保持原有
+     * 同步阶段划分。</p>
+     *
+     * @return 是否使用异步求解
+     */
+    default boolean usesAsyncSolve() {
+        return false;
+    }
+
+    /**
+     * 当前 tick 是否已经可以应用结果。
+     *
+     * <p>异步实现可以在后台求解完成前返回 {@code false}，使 {@link ScanManager} 跳过
+     * 应用前的指纹重算；求解完成后再返回 {@code true}，此时才校验输入是否在求解期间变化。
+     * 默认返回 {@code true}，表示同步应用每次调用前都应校验。</p>
+     *
+     * @param data 采集阶段产生的快照数据
+     * @return 可以应用时返回 {@code true}
+     */
+    default boolean isReadyToApply(SnapshotData data) {
+        return true;
+    }
+
+    /**
+     * 扫描正常完成后的收尾回调。
+     *
+     * <p>调用时本轮最后一个 tick 的耗时与内存样本已经记录完毕，因此实现方可以安全地
+     * 在这里写出需要包含全部 tick 指标的完整诊断报告。默认实现为空，兼容只关心应用的
+     * lambda 调用点。实现方不应抛出异常；即使抛出，本类也只记录日志并继续。</p>
+     */
+    default void onCompleted() {
+    }
+    }
+
+    /**
+     * 扫描被取消或失败时的终止回调。
+     *
+     * <p>只会在 {@link ScanPhase#CANCELLED} 与 {@link ScanPhase#FAILED} 时触发，用于在
+     * 管线来不及走完正常应用阶段时写出部分诊断报告。实现方不得抛出异常；即使抛出，本类
+     * 也只记录日志并继续。</p>
+     */
+    @FunctionalInterface
+    public interface AbortListener {
+
+        /**
+         * @param phase       终止阶段，只会是 {@link ScanPhase#CANCELLED} 或 {@link ScanPhase#FAILED}
+         * @param progress    终止时的进度快照
+         * @param diagnostics 本次扫描的耗时与内存采样
+         */
+        void onScanAborted(ScanPhase phase, ScanProgress progress, ScanDiagnostics diagnostics);
+    }
+
+    /**
+     * 扫描开始回调，在一次新的 {@link #requestScan()} 被接受后触发。
+     *
+     * <p>用于重置跨扫描状态（例如诊断报告是否已写出）。回调在扫描状态已经重置、进度
+     * 已切到 {@link ScanPhase#COLLECTING_SNAPSHOT} 之后执行，但早于首个采集 tick，因此
+     * 采集失败或采集阶段取消时，下一轮的部分报告不会被上一轮遗留状态跳过。实现方不得
+     * 抛出异常；即使抛出，本类也只记录日志并继续。</p>
+     */
+    @FunctionalInterface
+    public interface ScanStartListener {
+
+        /**
+         * 新扫描已被接受并即将进入采集阶段。
+         */
+        void onScanStarted();
+    }
+
 
     /**
      * 把一次性快照包装成单批次采集会话，供过渡接线与测试使用。
@@ -533,7 +580,13 @@ public final class ScanManager {
     private final ResultApplier applier;
     private final StagedResultApplier stagedApplier;
     private final long tickBudgetNanos;
+    private final ScanDiagnostics diagnostics;
+    @Nullable
+    private final AbortListener abortListener;
+    @Nullable
     private final FingerprintSupplier fingerprintSupplier;
+    @Nullable
+    private final ScanStartListener scanStartListener;
     private final SaveHandler saveHandler;
     private final StagedSaveHandler stagedSaveHandler;
     private final boolean reloadTracking;
@@ -573,7 +626,28 @@ public final class ScanManager {
                        SnapshotCollector collector,
                        ResultApplier applier,
                        long tickBudgetNanos) {
-        this(batchProcessor, collector, applier, null, tickBudgetNanos, null, null, null);
+        this(batchProcessor, collector, applier, null, tickBudgetNanos,
+                null, null, null, null, null, null);
+    }
+
+    /**
+     * 创建带诊断采样与终止回调的调度器。
+     *
+     * @param batchProcessor  批量决策器，不能为 {@code null}
+     * @param collector       分片采集会话工厂，不能为 {@code null}
+     * @param applier         结果应用回调，不能为 {@code null}
+     * @param tickBudgetNanos 每 tick 的时间预算（纳秒），不得为负
+     * @param diagnostics     耗时与内存采样器；{@code null} 时新建一个
+     * @param abortListener   取消/失败终止回调，可为 {@code null}
+     */
+    public ScanManager(BatchProcessor batchProcessor,
+                       SnapshotCollector collector,
+                       ResultApplier applier,
+                       long tickBudgetNanos,
+                       @Nullable ScanDiagnostics diagnostics,
+                       @Nullable AbortListener abortListener) {
+        this(batchProcessor, collector, applier, null, tickBudgetNanos,
+                diagnostics, abortListener, null, null, null, null);
     }
 
     /**
@@ -590,8 +664,9 @@ public final class ScanManager {
                        SnapshotCollector collector,
                        ResultApplier applier,
                        long tickBudgetNanos,
-                       FingerprintSupplier fingerprintSupplier) {
-        this(batchProcessor, collector, applier, null, tickBudgetNanos, fingerprintSupplier, null, null);
+                       @Nullable FingerprintSupplier fingerprintSupplier) {
+        this(batchProcessor, collector, applier, null, tickBudgetNanos,
+                null, null, fingerprintSupplier, null, null, null);
     }
 
     /**
@@ -610,7 +685,33 @@ public final class ScanManager {
                        long tickBudgetNanos,
                        FingerprintSupplier fingerprintSupplier,
                        SaveHandler saveHandler) {
-        this(batchProcessor, collector, applier, null, tickBudgetNanos, fingerprintSupplier, saveHandler, null);
+        this(batchProcessor, collector, applier, null, tickBudgetNanos,
+                null, null, fingerprintSupplier, saveHandler, null, null);
+    }
+
+    /**
+     * 创建带诊断采样、终止回调、快照一致性校验与扫描开始回调的调度器。
+     *
+     * @param batchProcessor      批量决策器，不能为 {@code null}
+     * @param collector           分片采集会话工厂，不能为 {@code null}
+     * @param applier             结果应用回调，不能为 {@code null}
+     * @param tickBudgetNanos     每 tick 的时间预算（纳秒），不得为负
+     * @param diagnostics         耗时与内存采样器；{@code null} 时新建一个
+     * @param abortListener       取消/失败终止回调，可为 {@code null}
+     * @param fingerprintSupplier 输入指纹提供器；{@code null} 表示跳过一致性校验
+     * @param scanStartListener   扫描开始回调；{@code null} 表示跳过。生产接线用它重置
+     *                            管线的跨扫描报告状态
+     */
+    public ScanManager(BatchProcessor batchProcessor,
+                       SnapshotCollector collector,
+                       ResultApplier applier,
+                       long tickBudgetNanos,
+                       @Nullable ScanDiagnostics diagnostics,
+                       @Nullable AbortListener abortListener,
+                       @Nullable FingerprintSupplier fingerprintSupplier,
+                       @Nullable ScanStartListener scanStartListener) {
+        this(batchProcessor, collector, applier, null, tickBudgetNanos,
+                diagnostics, abortListener, fingerprintSupplier, null, null, scanStartListener);
     }
 
     private ScanManager(BatchProcessor batchProcessor,
@@ -618,9 +719,12 @@ public final class ScanManager {
                         ResultApplier applier,
                         StagedResultApplier stagedApplier,
                         long tickBudgetNanos,
-                        FingerprintSupplier fingerprintSupplier,
+                        @Nullable ScanDiagnostics diagnostics,
+                        @Nullable AbortListener abortListener,
+                        @Nullable FingerprintSupplier fingerprintSupplier,
                         SaveHandler saveHandler,
-                        StagedSaveHandler stagedSaveHandler) {
+                        StagedSaveHandler stagedSaveHandler,
+                        @Nullable ScanStartListener scanStartListener) {
         this.batchProcessor = Objects.requireNonNull(batchProcessor, "batchProcessor");
         this.collector = Objects.requireNonNull(collector, "collector");
         if (applier == null && stagedApplier == null) {
@@ -632,7 +736,10 @@ public final class ScanManager {
         this.applier = applier;
         this.stagedApplier = stagedApplier;
         this.tickBudgetNanos = tickBudgetNanos;
+        this.diagnostics = diagnostics == null ? new ScanDiagnostics() : diagnostics;
+        this.abortListener = abortListener;
         this.fingerprintSupplier = fingerprintSupplier;
+        this.scanStartListener = scanStartListener;
         this.saveHandler = saveHandler;
         this.stagedSaveHandler = stagedSaveHandler;
         this.reloadTracking = fingerprintSupplier != null
@@ -658,8 +765,16 @@ public final class ScanManager {
                                      StagedSaveHandler saveHandler) {
         return new ScanManager(batchProcessor, collector, null,
                 Objects.requireNonNull(applier, "applier"),
-                tickBudgetNanos, fingerprintSupplier, null, saveHandler);
+                tickBudgetNanos, null, null, fingerprintSupplier, null, saveHandler, null);
     }
+
+    /**
+     * @return 本次扫描使用的诊断采样器，便于调用方复用同一份耗时与内存数据
+     */
+    public ScanDiagnostics diagnostics() {
+        return diagnostics;
+    }
+
 
     /**
      * 请求开始一次新扫描。
@@ -685,11 +800,14 @@ public final class ScanManager {
         collectedFingerprint = null;
         collectReloadGeneration = 0L;
         lastBatchNanos = 0L;
+        diagnostics.reset();
+        diagnostics.recordMemory();
         if (applier != null) {
             applier.reset();
         }
         long now = System.currentTimeMillis();
         progress = new ScanProgress(ScanPhase.COLLECTING_SNAPSHOT, 0, 0, now, now, "等待采集快照");
+        notifyScanStarted();
         return true;
     }
 
@@ -763,11 +881,19 @@ public final class ScanManager {
     }
 
     private void tickInternal(ScanProgress current) {
+        // 先采样堆内存再开始计时，避免采样开销污染本 tick 耗时与自适应批量反馈。
+        diagnostics.recordMemory();
+        long tickStartedNanos = System.nanoTime();
         if (cancelRequested) {
             cancelRequested = false;
             cancelTasks();
             progress = current.advance(ScanPhase.CANCELLED, current.processed(), current.total(),
                     "扫描已取消");
+            // 取消的 tick 也要留下耗时/内存样本，保证部分报告包含本 tick 指标。
+            diagnostics.recordTick(System.nanoTime() - tickStartedNanos);
+            diagnostics.recordMemory();
+            // 取消同样要通知终止回调，供管线写出 scanCancelled 部分报告。
+            notifyAborted(ScanPhase.CANCELLED);
             return;
         }
 
@@ -776,14 +902,22 @@ public final class ScanManager {
         long startedNanos = System.nanoTime();
         long deadlineNanos = deadlineFrom(startedNanos);
         int actualProcessed = 0;
+        ScanPhase abortedPhase = null;
         try {
-            switch (phase) {
-                case COLLECTING_SNAPSHOT -> actualProcessed = collectStep(batch, deadlineNanos);
-                case SOLVING -> actualProcessed = solveStep(batch, deadlineNanos);
-                case APPLYING -> actualProcessed = applyStep(batch, deadlineNanos);
-                case SAVING -> saveStep(deadlineNanos);
-                default -> {
-                    // 防御性分支：isRunning() 已经排除了所有终止阶段。
+            if (cancelRequested) {
+                cancelRequested = false;
+                progress = current.advance(ScanPhase.CANCELLED, current.processed(),
+                        current.total(), "扫描已取消");
+                abortedPhase = ScanPhase.CANCELLED;
+            } else {
+                switch (phase) {
+                    case COLLECTING_SNAPSHOT -> actualProcessed = collectStep(batch, deadlineNanos);
+                    case SOLVING -> actualProcessed = solveStep(batch, deadlineNanos);
+                    case APPLYING -> actualProcessed = applyStep(batch, deadlineNanos);
+                    case SAVING -> saveStep(deadlineNanos);
+                    default -> {
+                        // 防御性分支：isRunning() 已经排除了所有终止阶段。
+                    }
                 }
             }
         } catch (RuntimeException e) {
@@ -798,13 +932,61 @@ public final class ScanManager {
             ScanProgress failed = progress;
             progress = failed.advance(ScanPhase.FAILED, failed.processed(), failed.total(),
                     failureDetail(e));
+            abortedPhase = ScanPhase.FAILED;
         } finally {
-            // 只有采集真正处理了元素才记入自适应样本；求解空转、应用与持久化不得污染样本。
-            if (actualProcessed > 0 && phase == ScanPhase.COLLECTING_SNAPSHOT) {
-                long elapsedNanos = System.nanoTime() - startedNanos;
+            long elapsedNanos = System.nanoTime() - startedNanos;
+            // 只有采集/求解真正处理了元素才记入自适应样本；应用与持久化的耗时不得污染样本。
+            if (actualProcessed > 0) {
                 lastBatchNanos = elapsedNanos;
                 batchProcessor.recordBatch(actualProcessed, elapsedNanos);
             }
+            // tick 边界统一采样：即使本 tick 被取消或失败，也会留下耗时与内存数据。
+            diagnostics.recordTick(elapsedNanos);
+            diagnostics.recordMemory();
+        }
+
+        if (abortedPhase != null) {
+            notifyAborted(abortedPhase);
+        } else if (current.phase() != ScanPhase.COMPLETED
+                && progress.phase() == ScanPhase.COMPLETED) {
+            // 完成回调放在最后一个 tick 的 recordTick 之后，保证报告能包含 APPLYING/SAVING tick。
+            notifyCompleted();
+        }
+    }
+
+    private void notifyScanStarted() {
+        ScanStartListener listener = scanStartListener;
+        if (listener == null) {
+            return;
+        }
+        try {
+            listener.onScanStarted();
+        } catch (RuntimeException failure) {
+            LOGGER.warn("SudoersEMC 扫描开始回调失败，已忽略", failure);
+        }
+    }
+
+    private void notifyCompleted() {
+        if (applier == null) {
+            // staged 接线没有同步应用回调，完成通知由 ApplyTask/SaveTask 自身负责。
+            return;
+        }
+        try {
+            applier.onCompleted();
+        } catch (RuntimeException failure) {
+            LOGGER.warn("SudoersEMC 扫描完成回调失败，已忽略", failure);
+        }
+    }
+
+    private void notifyAborted(ScanPhase phase) {
+        AbortListener listener = abortListener;
+        if (listener == null) {
+            return;
+        }
+        try {
+            listener.onScanAborted(phase, progress, diagnostics);
+        } catch (RuntimeException failure) {
+            LOGGER.warn("SudoersEMC 扫描终止回调失败（{}），已忽略", phase, failure);
         }
     }
 
@@ -831,6 +1013,7 @@ public final class ScanManager {
         collectedFingerprint = null;
         collectReloadGeneration = 0L;
         lastBatchNanos = 0L;
+        diagnostics.reset();
         if (applier != null) {
             applier.reset();
         }

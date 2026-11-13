@@ -1,9 +1,15 @@
 package com.itzplana.sudoersemc.task;
 
+import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryMXBean;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import org.jetbrains.annotations.Nullable;
 
 /**
  * 单次扫描的轻量诊断收集器。
@@ -12,6 +18,10 @@ import java.util.Map;
  * 指定阶段，因此同一阶段可以重复标记并正确累加。内部以纳秒保存，读取时再换算为毫秒，
  * 避免多次短阶段被逐次截断为零。峰值堆内存由 {@link #recordMemory()} 主动采样，
  * 未采样时报告显示 0.0 MiB。</p>
+ *
+ * <p>逐 tick 耗时通过 {@link #recordTick(long)} 记录。P95 使用最近秩法（nearest-rank）：
+ * 对 {@code n} 个样本升序排序后取第 {@code ceil(0.95 * n)} 个值（1 基序号）。因此
+ * 0 个样本返回 0，1 个样本返回该样本本身，多值不会做插值。</p>
  *
  * <p><strong>线程约定：</strong>本类面向单线程使用。扫描由服务器线程驱动，诊断读取通常
  * 也在同一线程完成，因此没有为并发写入做额外同步。所有公开方法都不会抛出异常：
@@ -22,17 +32,32 @@ public final class ScanDiagnostics {
     private static final long NANOS_PER_MILLI = 1_000_000L;
     private static final double BYTES_PER_MIB = 1024.0 * 1024.0;
 
+    /** 最近秩法使用的 P95 比例。 */
+    private static final double P95_RATIO = 0.95D;
+
+    /** 复用同一个管理接口代理，tick 采样只调用 getHeapMemoryUsage()。 */
+    private static final MemoryMXBean MEMORY_MX_BEAN = resolveMemoryBean();
+
     /** 按首次出现顺序保序，便于报告稳定输出。 */
     private final Map<String, Long> stageNanos = new LinkedHashMap<>();
 
+    /** 每个 tick 的耗时样本，单位纳秒；按调用顺序保存。 */
+    private final List<Long> tickNanos = new ArrayList<>();
+
     private long lastMarkNanos;
+    private long scanStartedNanos;
+    private long totalTickNanos;
+    private long maxTickNanos;
     private long peakHeapBytes;
+    private long heapBytes;
 
     /**
-     * 创建诊断收集器，并以当前时刻作为第一次打点的计时基准。
+     * 创建诊断收集器，并以当前时刻作为第一次打点与整次扫描计时的基准。
      */
     public ScanDiagnostics() {
-        this.lastMarkNanos = System.nanoTime();
+        long now = System.nanoTime();
+        this.lastMarkNanos = now;
+        this.scanStartedNanos = now;
     }
 
     /**
@@ -95,15 +120,122 @@ public final class ScanDiagnostics {
     }
 
     /**
+     * 记录一个 tick 的实际耗时。
+     *
+     * <p>负数按 0 处理，样本数量不设硬上限；扫描器按 tick 批量推进，实际样本量受扫描
+     * 时长约束。P95 只在读取时排序，不影响 tick 主路径。</p>
+     *
+     * @param elapsedNanos 本 tick 实际耗时（纳秒）
+     */
+    public void recordTick(long elapsedNanos) {
+        long sample = Math.max(0L, elapsedNanos);
+        tickNanos.add(sample);
+        totalTickNanos += sample;
+        maxTickNanos = Math.max(maxTickNanos, sample);
+    }
+
+    /**
+     * @return 已记录的 tick 样本数量
+     */
+    public int tickCount() {
+        return tickNanos.size();
+    }
+
+    /**
+     * @return 所有 tick 样本的累计耗时（纳秒）
+     */
+    public long totalTickNanos() {
+        return totalTickNanos;
+    }
+
+    /**
+     * @return 最大 tick 耗时（纳秒）；没有样本时为 0
+     */
+    public long maxTickNanos() {
+        return maxTickNanos;
+    }
+
+    /**
+     * @return 平均 tick 耗时（纳秒）；没有样本时为 0.0
+     */
+    public double averageTickNanos() {
+        return tickNanos.isEmpty() ? 0.0D : totalTickNanos / (double) tickNanos.size();
+    }
+
+    /**
+     * 返回 P95 tick 耗时（纳秒，最近秩法）。
+     *
+     * <p>0 个样本返回 0；1 个样本返回该值；多值取升序后的
+     * {@code ceil(0.95 * n)} 个样本，不做线性插值。</p>
+     *
+     * @return P95 耗时（纳秒）
+     */
+    public long p95TickNanos() {
+        int size = tickNanos.size();
+        if (size == 0) {
+            return 0L;
+        }
+        long[] sorted = new long[size];
+        for (int i = 0; i < size; i++) {
+            sorted[i] = tickNanos.get(i);
+        }
+        Arrays.sort(sorted);
+        int rank = (int) Math.ceil(P95_RATIO * size);
+        int index = Math.max(0, Math.min(size - 1, rank - 1));
+        return sorted[index];
+    }
+
+    /**
+     * @return 最大 tick 耗时（毫秒）
+     */
+    public long maxTickMillis() {
+        return maxTickNanos / NANOS_PER_MILLI;
+    }
+
+    /**
+     * @return 平均 tick 耗时（毫秒）
+     */
+    public double averageTickMillis() {
+        return averageTickNanos() / NANOS_PER_MILLI;
+    }
+
+    /**
+     * @return P95 tick 耗时（毫秒）
+     */
+    public long p95TickMillis() {
+        return p95TickNanos() / NANOS_PER_MILLI;
+    }
+
+    /**
      * 采样当前已使用的堆内存，并更新峰值。
      *
-     * <p>使用 {@code totalMemory() - freeMemory()} 作为近似值；该值包含尚未回收的对象，
-     * 因此只适合观察趋势，不适合作为精确内存计量。</p>
+     * <p>使用 {@link MemoryMXBean#getHeapMemoryUsage()} 的 {@code used} 字段；该值来自
+     * JVM 内存管理接口，比 {@code Runtime} 的近似计算更直接。若管理接口不可用，退回
+     * {@code totalMemory() - freeMemory()}，保证诊断采样永远不会影响扫描主路径。</p>
      */
     public void recordMemory() {
-        Runtime runtime = Runtime.getRuntime();
-        long used = runtime.totalMemory() - runtime.freeMemory();
-        peakHeapBytes = Math.max(peakHeapBytes, Math.max(0L, used));
+        long used;
+        try {
+            MemoryMXBean bean = MEMORY_MX_BEAN;
+            used = bean == null
+                    ? Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()
+                    : bean.getHeapMemoryUsage().getUsed();
+        } catch (RuntimeException | LinkageError failure) {
+            Runtime runtime = Runtime.getRuntime();
+            used = runtime.totalMemory() - runtime.freeMemory();
+        }
+        used = Math.max(0L, used);
+        heapBytes = used;
+        peakHeapBytes = Math.max(peakHeapBytes, used);
+    }
+
+    @Nullable
+    private static MemoryMXBean resolveMemoryBean() {
+        try {
+            return ManagementFactory.getMemoryMXBean();
+        } catch (RuntimeException | LinkageError failure) {
+            return null;
+        }
     }
 
     /**
@@ -114,10 +246,25 @@ public final class ScanDiagnostics {
     }
 
     /**
+     * @return 最近一次 {@link #recordMemory()} 采样到的堆内存字节数；尚未采样时为 0
+     */
+    public long heapBytes() {
+        return heapBytes;
+    }
+
+    /**
+     * @return 从 {@link #reset()} 或构造时刻到现在的墙钟耗时毫秒数
+     */
+    public long elapsedSinceResetMillis() {
+        return Math.max(0L, (System.nanoTime() - scanStartedNanos) / NANOS_PER_MILLI);
+    }
+
+    /**
      * 生成多行中文诊断报告。
      *
-     * <p>依次输出每个阶段的毫秒耗时、总计耗时，以及保留一位小数的峰值堆内存 MiB。
-     * 即使没有任何阶段记录，报告仍然包含总计与峰值两行，方便日志解析。</p>
+     * <p>依次输出每个阶段的毫秒耗时、总计耗时、逐 tick 统计（最大/平均/P95），以及保留
+     * 一位小数的峰值与当前堆内存 MiB。即使没有任何阶段或 tick 记录，报告仍然包含固定行，
+     * 方便日志解析。</p>
      *
      * @return 以换行分隔的中文报告文本
      */
@@ -136,22 +283,52 @@ public final class ScanDiagnostics {
             }
         }
         report.append("  总计: ").append(totalMillis()).append(" ms\n");
-        report.append("  峰值堆内存: ")
-                .append(String.format(Locale.ROOT, "%.1f", peakHeapBytes / BYTES_PER_MIB))
-                .append(" MiB");
+        if (tickNanos.isEmpty()) {
+            report.append("  逐 tick: 无采样\n");
+        } else {
+            report.append("  逐 tick: 样本 ")
+                    .append(tickCount())
+                    .append("，最大 ")
+                    .append(formatMillis(maxTickNanos))
+                    .append("，平均 ")
+                    .append(formatMillis(averageTickNanos()))
+                    .append("，P95 ")
+                    .append(formatMillis(p95TickNanos()))
+                    .append('\n');
+        }
+        report.append("  峰值堆内存: ").append(formatMiB(peakHeapBytes)).append('\n');
+        report.append("  报告时堆内存: ").append(formatMiB(heapBytes));
         return report.toString();
     }
 
     /**
-     * 清空所有阶段耗时与峰值内存，并以当前时刻重新开始计时。
+     * 清空所有阶段耗时、tick 样本与内存采样，并以当前时刻重新开始计时。
      *
      * <p>用于在复用同一个诊断实例开始下一次扫描前丢弃旧数据；调用后
-     * {@link #stageMillis()} 为空，{@link #totalMillis()} 与 {@link #peakHeapBytes()}
-     * 均为 0。</p>
+     * {@link #stageMillis()} 为空，{@link #totalMillis()}、{@link #tickCount()} 与
+     * {@link #peakHeapBytes()} 均为 0。</p>
      */
     public void reset() {
         stageNanos.clear();
+        tickNanos.clear();
+        totalTickNanos = 0L;
+        maxTickNanos = 0L;
         peakHeapBytes = 0L;
-        lastMarkNanos = System.nanoTime();
+        heapBytes = 0L;
+        long now = System.nanoTime();
+        lastMarkNanos = now;
+        scanStartedNanos = now;
+    }
+
+    private static String formatMiB(long bytes) {
+        return String.format(Locale.ROOT, "%.1f", Math.max(0L, bytes) / BYTES_PER_MIB) + " MiB";
+    }
+
+    private static String formatMillis(long nanos) {
+        return String.format(Locale.ROOT, "%.2f", Math.max(0L, nanos) / 1_000_000.0) + " ms";
+    }
+
+    private static String formatMillis(double nanos) {
+        return String.format(Locale.ROOT, "%.2f", Math.max(0.0D, nanos) / 1_000_000.0) + " ms";
     }
 }

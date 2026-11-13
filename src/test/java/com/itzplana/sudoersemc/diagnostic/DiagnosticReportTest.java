@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.itzplana.sudoersemc.core.PriceSource;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
@@ -124,6 +125,107 @@ class DiagnosticReportTest {
                 -1L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, Map.of()));
         assertThrows(IllegalArgumentException.class, () -> new DiagnosticReport(
                 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, Map.of("bad", -1L)));
+    }
+
+    @Test
+    void extraCountersAndRecipeStatsAreRendered() {
+        Map<String, Long> counters = new LinkedHashMap<>();
+        counters.put("totalRecipes", 10L);
+        counters.put("usableRecipes", 4L);
+        counters.put("unsupportedRecipes", 2L);
+        counters.put("invalidRecipes", 1L);
+        counters.put("failedRecipes", 3L);
+        counters.put("retiredEntries", 3L);
+        counters.put("quarantinedDrops", 2L);
+        counters.put("scanTotalMillis", 999L);
+        counters.put("scanTicks", 4L);
+        counters.put("tickMaxMicros", 12_000L);
+        counters.put("tickAvgMicros", 5_000L);
+        counters.put("tickP95Micros", 11_000L);
+        counters.put("heapAtReportBytes", 1_048_576L);
+        DiagnosticReport report = new DiagnosticReport(
+                10L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 2L, 3L, 999L, 2_097_152L,
+                counters, List.of("recipe:boom"));
+
+        String text = report.formatText();
+
+        assertLine(text, "配方扫描总数", "10");
+        assertLine(text, "可用配方", "4");
+        assertLine(text, "不支持配方", "2");
+        assertLine(text, "无效配方", "1");
+        assertLine(text, "失败配方", "3");
+        assertLine(text, "扫描失败配方", "3");
+        assertTrue(text.contains("recipe:boom"), "失败明细必须出现在报告中");
+        assertTrue(text.contains("retiredEntries: 3"), "全部额外计数器都必须输出");
+        assertTrue(text.contains("quarantinedDrops: 2"));
+        assertTrue(text.contains("tick 采样数"));
+        assertTrue(text.contains("tick 最大耗时"));
+        assertTrue(text.contains("12.00 ms"));
+        assertTrue(text.contains("tick P95 耗时"));
+        assertTrue(text.contains("11.00 ms"));
+        assertTrue(text.contains("报告时堆内存"));
+        assertTrue(text.contains("1.0 MiB"));
+        assertTrue(text.contains("扫描总耗时"));
+        assertTrue(text.contains("999 ms"));
+    }
+
+    @Test
+    void recipeEnumerationFailureShowsUnknownStatistics() {
+        DiagnosticReport report = new DiagnosticReport(
+                1L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 1L, 0L,
+                Map.of("recipeEnumerationFailed", 1L),
+                List.of("recipe-manager: boom"));
+
+        String text = report.formatText();
+
+        assertTrue(text.contains("不可用（配方枚举失败）"),
+                "枚举失败时必须明确标注统计不可用");
+        assertFalse(text.lines().anyMatch(line -> line.startsWith("配方扫描总数")),
+                "枚举失败时不得输出伪造的配方总数");
+        assertTrue(text.contains("recipe-manager: boom"));
+    }
+
+    @Test
+    void failedRecipeDetailsAreCappedAndSanitized() {
+        List<String> details = new ArrayList<>();
+        details.add("multi\nline\r\n" + "x".repeat(400));
+        for (int i = 0; i < 15; i++) {
+            details.add("recipe_" + i + ": boom");
+        }
+        DiagnosticReport report = new DiagnosticReport(
+                1L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 16L, 1L, 0L,
+                Map.of("totalRecipes", 16L), details);
+
+        String text = report.formatText();
+
+        assertTrue(text.contains("显示 " + DiagnosticReport.MAX_FAILED_RECIPE_DETAILS + "/16 条"),
+                "失败明细必须显示显示的条数与总数");
+        assertTrue(text.contains("recipe_0: boom"));
+        assertTrue(text.contains("recipe_8: boom"));
+        assertFalse(text.contains("recipe_9: boom"), "第 11 条起必须被截断");
+        assertTrue(text.contains("其余 6 条失败配方未显示"));
+        assertFalse(text.contains("multi\nline"), "明细中的换行必须被清洗为单行");
+        assertTrue(text.lines().anyMatch(line ->
+                        line.startsWith("  - multi line") && line.length() <= 250),
+                "超长单条明细必须被截断到可读长度");
+    }
+
+    @Test
+    void emptyAndMissingCountersRemainReadable() {
+        DiagnosticReport empty = new DiagnosticReport(
+                0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, Map.of(), null);
+
+        String text = empty.formatText();
+
+        assertTrue(text.contains("配方扫描统计"));
+        assertTrue(text.contains("无数据"));
+        assertTrue(text.contains("每 tick 耗时"));
+        assertTrue(text.contains("无采样"));
+        assertTrue(text.contains("报告时堆内存"));
+        assertTrue(text.contains("不可用"));
+        assertTrue(text.contains("额外计数器"));
+        assertTrue(text.contains("（无）"));
+        assertFalse(text.endsWith("\n"), "报告末尾保持无换行");
     }
 
     private static void assertLine(String text, String label, String value) {

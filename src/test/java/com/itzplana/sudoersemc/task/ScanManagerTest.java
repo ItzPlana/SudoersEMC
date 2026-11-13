@@ -676,6 +676,88 @@ class ScanManagerTest {
     }
 
     @Test
+    void diagnosticsRecordTickTimingsAndMemory() {
+        ScanDiagnostics diagnostics = new ScanDiagnostics();
+        ScanManager manager = new ScanManager(new BatchProcessor(10, false),
+                ScanManager.oneShot(data(0, 0)), snapshot -> { }, TICK_BUDGET_NANOS, diagnostics, null);
+
+        assertSame(diagnostics, manager.diagnostics());
+        manager.requestScan();
+        int ticks = 0;
+        while (manager.isRunning() && ticks < TICK_GUARD) {
+            manager.tick();
+            ticks++;
+        }
+
+        assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
+        assertTrue(diagnostics.tickCount() > 0, "每个 tick 都应留下耗时样本");
+        assertTrue(diagnostics.totalTickNanos() >= 0L);
+        assertTrue(diagnostics.maxTickNanos() >= 0L);
+        assertTrue(diagnostics.p95TickNanos() >= 0L);
+        assertTrue(diagnostics.peakHeapBytes() >= 0L, "tick 边界必须采样堆内存");
+        assertTrue(diagnostics.heapBytes() >= 0L);
+    }
+
+    @Test
+    void completionCallbackRunsAfterFinalTickIsRecorded() {
+        ScanDiagnostics diagnostics = new ScanDiagnostics();
+        AtomicInteger completedTickCount = new AtomicInteger(-1);
+        ScanManager manager = new ScanManager(new BatchProcessor(10, false),
+                ScanManager.oneShot(data(1, 0)),
+                new ScanManager.ResultApplier() {
+                    @Override
+                    public void apply(ScanManager.SnapshotData data) {
+                        // 应用本身不影响本测试关注的 tick 记录顺序。
+                    }
+
+                    @Override
+                    public void onCompleted() {
+                        completedTickCount.set(diagnostics.tickCount());
+                    }
+                },
+                TICK_BUDGET_NANOS, diagnostics, null);
+
+        manager.requestScan();
+        int ticks = 0;
+        while (manager.isRunning() && ticks < TICK_GUARD) {
+            manager.tick();
+            ticks++;
+        }
+
+        assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
+        assertEquals(ticks, completedTickCount.get(),
+                "完成回调必须在本轮最后一个 tick 记录耗时之后执行");
+        assertEquals(ticks, diagnostics.tickCount(),
+                "每个 tick（含 APPLYING/SAVING）都必须留下耗时样本");
+    }
+
+    @Test
+    void completionCallbackExceptionDoesNotEscape() {
+        ScanManager manager = new ScanManager(new BatchProcessor(10, false),
+                ScanManager.oneShot(data(0, 0)),
+                new ScanManager.ResultApplier() {
+                    @Override
+                    public void apply(ScanManager.SnapshotData data) {
+                    }
+
+                    @Override
+                    public void onCompleted() {
+                        throw new IllegalStateException("完成回调爆炸");
+                    }
+                },
+                TICK_BUDGET_NANOS, new ScanDiagnostics(), null);
+
+        manager.requestScan();
+        int ticks = 0;
+        while (manager.isRunning() && ticks < TICK_GUARD) {
+            assertDoesNotThrow(manager::tick);
+            ticks++;
+        }
+
+        assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
+    }
+
+    @Test
     void saveHandlerRunsOnceInSavingStage() {
         AtomicInteger saves = new AtomicInteger();
         ScanManager manager = new ScanManager(
@@ -693,6 +775,89 @@ class ScanManagerTest {
 
         assertEquals(1, saves.get(), "save handler must run exactly once");
         assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
+    }
+
+    @Test
+    void cancelInvokesAbortListener() {
+        AtomicReference<ScanPhase> observedPhase = new AtomicReference<>();
+        AtomicReference<ScanDiagnostics> observedTelemetry = new AtomicReference<>();
+        ScanDiagnostics diagnostics = new ScanDiagnostics();
+        ScanManager manager = new ScanManager(new BatchProcessor(1, false),
+                ScanManager.oneShot(data(5, 5)), snapshot -> { }, TICK_BUDGET_NANOS, diagnostics,
+                (phase, progress, telemetry) -> {
+                    observedPhase.set(phase);
+                    observedTelemetry.set(telemetry);
+                });
+
+        manager.requestScan();
+        manager.cancel();
+        manager.tick();
+
+        assertEquals(ScanPhase.CANCELLED, observedPhase.get(),
+                "取消必须触发终止回调，供管线写出部分报告");
+        assertSame(diagnostics, observedTelemetry.get());
+        assertTrue(diagnostics.tickCount() > 0, "取消的 tick 也应记录耗时");
+    }
+
+    @Test
+    void collectorFailureInvokesAbortListener() {
+        AtomicReference<ScanPhase> observedPhase = new AtomicReference<>();
+        ScanManager manager = new ScanManager(new BatchProcessor(1, false),
+                () -> {
+                    throw new IllegalStateException("采集爆炸");
+                },
+                snapshot -> { }, TICK_BUDGET_NANOS, new ScanDiagnostics(),
+                (phase, progress, telemetry) -> observedPhase.set(phase));
+
+        manager.requestScan();
+        assertDoesNotThrow(manager::tick);
+
+        assertEquals(ScanPhase.FAILED, observedPhase.get(),
+                "失败必须触发终止回调，供管线写出部分报告");
+    }
+
+    @Test
+    void abortListenerExceptionDoesNotEscape() {
+        ScanManager manager = new ScanManager(new BatchProcessor(1, false),
+                () -> {
+                    throw new IllegalStateException("采集爆炸");
+                },
+                snapshot -> { }, TICK_BUDGET_NANOS, new ScanDiagnostics(),
+                (phase, progress, telemetry) -> {
+                    throw new IllegalStateException("报告回调爆炸");
+                });
+
+        manager.requestScan();
+        assertDoesNotThrow(manager::tick);
+        assertEquals(ScanPhase.FAILED, manager.progress().phase());
+    }
+    @Test
+    void requestScanInvokesScanStartListenerOnlyWhenAccepted() {
+        AtomicInteger starts = new AtomicInteger();
+        ScanManager manager = new ScanManager(new BatchProcessor(1, false),
+                ScanManager.oneShot(data(1, 1)), snapshot -> { }, TICK_BUDGET_NANOS,
+                new ScanDiagnostics(), null, null, starts::incrementAndGet);
+
+        assertTrue(manager.requestScan());
+        assertEquals(1, starts.get(), "每次成功开始扫描都必须重置跨扫描状态");
+        assertFalse(manager.requestScan(), "活动扫描期间不得重复开始");
+        assertEquals(1, starts.get(), "被拒绝的请求不得重置跨扫描状态");
+
+        manager.reset();
+        assertTrue(manager.requestScan());
+        assertEquals(2, starts.get(), "重置后新一轮扫描必须再次触发开始回调");
+    }
+
+    @Test
+    void scanStartListenerExceptionDoesNotEscape() {
+        ScanManager manager = new ScanManager(new BatchProcessor(1, false),
+                ScanManager.oneShot(data(1, 1)), snapshot -> { }, TICK_BUDGET_NANOS,
+                new ScanDiagnostics(), null, null, () -> {
+                    throw new IllegalStateException("开始回调爆炸");
+                });
+
+        assertDoesNotThrow(manager::requestScan);
+        assertTrue(manager.isRunning());
     }
 
     @Test

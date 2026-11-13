@@ -99,6 +99,7 @@ class ScanDiagnosticsTest {
         Thread.sleep(5L);
         diagnostics.mark("采集快照");
         diagnostics.recordMemory();
+        diagnostics.recordTick(5_000_000L);
 
         diagnostics.reset();
 
@@ -106,6 +107,68 @@ class ScanDiagnosticsTest {
         assertEquals(0L, diagnostics.stageMillis("采集快照"));
         assertEquals(0L, diagnostics.totalMillis());
         assertEquals(0L, diagnostics.peakHeapBytes());
+        assertEquals(0, diagnostics.tickCount());
+        assertEquals(0L, diagnostics.p95TickNanos());
+        assertEquals(0L, diagnostics.heapBytes());
+    }
+
+    @Test
+    void p95TickIsZeroWithoutSamples() {
+        ScanDiagnostics diagnostics = new ScanDiagnostics();
+
+        assertEquals(0, diagnostics.tickCount());
+        assertEquals(0L, diagnostics.p95TickNanos());
+        assertEquals(0L, diagnostics.maxTickNanos());
+        assertEquals(0.0D, diagnostics.averageTickNanos());
+    }
+
+    @Test
+    void p95TickReturnsSingleSample() {
+        ScanDiagnostics diagnostics = new ScanDiagnostics();
+        diagnostics.recordTick(7_000_000L);
+
+        assertEquals(1, diagnostics.tickCount());
+        assertEquals(7_000_000L, diagnostics.p95TickNanos());
+        assertEquals(7L, diagnostics.p95TickMillis());
+        assertEquals(7_000_000L, diagnostics.maxTickNanos());
+    }
+
+    @Test
+    void p95TickUsesNearestRankForMultipleSamples() {
+        ScanDiagnostics diagnostics = new ScanDiagnostics();
+        // 逆序写入 1..20 ms，验证 P95 先排序再按最近秩取值：ceil(0.95 * 20) = 19 -> 19ms。
+        for (int millis = 20; millis >= 1; millis--) {
+            diagnostics.recordTick(millis * 1_000_000L);
+        }
+
+        assertEquals(20, diagnostics.tickCount());
+        assertEquals(20L, diagnostics.maxTickMillis());
+        assertEquals(10.5D, diagnostics.averageTickMillis(), 1.0E-9D);
+        assertEquals(19L, diagnostics.p95TickMillis());
+    }
+
+    @Test
+    void tickStatsAccumulateTotalAndAverage() {
+        ScanDiagnostics diagnostics = new ScanDiagnostics();
+        diagnostics.recordTick(10_000_000L);
+        diagnostics.recordTick(20_000_000L);
+        diagnostics.recordTick(30_000_000L);
+
+        assertEquals(3, diagnostics.tickCount());
+        assertEquals(60_000_000L, diagnostics.totalTickNanos());
+        assertEquals(30_000_000L, diagnostics.maxTickNanos());
+        assertEquals(20_000_000.0D, diagnostics.averageTickNanos(), 1.0E-9D);
+    }
+
+    @Test
+    void recordMemoryTracksCurrentAndPeakTogether() {
+        ScanDiagnostics diagnostics = new ScanDiagnostics();
+
+        assertEquals(0L, diagnostics.heapBytes());
+        diagnostics.recordMemory();
+
+        assertTrue(diagnostics.heapBytes() >= 0L);
+        assertTrue(diagnostics.peakHeapBytes() >= diagnostics.heapBytes());
     }
 
     @Test
