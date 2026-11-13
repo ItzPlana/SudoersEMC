@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.itzplana.sudoersemc.task.BatchProcessor;
 import com.itzplana.sudoersemc.task.ScanManager;
 import com.itzplana.sudoersemc.task.ScanPhase;
+import com.itzplana.sudoersemc.task.TestCollectSessions;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -23,7 +24,7 @@ class SudoersemcLifecycleTest {
     private static ScanManager activeManager() {
         ScanManager manager = new ScanManager(
                 new BatchProcessor(1, false),
-                () -> new ScanManager.SnapshotData("测试快照", 10, 2),
+                TestCollectSessions.completed("测试快照", 10, 2),
                 data -> { },
                 1_000_000L);
         assertTrue(manager.requestScan());

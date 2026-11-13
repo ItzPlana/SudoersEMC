@@ -3,6 +3,7 @@ package com.itzplana.sudoersemc.resolver;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.itzplana.sudoersemc.core.ItemKey;
 import java.util.UUID;
@@ -31,6 +32,8 @@ class VariantNormalizerTest {
             new ResourceLocation("sudoersemc", "token");
     private static final ResourceLocation DIAMOND_SWORD_ID =
             new ResourceLocation("minecraft", "diamond_sword");
+    private static final ResourceLocation SHULKER_BOX_ID =
+            new ResourceLocation("minecraft", "shulker_box");
 
     @Test
     void displayOnlyTagNormalisesToNull() {
@@ -143,15 +146,35 @@ class VariantNormalizerTest {
     }
 
     @Test
-    void storedEmcIsStrippedAtEveryNestingLevel() {
-        CompoundTag nested = new CompoundTag();
-        nested.putLong("StoredEMC", 4096L);
-        nested.putLong("stored_emc", 1024L);
-        nested.putInt("value", 1);
+    void rootStoredEmcIsStrippedWhileContainerContentStoredEmcIsPreserved() throws Exception {
+        CompoundTag contentTag = new CompoundTag();
+        contentTag.putLong("StoredEMC", 2048L);
+        contentTag.putLong("stored_emc", 512L);
+        CompoundTag entry = new CompoundTag();
+        entry.putString("id", "projecte:klein_star_omega");
+        entry.putByte("Count", (byte) 1);
+        entry.put("tag", contentTag);
+        ListTag items = new ListTag();
+        items.add(entry);
+        CompoundTag blockEntity = new CompoundTag();
+        blockEntity.put("Items", items);
         CompoundTag tag = new CompoundTag();
-        tag.put("BlockEntityTag", nested);
+        tag.putLong("StoredEMC", 4096L);
+        tag.putLong("stored_emc", 1024L);
+        tag.put("BlockEntityTag", blockEntity);
 
-        assertEquals("{BlockEntityTag:{value:1}}", VariantNormalizer.normalize(tag));
+        CompoundTag parsed = TagParser.parseTag(VariantNormalizer.normalize(tag));
+
+        // 根级 StoredEMC/stored_emc 仍由 ProjectE 处理；容器内容物的 StoredEMC 必须保留，
+        // 否则真实容器的精确 ItemInfo 查找会 miss。
+        assertFalse(parsed.contains("StoredEMC"));
+        assertFalse(parsed.contains("stored_emc"));
+        CompoundTag parsedContentTag = parsed.getCompound("BlockEntityTag")
+                .getList("Items", 10)
+                .getCompound(0)
+                .getCompound("tag");
+        assertEquals(2048L, parsedContentTag.getLong("StoredEMC"));
+        assertFalse(parsedContentTag.contains("stored_emc"));
     }
 
     @Test
@@ -284,19 +307,126 @@ class VariantNormalizerTest {
 
     @Test
     void keyForKeepsOtherVariantDataOnDamageableItems() {
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 17);
+        tag.put("Enchantments", sharpnessFive());
+        // 有意限制：实际 Damage>0 的精确 ItemInfo 是 {Damage:17,...}，与这里生成的
+        // {Damage:0,...} 不匹配；ProjectE 会回退到基础价 + DamageProcessor，不会误用变体价。
+        // 端到端断言见 GeneratedEmcMapperKeyTest#damagedVariantKeyIsIntentionallyNotExactProjectEInfo。
+
+        assertEquals(ItemKey.of(DIAMOND_SWORD_ID,
+                        "{Damage:0,Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}"),
+                VariantNormalizer.keyFor(DIAMOND_SWORD_ID, tag));
+    }
+
+    @Test
+    void keyForCollapsesDamageValuesOnTheSameDamageableVariant() {
+        CompoundTag first = new CompoundTag();
+        first.putInt("Damage", 1);
+        first.put("Enchantments", sharpnessFive());
+        CompoundTag second = new CompoundTag();
+        second.putInt("Damage", 400);
+        second.put("Enchantments", sharpnessFive());
+
+        ItemKey expected = ItemKey.of(DIAMOND_SWORD_ID,
+                "{Damage:0,Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}");
+        assertEquals(expected, VariantNormalizer.keyFor(DIAMOND_SWORD_ID, first));
+        assertEquals(expected, VariantNormalizer.keyFor(DIAMOND_SWORD_ID, second));
+    }
+
+    @Test
+    void keyForKeepsExplicitZeroDamageAlongsideOtherVariantData() {
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 0);
+        tag.put("Enchantments", sharpnessFive());
+
+        assertEquals(ItemKey.of(DIAMOND_SWORD_ID,
+                        "{Damage:0,Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}"),
+                VariantNormalizer.keyFor(DIAMOND_SWORD_ID, tag));
+    }
+
+    @Test
+    void keyForDoesNotInventDamageKeyForDamageableItems() {
+        CompoundTag tag = new CompoundTag();
+        tag.put("Enchantments", sharpnessFive());
+
+        assertEquals(ItemKey.of(DIAMOND_SWORD_ID,
+                        "{Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}"),
+                VariantNormalizer.keyFor(DIAMOND_SWORD_ID, tag));
+    }
+
+    @Test
+    void keyForStripsStoredEmcFromDamageableVariantKey() {
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 5);
+        tag.put("Enchantments", sharpnessFive());
+        tag.putLong("StoredEMC", 4096L);
+        tag.putLong("stored_emc", 1024L);
+
+        assertEquals(ItemKey.of(DIAMOND_SWORD_ID,
+                        "{Damage:0,Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}"),
+                VariantNormalizer.keyFor(DIAMOND_SWORD_ID, tag));
+    }
+
+    @Test
+    void keyForContainerPreservesContentStoredEmcButStripsRootStoredEmc() throws Exception {
+        CompoundTag contentTag = new CompoundTag();
+        contentTag.putLong("StoredEMC", 4096L);
+        CompoundTag entry = new CompoundTag();
+        entry.putString("id", "projecte:klein_star_omega");
+        entry.putByte("Count", (byte) 1);
+        entry.put("tag", contentTag);
+        ListTag items = new ListTag();
+        items.add(entry);
+        CompoundTag blockEntity = new CompoundTag();
+        blockEntity.put("Items", items);
+        CompoundTag tag = new CompoundTag();
+        tag.putLong("StoredEMC", 123L);
+        tag.put("BlockEntityTag", blockEntity);
+
+        ItemKey key = VariantNormalizer.keyFor(SHULKER_BOX_ID, tag);
+
+        assertTrue(key.hasVariant());
+        CompoundTag parsed = TagParser.parseTag(key.variantHash());
+        assertFalse(parsed.contains("StoredEMC"));
+        assertEquals(4096L, parsed.getCompound("BlockEntityTag")
+                .getList("Items", 10)
+                .getCompound(0)
+                .getCompound("tag")
+                .getLong("StoredEMC"));
+    }
+
+    @Test
+    void keyForKeepsDamageOnNonDamageableItemsWithOtherVariantData() {
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 17);
+        tag.put("Enchantments", sharpnessFive());
+
+        assertEquals(ItemKey.of(SUDOERSEMC_TOKEN,
+                        "{Damage:17,Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}"),
+                VariantNormalizer.keyFor(SUDOERSEMC_TOKEN, tag));
+    }
+
+    @Test
+    void keyForDropsVariantWhenOnlyDamageAndDisplayDataRemain() {
+        CompoundTag display = new CompoundTag();
+        display.putString("Name", "{\"text\":\"custom\"}");
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 17);
+        tag.putLong("StoredEMC", 4096L);
+        tag.put("display", display);
+
+        assertEquals(ItemKey.of(DIAMOND_SWORD_ID),
+                VariantNormalizer.keyFor(DIAMOND_SWORD_ID, tag));
+    }
+
+    private static ListTag sharpnessFive() {
         CompoundTag enchantment = new CompoundTag();
         enchantment.putString("id", "minecraft:sharpness");
         enchantment.putShort("lvl", (short) 5);
         ListTag enchantments = new ListTag();
         enchantments.add(enchantment);
-
-        CompoundTag tag = new CompoundTag();
-        tag.putInt("Damage", 17);
-        tag.put("Enchantments", enchantments);
-
-        assertEquals(ItemKey.of(DIAMOND_SWORD_ID,
-                        "{Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}"),
-                VariantNormalizer.keyFor(DIAMOND_SWORD_ID, tag));
+        return enchantments;
     }
 
     @Test

@@ -17,6 +17,7 @@ import com.itzplana.sudoersemc.storage.ScanStateStore;
 import com.itzplana.sudoersemc.task.BatchProcessor;
 import com.itzplana.sudoersemc.task.ScanFingerprint;
 import com.itzplana.sudoersemc.task.ScanManager;
+import com.itzplana.sudoersemc.task.TestCollectSessions;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
@@ -42,7 +43,7 @@ class CommandServiceTest {
     private static ScanManager idleManager() {
         return new ScanManager(
                 new BatchProcessor(1, false),
-                () -> new ScanManager.SnapshotData("主世界", 0, 0),
+                TestCollectSessions.completed("主世界", 0, 0),
                 snapshot -> { },
                 1_000_000L);
     }
