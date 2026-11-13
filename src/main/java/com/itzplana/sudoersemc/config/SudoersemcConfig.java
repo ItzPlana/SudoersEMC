@@ -1,5 +1,8 @@
 package com.itzplana.sudoersemc.config;
 
+import com.electronwill.nightconfig.core.CommentedConfig;
+import com.electronwill.nightconfig.core.file.CommentedFileConfig;
+import com.itzplana.sudoersemc.Sudoersemc;
 import com.itzplana.sudoersemc.core.OverflowScope;
 import com.itzplana.sudoersemc.safety.OverflowProtection;
 import com.itzplana.sudoersemc.solver.SolveSettings;
@@ -7,9 +10,14 @@ import com.mojang.logging.LogUtils;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import net.minecraftforge.common.ForgeConfigSpec;
 import net.minecraftforge.eventbus.api.IEventBus;
+import net.minecraftforge.fml.ModList;
 import net.minecraftforge.fml.ModLoadingContext;
+import net.minecraftforge.fml.config.ConfigFileTypeHandler;
+import net.minecraftforge.fml.config.ConfigTracker;
+import net.minecraftforge.fml.config.IConfigEvent;
 import net.minecraftforge.fml.config.ModConfig;
 import net.minecraftforge.fml.event.config.ModConfigEvent;
 import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
@@ -297,6 +305,91 @@ public final class SudoersemcConfig {
      */
     public static ConfigValidator.Values activeValues() {
         return activeValues;
+    }
+
+    /**
+     * Validates the values currently held by the loaded spec.
+     *
+     * @return validation result; never throws
+     */
+    public static ConfigValidationResult validateCurrent() {
+        try {
+            return ConfigValidator.validate(validationValues());
+        } catch (RuntimeException failure) {
+            return ConfigValidationResult.failed(
+                    List.of("无法读取当前配置: " + describe(failure)), List.of());
+        }
+    }
+
+    /**
+     * Re-reads the common config file from disk and applies it to the live spec.
+     *
+     * <p>This mirrors Forge's own {@code ConfigFileTypeHandler.ConfigWatcher}: the existing
+     * {@link CommentedFileConfig} bound to the spec is reloaded, corrected when necessary,
+     * accepted by the spec and followed by {@code afterReload()}. A
+     * {@code ModConfigEvent.Reloading} event is dispatched on the mod event bus so listeners
+     * observe the same lifecycle as a file-watch reload. Runtime components are not rebuilt
+     * here; the caller decides whether the new values are safe to apply.</p>
+     *
+     * @return validation result for the values read from disk; never throws
+     */
+    public static ConfigValidationResult reloadFromDisk() {
+        if (!SPEC.isLoaded()) {
+            return ConfigValidationResult.failed(List.of("配置尚未加载"), List.of());
+        }
+        ModConfig config = findConfig();
+        if (config == null) {
+            return ConfigValidationResult.failed(List.of("配置尚未注册"), List.of());
+        }
+
+        try {
+            CommentedConfig data = config.getConfigData();
+            if (data == null) {
+                return ConfigValidationResult.failed(List.of("配置文件尚未读取"), List.of());
+            }
+            if (data instanceof CommentedFileConfig fileConfig) {
+                fileConfig.load();
+                if (!SPEC.isCorrect(fileConfig)) {
+                    LOGGER.warn("[config] {} 不满足当前配置结构，已备份并修正", fileConfig.getFile());
+                    ConfigFileTypeHandler.backUpConfig(fileConfig);
+                    SPEC.correct(fileConfig);
+                    fileConfig.save();
+                }
+            }
+            SPEC.acceptConfig(data);
+            SPEC.afterReload();
+            ConfigValidationResult result = validateCurrent();
+            if (result.valid()) {
+                dispatchReloading(config);
+            }
+            return result;
+        } catch (RuntimeException failure) {
+            LOGGER.warn("[config] 重新读取配置文件失败，继续使用上一份有效配置", failure);
+            return ConfigValidationResult.failed(
+                    List.of("配置重载失败: " + describe(failure)), List.of());
+        }
+    }
+
+    private static ModConfig findConfig() {
+        for (ModConfig candidate : ConfigTracker.INSTANCE.configSets()
+                .getOrDefault(ModConfig.Type.COMMON, Set.of())) {
+            if (candidate.getSpec() == SPEC) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    private static void dispatchReloading(ModConfig config) {
+        ModList.get().getModContainerById(Sudoersemc.MODID)
+                .ifPresent(container -> container.dispatchConfigEvent(IConfigEvent.reloading(config)));
+    }
+
+    private static String describe(RuntimeException failure) {
+        String message = failure.getMessage();
+        return message == null || message.isBlank()
+                ? failure.getClass().getSimpleName()
+                : message;
     }
 
     /**

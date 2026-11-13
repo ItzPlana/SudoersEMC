@@ -3,11 +3,11 @@ name: Build
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
   workflow_dispatch:
     inputs:
       version:
-        description: '发布版本号（留空则使用 gradle.properties 中的 mod_version）'
+        description: "发布版本号（留空则使用 gradle.properties 中的 mod_version）"
         required: false
         type: string
 
@@ -31,13 +31,10 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
-
-      - name: Build
-        run: ./gradlew build --no-daemon --stacktrace
 
       - name: Resolve version
         id: version
@@ -54,6 +51,11 @@ jobs:
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Resolved version: $VERSION"
+
+      - name: Build
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: ./gradlew build --no-daemon --stacktrace -Pmod_version="$VERSION"
 
       - name: Collect artifacts
         shell: bash

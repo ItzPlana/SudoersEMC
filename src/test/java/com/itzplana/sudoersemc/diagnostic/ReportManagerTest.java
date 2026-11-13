@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -89,6 +90,16 @@ class ReportManagerTest {
 
         assertDoesNotThrow(() -> manager.writeReport(null));
         assertFalse(Files.exists(manager.reportFile()));
+    }
+
+    @Test
+    void readLastReportUsesCacheAfterSuccessfulWrite() throws IOException {
+        ReportManager manager = new ReportManager(tempDir);
+        DiagnosticReport report = report(42L);
+        manager.writeReport(report);
+        Files.delete(manager.reportFile());
+
+        assertEquals(Optional.of(report.formatText()), manager.readLastReport());
     }
 
     @Test

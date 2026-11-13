@@ -37,14 +37,16 @@ SudoersEMC 是一个**独立实现**的 Minecraft Forge 1.20.1 模组。它扫�
 
 ## 当前状态
 
-项目按阶段推进，已完成前两个阶段：
+项目按阶段线性推进，当前分支（`phase-11-release`）包含 Phase 0–10 的组件与 Phase 11 的入口接线：
 
-| 阶段     | 内容                                                         | 状态      |
-| -------- | ------------------------------------------------------------ | --------- |
-| Phase 0  | Forge 1.20.1 工程骨架、ProjectE 1.0.1 集成调研               | ✅ 完成   |
-| Phase 1  | ProjectE 查询/写入、归属持久化、溢出保护数学、配置、单元测试 | ✅ 完成   |
-| Phase 2  | 物品与配方扫描（含仪式配方）                                 | 🚧 进行中 |
-| Phase 3+ | 递归求解、兜底定价、NBT 变体、批处理、命令、诊断             | ⏳ 计划中 |
+| 阶段       | 内容                                                             | 状态                          |
+| ---------- | ---------------------------------------------------------------- | ----------------------------- |
+| Phase 0    | Forge 1.20.1 工程骨架、ProjectE 1.0.1 集成调研                   | ✅ 完成                       |
+| Phase 1    | ProjectE 查询/写入、归属持久化、溢出保护数学、配置、单元测试     | ✅ 完成                       |
+| Phase 2–10 | 扫描、配方求解、兜底定价、NBT 变体、批处理、安全保护、诊断、命令 | ✅ 组件实现，单元测试通过     |
+| Phase 11   | 模组入口接线与发布验收                                           | 🚧 部分完成（见下方已知限制） |
+
+**已知限制（Phase 11）**：`Sudoersemc.createScanManager()` 的采集/应用回调仍是占位实现（`"待接入真实扫描", 0, 0`），真实扫描管线尚未组装。因此当前构建**不会生成任何 EMC 值**：`/sudoemc rescan-all` 只会跑完一个空状态机，`last_report.txt` 也不会自动生成。DoD 第 4、12 项未达成；命令、调度、持久化、安全与定价组件仅通过单元测试，尚未完成端到端实机验证。
 
 Phase 1 已在专用服务器上验证：写入生效、重启后自动恢复、手动值不被覆盖、缺少 ProjectE 时优雅降级。
 
@@ -278,17 +280,21 @@ generateReports = true
 
 ## 数据文件
 
-| 路径                                       | 说明                                                          |
-| ------------------------------------------ | ------------------------------------------------------------- |
-| `config/sudoersemc/generated_entries.json` | 生成值、来源、配方、归属与时间戳                              |
-| `config/sudoersemc/overflow_resets.json`   | 溢出重置审计记录                                              |
-| `config/ProjectE/custom_emc.json`          | ProjectE 手动配置（本模组只读，`entire_custom_emc` 模式除外） |
+| 路径                                       | 说明                                                                                   |
+| ------------------------------------------ | -------------------------------------------------------------------------------------- |
+| `config/sudoersemc/generated_entries.json` | 生成值、来源、配方、归属与时间戳                                                       |
+| `config/sudoersemc/overflow_resets.json`   | 溢出重置审计记录                                                                       |
+| `config/ProjectE/custom_emc.json`          | ProjectE 手动配置（本模组只读，`entire_custom_emc` 模式除外）                          |
+| `config/sudoersemc/scan_state.json`        | 上次扫描指纹/耗时/计数；启动时加载、停服时按需保存（当前扫描管线未接线，通常不会生成） |
+| `config/sudoersemc/last_report.txt`        | 最近一次诊断报告；当前扫描管线未接线，不会自动生成                                     |
 
 所有写入采用「临时文件 + 原子替换」，加载失败只告警不崩溃，遇到更高版本 schema 时拒绝覆盖。
 
 ---
 
 ## 工作原理
+
+> 以下是完整目标链路。当前 Phase 11 只接入了调度骨架、命令与持久化加载；下列第 1–5 步的组件已实现并有单元测试，但**尚未组装进运行时**（采集器仍返回 `"待接入真实扫描", 0, 0`），因此当前构建不会产生任何生成值。
 
 1. **查询** — 通过 `IEMCProxy` 判断物品是否已有 EMC。
 2. **计算** — 从配方、标签、稀有度、层级规则推导候选值；同一物品有多个配方时取最低的有效确定性成本。
@@ -309,7 +315,9 @@ generateReports = true
 ./gradlew test
 ```
 
-测试覆盖：加权采样分布与权重重置、阈值边界、幂等性、持久化往返、损坏文件容错、schema 版本保护。
+测试覆盖：加权采样分布与权重重置、阈值边界、幂等性、持久化往返、损坏文件容错、schema 版本保护、命令层、扫描状态机、General 开关降级与停服清理。
+
+当前测试均为单元/组件测试；扫描管线尚未接线，没有端到端测试。
 
 ---
 
@@ -334,6 +342,7 @@ SudoersEMC is an independent Minecraft Forge 1.20.1 mod that generates EMC value
 - **Overflow protection** resets values above `999999` into a weighted range of `100..999000`, with a hard per-bucket weight cap so the top of the range stays reachable without dominating.
 - **Optional integration**: ProjectE Integration values always win, and Goety ritual recipes (`goety:ritual`, `craft` type only) are evaluated when Goety is installed.
 - Runs on dedicated servers. Loads normally without ProjectE.
+- **Current status (Phase 11)**: the scan pipeline is not wired yet. The jar starts, registers commands and persists state, but generates no EMC values; `/sudoemc rescan-all` only runs an empty state machine.
 
 Build with `./gradlew build`. Output: `build/libs/sudoersemc-<version>.jar`.
 

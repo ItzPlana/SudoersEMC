@@ -153,6 +153,20 @@ class GeneratedEntryStoreTest {
     }
 
     @Test
+    void getReturnsSingleEntryWithoutSnapshotting() {
+        Path file = tempDir.resolve(GeneratedEntryStore.FILE_NAME);
+        GeneratedEntryStore store = new GeneratedEntryStore(file);
+        ItemKey key = ItemKey.of(STONE);
+        GeneratedEmcEntry entry = new GeneratedEmcEntry(
+                key, 12L, PriceSource.RECIPE, STONE, true, 1L);
+        assertTrue(store.stage(entry));
+
+        assertEquals(entry, store.get(key));
+        assertNull(store.get(ItemKey.of(DIRT)));
+        assertNull(store.get(null));
+    }
+
+    @Test
     void rejectsStagingOverNonOwnedEntry() {
         Path file = tempDir.resolve(GeneratedEntryStore.FILE_NAME);
         GeneratedEntryStore store = new GeneratedEntryStore(file);
