@@ -37,7 +37,7 @@ SudoersEMC 是一个**独立实现**的 Minecraft Forge 1.20.1 模组。它扫�
 
 ## 当前状态
 
-项目按阶段线性推进，当前分支（`phase-13-runtime-pricing`）包含 Phase 0–12 的组件与 Phase 13 的自动扫描/兜底定价真实化：
+项目按阶段线性推进，当前分支（`phase-14-ownership-audit`）包含 Phase 0–13 的组件与 Phase 14 的归属审计：
 
 | 阶段       | 内容                                                              | 状态                      |
 | ---------- | ----------------------------------------------------------------- | ------------------------- |
@@ -47,8 +47,9 @@ SudoersEMC 是一个**独立实现**的 Minecraft Forge 1.20.1 模组。它扫�
 | Phase 11   | 模组入口接线与发布验收                                            | ✅ 入口接线完成           |
 | Phase 12   | 扫描管线集成、指纹缓存、报告与审批闭环                            | ✅ 完成                   |
 | Phase 13   | 自动扫描真实化、兜底定价链、运行时元数据注入与 owned 条目缓存判定 | ✅ 完成                   |
+| Phase 14   | 所有权审计、外部修改检测、多级自有链、溢出审计落盘与归属统计      | ✅ 完成                   |
 
-**已知限制（Phase 13）**：生产接线使用 `ScanPipeline` 统一完成分片采集、后台求解、所有权分离、统一排除、TagPricing 锚点、降价/溢出保护、审计落盘与报告生命周期；启动自动扫描由 `AutoScanPolicy` 根据开关、上次扫描时刻与 owned 条目数量判定，完整输入指纹工具保留用于一致性校验。Phase 7 的 `ScanCollectionPipeline` 保留为回归实现，不参与生产接线。尚未在大型整合包与专用服务器完成端到端实机验证；`KnownItemsStore` 未接入生产管线；`entire_custom_emc` 文件改写未实现；ProjectE Integration 的映射优先级尚未在运行期验证。
+**已知限制（Phase 14）**：生产接线使用 `ScanPipeline` 统一完成分片采集、后台求解、所有权分离、外部修改检测、多级自有链、统一排除、TagPricing 锚点、降价/溢出保护、审计落盘与报告生命周期；启动自动扫描由 `AutoScanPolicy` 判定。Phase 7 的 `ScanCollectionPipeline` 保留为回归实现，不参与生产接线。尚未在大型整合包与专用服务器完成端到端实机验证；`KnownItemsStore` 未接入生产管线；`entire_custom_emc` 文件改写未实现；ProjectE Integration 的映射优先级尚未在运行期验证。
 
 Phase 1 已在专用服务器上验证：写入生效、重启后自动恢复、手动值不被覆盖、缺少 ProjectE 时优雅降级。
 
@@ -337,7 +338,7 @@ generateReports = true
 
 测试覆盖：加权采样分布与权重重置、阈值边界、幂等性、持久化往返、损坏文件容错、schema 版本保护、分片扫描管线、双扫描器 API 兼容、命令层、扫描状态机、General 开关降级与停服清理。
 
-当前共 **617** 个单元/组件测试（53 个测试类），0 failure / 0 error；尚未加入专用服务器端到端测试。
+当前共 **631** 个单元/组件测试（53 个测试类），0 failure / 0 error；尚未加入专用服务器端到端测试。
 
 ---
 
@@ -362,7 +363,7 @@ SudoersEMC is an independent Minecraft Forge 1.20.1 mod that generates EMC value
 - **Overflow protection** resets values above `999999` into a weighted range of `100..999000`, with a hard per-bucket weight cap so the top of the range stays reachable without dominating. The protection components are instantiated by the runtime and applied by `ScanPipeline` before values are staged.
 - **Optional integration**: values are only intended for items ProjectE does not already price; the mapping priority against ProjectE Integration has not been runtime-verified, so "ProjectE Integration values always win" is not guaranteed. Goety ritual recipes (`goety:ritual`, `craft` type only) are evaluated when Goety is installed.
 - Runs on dedicated servers. Loads normally without ProjectE.
-- **Current status (Phase 13)**: the scan pipeline is fully wired through `ScanPipeline`, and startup auto-scan now uses `AutoScanPolicy` with owned-entry counts and fail-closed config reads. Runtime metadata injection feeds tag/rarity pricing. A legacy `ScanCollectionPipeline` remains covered by regression tests but is not part of production wiring.
+- **Current status (Phase 14)**: the scan pipeline is fully wired through `ScanPipeline`, with ownership separation, external-modification detection, multi-level owned chains, overflow audit persistence and ownership diagnostics. Startup auto-scan uses `AutoScanPolicy`; the full input fingerprint remains enforced for fail-closed consistency. A legacy `ScanCollectionPipeline` remains covered by regression tests but is not part of production wiring.
 
 Build with `./gradlew build`. Output: `build/libs/sudoersemc-<version>.jar`.
 

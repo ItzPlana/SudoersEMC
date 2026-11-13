@@ -92,8 +92,8 @@ public final class Sudoersemc {
     private static volatile ScanStateStore scanStateStore;
     private static volatile ScanManager scanManager;
     private static volatile ScanPipeline scanPipeline;
-    private static volatile ReportManager reportManager;
     private static volatile OverflowResetLog overflowResetLog;
+    private static volatile ReportManager reportManager;
     private static volatile QuarantinedDropsStore quarantinedDropsStore;
     private static volatile CommandService commandService;
     private static volatile MinecraftServer currentServer;
@@ -124,7 +124,6 @@ public final class Sudoersemc {
             ScanStateStore stateStore = new ScanStateStore();
             stateStore.load();
             scanStateStore = stateStore;
-
             OverflowResetLog resetLog = new OverflowResetLog();
             overflowResetLog = resetLog;
             QuarantinedDropsStore dropsStore = new QuarantinedDropsStore();
@@ -491,7 +490,7 @@ public final class Sudoersemc {
         }
         OverflowResetLog resetLog = overflowResetLog;
         if (resetLog != null) {
-            resetLog.save();
+            resetLog.saveIfDirty();
         }
         QuarantinedDropsStore dropsStore = quarantinedDropsStore;
         if (dropsStore != null) {
@@ -689,6 +688,7 @@ public final class Sudoersemc {
      */
     static void resetScanManager(ScanManager manager) {
         if (manager != null) {
+            manager.cancel();
             manager.reset();
         }
     }

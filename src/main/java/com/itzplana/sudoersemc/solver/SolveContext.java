@@ -13,9 +13,10 @@ import org.jetbrains.annotations.Nullable;
 /**
  * 一次求解运行的可变工作状态，同时实现 {@link EmcLookup} 以便直接交给评估器。
  *
- * <p>状态分为两层：{@code knownValues} 是运行开始前就存在的 EMC 快照，整个运行期间只读；
- * {@code generatedValues} 是本次运行产出的值。查找时生成值优先于已有值，但在发布阶段求解器会
- * 先检查 {@link #hasSeedValue(ItemKey)}，因此已有 EMC 永远不会被覆盖。</p>
+ * <p>状态分为三层：{@code knownValues} 是运行开始前就存在的 EMC 快照，整个运行期间只读；
+ * {@code provisionalValues} 是为自有叶子条目预置的兜底定价，只参与输入查找、不会阻止配方覆盖；
+ * {@code generatedValues} 是本次运行产出的值。查找时生成值优先于预置值，预置值优先于已有值，
+ * 但在发布阶段求解器会先检查 {@link #hasSeedValue(ItemKey)}，因此已有 EMC 永远不会被覆盖。</p>
  *
  * <p>该类不做线程安全承诺；求解在单个线程内完成。物品映射使用 {@link TreeMap}，保证诊断输出顺序
  * 只取决于物品身份，而不依赖哈希表迭代顺序。</p>
@@ -23,6 +24,7 @@ import org.jetbrains.annotations.Nullable;
 public final class SolveContext implements EmcLookup {
 
     private final Map<ItemKey, Long> knownValues;
+    private final NavigableMap<ItemKey, Long> provisionalValues = new TreeMap<>();
     private final NavigableMap<ItemKey, Long> generatedValues = new TreeMap<>();
     private final NavigableMap<ItemKey, SolveTrace> traces = new TreeMap<>();
     private int currentPass = 1;
@@ -93,6 +95,10 @@ public final class SolveContext implements EmcLookup {
         if (generated != null) {
             return generated;
         }
+        Long provisional = provisionalValues.get(item);
+        if (provisional != null) {
+            return provisional;
+        }
         return knownValues.getOrDefault(item, 0L);
     }
 
@@ -131,6 +137,32 @@ public final class SolveContext implements EmcLookup {
      */
     public Map<ItemKey, Long> generatedValues() {
         return Collections.unmodifiableMap(generatedValues);
+    }
+
+    /**
+     * 预置一个仅供输入查找使用的兜底值。
+     *
+     * <p>预置值与 {@code knownValues} 的区别：它不会让 {@link #hasSeedValue(ItemKey)} 返回
+     * {@code true}，因此求解器仍可为同一物品发布配方值并覆盖预置值；它也不会出现在
+     * {@link #generatedValues()} 中，最终候选仍由调用方按兜底定价链生成。该能力用于把自有
+     * 叶子条目的新鲜兜底价传给同一轮的多级配方链。</p>
+     *
+     * @param item  物品身份，不能为 {@code null}
+     * @param value 兜底值，必须 {@code > 0}
+     */
+    public void putProvisional(ItemKey item, long value) {
+        Objects.requireNonNull(item, "item");
+        if (value <= 0L) {
+            throw new IllegalArgumentException("预置值必须 > 0，实际为 " + value);
+        }
+        provisionalValues.put(item, value);
+    }
+
+    /**
+     * @return 预置值的只读视图，按 {@link ItemKey} 升序排列
+     */
+    public Map<ItemKey, Long> provisionalValues() {
+        return Collections.unmodifiableMap(provisionalValues);
     }
 
     /**
