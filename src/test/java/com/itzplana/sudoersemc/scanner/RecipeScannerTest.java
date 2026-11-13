@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.itzplana.sudoersemc.core.ItemKey;
@@ -12,6 +13,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.stream.Stream;
 import net.minecraft.SharedConstants;
+import java.util.List;
 import net.minecraft.core.NonNullList;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.registries.Registries;
@@ -54,6 +56,85 @@ class RecipeScannerTest {
     static {
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
+    }
+    @Test
+    void recipeIdEnumerationFailureAbortsInsteadOfReturningEmptyScan() {
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> scanner.beginScan(new ThrowingIdRecipeManager()));
+
+        assertTrueEnumeratingFailure(failure);
+    }
+
+    @Test
+    void singleRecipeFailureIncrementsFailedWithoutAborting() {
+        RecipeScanner.ScanResult result = scanner.scan(new OneBrokenRecipeManager());
+
+        assertEquals(0, result.recipes().size(),
+                "单条配方失败不得产生可用快照");
+        assertEquals(1, result.failed(),
+                "单条配方失败必须计入 failed，而不是把整次枚举降级为空");
+        assertEquals(1, result.total());
+    }
+
+    private static void assertTrueEnumeratingFailure(IllegalStateException failure) {
+        assertNotNull(failure.getMessage());
+        assertEquals(true, failure.getMessage().contains("无法枚举配方 id"),
+                "异常必须带可诊断的枚举失败原因，实际为 " + failure.getMessage());
+    }
+
+    /** RecipeManager whose id enumeration always fails. */
+    private static final class ThrowingIdRecipeManager extends RecipeManager {
+        @Override
+        public Stream<ResourceLocation> getRecipeIds() {
+            throw new IllegalStateException("broken recipe manager");
+        }
+    }
+
+    /** RecipeManager that exposes one id but fails when the recipe is looked up. */
+    private static final class OneBrokenRecipeManager extends RecipeManager {
+        @Override
+        public Stream<ResourceLocation> getRecipeIds() {
+            return Stream.of(RECIPE_ID);
+        }
+
+        @Override
+        public Optional<? extends Recipe<?>> byKey(ResourceLocation id) {
+            throw new IllegalStateException("broken recipe lookup");
+        }
+    }
+
+    @Test
+    void sessionHonoursStepBudgetAndProducesSameRecipesAsScan() {
+        RecipeManager manager = new RecipeManager();
+        NonNullList<Ingredient> ingredients = NonNullList.withSize(1, Ingredient.EMPTY);
+        ingredients.set(0, Ingredient.of(Items.DIRT));
+        ShapedRecipe first = new ShapedRecipe(
+                new ResourceLocation("sudoersemc_test", "first"), "", CraftingBookCategory.MISC,
+                1, 1, ingredients, new ItemStack(Items.DIAMOND));
+        NonNullList<Ingredient> secondIngredients = NonNullList.withSize(1, Ingredient.EMPTY);
+        secondIngredients.set(0, Ingredient.of(Items.DIRT));
+        ShapedRecipe second = new ShapedRecipe(
+                new ResourceLocation("sudoersemc_test", "second"), "", CraftingBookCategory.MISC,
+                1, 1, secondIngredients, new ItemStack(Items.EMERALD));
+        manager.replaceRecipes(List.of(first, second));
+
+        RecipeScanner.RecipeScanSession session = scanner.beginSession(manager);
+        assertEquals(2, session.total());
+        assertEquals(0, session.processed());
+        assertFalse(session.isDone());
+
+        assertEquals(1, session.step(1));
+        assertEquals(1, session.processed());
+        assertFalse(session.isDone());
+        assertEquals(1, session.result().recipes().size(),
+                "部分结果只包含已扫描配方");
+
+        assertEquals(1, session.step(1));
+        assertTrue(session.isDone());
+        assertEquals(2, session.processed());
+        assertEquals(2, session.result().recipes().size());
+        assertEquals(2, scanner.scan(manager).recipes().size(),
+                "分片会话与一次性 scan 必须得到相同配方数量");
     }
 
     @Test

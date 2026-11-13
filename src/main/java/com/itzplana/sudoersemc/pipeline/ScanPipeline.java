@@ -16,6 +16,7 @@ import com.itzplana.sudoersemc.resolver.VariantScanner;
 import com.itzplana.sudoersemc.safety.CreativeItemProtection;
 import com.itzplana.sudoersemc.safety.LargeDropProtection;
 import com.itzplana.sudoersemc.safety.OverflowPipeline;
+import com.itzplana.sudoersemc.safety.OwnershipManager;
 import com.itzplana.sudoersemc.safety.PriceDropDecision;
 import com.itzplana.sudoersemc.safety.OwnershipManager;
 import com.itzplana.sudoersemc.scanner.ItemScanner;
@@ -24,6 +25,7 @@ import com.itzplana.sudoersemc.scanner.ItemSnapshot;
 import com.itzplana.sudoersemc.scanner.RecipeInput;
 import com.itzplana.sudoersemc.scanner.RecipeOutput;
 import com.itzplana.sudoersemc.scanner.RecipeScanner;
+import com.itzplana.sudoersemc.scanner.RecipeOutput;
 import com.itzplana.sudoersemc.scanner.RecipeSnapshot;
 import com.itzplana.sudoersemc.solver.EvaluatorRegistry;
 import com.itzplana.sudoersemc.solver.EvaluationPolicy;
@@ -37,6 +39,7 @@ import com.itzplana.sudoersemc.storage.QuarantinedDropsStore;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
 import com.itzplana.sudoersemc.task.ScanDiagnostics;
 import com.itzplana.sudoersemc.task.ScanFingerprint;
+import com.itzplana.sudoersemc.task.ScanManager;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -47,11 +50,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Supplier;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.function.Predicate;
@@ -78,6 +84,11 @@ import org.slf4j.LoggerFactory;
  *   <li>{@link #solveAndApply(PipelineSnapshot)} 只做计算与存储写入；它自身不直接读取注册表，
  *       但注入的 ProjectE 手工值判定器在解析标签条目时可能访问物品注册表与标签管理器，
  *       因此该方法必须由服务器线程调用。</li>
+ *   <li>{@link #beginCollection(MinecraftServer)} 返回按批推进的采集会话，物品与配方都不会在
+ *       单个 tick 内全量遍历；长时间运行或测试仍可使用一次性的 {@link #collect(MinecraftServer)}；</li>
+ *   <li>求解与写入拆成两步：{@link #startStashedSolve()} 把纯计算提交到工作线程，服务器线程
+ *       轮询 {@link #isSolveComplete()} 后调用 {@link #applyCompletedSolve()} 完成安全判定、
+ *       存储写入与报告落盘。同步调用 {@link #solveAndApply(PipelineSnapshot)} 保留给测试。</li>
  * </ol>
  *
  * <p>{@link com.itzplana.sudoersemc.task.ScanManager} 会在采集阶段与阶段之间跨越多个 tick，
@@ -86,14 +97,16 @@ import org.slf4j.LoggerFactory;
  * 更容易测试、诊断与避免重复应用。</p>
  *
  * <p><strong>空值语义：</strong>{@code store} 为 {@code null} 表示干跑模式，所有计数与报告照常
- * 计算，但不会写入任何持久化条目，也不会写隔离记录文件。其余协作者为 {@code null} 时按
- * “关闭该能力”处理：降价保护与创造物品保护使用安全默认值，兜底定价与溢出保护在缺失时直接
- * 跳过。这样单元测试可以在没有完整运行时环境的情况下验证管线主干。</p>
+ * 计算，但不会写入任何持久化条目。其余协作者为 {@code null} 时按“关闭该能力”处理：降价保护与
+ * 创造物品保护使用安全默认值，兜底定价与溢出保护在缺失时直接跳过。这样单元测试可以在没有完整
+ * 运行时环境的情况下验证管线主干。</p>
  *
  * <p><strong>异常契约：</strong>{@link #collect(MinecraftServer)} 在服务器未就绪或采集失败时
- * 抛出 {@link IllegalStateException}，由 {@code ScanManager} 转为 {@code FAILED}，绝不把失败
- * 伪装成“成功的空扫描”；{@link #solveAndApply(PipelineSnapshot)} 仍不向调用方抛出异常，
- * 任何未预期失败记录日志后返回全零结果，保证服务器主循环不被单次扫描拖垮。</p>
+ * 抛出 {@link IllegalStateException}；{@link #solveAndApply(PipelineSnapshot)} 在求解或应用
+ * 过程遇到运行时异常时记录日志并转换为 {@link IllegalStateException}；
+ * {@link #applyCompletedSolve()} 在后台求解失败、被取消或没有待处理结果时同样抛出
+ * {@link IllegalStateException}。这些异常由 {@code ScanManager} 转为 {@code FAILED}，绝不把
+ * 失败伪装成“成功的空扫描”或全零结果，避免服务器主循环被静默的错误状态污染。</p>
  */
 public final class ScanPipeline {
 
@@ -122,9 +135,20 @@ public final class ScanPipeline {
 
     /** 兜底/合并/清理等全量循环每处理多少个条目检查一次取消信号。 */
     static final int FULL_SWEEP_CANCEL_CHECK_INTERVAL = 256;
+    /**
+     * 单线程守护线程池，只执行不接触游戏状态的纯求解计算。
+     *
+     * <p>求解函数只读取不可变快照、定价规则与存储归属标记，不访问注册表、RecipeManager、
+     * ProjectE API 或文件系统；存储写入与报告落盘全部回到服务器线程的
+     * {@link #applyCompletedSolve()}。</p>
+     */
+    private static final ExecutorService SOLVER_EXECUTOR = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "sudoersemc-solver");
+        thread.setDaemon(true);
+        return thread;
+    });
 
     private final GeneratedEntryStore store;
-    private volatile QuarantinedDropsStore quarantinedDropsStore;
     private final ScanStateStore stateStore;
     private final ReportManager reportManager;
     private final LargeDropProtection dropProtection;
@@ -163,16 +187,29 @@ public final class ScanPipeline {
      * 生产环境由 {@code Sudoersemc} 注入同一个 tracker，测试默认使用独立实例。
      */
     private volatile RemapTracker remapTracker = new RemapTracker();
+    private final AtomicReference<CompletableFuture<Computation>> pendingSolve = new AtomicReference<>();
 
     private volatile EmcProvider emcProvider;
     private volatile OverflowScope overflowScope = OverflowScope.OWNED_ONLY;
     private volatile boolean allowProjectEFileRewrite;
     private volatile Path projectECustomEmcFile;
+    private volatile boolean useProjectEIntegrationBaselines = true;
+
+    /**
+     * 完整扫描输入指纹提供器，必须在服务器线程调用。
+     *
+     * <p>生产接线由 {@code Sudoersemc} 注入物品注册表、配方 id、标签与配置摘要；注入后，
+     * 扫描状态文件会保存完整输入指纹，启动缓存只有在该指纹完全匹配时才会复用。未注入时
+     * 退回基于本次快照的指纹，仅用于不接触游戏状态的单元测试。</p>
+     */
+    @Nullable
+    private volatile Supplier<ScanFingerprint> inputFingerprintSupplier;
     private volatile int lastSolvedCount;
     private volatile int lastUnresolvedCount;
     private volatile int lastSolverRoundCount;
     private volatile long lastDurationMillis;
     private volatile ScanDiagnostics diagnostics = new ScanDiagnostics();
+    /** 本轮扫描是否已经成功写出完整报告；只对单次扫描有效，由 {@link #beginScan()} 重置。 */
     private volatile boolean fullReportWritten;
     /** 最近一次采集失败的中文原因；采集成功后清空，供应用阶段写出失败报告。 */
     private volatile String lastCollectFailure;
@@ -227,19 +264,6 @@ public final class ScanPipeline {
      */
     public void setEmcProvider(@Nullable EmcProvider provider) {
         this.emcProvider = provider;
-    }
-
-    /**
-     * 注入隔离记录存储。
-     *
-     * <p>注入后，每当大幅降价保护判定隔离时，管线会把旧值、拟写入值、降幅、原因与时间戳
-     * 写入该存储，供管理员通过 {@code /sudoemc approve} 审批。传入 {@code null} 时只保留原有
-     * 的内存计数与日志行为。干跑模式（生成条目存储为 {@code null}）永远不会写隔离文件。</p>
-     *
-     * @param newStore 隔离记录存储，允许为 {@code null}
-     */
-    public void setQuarantinedDropsStore(@Nullable QuarantinedDropsStore newStore) {
-        this.quarantinedDropsStore = newStore;
     }
 
     /**
@@ -638,6 +662,19 @@ public final class ScanPipeline {
     }
 
     /**
+     * 注入隔离记录存储。
+     *
+     * <p>注入后，每当大幅降价保护判定隔离时，管线会把旧值、拟写入值、降幅、原因与时间戳
+     * 写入该存储，供管理员通过 {@code /sudoemc approve} 审批。传入 {@code null} 时只保留原有
+     * 的内存计数与日志行为。干跑模式（生成条目存储为 {@code null}）永远不会写隔离文件。</p>
+     *
+     * @param newStore 隔离记录存储，允许为 {@code null}
+     */
+    public void setQuarantinedDropsStore(@Nullable QuarantinedDropsStore newStore) {
+        dropProtection.setQuarantineStore(newStore);
+    }
+
+    /**
      * 覆盖 ProjectE 手动 EMC 文件路径，主要用于测试或嵌入式场景。
      *
      * <p>传入 {@code null} 时恢复生产路径（{@code config/ProjectE/custom_emc.json}）。</p>
@@ -646,6 +683,31 @@ public final class ScanPipeline {
      */
     public void setProjectECustomEmcFile(@Nullable Path file) {
         this.projectECustomEmcFile = file;
+    }
+
+    /**
+     * 控制是否允许使用 ProjectE 集成基线。
+     *
+     * <p><strong>阶段说明：</strong>Phase 12 尚未提供外部基线数据源，本开关当前只记录
+     * {@code fallback.useProjectEIntegrationBaselines} 的值；真正的基线读取器在 Phase 25
+     * 接线后生效。关闭时显式传 {@code 0}，避免未来接线后误用基线。</p>
+     *
+     * @param enabled 是否允许使用外部基线
+     */
+    public void setUseProjectEIntegrationBaselines(boolean enabled) {
+        this.useProjectEIntegrationBaselines = enabled;
+    }
+
+    /**
+     * 注册完整扫描输入指纹提供器。
+     *
+     * <p>提供器在服务器线程的求解启动阶段调用一次，其返回值会随扫描状态一起持久化。
+     * 启动缓存判定必须使用同一套指纹通道，否则模组、配方或配置变化后仍可能误用旧值。</p>
+     *
+     * @param supplier 指纹提供器；{@code null} 时退回基于本次快照的指纹
+     */
+    public void setInputFingerprintSupplier(@Nullable Supplier<ScanFingerprint> supplier) {
+        this.inputFingerprintSupplier = supplier;
     }
 
     /**
@@ -672,77 +734,11 @@ String detail = "扫描采集失败：服务器尚未就绪";
         }
 
         try {
-            // 在读取任何后端值之前记录代次：采集期间完成的重映射会让本快照的 observed 值过期。
-            long collectedRemapGeneration = remapTracker.generation();
-            ItemScanner.EmcQuery query = new ItemScanner.EmcQuery() {
-                @Override
-                public boolean hasValue(ItemStack stack) {
-                    EmcProvider provider = emcProvider;
-                    if (provider == null) {
-                        return false;
-                    }
-                    try {
-                        return provider.isAvailable() && provider.hasValue(stack);
-                    } catch (RuntimeException | LinkageError failure) {
-                        LOGGER.debug("EMC 后端查询物品是否有值失败，按无值处理", failure);
-                        return false;
-                    }
-                }
-
-                @Override
-                public long getValue(ItemStack stack) {
-                    EmcProvider provider = emcProvider;
-                    if (provider == null) {
-                        return 0L;
-                    }
-                    try {
-                        if (!provider.isAvailable()) {
-                            return 0L;
-                        }
-                        return Math.max(0L, provider.getValue(stack));
-                    } catch (RuntimeException | LinkageError failure) {
-                        LOGGER.debug("EMC 后端读取物品数值失败，按 0 处理", failure);
-                        return 0L;
-                    }
-                }
-
-                @Override
-                public long getExactValue(ItemStack stack) {
-                    EmcProvider provider = emcProvider;
-                    if (provider == null) {
-                        return 0L;
-                    }
-                    try {
-                        if (!provider.isAvailable()) {
-                            return 0L;
-                        }
-                        return Math.max(0L, provider.getExactValue(stack));
-                    } catch (RuntimeException | LinkageError failure) {
-                        LOGGER.debug("EMC 后端读取精确 NBT 数值失败，按 0 处理", failure);
-                        return 0L;
-                    }
-                }
-            };
-
-            List<ItemSnapshot> items = new ItemScanner(query, Set.of(), Set.of()).scan(this::isCancelled);
-            if (isCancelled()) {
-                return partialSnapshot(items, List.of(), collectedRemapGeneration);
+            CollectionSession session = new CollectionSession(server, false);
+            while (!session.isDone()) {
+                session.step(Integer.MAX_VALUE);
             }
-
-            RecipeScanner recipeScanner = RecipeScanner.withGoety(scanContainerRemainders)
-                    .orElseGet(() -> new RecipeScanner(
-                            GoetyRitualReader.unavailable(), scanContainerRemainders));
-            RecipeScanner.ScanResult scanResult =
-                    recipeScanner.scan(server.getRecipeManager(), this::isCancelled);
-            if (isCancelled()) {
-                return partialSnapshot(items, scanResult.recipes(), collectedRemapGeneration);
-            }
-
-            PipelineSnapshot snapshot = collectSnapshotData(items, scanResult, query,
-                    collectedRemapGeneration);
-            // 成功采集必须清除上一次失败原因，否则下一次 applyStashed 会误丢新快照。
-            lastCollectFailure = null;
-            return snapshot;
+            return session.buildSnapshot();
         } catch (Throwable failure) {
             String detail = "扫描采集失败：" + failureDetail(failure);
             LOGGER.error("SudoersEMC 扫描采集失败", failure);
@@ -809,6 +805,126 @@ String detail = "扫描采集失败：服务器尚未就绪";
         } catch (Exception failure) {
             LOGGER.debug("无法把变体 {} 还原为 ItemStack，跳过既有值读取", key, failure);
             return null;
+        }
+    }
+
+    /**
+     * 创建一个真正的分片采集会话，供 {@link ScanManager} 跨 tick 推进。
+     *
+     * <p>会话先按批遍历物品注册表，再按批描述配方；每个 {@link ScanManager.CollectSession#step(int)}
+     * 最多处理调用方给定的工作单元。完成时 {@link ScanManager.CollectSession#finish()} 会把
+     * 快照暂存到本管线，等待应用阶段取出。</p>
+     *
+     * @param server 当前服务器实例，不能为 {@code null}
+     * @return 分片采集会话
+     * @throws IllegalStateException 服务器未就绪或无法创建会话时抛出
+     */
+    public ScanManager.CollectSession beginCollection(@Nullable MinecraftServer server) {
+        if (server == null) {
+            throw new IllegalStateException("扫描采集失败：服务器尚未就绪");
+        }
+        try {
+            return new CollectionSession(server, true);
+        } catch (RuntimeException | LinkageError failure) {
+            throw new IllegalStateException("SudoersEMC 扫描采集失败", failure);
+        }
+    }
+
+    /**
+     * 分片采集会话：物品与配方分别使用各自的增量会话，绝不单个 tick 全量遍历。
+     */
+    private final class CollectionSession implements ScanManager.CollectSession {
+
+        private final MinecraftServer server;
+        private final boolean stashOnFinish;
+        private final ItemScanner.ScanSession itemSession;
+
+        @Nullable
+        private RecipeScanner recipeScanner;
+        @Nullable
+        private RecipeScanner.ScanSession recipeSession;
+        @Nullable
+        private PipelineSnapshot completedSnapshot;
+
+        private CollectionSession(MinecraftServer server, boolean stashOnFinish) {
+            this.server = server;
+            this.stashOnFinish = stashOnFinish;
+            this.itemSession = new ItemScanner(emcQuery(), Set.of(), Set.of()).beginScan();
+        }
+
+        @Override
+        public int itemCount() {
+            return itemSession.totalItems();
+        }
+
+        @Override
+        public int recipeCount() {
+            return recipeSession == null ? 0 : recipeSession.totalRecipes();
+        }
+
+        @Override
+        public int processedItems() {
+            return itemSession.processedItems();
+        }
+
+        @Override
+        public int processedRecipes() {
+            return recipeSession == null ? 0 : recipeSession.processedRecipes();
+        }
+
+        @Override
+        public boolean isDone() {
+            return itemSession.isDone() && recipeSession != null && recipeSession.isDone();
+        }
+
+        @Override
+        public ScanManager.StepResult step(int maxItems) {
+            if (maxItems < 1) {
+                throw new IllegalArgumentException("maxItems 必须 >= 1，实际为 " + maxItems);
+            }
+            if (!itemSession.isDone()) {
+                int processed = itemSession.step(maxItems);
+                return new ScanManager.StepResult(processed, false);
+            }
+            if (recipeSession == null) {
+                RecipeScanner scanner = recipeScanner;
+                if (scanner == null) {
+                    scanner = RecipeScanner.withGoety().orElseGet(RecipeScanner::new);
+                    recipeScanner = scanner;
+                }
+                if (server.getRecipeManager() == null) {
+                    throw new IllegalStateException("扫描采集失败：配方管理器尚未就绪");
+                }
+                recipeSession = scanner.beginScan(server.getRecipeManager());
+            }
+            if (!recipeSession.isDone()) {
+                int processed = recipeSession.step(maxItems);
+                return new ScanManager.StepResult(processed, recipeSession.isDone());
+            }
+            return new ScanManager.StepResult(0, true);
+        }
+
+        @Override
+        public ScanManager.SnapshotData finish() {
+            PipelineSnapshot snapshot = buildSnapshot();
+            completedSnapshot = snapshot;
+            if (stashOnFinish) {
+                stash(snapshot);
+            }
+            return new ScanManager.SnapshotData(
+                    "真实扫描管线", snapshot.itemCount(), snapshot.recipeCount());
+        }
+
+        private PipelineSnapshot buildSnapshot() {
+            PipelineSnapshot existing = completedSnapshot;
+            if (existing != null) {
+                return existing;
+            }
+            List<ItemSnapshot> items = itemSession.snapshots();
+            RecipeScanner.ScanResult scanResult = recipeSession == null
+                    ? new RecipeScanner.ScanResult(List.of(), 0, 0, 0)
+                    : recipeSession.result();
+            return collectSnapshotData(items, scanResult, emcQuery());
         }
     }
 
@@ -1073,9 +1189,11 @@ int totalBudget = VariantScanner.HARD_TOTAL_VARIANT_CEILING;
     }
 
     /**
-     * 查询一个变体身份下所有观测原始 NBT 的精确既有值。
+     * 查询一个变体身份的精确既有值。
      *
-     * <p>同一经济变体可能对应多个原始 SNBT；采用最大值可避免把任何一个已存在的 NBT 专属
+     * <p>注册侧会同时写入规范 SNBT 与观测到的原始 SNBT，因此这里也必须覆盖两类形态：
+     * 规范 key 可能已经被 ProjectE 的 NBT 处理器或其它模组注册，原始形态则对应真实堆叠。
+     * 同一经济变体可能对应多个原始 SNBT；采用最大值可避免把任何一个已存在的 NBT 专属
      * 值当成“无值”后覆盖。任一查询失败只按该形态无值处理。</p>
      *
      * @return 精确 NBT 既有值；没有专属映射时返回 {@code 0}
@@ -1086,8 +1204,19 @@ int totalBudget = VariantScanner.HARD_TOTAL_VARIANT_CEILING;
         if (emcQuery == null) {
             return 0L;
         }
-        long maxValue = 0L;
+        TreeSet<String> probes = new TreeSet<>();
+        String canonical = variantKey.variantHash();
+        if (canonical != null && !canonical.isBlank()) {
+            probes.add(canonical);
+        }
         for (String snbt : rawSnbts) {
+            if (snbt != null && !snbt.isBlank()) {
+                probes.add(snbt);
+            }
+        }
+
+        long maxValue = 0L;
+        for (String snbt : probes) {
             try {
                 CompoundTag tag = TagParser.parseTag(snbt);
                 ItemStack probe = new ItemStack(item);
@@ -1104,6 +1233,76 @@ int totalBudget = VariantScanner.HARD_TOTAL_VARIANT_CEILING;
     }
 
     /**
+     * 开始新一轮扫描前重置跨扫描的报告状态。
+     *
+     * <p>生产接线在 {@code ScanManager.requestScan()} 成功后、首个采集 tick 之前调用。
+     * {@code fullReportWritten} 与 {@code pendingReport} 只属于单次扫描：若不在扫描开始时清除，
+     * 上一轮成功写出的完整报告会让本轮“采集失败”或“采集阶段取消”的部分报告被静默跳过，
+     * 磁盘上继续保留旧的成功报告。{@code lastCollectFailure} 同理，旧扫描的失败原因不得泄漏
+     * 到新一轮。</p>
+     */
+    public void beginScan() {
+        fullReportWritten = false;
+        pendingReport = null;
+        lastCollectFailure = null;
+    }
+
+    /**
+     * 构建 EMC 查询适配器，把后端的运行时异常与链接错误统一降级为“无值”。
+     */
+    private ItemScanner.EmcQuery emcQuery() {
+        return new ItemScanner.EmcQuery() {
+            @Override
+            public boolean hasValue(ItemStack stack) {
+                EmcProvider provider = emcProvider;
+                if (provider == null) {
+                    return false;
+                }
+                try {
+                    return provider.isAvailable() && provider.hasValue(stack);
+                } catch (RuntimeException | LinkageError failure) {
+                    LOGGER.debug("EMC 后端查询物品是否有值失败，按无值处理", failure);
+                    return false;
+                }
+            }
+
+            @Override
+            public long getValue(ItemStack stack) {
+                EmcProvider provider = emcProvider;
+                if (provider == null) {
+                    return 0L;
+                }
+                try {
+                    if (!provider.isAvailable()) {
+                        return 0L;
+                    }
+                    return Math.max(0L, provider.getValue(stack));
+                } catch (RuntimeException | LinkageError failure) {
+                    LOGGER.debug("EMC 后端读取物品数值失败，按 0 处理", failure);
+                    return 0L;
+                }
+            }
+
+            @Override
+            public long getExactValue(ItemStack stack) {
+                EmcProvider provider = emcProvider;
+                if (provider == null) {
+                    return 0L;
+                }
+                try {
+                    if (!provider.isAvailable()) {
+                        return 0L;
+                    }
+                    return Math.max(0L, provider.getExactValue(stack));
+                } catch (RuntimeException | LinkageError failure) {
+                    LOGGER.debug("EMC 后端读取精确 NBT 数值失败，按 0 处理", failure);
+                    return 0L;
+                }
+            }
+        };
+    }
+
+    /**
      * 暂存采集结果，等待应用阶段取用。
      *
      * <p>该方法是“stash + applyStashed”接线方式的一半，专门服务于
@@ -1112,6 +1311,8 @@ int totalBudget = VariantScanner.HARD_TOTAL_VARIANT_CEILING;
      * @param snapshot 采集结果，允许为 {@code null}
      */
     public void stash(@Nullable PipelineSnapshot snapshot) {
+        // 防御性重置：测试或嵌入式调用可能绕过 ScanManager 直接 stash，
+        // 但生产路径的真正重置点是每次 requestScan() 触发的 beginScan()。
         fullReportWritten = false;
         pendingReport = null;
         if (snapshot != null) {
@@ -1150,7 +1351,8 @@ int totalBudget = VariantScanner.HARD_TOTAL_VARIANT_CEILING;
         }
         String collectFailure = lastCollectFailure;
         if (collectFailure != null) {
-            // collect(...) 吞掉异常后返回空快照；这里不能再把它当成正常空扫描。
+            // collect(...) 失败会抛出异常且不会 stash；若暂存快照来自更早的扫描，
+            // 残留的失败原因说明本轮采集失败，不能把旧快照当成正常空扫描继续应用。
             lastCollectFailure = null;
             writeFailedReport(collectFailure, diagnostics);
             return PipelineResult.zeroed(0L);
@@ -1518,9 +1720,11 @@ int totalBudget = VariantScanner.HARD_TOTAL_VARIANT_CEILING;
      * CANCELLED 状态。</p>
      *
      * @param snapshot 采集结果，允许为 {@code null}
-     * @return 汇总结果；任何未预期异常都会转为全零结果
+     * @return 汇总结果
+     * @throws IllegalStateException 求解或应用过程抛出运行时异常时
      */
     public PipelineResult solveAndApply(@Nullable PipelineSnapshot snapshot) {
+        long startedAtNanos = System.nanoTime();
         PipelineSnapshot data = snapshot == null ? PipelineSnapshot.empty() : snapshot;
 fullReportWritten = false;
         lastSnapshotForReport = data;
@@ -1530,246 +1734,392 @@ fullReportWritten = false;
         lastCollectFailure = null;
         // 持久化隔离存储已经接管审计；每轮扫描开始时清空内存列表，避免长期自动扫描无限累积。
         dropProtection.clearQuarantine();
-        long cacheHitsBefore = recipeSolver.cacheHits();
-        long cacheMissesBefore = recipeSolver.cacheMisses();
-        long startedAtNanos = System.nanoTime();
-
+        ScanFingerprint inputFingerprint = captureInputFingerprint(data);
         try {
-            OwnershipApplication ownership = applyOwnershipSeparation(data);
-            data = ownership.snapshot();
-            lastOwnershipExternalModifications = ownership.detected();
-            lastOwnershipReleased = ownership.released();
-            lastSnapshotForReport = data;
+            // 求解开始前已请求取消：不进入任何计算，直接走取消路径并失效旧指纹。
             if (isCancelled()) {
                 return cancelledResult(data, startedAtNanos);
             }
-            long minimumEmc = solveSettings.minimumEmc();
-
-            Map<ItemKey, Candidate> recipeCandidates = new TreeMap<>();
-            Map<ItemKey, Candidate> fallbackCandidates = new TreeMap<>();
-            Map<ItemKey, Long> seeds = initialSeeds(data);
-
-            CreativeProtectionPlan protection = planCreativeProtection(data, seeds, minimumEmc);
-            for (Map.Entry<ItemKey, Long> entry : protection.specialValues().entrySet()) {
-                ItemKey item = entry.getKey();
-                long value = entry.getValue();
-                seeds.put(item, value);
-                recipeCandidates.put(item,
-                        new Candidate(item, value, PriceSource.SPECIAL_VALUE, null));
-            }
-            Set<ItemKey> recipeOutputs = recipeOutputItems(data);
-            Set<ItemKey> variantItems = variantItemKeys(data.items());
-            Map<ItemKey, List<String>> variantRegistrationNbts =
-                    collectVariantRegistrationNbts(data.recipes(), variantItems);
-
-            SolveResult lastSolveResult = skippedSolveResult();
-            int roundsUsed = 0;
-            boolean cancelledDuringSolve = false;
-            for (int round = 1; round <= MAX_SOLVE_ROUNDS; round++) {
-                if (isCancelled()) {
-                    cancelledDuringSolve = true;
-                    break;
-                }
-                roundsUsed = round;
-                SolveResult roundResult = solveRound(data, seeds, protection.deniedItems());
-                lastSolveResult = roundResult;
-
-boolean solvedProgress = mergeSolvedValues(roundResult, recipeCandidates, seeds,
-                        protection.deniedItems(), protection.specialValues(), variantItems);
-                if (isCancelled()) {
-                    cancelledDuringSolve = true;
-                    break;
-                }
-                int fallbackAdded = addFallbackCandidates(
-                        data, seeds, fallbackCandidates, recipeOutputs);
-                if (isCancelled()) {
-                    cancelledDuringSolve = true;
-                    break;
-                }
-                if (!solvedProgress && fallbackAdded == 0) {
-                    break;
-                }
-            }
-            lastSolverRoundCount = roundsUsed;
-            lastSolverCacheHits = (int) Math.min(Integer.MAX_VALUE,
-                    recipeSolver.cacheHits() - cacheHitsBefore);
-            lastSolverCacheMisses = (int) Math.min(Integer.MAX_VALUE,
-                    recipeSolver.cacheMisses() - cacheMissesBefore);
-
-if (cancelledDuringSolve || isCancelled()) {
-                return cancelledResult(data, startedAtNanos);
-            }
-
-            // 收敛后再兜底：配方输出在循环内不会被兜底种子抢先定价，此处只处理仍然无值的物品。
-            addFallbackCandidates(data, seeds, fallbackCandidates, Set.of());
-
-            List<Candidate> candidates = selectFinalCandidates(
-                    recipeCandidates, fallbackCandidates, minimumEmc, this::isCancelled);
+            Computation computation = compute(data, startedAtNanos, inputFingerprint);
+            // 求解循环内的检查点可能提前结束；此时尚未写入任何条目，按取消处理。
             if (isCancelled()) {
                 return cancelledResult(data, startedAtNanos);
             }
-
-            if (!ownership.protectedItems().isEmpty()) {
-                List<Candidate> filtered = new ArrayList<>(candidates.size());
-                for (Candidate candidate : candidates) {
-                    if (!ownership.protectedItems().contains(candidate.item())) {
-                        filtered.add(candidate);
-                    }
-                }
-                candidates = List.copyOf(filtered);
-            }
-            int solvedByRecipe = 0;
-            int solvedByFallback = 0;
-            for (Candidate candidate : candidates) {
-                if (candidate.source() == PriceSource.RECIPE) {
-                    solvedByRecipe++;
-                } else {
-                    solvedByFallback++;
-                }
-            }
-
-            Map<ItemKey, GeneratedEmcEntry> previousEntries =
-                    store == null ? Map.of() : store.snapshotAll();
-            int overflowBefore = overflowPipeline == null ? 0 : overflowPipeline.resetsApplied();
-
-            int applied = 0;
-            int quarantined = 0;
-            Map<String, Long> sourceCounts = new LinkedHashMap<>();
-            boolean cancelledDuringApply = false;
-            int applyIndex = 0;
-
-            for (Candidate candidate : candidates) {
-                if (applyIndex++ % APPLY_CANCEL_CHECK_INTERVAL == 0 && isCancelled()) {
-                    cancelledDuringApply = true;
-                    break;
-                }
-                GeneratedEmcEntry previous = previousEntries.get(candidate.item());
-                long previousValue = previous == null ? 0L : previous.value();
-
-                PriceDropDecision decision = evaluateDropProtection(candidate, previousValue);
-                if (!decision.allowed()) {
-                    quarantined++;
-                    recordQuarantine(candidate, decision);
-                    LOGGER.debug("物品 {} 的拟写入值 {} 因大幅降价被隔离（旧值 {}，降幅 {}）",
-                            candidate.item(), candidate.value(), previousValue, decision.dropRatio());
-                    continue;
-                }
-
-                long finalValue = applyOverflowProtection(candidate);
-                if (finalValue <= 0L) {
-                    LOGGER.debug("物品 {} 经过溢出保护后数值为 {}，跳过写入", candidate.item(), finalValue);
-                    continue;
-                }
-
-                if (store != null) {
-                    // 溢出保护已经改变数值时，求解器给出的备选成本不再与最终值可比，
-                    // 继续持久化会让 /sudoemc explain 展示误导性的对比结果。
-                    List<Long> alternativeCosts = finalValue == candidate.value()
-                            ? candidate.alternativeCosts()
-                            : List.of();
-                    boolean staged = store.stage(new GeneratedEmcEntry(
-                            candidate.item(),
-                            finalValue,
-                            candidate.source(),
-                            candidate.recipeId(),
-                            true,
-                            System.currentTimeMillis(),
-                            alternativeCosts),
-                            variantRegistrationNbts.getOrDefault(candidate.item(), List.of()));
-                    if (!staged) {
-                        LOGGER.debug("物品 {} 的生成值未被存储接受，可能已有非 SudoersEMC 拥有的条目",
-                                candidate.item());
-                        continue;
-                    }
-                }
-
-                applied++;
-                sourceCounts.merge(candidate.source().name(), 1L, Long::sum);
-            }
-
-            Set<ItemKey> candidateKeys = new HashSet<>(candidates.size());
-            for (Candidate candidate : candidates) {
-                candidateKeys.add(candidate.item());
-            }
-            int retiredEntries = 0;
-            if (!cancelledDuringApply) {
-                retiredEntries = retireStaleOwnedEntries(
-                        data, candidateKeys, data.existingValues());
-                if (isCancelled()) {
-                    // 清理循环中途取消：不再改写 ProjectE 文件，交由取消路径统一失效指纹。
-                    cancelledDuringApply = true;
-                } else {
-                    rewriteProjectECustomEmcIfEnabled();
-                }
-            }
-
-            int overflowResets = overflowPipeline == null
-                    ? 0
-                    : Math.max(0, overflowPipeline.resetsApplied() - overflowBefore);
-if (store != null) {
-                // 每轮扫描结束即刷新审计日志，崩溃时最多丢失当前这一轮。
-                persistOverflowAudit();
-            }
-            int unresolved = cancelledDuringApply ? 0 : countUnresolved(lastSolveResult, seeds);
-            long durationMillis = elapsedMillis(startedAtNanos);
-
-            lastSolvedCount = applied;
-            lastUnresolvedCount = unresolved;
-            lastDurationMillis = durationMillis;
-
-            boolean appliedToStore = store != null;
-if (!cancelledDuringApply) {
-                updateScanState(data, durationMillis, applied, unresolved, roundsUsed);
-            } else {
-                // 取消时可能已有部分条目 stage 成功并被调度器落盘/重映射；
-                // 即使输入与旧指纹一致，也必须让下一次启动重新扫描，避免部分价格永久生效。
-                invalidateScanState();
-            }
-
-            Map<String, Long> extraCounters = buildExtraCounters(data, lastSolveResult,
-                    quarantined, overflowResets, durationMillis, appliedToStore,
-                    retiredEntries, roundsUsed, lastOwnershipExternalModifications,
-                    lastOwnershipReleased, ownership.refreshedOwned(), diagnostics);
-            extraCounters.put("solverCacheHits", (long) lastSolverCacheHits);
-            extraCounters.put("solverCacheMisses", (long) lastSolverCacheMisses);
-            if (cancelledDuringApply) {
-                extraCounters.put("scanCancelled", 1L);
-                extraCounters.put("partialReport", 1L);
-            }
-
-                    PipelineResult result = new PipelineResult(
-                    solvedByRecipe,
-                    solvedByFallback,
-                    applied,
-                    quarantined,
-                    overflowResets,
-                    unresolved,
-                    durationMillis,
-                    appliedToStore,
-                    sourceCounts,
-                    extraCounters);
-if (cancelledDuringApply) {
-                // 已写入的条目各自原子且一致；这里只写部分报告，交由调度器终止扫描。
-                writePartialReport(data, diagnostics, true, "扫描已取消");
-                fullReportWritten = true;
-            } else {
-                // 完整报告延迟到 ScanManager 完成回调写出，确保 APPLYING/SAVING tick 已经计数。
-                pendingReport = new PendingReport(data, result);
-            }
-            return result;
-        } catch (Throwable failure) {
+            return applyComputation(computation);
+        } catch (RuntimeException failure) {
             long durationMillis = elapsedMillis(startedAtNanos);
             lastSolvedCount = 0;
             lastUnresolvedCount = 0;
             lastSolverRoundCount = 0;
             lastDurationMillis = durationMillis;
-            LOGGER.error("SudoersEMC 扫描管线求解与应用失败，本轮返回全零结果：{}",
-                    failureDetail(failure), failure);
-            // 失败也要留下部分报告；报告层自身保证不抛出异常。
-            // 失败前可能已经 stage 了部分条目；让下一次启动必然重扫，不能复用旧指纹。
+            LOGGER.error("SudoersEMC 扫描管线求解与应用失败", failure);
+            throw new IllegalStateException("扫描管线求解与应用失败", failure);
+        }
+    }
+
+    /**
+     * 开始异步求解最近一次暂存的快照。
+     *
+     * <p>本方法只在服务器线程调用。它立即取走暂存快照并把纯计算提交到 {@link #SOLVER_EXECUTOR}；
+     * 调用方在后续 tick 轮询 {@link #isSolveComplete()}，完成后在服务器线程调用
+     * {@link #applyCompletedSolve()} 执行安全层、存储写入与报告落盘。</p>
+     *
+     * @return 存在暂存快照并已提交求解时返回 {@code true}
+     */
+    public boolean startStashedSolve() {
+        CompletableFuture<Computation> previous = pendingSolve.getAndSet(null);
+        if (previous != null) {
+            previous.cancel(false);
+        }
+        PipelineSnapshot snapshot = stashedSnapshot.getAndSet(null);
+        if (snapshot == null) {
+            LOGGER.warn("SudoersEMC 应用阶段没有可用的暂存快照，跳过本轮写入");
+            return false;
+        }
+        long startedAtNanos = System.nanoTime();
+        ScanFingerprint inputFingerprint = captureInputFingerprint(snapshot);
+        pendingSolve.set(CompletableFuture.supplyAsync(
+                () -> compute(snapshot, startedAtNanos, inputFingerprint), SOLVER_EXECUTOR));
+        return true;
+    }
+
+    /**
+     * @return 后台求解是否已经完成（成功、失败或取消都算完成）
+     */
+    public boolean isSolveComplete() {
+        CompletableFuture<Computation> future = pendingSolve.get();
+        return future != null && future.isDone();
+    }
+
+    /**
+     * 在服务器线程应用已完成的异步求解结果。
+     *
+     * <p>该方法只在后台求解成功时返回结果。没有待处理结果、求解被取消、求解线程抛出异常或
+     * 返回 {@code null} 时都会抛出 {@link IllegalStateException}，由调用方把扫描转为
+     * {@link com.itzplana.sudoersemc.task.ScanPhase#FAILED}；绝不会用全零结果伪装成功，
+     * 从而避免 {@code ScanManager} 进入 COMPLETED。</p>
+     *
+     * @return 本次应用的结果
+     * @throws IllegalStateException 后台求解失败、被取消或没有待处理结果时抛出
+     */
+    public PipelineResult applyCompletedSolve() {
+        CompletableFuture<Computation> future = pendingSolve.getAndSet(null);
+        if (future == null) {
+            throw new IllegalStateException("应用求解结果失败：没有待处理的后台求解");
+        }
+        Computation computation;
+        try {
+            computation = future.join();
+        } catch (RuntimeException failure) {
+            String detail = failure.getMessage();
+            if (detail == null || detail.isBlank()) {
+                detail = failure.getClass().getSimpleName();
+            }
+            LOGGER.error("SudoersEMC 后台求解失败", failure);
+            throw new IllegalStateException("后台求解失败：" + detail, failure);
+        }
+        if (computation == null) {
+            throw new IllegalStateException("应用求解结果失败：后台求解返回 null");
+        }
+        return applyComputation(computation);
+    }
+
+    /**
+     * 取消尚未完成的异步求解。计算本身不可中断，但其结果会被丢弃，绝不会写入存储。
+     */
+    public void cancelPendingSolve() {
+        CompletableFuture<Computation> future = pendingSolve.getAndSet(null);
+        if (future != null) {
+            future.cancel(false);
+        }
+    }
+
+    /**
+     * 纯计算阶段：归属分离、配方求解与候选构建。不得访问注册表、配方管理器或文件系统。
+     */
+    private Computation compute(PipelineSnapshot snapshot, long startedAtNanos,
+                                ScanFingerprint inputFingerprint) {
+        OwnershipApplication ownership = applyOwnershipSeparation(snapshot);
+        PipelineSnapshot data = ownership.snapshot();
+        lastOwnershipExternalModifications = ownership.detected();
+        lastOwnershipReleased = ownership.released();
+        Set<ItemKey> externallyModified = ownership.protectedItems();
+        long minimumEmc = solveSettings.minimumEmc();
+
+        long cacheHitsBefore = recipeSolver.cacheHits();
+        long cacheMissesBefore = recipeSolver.cacheMisses();
+        Map<ItemKey, Candidate> recipeCandidates = new TreeMap<>();
+        Map<ItemKey, Candidate> fallbackCandidates = new TreeMap<>();
+        Map<ItemKey, Long> seeds = initialSeeds(data);
+
+        CreativeProtectionPlan protection = planCreativeProtection(data, seeds, minimumEmc);
+        for (Map.Entry<ItemKey, Long> entry : protection.specialValues().entrySet()) {
+            ItemKey item = entry.getKey();
+            long value = entry.getValue();
+            seeds.put(item, value);
+            recipeCandidates.put(item,
+                    new Candidate(item, value, PriceSource.SPECIAL_VALUE, null));
+        }
+        Set<ItemKey> recipeOutputs = recipeOutputItems(data);
+        Set<ItemKey> variantItems = variantItemKeys(data.items());
+
+        SolveResult lastSolveResult = skippedSolveResult();
+        int roundsUsed = 0;
+        for (int round = 1; round <= MAX_SOLVE_ROUNDS; round++) {
+            roundsUsed = round;
+            SolveResult roundResult = solveRound(data, seeds, protection.deniedItems());
+            lastSolveResult = roundResult;
+
+            boolean solvedProgress = mergeSolvedValues(roundResult, recipeCandidates, seeds,
+                    protection.deniedItems(), protection.specialValues(), variantItems);
+            int fallbackAdded = addFallbackCandidates(
+                    data, seeds, fallbackCandidates, recipeOutputs);
+            if (!solvedProgress && fallbackAdded == 0) {
+                break;
+            }
+        }
+        lastSolverRoundCount = roundsUsed;
+
+        // 收敛后再兜底：配方输出在循环内不会被兜底种子抢先定价，此处只处理仍然无值的物品。
+        addFallbackCandidates(data, seeds, fallbackCandidates, Set.of());
+
+        List<Candidate> candidates =
+                selectFinalCandidates(recipeCandidates, fallbackCandidates, minimumEmc,
+                        this::isCancelled);
+        if (!ownership.protectedItems().isEmpty()) {
+            List<Candidate> filtered = new ArrayList<>(candidates.size());
+            for (Candidate candidate : candidates) {
+                if (!ownership.protectedItems().contains(candidate.item())) {
+                    filtered.add(candidate);
+                }
+            }
+            candidates = List.copyOf(filtered);
+        }
+        int solvedByRecipe = 0;
+        int solvedByFallback = 0;
+        for (Candidate candidate : candidates) {
+            if (candidate.source() == PriceSource.RECIPE) {
+                solvedByRecipe++;
+            } else {
+                solvedByFallback++;
+            }
+        }
+        // 记录本轮求解缓存命中/未命中，供诊断报告暴露（Phase 23 缓存指标）。
+        lastSolverCacheHits = (int) Math.max(0L, recipeSolver.cacheHits() - cacheHitsBefore);
+        lastSolverCacheMisses = (int) Math.max(0L, recipeSolver.cacheMisses() - cacheMissesBefore);
+        return new Computation(data, lastSolveResult, List.copyOf(candidates),
+                solvedByRecipe, solvedByFallback, ownership.refreshedOwned(),
+                externallyModified, inputFingerprint, startedAtNanos);
+    }
+
+    /**
+     * 应用阶段：安全判定、溢出保护、存储写入、状态更新与报告落盘。必须在服务器线程执行。
+     */
+    private PipelineResult applyComputation(Computation computation) {
+        PipelineSnapshot data = computation.snapshot();
+        SolveResult solveResult = computation.solveResult();
+        List<Candidate> candidates = computation.candidates();
+        Set<ItemKey> variantItems = variantItemKeys(data.items());
+        Map<ItemKey, List<String>> variantRegistrationNbts =
+                collectVariantRegistrationNbts(data.recipes(), variantItems);
+
+        Map<ItemKey, GeneratedEmcEntry> previousEntries =
+                store == null ? Map.of() : store.snapshotAll();
+        int staleOwned = countStaleOwned(previousEntries, data, candidates);
+        int overflowBefore = overflowPipeline == null ? 0 : overflowPipeline.resetsApplied();
+
+        int applied = 0;
+        int quarantined = 0;
+        Map<String, Long> sourceCounts = new LinkedHashMap<>();
+
+        int applyIndex = 0;
+        for (Candidate candidate : candidates) {
+            if (applyIndex++ % APPLY_CANCEL_CHECK_INTERVAL == 0 && isCancelled()) {
+                break;
+            }
+            GeneratedEmcEntry previous = previousEntries.get(candidate.item());
+            long previousValue = previous == null ? 0L : previous.value();
+
+            PriceDropDecision decision = evaluateDropProtection(candidate, previousValue);
+            if (!decision.allowed()) {
+                quarantined++;
+                LOGGER.debug("物品 {} 的拟写入值 {} 因大幅降价被隔离（旧值 {}，降幅 {}）",
+                        candidate.item(), candidate.value(), previousValue, decision.dropRatio());
+                continue;
+            }
+
+            long finalValue = applyOverflowProtection(candidate);
+            if (finalValue <= 0L) {
+                LOGGER.debug("物品 {} 经过溢出保护后数值为 {}，跳过写入", candidate.item(), finalValue);
+                continue;
+            }
+
+            if (store != null) {
+                // 溢出保护已经改变数值时，求解器给出的备选成本不再与最终值可比，
+                // 继续持久化会让 /sudoemc explain 展示误导性的对比结果。
+                List<Long> alternativeCosts = finalValue == candidate.value()
+                        ? candidate.alternativeCosts()
+                        : List.of();
+                boolean staged = store.stage(new GeneratedEmcEntry(
+                        candidate.item(),
+                        finalValue,
+                        candidate.source(),
+                        candidate.recipeId(),
+                        true,
+                        System.currentTimeMillis(),
+                        alternativeCosts),
+                        variantRegistrationNbts.getOrDefault(candidate.item(), List.of()));
+                if (!staged) {
+                    LOGGER.debug("物品 {} 的生成值未被存储接受，可能已有非 SudoersEMC 拥有的条目",
+                            candidate.item());
+                    continue;
+                }
+            }
+
+            applied++;
+            sourceCounts.merge(candidate.source().name(), 1L, Long::sum);
+        }
+
+        if (isCancelled()) {
+            // 应用阶段取消：已经 stage 的条目由调度器决定回滚，但持久化指纹必须失效，
+            // 否则下一次启动会以“输入未变化”跳过扫描并沿用部分结果。
+            long durationMillis = elapsedMillis(computation.startedAtNanos());
             invalidateScanState();
-            writePartialReport(data, diagnostics, false, "扫描失败");
-            return PipelineResult.zeroed(durationMillis);
+            lastSolvedCount = applied;
+            lastUnresolvedCount = 0;
+            lastDurationMillis = durationMillis;
+            writePartialReport(data, diagnostics, true, "扫描已取消");
+            fullReportWritten = true;
+            int overflowResets = overflowPipeline == null
+                    ? 0
+                    : Math.max(0, overflowPipeline.resetsApplied() - overflowBefore);
+            long auditDropped = overflowPipeline == null ? 0L : overflowPipeline.auditDroppedCount();
+            Map<String, Long> extraCounters = buildExtraCounters(data, solveResult,
+                    quarantined, overflowResets, durationMillis, store != null,
+                    0, lastSolverRoundCount, lastOwnershipExternalModifications,
+                    lastOwnershipReleased, computation.refreshedOwned(),
+                    auditDropped, staleOwned, diagnostics);
+            extraCounters.put("scanCancelled", 1L);
+            return new PipelineResult(
+                    computation.solvedByRecipe(),
+                    computation.solvedByFallback(),
+                    applied,
+                    quarantined,
+                    overflowResets,
+                    0,
+                    durationMillis,
+                    store != null,
+                    sourceCounts,
+                    extraCounters);
+        }
+
+        Set<ItemKey> candidateKeys = new HashSet<>(candidates.size());
+        for (Candidate candidate : candidates) {
+            candidateKeys.add(candidate.item());
+        }
+        int retiredEntries = retireStaleOwnedEntries(data, candidateKeys, data.existingValues());
+        rewriteProjectECustomEmcIfEnabled();
+
+        if (store != null) {
+            // 每轮扫描结束即刷新审计日志，崩溃时最多丢失当前这一轮。
+            persistOverflowAudit();
+        }
+        int overflowResets = overflowPipeline == null
+                ? 0
+                : Math.max(0, overflowPipeline.resetsApplied() - overflowBefore);
+        long auditDropped = overflowPipeline == null ? 0L : overflowPipeline.auditDroppedCount();
+        int unresolved = solveResult.unresolvedItems().size();
+        long durationMillis = elapsedMillis(computation.startedAtNanos());
+
+        lastSolvedCount = applied;
+        lastUnresolvedCount = unresolved;
+        lastDurationMillis = durationMillis;
+
+        boolean appliedToStore = store != null;
+        updateScanState(computation.inputFingerprint(), durationMillis, applied, unresolved,
+                lastSolverRoundCount);
+        Map<String, Long> extraCounters = buildExtraCounters(data, solveResult,
+                quarantined, overflowResets, durationMillis, appliedToStore,
+                retiredEntries, lastSolverRoundCount, lastOwnershipExternalModifications,
+                lastOwnershipReleased, computation.refreshedOwned(),
+                auditDropped, staleOwned, diagnostics);
+        PipelineResult result = new PipelineResult(
+                computation.solvedByRecipe(),
+                computation.solvedByFallback(),
+                applied,
+                quarantined,
+                overflowResets,
+                unresolved,
+                durationMillis,
+                appliedToStore,
+                sourceCounts,
+                extraCounters);
+        // 完整报告延迟到 ScanManager 完成回调写出，确保 APPLYING/SAVING tick 已经计数。
+        pendingReport = new PendingReport(data, result, null);
+        // 同时立即写出一份：直接调用 solveAndApply 的调用方（命令、测试）期望报告已落盘；
+        // 保留 pendingReport 让完成回调能用最新 tick 采样重写，不丢失 APPLYING/SAVING 指标。
+        writeFullReport(pendingReport);
+        return result;
+    }
+
+    /**
+     * 把一次失败统一转换为全零结果，并清空最近一次运行的统计字段。
+     */
+    private PipelineResult failedResult(long startedAtNanos, Throwable failure) {
+        long durationMillis = elapsedMillis(startedAtNanos);
+        lastSolvedCount = 0;
+        lastUnresolvedCount = 0;
+        lastDurationMillis = durationMillis;
+        LOGGER.error("SudoersEMC 扫描管线求解与应用失败，本轮返回全零结果", failure);
+        return PipelineResult.zeroed(durationMillis);
+    }
+
+    /**
+     * 只读检测被外部修改过的自有条目。
+     *
+     * <p>采集阶段观察到的 ProjectE 当前值如果与持久化记录中的自有值不同，说明管理员或其它
+     * 模组已经改写了该条目。检测只读取存储快照与本轮快照，不写任何状态，因此可以安全地在
+     * 求解工作线程执行；真正的所有权迁移在服务器线程的 {@link #applyComputation} 中完成。</p>
+     *
+     * @return 被外部修改的物品集合；没有存储或读取失败时为空
+     */
+    private Set<ItemKey> detectExternallyModifiedOwnership(PipelineSnapshot snapshot) {
+        if (store == null) {
+            return Set.of();
+        }
+        Map<ItemKey, Long> observed = new TreeMap<>();
+        for (ItemSnapshot item : snapshot.items()) {
+            if (item.hasExistingEmc() && item.existingValue() > 0L) {
+                observed.put(item.key(), item.existingValue());
+            }
+        }
+        OwnershipManager manager = new OwnershipManager(store, item -> observed.getOrDefault(item, 0L));
+        try {
+            return Set.copyOf(manager.detectExternalModifications());
+        } catch (RuntimeException failure) {
+            LOGGER.warn("SudoersEMC 检测外部修改失败，本轮保留现有归属", failure);
+            return Set.of();
+        }
+    }
+
+    /**
+     * 纯计算结果载体：快照、求解结果、候选与计数。
+     */
+    private record Computation(
+            PipelineSnapshot snapshot,
+            SolveResult solveResult,
+            List<Candidate> candidates,
+            int solvedByRecipe,
+            int solvedByFallback,
+            int refreshedOwned,
+            Set<ItemKey> externallyModified,
+            ScanFingerprint inputFingerprint,
+            long startedAtNanos
+    ) {
+
+        private Computation {
+            candidates = List.copyOf(candidates);
+            externallyModified = externallyModified == null ? Set.of() : Set.copyOf(externallyModified);
         }
     }
 
@@ -1799,8 +2149,8 @@ if (cancelledDuringApply) {
      * 即视为完全没有参与定价。非自有条目（手动配置或外部后端写入）永远不会删除。</p>
      *
      * <p>以下情况直接跳过，避免把“本轮没有计算”误判成“条目陈旧”：干跑模式
-     * （{@code store == null}）、配方求解被禁用、本轮没有任何候选，或快照没有任何物品
-     * （例如服务器尚未就绪）。</p>
+     * （{@code store == null}）、配方求解被禁用、配方描述失败导致本轮求解不完整、本轮没有任何
+     * 候选，或快照没有任何物品（例如服务器尚未就绪）。</p>
      *
      * @param snapshot       本轮采集结果
      * @param pricedKeys     本轮选出的候选物品集合
@@ -1812,6 +2162,12 @@ if (cancelledDuringApply) {
         if (store == null) {
             return 0;
         }
+        if (snapshot.failedRecipes() > 0) {
+            LOGGER.debug("本轮有 {} 条配方描述失败，求解结果可能不完整，跳过陈旧自有条目清理",
+                    snapshot.failedRecipes());
+            return 0;
+        }
+
         if (!solveRecipesEnabled) {
             LOGGER.debug("配方求解已禁用，跳过陈旧自有条目清理");
             return 0;
@@ -1876,15 +2232,75 @@ if (cancelledDuringApply) {
     }
 
     /**
-     * @return 最近一次 {@link #solveAndApply(PipelineSnapshot)} 实际执行的求解轮数；
-     *         空世界或第一轮就无新增值时为 {@code 1}
+     * @return 最近一次求解实际执行的轮数；空世界或首轮无进展时为 1
      */
     int lastSolverRoundCount() {
         return lastSolverRoundCount;
     }
 
     /**
-     * 构造初始求解种子。
+     * 把自有叶子条目的兜底价预置到求解上下文中。
+     *
+     * <p>叶子条目指本轮没有任何“实际会被发布的配方输出”的自有物品。默认
+     * {@link EvaluationPolicy#defaults()} 只发布主输出，副产物不会被求解器写值，因此仅作为
+     * 副产物出现的自有物品也必须按叶子处理。它们的旧值已被归属分离清除，若等到求解结束才做
+     * 兜底定价，依赖它们的多级配方产物在本轮就看不到新值。预置值只参与输入查找，不会让
+     * {@link SolveContext#hasSeedValue(ItemKey)} 返回 {@code true}，因此配方仍可覆盖同一物品
+     * 的预置值。</p>
+     *
+     * @param snapshot   已完成归属分离的快照
+     * @param ownedItems 自有物品键集合
+     * @param context    本次求解上下文
+     * @param policy     与求解器一致的发布策略
+     * @return 实际预置的条目数量
+     */
+    private int seedOwnedFallbackValues(PipelineSnapshot snapshot, Set<ItemKey> ownedItems,
+                                        SolveContext context, EvaluationPolicy policy) {
+        if (ownedItems.isEmpty()) {
+            return 0;
+        }
+        Set<ItemKey> recipeOutputs = new HashSet<>();
+        for (RecipeSnapshot recipe : snapshot.recipes()) {
+            recipeOutputs.addAll(RecipeSolver.publicationTargets(recipe, policy));
+        }
+
+        int seeded = 0;
+        for (ItemSnapshot itemSnapshot : snapshot.items()) {
+            ItemKey item = itemSnapshot.key();
+            if (!ownedItems.contains(item) || recipeOutputs.contains(item)) {
+                continue;
+            }
+            Optional<Candidate> fallback = fallbackCandidate(itemSnapshot);
+            if (fallback.isEmpty()) {
+                continue;
+            }
+            context.putProvisional(item, fallback.get().value());
+            seeded++;
+        }
+        if (seeded > 0) {
+            LOGGER.debug("为 {} 个自有叶子条目预置兜底定价，供本轮多级配方链使用", seeded);
+        }
+        return seeded;
+    }
+
+    /**
+     * 批准某个物品当前的内存隔离决策。
+     *
+     * <p>命令层在批准持久化记录后调用本方法，确保 {@link LargeDropProtection#approve} 有生产
+     * 调用方；返回的决策只用于诊断与回执，数值应用由命令层依据持久化记录完成。</p>
+     *
+     * @param item 被批准物品；{@code null} 会被忽略
+     * @return 本次从内存隔离列表移除的决策，按加入顺序排列
+     */
+    public List<PriceDropDecision> approveQuarantined(@Nullable ItemKey item) {
+        if (item == null) {
+            return List.of();
+        }
+        return dropProtection.approve(item);
+    }
+
+    /**
+     * 把求解器产出的配方值转换为候选条目。
      *
      * <p>只有严格大于 0 的既有 EMC 才能成为种子：0 或负值等同于“没有值”，
      * 否则会遮蔽后续的配方与兜底定价。</p>
@@ -1893,7 +2309,11 @@ if (cancelledDuringApply) {
         Map<ItemKey, Long> seeds = new TreeMap<>();
         for (Map.Entry<ItemKey, Long> entry : snapshot.existingValues().entrySet()) {
             Long value = entry.getValue();
-            if (value != null && value > 0L) {
+            if (value == null) {
+                throw new IllegalArgumentException(
+                        "existingValues 不允许 null 值：" + entry.getKey());
+            }
+            if (value > 0L) {
                 seeds.put(entry.getKey(), value);
             }
         }
@@ -2143,8 +2563,9 @@ SolveContext context = new SolveContext(seeds, deniedItems);
                     continue;
                 }
                 TreeSet<String> forms = observed.computeIfAbsent(key, ignored -> new TreeSet<>());
-                if (forms.size() < VariantRegistration.MAX_OBSERVED_NBT_PER_VARIANT) {
-                    forms.add(snbt);
+                forms.add(snbt);
+                if (forms.size() > VariantRegistration.MAX_OBSERVED_NBT_PER_VARIANT) {
+                    forms.pollLast();
                 }
             }
         }
@@ -2195,55 +2616,14 @@ SolveContext context = new SolveContext(seeds, deniedItems);
             if (existingValue != null && existingValue > 0L) {
                 continue;
             }
-            CreativeItemProtection.Decision decision;
-            try {
-                decision = creativeProtection.decide(item, false, false);
-            } catch (RuntimeException failure) {
-                LOGGER.warn("创造物品保护判定失败，跳过物品 {} 的兜底定价", item, failure);
+            Optional<Candidate> fallback = fallbackCandidate(itemSnapshot);
+            if (fallback.isEmpty()) {
                 continue;
             }
-            if (!decision.priceable()) {
-                LOGGER.debug("物品 {} 被创造物品保护排除，跳过兜底定价", item);
+            Candidate candidate = fallback.get();
+            if (candidate.value() <= 0L || candidate.value() < minimumEmc) {
                 continue;
             }
-            if (decision.specialValue() <= 0L && isTierExcluded(item)) {
-                LOGGER.debug("物品 {} 被层级排除规则命中，跳过兜底定价", item);
-                continue;
-            }
-
-            if (decision.specialValue() > 0L) {
-                if (decision.specialValue() >= minimumEmc) {
-                    Candidate candidate = new Candidate(
-                            item, decision.specialValue(), PriceSource.TIER, null);
-                    candidates.put(item, candidate);
-                    seeds.put(item, candidate.value());
-                    added++;
-                }
-                continue;
-            }
-
-            if (fallbackPricing == null) {
-                continue;
-            }
-
-            Optional<FallbackPricing.PricedValue> priced;
-            try {
-                priced = fallbackPricing.price(new FallbackPricing.PricingRequest(
-                        item, itemSnapshot.tagPaths(), itemSnapshot.rarity(), 0L, 0L));
-            } catch (RuntimeException failure) {
-                LOGGER.warn("兜底定价失败，跳过物品 {}", item, failure);
-                continue;
-            }
-            if (priced.isEmpty()) {
-                continue;
-            }
-
-            FallbackPricing.PricedValue pricedValue = priced.get();
-            if (pricedValue.value() <= 0L || pricedValue.value() < minimumEmc) {
-                continue;
-            }
-            Candidate candidate =
-                    new Candidate(item, pricedValue.value(), pricedValue.source(), null);
             candidates.put(item, candidate);
             seeds.put(item, candidate.value());
             added++;
@@ -2252,33 +2632,58 @@ SolveContext context = new SolveContext(seeds, deniedItems);
     }
 
     /**
-     * 把一次被隔离的降价写入持久化隔离记录。
+     * 按创造物品保护与兜底定价链为一个物品计算兜底候选。
      *
-     * <p>干跑模式（生成条目存储为 {@code null}）或未注入隔离存储时不产生任何磁盘写入，原有
-     * 的计数与日志行为保持不变。记录失败只影响隔离文件，不影响本轮扫描结果。</p>
-     *
-     * @param candidate 被隔离的候选值
-     * @param decision  降价保护判定结果
+     * <p>预置值与求解后的兜底候选共用这段逻辑，确保同一轮内看到的定价完全一致。任何定价
+     * 组件抛出异常时都按“该物品不定价”处理，不影响其余物品。</p>
      */
-    private void recordQuarantine(Candidate candidate, PriceDropDecision decision) {
-        QuarantinedDropsStore target = quarantinedDropsStore;
-        if (target == null || store == null) {
-            return;
+    private Optional<Candidate> fallbackCandidate(ItemSnapshot itemSnapshot) {
+        ItemKey item = itemSnapshot.key();
+        if (isExcludedFromPricing(item)) {
+            LOGGER.debug("物品 {} 被排除规则命中，跳过兜底定价", item);
+            return Optional.empty();
         }
+        CreativeItemProtection.Decision decision;
         try {
-            target.record(new QuarantinedDropsStore.QuarantinedDrop(
-                    candidate.item(),
-                    decision.previousValue(),
-                    decision.proposedValue(),
-                    decision.dropRatio(),
-                    decision.reason(),
-                    System.currentTimeMillis(),
-                    // 审批状态由 QuarantinedDropsStore.record 在“同一经济判定”时保留。
-                    false));
+            decision = creativeProtection.decide(item, false, false);
         } catch (RuntimeException failure) {
-            LOGGER.warn("写入隔离记录失败，物品 {} 的隔离计数仍然有效", candidate.item(), failure);
+            LOGGER.warn("创造物品保护判定失败，跳过物品 {} 的兜底定价", item, failure);
+            return Optional.empty();
         }
+        if (!decision.priceable()) {
+            return Optional.empty();
+        }
+
+        if (decision.specialValue() > 0L) {
+            return Optional.of(new Candidate(item, decision.specialValue(), PriceSource.SPECIAL_VALUE, null));
+        }
+
+        if (fallbackPricing == null) {
+            return Optional.empty();
+        }
+
+        Optional<FallbackPricing.PricedValue> priced;
+        try {
+            long externalBaseline = useProjectEIntegrationBaselines
+                    ? externalBaselineFor(itemSnapshot)
+                    : 0L;
+            priced = fallbackPricing.price(new FallbackPricing.PricingRequest(
+                    item, itemSnapshot.tagPaths(), itemSnapshot.rarity(), 0L, externalBaseline));
+        } catch (RuntimeException failure) {
+            LOGGER.warn("兜底定价失败，跳过物品 {}", item, failure);
+            return Optional.empty();
+        }
+        if (priced.isEmpty()) {
+            return Optional.empty();
+        }
+
+        FallbackPricing.PricedValue pricedValue = priced.get();
+        if (pricedValue.value() <= 0L) {
+            return Optional.empty();
+        }
+        return Optional.of(new Candidate(item, pricedValue.value(), pricedValue.source(), null));
     }
+
 
     /**
      * 汇总创造物品保护在本轮扫描中的判定结果。
@@ -2335,15 +2740,12 @@ SolveContext context = new SolveContext(seeds, deniedItems);
      */
     private static Set<ItemKey> recipeOutputItems(PipelineSnapshot snapshot) {
         Set<ItemKey> outputs = new HashSet<>();
+        EvaluationPolicy policy = EvaluationPolicy.defaults();
         for (RecipeSnapshot recipe : snapshot.recipes()) {
-            if (recipe == null || recipe.outputs() == null) {
+            if (recipe == null) {
                 continue;
             }
-            for (RecipeOutput output : recipe.outputs()) {
-                if (output != null && output.item() != null) {
-                    outputs.add(output.item());
-                }
-            }
+            outputs.addAll(RecipeSolver.publicationTargets(recipe, policy));
         }
         return outputs;
     }
@@ -2361,6 +2763,34 @@ SolveContext context = new SolveContext(seeds, deniedItems);
             deniedItems = Set.copyOf(deniedItems);
             specialValues = Map.copyOf(specialValues);
         }
+    }
+
+
+    /**
+     * 执行创造物品保护判定。
+     *
+     * @return 判定结果；判定异常时返回 {@code null}，调用方必须按“排除”处理
+     */
+    @Nullable
+    private CreativeItemProtection.Decision creativeDecision(ItemKey item) {
+        try {
+            return creativeProtection.decide(item, true, true);
+        } catch (RuntimeException failure) {
+            LOGGER.warn("创造物品保护判定失败，按排除处理：{}", item, failure);
+            return null;
+        }
+    }
+
+    /**
+     * 读取物品的 ProjectE 集成基线。
+     *
+     * <p><strong>Phase 12 阶段说明：</strong>本阶段没有接入外部基线数据源，返回值恒为
+     * {@code 0}。Phase 25 的 {@code ExternalBaselineSource} 接线后由本方法转发真实基线。
+     * 配置开关 {@code fallback.useProjectEIntegrationBaselines=false} 时调用方会直接传
+     * {@code 0}，不会走到这里。</p>
+     */
+    private long externalBaselineFor(ItemSnapshot item) {
+        return 0L;
     }
 
     /**
@@ -2461,13 +2891,13 @@ SolveContext context = new SolveContext(seeds, deniedItems);
     /**
      * 更新增量扫描状态。状态存储自身不会抛出异常，这里仍捕获运行时异常以保护结果返回路径。
      */
-    private void updateScanState(PipelineSnapshot snapshot, long durationMillis,
+    private void updateScanState(@Nullable ScanFingerprint inputFingerprint, long durationMillis,
                                  int solvedCount, int unresolvedCount, int solverRounds) {
-        if (stateStore == null) {
+        if (stateStore == null || inputFingerprint == null) {
             return;
         }
         try {
-            stateStore.update(fingerprint(snapshot), durationMillis, solvedCount, unresolvedCount,
+            stateStore.update(inputFingerprint, durationMillis, solvedCount, unresolvedCount,
                     solverRounds);
         } catch (RuntimeException failure) {
             LOGGER.warn("更新扫描状态失败，本轮结果仍然有效", failure);
@@ -2492,7 +2922,7 @@ SolveContext context = new SolveContext(seeds, deniedItems);
     }
 
     /**
-     * 写出等待中的完整诊断报告。
+     * 写出等待中的诊断报告。
      *
      * <p>必须在扫描的最后一个 tick 采样完成后调用（生产接线由
      * {@code ScanManager.ResultApplier#onCompleted()} 触发），这样 APPLYING/SAVING tick 的
@@ -2500,31 +2930,71 @@ SolveContext context = new SolveContext(seeds, deniedItems);
      * tick 数、耗时与峰值堆可能比 {@code applyStashed()} 返回的 {@link PipelineResult#extraCounters()}
      * 更新；磁盘写入失败时 {@code fullReportWritten} 保持 {@code false}，后续取消/失败路径
      * 仍可写出部分报告。</p>
+     *
+     * <p>{@code solveAndApply} 内部失败时同样通过这里写出失败报告：异常被捕获时 APPLYING
+     * tick 尚未由 {@code ScanManager} 统一采样，立即写盘会漏掉本 tick 的耗时与 P95，
+     * 因此失败报告与完整报告共用“完成回调后再写”的时点。</p>
      */
-public void writePendingReport() {
+    public void writePendingReport() {
+        flushPendingReport(diagnostics);
+    }
+
+    /**
+     * 消费并写出等待中的报告。
+     *
+     * @param telemetry 调度器共享的诊断采样器；{@code null} 时使用管线内部实例
+     * @return {@code true} 表示等待中的报告已被处理（完整报告写出、延迟失败报告写出，
+     *         或报告开关关闭）；{@code false} 表示没有等待报告，或完整报告写盘失败、
+     *         调用方仍应回退到部分报告
+     */
+    private boolean flushPendingReport(@Nullable ScanDiagnostics telemetry) {
         PendingReport pending = pendingReport;
         pendingReport = null;
         if (pending == null) {
-            return;
+            return false;
         }
         if (!generateReportsEnabled || reportManager == null) {
-            return;
+            return true;
+        }
+        if (pending.failureReason() != null) {
+            ScanDiagnostics selected = telemetry == null ? diagnostics : telemetry;
+            writePartialReportNow(pending.snapshot(), selected, false, "扫描失败");
+            return true;
+        }
+        return writeFullReport(pending);
+    }
+
+    /**
+     * 写出完整诊断报告。
+     *
+     * @return 磁盘写入成功返回 {@code true}；写入失败或异常时返回 {@code false}
+     */
+    private boolean writeFullReport(PendingReport pending) {
+        if (!generateReportsEnabled || reportManager == null) {
+            return false;
         }
         try {
             Map<String, Long> counters = new LinkedHashMap<>(pending.result().extraCounters());
             refreshDiagnosticCounters(counters, pending.result().durationMillis(), diagnostics);
             if (reportManager.writeReport(buildReport(pending.snapshot(), pending.result(), counters))) {
                 fullReportWritten = true;
+                return true;
             }
         } catch (RuntimeException failure) {
             LOGGER.warn("写入诊断报告失败，本轮结果仍然有效", failure);
         }
+        return false;
     }
 
     /**
-     * 等待完成回调写出的完整报告参数。
+     * 等待完成回调写出的报告参数。
+     *
+     * @param snapshot      本轮采集快照
+     * @param result        本轮完整结果；失败报告时为全零结果
+     * @param failureReason 非 {@code null} 表示求解/应用阶段失败，报告必须按部分报告写出
      */
-    private record PendingReport(PipelineSnapshot snapshot, PipelineResult result) {
+    private record PendingReport(PipelineSnapshot snapshot, PipelineResult result,
+                                 @Nullable String failureReason) {
     }
 
     /**
@@ -2566,13 +3036,27 @@ public void writePendingReport() {
     private void writePartialReport(@Nullable PipelineSnapshot snapshot,
                                     @Nullable ScanDiagnostics telemetry,
                                     boolean cancelled, String reason) {
-        if (!generateReportsEnabled || reportManager == null) {
+        ScanDiagnostics selected = telemetry == null ? diagnostics : telemetry;
+        // 扫描已经完成或求解阶段失败时，等待中的报告必须包含完成回调前的全部 tick；
+        // 先消费它，既避免完整报告被部分报告覆盖，也避免延迟失败报告重复写出。
+        if (flushPendingReport(selected)) {
+            LOGGER.debug("本轮扫描已有待写报告，跳过部分报告（{}）", reason);
             return;
         }
-        // 扫描已经完成但完成回调尚未触发时，优先写出包含全部 tick 的完整报告。
-        writePendingReport();
         if (fullReportWritten) {
             LOGGER.debug("完整诊断报告已写出，跳过部分报告（{}）", reason);
+            return;
+        }
+        writePartialReportNow(snapshot, selected, cancelled, reason);
+    }
+
+    /**
+     * 立即写出部分报告。调用方必须已经消费等待中的报告，避免覆盖完整报告。
+     */
+    private void writePartialReportNow(@Nullable PipelineSnapshot snapshot,
+                                       @Nullable ScanDiagnostics telemetry,
+                                       boolean cancelled, String reason) {
+        if (!generateReportsEnabled || reportManager == null) {
             return;
         }
         ScanDiagnostics selected = telemetry == null ? diagnostics : telemetry;
@@ -2583,7 +3067,7 @@ public void writePendingReport() {
             PipelineResult partial = PipelineResult.zeroed(durationMillis);
             Map<String, Long> counters = buildExtraCounters(data, skippedSolveResult(), 0, 0,
                     durationMillis, store != null, 0, 0,
-                    lastOwnershipExternalModifications, lastOwnershipReleased, 0, selected);
+                    lastOwnershipExternalModifications, lastOwnershipReleased, 0, 0L, 0, selected);
             counters.put("partialReport", 1L);
             counters.put("scanCancelled", cancelled ? 1L : 0L);
             counters.put("scanFailed", cancelled ? 0L : 1L);
@@ -2602,7 +3086,7 @@ public void writePendingReport() {
      * 完全一致。配方统计、求解轮数、隔离/清理数量、逐 tick 耗时与内存采样都集中在这里，
      * 报告层无需再次推算。</p>
      */
-    private static Map<String, Long> buildExtraCounters(PipelineSnapshot snapshot,
+    private Map<String, Long> buildExtraCounters(PipelineSnapshot snapshot,
                                                          SolveResult solveResult,
                                                          int quarantined, int overflowResets,
                                                          long durationMillis,
@@ -2611,6 +3095,7 @@ public void writePendingReport() {
                                                          int ownershipExternalModifications,
                                                          int ownershipReleased,
                                                          int refreshedOwned,
+                                                         long auditDropped, int staleOwned,
                                                          @Nullable ScanDiagnostics telemetry) {
         ScanDiagnostics selected = telemetry == null ? new ScanDiagnostics() : telemetry;
         selected.recordMemory();
@@ -2666,6 +3151,10 @@ public void writePendingReport() {
         counters.put("ownershipExternalModifications", (long) ownershipExternalModifications);
         counters.put("ownershipReleasedEntries", (long) ownershipReleased);
         counters.put("ownedRefreshed", (long) refreshedOwned);
+        counters.put("overflowAuditDropped", auditDropped);
+        counters.put("staleOwnedEntries", (long) staleOwned);
+        counters.put("solverCacheHits", (long) lastSolverCacheHits);
+        counters.put("solverCacheMisses", (long) lastSolverCacheMisses);
         counters.put("dryRun", appliedToStore ? 0L : 1L);
         refreshDiagnosticCounters(counters, durationMillis, telemetry);
         counters.put("partialReport", 0L);
@@ -2737,9 +3226,73 @@ public void writePendingReport() {
     }
 
     /**
-     * 计算扫描指纹：物品/配方内容、标签、配置与外部基线五个通道全部参与。
+     * 统计本轮未被刷新的自有条目数量。
      *
-     * <p>配置与基线来源在读取失败时退化为固定错误标记，不会阻止扫描完成。</p>
+     * <p>包括两类：物品已不在本次扫描快照中（例如注册表移除或被忽略），以及物品仍在扫描
+     * 结果中但本轮没有产生任何候选值（例如配方/标签变化后不再可定价）。本方法只用于诊断
+     * 暴露，不会自动删除或迁移记录；删除玩家数据需要明确的业务语义，留待后续阶段。</p>
+     *
+     * @param previousEntries 应用前的存储快照
+     * @param snapshot        本轮扫描快照
+     * @param candidates      本轮构建的候选值
+     * @return 未被刷新的自有条目数量
+     */
+    private static int countStaleOwned(Map<ItemKey, GeneratedEmcEntry> previousEntries,
+                                       PipelineSnapshot snapshot, List<Candidate> candidates) {
+        if (previousEntries.isEmpty()) {
+            return 0;
+        }
+        Set<ItemKey> scannedItems = new HashSet<>();
+        for (ItemSnapshot item : snapshot.items()) {
+            scannedItems.add(item.key());
+        }
+        Set<ItemKey> refreshedItems = new HashSet<>();
+        for (Candidate candidate : candidates) {
+            refreshedItems.add(candidate.item());
+        }
+        int stale = 0;
+        for (Map.Entry<ItemKey, GeneratedEmcEntry> entry : previousEntries.entrySet()) {
+            GeneratedEmcEntry value = entry.getValue();
+            if (value == null || !value.owned()) {
+                continue;
+            }
+            if (!scannedItems.contains(entry.getKey()) || !refreshedItems.contains(entry.getKey())) {
+                stale++;
+            }
+        }
+        return stale;
+    }
+
+    /**
+     * 计算本次扫描的完整输入指纹。
+     *
+     * <p>生产接线会注入完整指纹提供器（物品、配方内容、标签成员、配置与基线通道）；提供器
+     * 未注入时才退回仅基于快照的指纹，供不接触游戏状态的单元测试使用。已注入提供器但调用失败
+     * 或返回 {@code null} 时抛出 {@link IllegalStateException}，绝不把不完整指纹写入扫描状态或
+     * 用于采集前后一致性校验。提供器必须在服务器线程调用，因此本方法只在求解启动阶段执行。</p>
+     *
+     * @throws IllegalStateException 指纹提供器失败或返回 {@code null} 时
+     */
+    private ScanFingerprint captureInputFingerprint(PipelineSnapshot snapshot) {
+        Supplier<ScanFingerprint> supplier = inputFingerprintSupplier;
+        if (supplier == null) {
+            return fingerprint(snapshot);
+        }
+        ScanFingerprint fingerprint;
+        try {
+            fingerprint = supplier.get();
+        } catch (RuntimeException failure) {
+            LOGGER.error("计算扫描输入指纹失败，拒绝使用不完整指纹继续扫描", failure);
+            throw new IllegalStateException("计算扫描输入指纹失败", failure);
+        }
+        if (fingerprint == null) {
+            throw new IllegalStateException("计算扫描输入指纹失败：提供器返回 null");
+        }
+        return fingerprint;
+    }
+
+    /**
+     * 计算扫描指纹：物品 id、配方 id 升序摘要；标签、配置与基线通道在快照降级路径中为空。
      */
     private ScanFingerprint fingerprint(PipelineSnapshot snapshot) {
         return fingerprintFor(

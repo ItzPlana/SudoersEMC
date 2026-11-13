@@ -137,6 +137,7 @@ public final class FallbackPricing {
         );
     }
 
+
     /**
      * 按 {@code EXISTING → 排除检查 → EXTERNAL_BASELINE → TAG → TIER → RARITY → FALLBACK}
      * 的顺序定价。

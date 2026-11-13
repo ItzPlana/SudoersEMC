@@ -13,6 +13,7 @@ import com.mojang.brigadier.exceptions.CommandSyntaxException;
 import com.mojang.brigadier.tree.CommandNode;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 import net.minecraft.commands.CommandSource;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.arguments.ResourceLocationArgument;
@@ -51,10 +52,13 @@ class SudoemcCommandsTest {
     void rootRegistersAllSubcommands() {
         CommandNode<CommandSourceStack> root = root();
 
-        for (String subcommand : List.of("status", "rescan-all", "reload", "report", "explain", "cancel")) {
+        for (String subcommand : List.of(
+                "status", "rescan-all", "reload", "report", "explain", "quarantine", "cancel")) {
             assertNotNull(root.getChild(subcommand), "缺少子命令 " + subcommand);
         }
         assertNotNull(root.getChild("explain").getChild("item"), "explain 必须带 item 参数");
+        assertNotNull(root.getChild("quarantine").getChild("approve").getChild("item"),
+                "quarantine approve 必须带 item 参数");
     }
 
     @Test
@@ -111,6 +115,25 @@ class SudoemcCommandsTest {
         List<String> cleared = new ArrayList<>();
         assertEquals(0, dispatcher.execute("sudoemc status", source(2, cleared)));
         assertEquals(List.of("命令服务尚未初始化"), cleared);
+    }
+
+    @Test
+    void quarantineApproveParsesItemAndInvokesAction() throws CommandSyntaxException {
+        AtomicReference<String> approved = new AtomicReference<>();
+        SudoemcCommands.setService(new CommandService(
+                null, null, null, null, null,
+                item -> {
+                    approved.set(item);
+                    return CommandResult.ok("已批准 " + item);
+                }));
+        List<String> messages = new ArrayList<>();
+
+        int result = dispatcher.execute(
+                "sudoemc quarantine approve minecraft:stone", source(2, messages));
+
+        assertEquals(1, result);
+        assertEquals("minecraft:stone", approved.get());
+        assertEquals(List.of("已批准 minecraft:stone"), messages);
     }
 
     @Test

@@ -1,6 +1,7 @@
 package com.itzplana.sudoersemc.safety;
 
 import com.itzplana.sudoersemc.core.ItemKey;
+import com.itzplana.sudoersemc.storage.QuarantinedDropsStore;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashSet;
@@ -9,6 +10,9 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.regex.Pattern;
 import net.minecraft.resources.ResourceLocation;
+import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * 大幅降价保护：当新值相对旧值下跌超过配置比例时，把这次变更放入隔离区，等待管理员确认。
@@ -24,17 +28,44 @@ public final class LargeDropProtection {
 
     /** 合法命名空间：小写字母、数字、下划线、连字符与点。 */
     private static final Pattern NAMESPACE_PATTERN = Pattern.compile("[a-z0-9_.-]+");
+    private static final Logger LOGGER =
+            LoggerFactory.getLogger("sudoersemc/safety/LargeDropProtection");
 
     private final Settings settings;
     private final Object lock = new Object();
     private final List<QuarantinedDecision> quarantine = new ArrayList<>();
     private final Set<ItemKey> approvedItems = new LinkedHashSet<>();
 
+    /** 可选持久化存储；生产环境注入后每次隔离都会同步记录。 */
+    @Nullable
+    private volatile QuarantinedDropsStore quarantineStore;
+
     /**
      * @param settings 保护配置；不能为 {@code null}
      */
     public LargeDropProtection(Settings settings) {
+        this(settings, null);
+    }
+
+    /**
+     * @param settings        保护配置；不能为 {@code null}
+     * @param quarantineStore 隔离记录持久化存储；{@code null} 时只保留内存状态
+     */
+    public LargeDropProtection(Settings settings, @Nullable QuarantinedDropsStore quarantineStore) {
         this.settings = Objects.requireNonNull(settings, "settings");
+        this.quarantineStore = quarantineStore;
+    }
+
+    /**
+     * 运行时注入或替换隔离记录存储。
+     *
+     * <p>供 {@code ScanPipeline#setQuarantinedDropsStore} 在管线重建或测试装配时使用；
+     * 传入 {@code null} 时只保留内存隔离状态。
+     *
+     * @param newStore 隔离记录存储，允许为 {@code null}
+     */
+    public void setQuarantineStore(@Nullable QuarantinedDropsStore newStore) {
+        this.quarantineStore = newStore;
     }
 
     /**
@@ -217,10 +248,37 @@ public final class LargeDropProtection {
                 quarantine.removeIf(entry -> entry.item().equals(item));
                 quarantine.add(new QuarantinedDecision(item, decision));
             }
+            recordQuarantine(item, decision);
             return decision;
         }
         return PriceDropDecision.allowed(
                 previousValue, proposedValue, dropRatio, "drop-within-threshold");
+    }
+
+    /**
+     * 把一次隔离写入可选的持久化存储。
+     *
+     * <p>持久化失败只记录警告，不影响本次判定与内存隔离列表；存储自身已经对输入做校验并
+     * 对同一物品去重。</p>
+     */
+    private void recordQuarantine(ItemKey item, PriceDropDecision decision) {
+        QuarantinedDropsStore store = quarantineStore;
+        if (store == null) {
+            return;
+        }
+        try {
+            store.record(new QuarantinedDropsStore.QuarantinedDrop(
+                    item,
+                    decision.previousValue(),
+                    decision.proposedValue(),
+                    decision.dropRatio(),
+                    decision.reason(),
+                    System.currentTimeMillis(),
+                    false));
+        } catch (RuntimeException failure) {
+            // 存储层已经承诺不抛出异常；这里仍然兜底，避免未来实现变化阻断扫描。
+            LOGGER.warn("写入隔离记录失败（物品 {}）", item, failure);
+        }
     }
 
     /**

@@ -442,7 +442,9 @@ public final class RecipeSolver {
      *
      * <p>默认策略只给主输出定价；显式开启副产物定价时，所有不同输出物品都会收到同一个单位值。</p>
      */
-    private static List<ItemKey> publicationTargets(RecipeSnapshot recipe, EvaluationPolicy policy) {
+    public static List<ItemKey> publicationTargets(RecipeSnapshot recipe, EvaluationPolicy policy) {
+        Objects.requireNonNull(recipe, "recipe");
+        Objects.requireNonNull(policy, "policy");
         if (!recipe.hasOutputs()) {
             return List.of();
         }

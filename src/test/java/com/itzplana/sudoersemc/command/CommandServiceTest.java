@@ -26,6 +26,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import net.minecraft.SharedConstants;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.Bootstrap;
@@ -137,6 +139,27 @@ class CommandServiceTest {
     }
 
     @Test
+    void statusShowsFailureDetail() {
+        ScanManager manager = new ScanManager(
+                new BatchProcessor(1, false),
+                () -> {
+                    throw new IllegalStateException("采集失败原因");
+                },
+                data -> { },
+                1_000_000L);
+        assertTrue(manager.requestScan());
+        manager.tick();
+
+        CommandService service = new CommandService(manager, null, null, null);
+        CommandResult result = service.status();
+
+        assertTrue(result.success());
+        assertTrue(result.joinLines().contains("扫描状态: 失败"), result.joinLines());
+        assertTrue(result.joinLines().contains("详情    : 采集失败原因"),
+                "FAILED 原因必须通过 /sudoemc status 的详情行保留");
+    }
+
+    @Test
     void statusUsesScanStateStoreForLastScanSummary() {
         ScanStateStore stateStore = new ScanStateStore(tempDir.resolve(ScanStateStore.FILE_NAME));
         stateStore.update(ScanFingerprint.of(null, null, null, null, null), 1234L, 56, 7, 3);
@@ -215,6 +238,43 @@ class CommandServiceTest {
 
         assertFalse(result.success());
         assertEquals(List.of("配置校验失败，已保留上一份有效配置"), result.lines());
+    }
+
+    @Test
+    void reloadConfigRejectsNullDecision() {
+        CommandService service = new CommandService(null, null, null, null, () -> null);
+
+        CommandResult result = service.reloadConfig();
+
+        assertFalse(result.success());
+        assertEquals(List.of("配置校验失败，已保留上一份有效配置"), result.lines());
+    }
+
+    @Test
+    void approveQuarantineWithoutActionFails() {
+        CommandService service = new CommandService(null, null, null, null);
+
+        CommandResult result = service.approveQuarantine("minecraft:stone");
+
+        assertFalse(result.success());
+        assertEquals(List.of("隔离审批服务不可用"), result.lines());
+    }
+
+    @Test
+    void approveQuarantineInvokesInjectedActionWithTrimmedId() {
+        AtomicReference<String> seen = new AtomicReference<>();
+        CommandService service = new CommandService(
+                null, null, null, null, null,
+                item -> {
+                    seen.set(item);
+                    return CommandResult.ok("已批准 " + item);
+                });
+
+        CommandResult result = service.approveQuarantine("  minecraft:stone  ");
+
+        assertTrue(result.success());
+        assertEquals("minecraft:stone", seen.get());
+        assertEquals(List.of("已批准 minecraft:stone"), result.lines());
     }
 
     @Test

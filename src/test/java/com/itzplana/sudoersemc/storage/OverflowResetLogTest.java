@@ -64,11 +64,31 @@ class OverflowResetLogTest {
         assertEquals(1_002L, kept.get(0).originalValue());
         assertEquals(1_004L, kept.get(2).originalValue());
         assertEquals(cap, log.entries().size());
+        assertEquals(2L, log.droppedEntries(), "记录超过容量必须累计 dropped 计数");
 
         log.save();
 
         OverflowResetLog reloaded = new OverflowResetLog(file, cap);
         assertEquals(kept, reloaded.entries());
+        assertEquals(0L, reloaded.droppedEntries(), "文件已在上限内，加载不应再丢弃记录");
+    }
+
+    @Test
+    void loadingOverCapFileDropsOldestAndReportsCount() {
+        Path file = tempDir.resolve(OverflowResetLog.FILE_NAME);
+        OverflowResetLog writer = new OverflowResetLog(file, 10);
+        for (int i = 0; i < 5; i++) {
+            writer.record(new OverflowReset(
+                    ItemKey.of(STONE), 1_000L + i, 10L + i, 500L, OverflowScope.OWNED_ONLY, i));
+        }
+        writer.save();
+
+        OverflowResetLog limited = new OverflowResetLog(file, 3);
+
+        assertEquals(3, limited.entries().size());
+        assertEquals(1_002L, limited.entries().get(0).originalValue());
+        assertEquals(2L, limited.droppedEntries(), "加载裁剪必须累计 dropped 计数");
+        assertTrue(limited.isDirty(), "加载时裁剪的文件应在下次保存时压缩");
     }
 
     @Test
