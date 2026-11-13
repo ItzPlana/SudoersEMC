@@ -77,6 +77,31 @@ public final class SolveContext implements EmcLookup {
     }
 
     /**
+     * 使用已有 EMC 快照与“本次运行开始时已由本模组拥有”的生成值创建上下文。
+     *
+     * <p>owned 值放入 {@code generatedValues} 而不是 {@code knownValues}：它们仍是本次求解的
+     * 生成值，求解器可以在新配方成本更低时替换它们，也不会被 {@link #hasSeedValue(ItemKey)}
+     * 当成永远胜出的种子。旧值到新值的降价/溢出保护由调用方在写入前执行。</p>
+     *
+     * @param knownValues             运行开始前由外部来源提供的 EMC；允许为空
+     * @param initialGeneratedValues  运行开始前由本模组拥有、允许本次更新的生成值；允许为空
+     */
+    public SolveContext(Map<ItemKey, Long> knownValues,
+                        Map<ItemKey, Long> initialGeneratedValues) {
+        this(knownValues);
+        Objects.requireNonNull(initialGeneratedValues, "initialGeneratedValues");
+        for (Map.Entry<ItemKey, Long> entry : initialGeneratedValues.entrySet()) {
+            ItemKey item = Objects.requireNonNull(
+                    entry.getKey(), "initialGeneratedValues 的键不能为 null");
+            Long value = Objects.requireNonNull(
+                    entry.getValue(), "initialGeneratedValues 的值不能为 null");
+            if (value > 0L) {
+                generatedValues.put(item, value);
+            }
+        }
+    }
+
+    /**
      * @return 不含任何已有 EMC 的空上下文
      */
     public static SolveContext empty() {

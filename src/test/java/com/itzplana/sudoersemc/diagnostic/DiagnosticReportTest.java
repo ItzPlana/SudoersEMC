@@ -87,7 +87,7 @@ class DiagnosticReportTest {
         assertTrue(text.contains("================================"));
 
         assertLine(text, "注册物品总数", "1000");
-        assertLine(text, "已有 EMC", "100");
+        assertLine(text, "受保护的非自有既有值", "100");
         assertLine(text, "配方求解", "10");
         assertLine(text, "标签定价", "20");
         assertLine(text, "稀有度定价", "30");
