@@ -24,14 +24,14 @@ SudoersEMC 是一个**独立实现**的 Minecraft Forge 1.20.1 模组。它扫�
 
 ### 核心原则
 
-| 原则 | 说明 |
-| --- | --- |
-| **不覆盖手动值** | `config/ProjectE/custom_emc.json` 中由管理员配置的条目永远不会被改写 |
-| **归属可追踪** | 每个生成值都记录来源（配方 / 标签 / 稀有度 / 层级 / 兜底）、配方 ID 与时间戳 |
-| **计算可解释** | 任意一个 EMC 值都能回答「它从哪里来、为什么是这个数」 |
-| **安全优先** | 大幅降价会被隔离；超出上限的数值会被重置到受控区间 |
-| **不阻塞主线程** | 扫描分批次执行，重计算在快照之上离线完成 |
-| **可选依赖** | 未安装 ProjectE 时模组正常加载，只是不生成任何值 |
+| 原则             | 说明                                                                         |
+| ---------------- | ---------------------------------------------------------------------------- |
+| **不覆盖手动值** | `config/ProjectE/custom_emc.json` 中由管理员配置的条目永远不会被改写         |
+| **归属可追踪**   | 每个生成值都记录来源（配方 / 标签 / 稀有度 / 层级 / 兜底）、配方 ID 与时间戳 |
+| **计算可解释**   | 任意一个 EMC 值都能回答「它从哪里来、为什么是这个数」                        |
+| **安全优先**     | 大幅降价会被隔离；超出上限的数值会被重置到受控区间                           |
+| **不阻塞主线程** | 扫描分批次执行，重计算在快照之上离线完成                                     |
+| **可选依赖**     | 未安装 ProjectE 时模组正常加载，只是不生成任何值                             |
 
 ---
 
@@ -39,12 +39,12 @@ SudoersEMC 是一个**独立实现**的 Minecraft Forge 1.20.1 模组。它扫�
 
 项目按阶段推进，已完成前两个阶段：
 
-| 阶段 | 内容 | 状态 |
-| --- | --- | --- |
-| Phase 0 | Forge 1.20.1 工程骨架、ProjectE 1.0.1 集成调研 | ✅ 完成 |
-| Phase 1 | ProjectE 查询/写入、归属持久化、溢出保护数学、配置、单元测试 | ✅ 完成 |
-| Phase 2 | 物品与配方扫描（含仪式配方） | 🚧 进行中 |
-| Phase 3+ | 递归求解、兜底定价、NBT 变体、批处理、命令、诊断 | ⏳ 计划中 |
+| 阶段     | 内容                                                         | 状态      |
+| -------- | ------------------------------------------------------------ | --------- |
+| Phase 0  | Forge 1.20.1 工程骨架、ProjectE 1.0.1 集成调研               | ✅ 完成   |
+| Phase 1  | ProjectE 查询/写入、归属持久化、溢出保护数学、配置、单元测试 | ✅ 完成   |
+| Phase 2  | 物品与配方扫描（含仪式配方）                                 | 🚧 进行中 |
+| Phase 3+ | 递归求解、兜底定价、NBT 变体、批处理、命令、诊断             | ⏳ 计划中 |
 
 Phase 1 已在专用服务器上验证：写入生效、重启后自动恢复、手动值不被覆盖、缺少 ProjectE 时优雅降级。
 
@@ -52,13 +52,13 @@ Phase 1 已在专用服务器上验证：写入生效、重启后自动恢复、
 
 ## 环境要求
 
-| 项目 | 版本 |
-| --- | --- |
-| Minecraft | 1.20.1 |
-| Forge | 47.2.0 及以上（47.x） |
-| Java | 17 |
-| ProjectE | 1.0.1（可选，缺失时模组不生成 EMC） |
-| Gradle | 8.1.1（随 Wrapper 提供） |
+| 项目      | 版本                                |
+| --------- | ----------------------------------- |
+| Minecraft | 1.20.1                              |
+| Forge     | 47.2.0 及以上（47.x）               |
+| Java      | 17                                  |
+| ProjectE  | 1.0.1（可选，缺失时模组不生成 EMC） |
+| Gradle    | 8.1.1（随 Wrapper 提供）            |
 
 ### 可选联动
 
@@ -99,11 +99,11 @@ gradlew.bat build
 
 可选参数：
 
-| 参数 | 作用 |
-| --- | --- |
-| `-PsmokeTest` | 启动后向内嵌探针写入一个测试 EMC 值并触发重算 |
-| `-PsmokeQuery` | 只查询内嵌探针的值，用于验证重启后持久化是否生效 |
-| `-PwithoutProjectE` | 不加载 ProjectE，用于验证优雅降级 |
+| 参数                | 作用                                             |
+| ------------------- | ------------------------------------------------ |
+| `-PsmokeTest`       | 启动后向内嵌探针写入一个测试 EMC 值并触发重算    |
+| `-PsmokeQuery`      | 只查询内嵌探针的值，用于验证重启后持久化是否生效 |
+| `-PwithoutProjectE` | 不加载 ProjectE，用于验证优雅降级                |
 
 > 这些参数只影响开发环境，不会进入发布 jar 的行为。
 
@@ -123,6 +123,9 @@ gradlew.bat build
 配置文件：`config/sudoersemc-common.toml`
 
 ```toml
+# Root-level schema version (managed by ConfigFileMigration; do not edit manually).
+schemaVersion = 2
+
 [general]
 enabled = true
 alwaysRescan = false
@@ -178,20 +181,108 @@ generateReports = true
 
 ### 改写范围
 
-| 取值 | 行为 |
-| --- | --- |
-| `owned_only`（默认） | 只重置由 SudoersEMC 自己生成的条目 |
-| `entire_custom_emc` | 额外重置 ProjectE `custom_emc.json` 中所有超限条目，需同时开启 `allowProjectEFileRewrite`，并会先做时间戳备份 |
+| 取值                 | 行为                                                                                                          |
+| -------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `owned_only`（默认） | 只重置由 SudoersEMC 自己生成的条目                                                                            |
+| `entire_custom_emc`  | 额外重置 ProjectE `custom_emc.json` 中所有超限条目，需同时开启 `allowProjectEFileRewrite`，并会先做时间戳备份 |
+
+---
+
+## 配置校验与迁移
+
+### 默认值
+
+| 配置项                              | 默认值       | 说明                                              |
+| ----------------------------------- | ------------ | ------------------------------------------------- |
+| `performance.itemsPerTick`          | `100`        | 服务端线程每 tick 最多处理的物品数                |
+| `recipe.maxRecipePasses`            | `20`         | 单次扫描的配方求解遍数上限                        |
+| `overflow.threshold`                | `999999`     | 严格大于该值的 EMC 会被重置                       |
+| `overflow.resetMin`                 | `100`        | 重置区间下界（含）                                |
+| `overflow.resetMax`                 | `999000`     | 重置区间上界（含）                                |
+| `overflow.bucketCount`              | `100`        | 加权采样桶数量                                    |
+| `overflow.weightCap`                | `20`         | 单个桶的权重上限                                  |
+| `overflow.overwriteScope`           | `owned_only` | 重置范围，可选 `owned_only` / `entire_custom_emc` |
+| `overflow.allowProjectEFileRewrite` | `false`      | 是否允许改写 ProjectE 的 `custom_emc.json`        |
+| `nbt.maxNbtVariantsPerItem`         | `100`        | 每个物品最多扫描的 NBT 变体数                     |
+| `safety.maxAllowedDropRatio`        | `0.5`        | 单次生成值允许的最大相对跌幅                      |
+
+> **`minEmc` 说明**：当前构建没有 `minEmc` 配置键。求解器下限固定为
+> `SolveSettings.DEFAULT_MINIMUM_EMC = 1`（与 `EvaluationPolicy.DEFAULT_MINIMUM_EMC` 相同）。
+> 配置化该值属于后续阶段；此前的 README 把它列为配置项是错误的，已移除。
+
+### 校验矩阵
+
+加载或重载配置后会执行交叉字段校验。以下取值会被判定为非法，并阻止新配置生效：
+
+| 配置项                       | 拒绝条件                                                         |
+| ---------------------------- | ---------------------------------------------------------------- |
+| `performance.itemsPerTick`   | `< 1`                                                            |
+| `recipe.maxRecipePasses`     | `< 1`                                                            |
+| `overflow.overwriteScope`    | 不是 `owned_only` 或 `entire_custom_emc`（忽略大小写与首尾空白） |
+| `overflow.resetMin`          | `< 1`                                                            |
+| `overflow.resetMin`          | `> resetMax`                                                     |
+| `overflow.threshold`         | `<= resetMax`                                                    |
+| `overflow.bucketCount`       | `< 1`                                                            |
+| `overflow.weightCap`         | `< 1`                                                            |
+| `nbt.maxNbtVariantsPerItem`  | `< 1` 或 `> 1000`                                                |
+| `safety.maxAllowedDropRatio` | 不在 `(0.0, 1.0]` 内，包括 `0.0`、负数与 `NaN`                   |
+
+所有 `overflow.*` 区间不变量始终校验；`overflow.enabled = false` 只表示运行时跳过重置，
+不会放宽配置合法性。`OverflowProtection.Settings` 即使关闭也会构造采样器并强制这些不变量，
+因此校验器必须在关闭时继续拒绝非法区间，否则非法配置会在组件重建时抛异常。
+
+接线方式：`SudoersemcConfig.onConfigLoading` / `onConfigReloading` 会从当前 Forge 值构造
+`ConfigValidator.Values`，调用 `ConfigValidator.validate(...)`，再交给
+`ConfigWatcher.fireReload(...)`。校验通过时重建并缓存不可变快照（`overflowSettings()` 返回该
+快照）；失败时 `fireReload` 不通知监听器，上一份有效快照继续生效，首次加载即非法时使用内置
+安全默认值。事件可能由配置加载线程触发，处理器只读取配置并交换 volatile 不可变快照，不访问
+服务器或世界状态。
+
+### 警告条件
+
+以下情况不会阻止配置生效，但会记录一条警告：
+
+| 条件                                                                       | 提示                           |
+| -------------------------------------------------------------------------- | ------------------------------ |
+| `overwriteScope = entire_custom_emc` 且 `allowProjectEFileRewrite = false` | ProjectE 文件改写将被跳过      |
+| `itemsPerTick > 5000`                                                      | 单 tick 处理量过大可能导致卡顿 |
+| `maxRecipePasses > 100`                                                    | 扫描耗时可能显著增加           |
+| `overflow.enabled = false`                                                 | 超大 EMC 值不会被重置          |
+
+同一条警告在一次运行中只记录一次：`ConfigWatcher.fireReload` 对成功结果统一调用
+`logConflictWarnings`，重复重载不会刷屏。
+
+### 迁移
+
+配置根级键 `schemaVersion` 表示 schema 版本，当前为 `2`，旧版本为 `1`；缺失该键的文件按
+`1` 处理。启动时 `SudoersemcConfig.register()` 在 Forge 解析 TOML 之前调用
+`ConfigFileMigration`，后者使用 `ConfigMigrations` 迁移文件：
+
+- **v1 → v2**：缺少 `overflow.threshold` 时补充 `999999`，缺少 `overflow.overwriteScope`
+  时补充 `owned_only`；已有值保持不变。
+- **v2 → v2**：不做任何修改，也不产生提示。
+- **高于 v2**：保持原样不做修改，并记录提示，防止旧构建覆盖新版本配置。
+- **未知版本（`<= 0`）**：按当前版本处理并记录提示。
+- `ConfigMigrations` 的 raw map 支持扁平键（`threshold`）、点分键（`overflow.threshold`）
+  和嵌套 `overflow` map；迁移沿用输入已有的键形状，不会把默认值写到错误层级。
+- 迁移只改写 `schemaVersion`、`overflow.threshold`、`overflow.overwriteScope`，保留注释与
+  未知键；先写同目录临时文件，尽力备份后原子替换，任何失败都保留原文件。
+
+> **English:** Schema version 2 validates numeric ranges and cross-field invariants in pure Java.
+> Invalid reloads keep the previously active snapshot, each distinct warning is logged once, and
+> v1 migrations only fill in missing `overflow.threshold` (`999999`) and `overflow.overwriteScope`
+> (`"owned_only"`). Configs declaring a newer schema are left untouched. There is no `minEmc`
+> config key in this phase; the solver lower bound is hard-coded to `1`.
 
 ---
 
 ## 数据文件
 
-| 路径 | 说明 |
-| --- | --- |
-| `config/sudoersemc/generated_entries.json` | 生成值、来源、配方、归属与时间戳 |
-| `config/sudoersemc/overflow_resets.json` | 溢出重置审计记录 |
-| `config/ProjectE/custom_emc.json` | ProjectE 手动配置（本模组只读，`entire_custom_emc` 模式除外） |
+| 路径                                       | 说明                                                          |
+| ------------------------------------------ | ------------------------------------------------------------- |
+| `config/sudoersemc/generated_entries.json` | 生成值、来源、配方、归属与时间戳                              |
+| `config/sudoersemc/overflow_resets.json`   | 溢出重置审计记录                                              |
+| `config/ProjectE/custom_emc.json`          | ProjectE 手动配置（本模组只读，`entire_custom_emc` 模式除外） |
 
 所有写入采用「临时文件 + 原子替换」，加载失败只告警不崩溃，遇到更高版本 schema 时拒绝覆盖。
 
