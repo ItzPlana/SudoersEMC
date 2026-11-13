@@ -11,6 +11,7 @@ import java.util.List;
 import java.util.function.Supplier;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
@@ -885,5 +886,217 @@ class ScanManagerTest {
         assertTrue(deadline != null && deadline > before,
                 "采集会话必须收到本 tick 的绝对截止时间");
         assertEquals(1, manager.progress().processed());
+    }
+
+    @Test
+    void reloadDuringCollectionFailsScan() {
+        ReloadTrackingFingerprints fingerprints = new ReloadTrackingFingerprints();
+        ShardedSession session = new ShardedSession(data(4, 0));
+        ScanManager manager = ScanManager.staged(new BatchProcessor(2, false),
+                () -> session,
+                snapshot -> ScanManager.ApplyTask.completed(0, 0),
+                TICK_BUDGET_NANOS, fingerprints, null);
+
+        assertTrue(manager.requestScan());
+        manager.tick();
+        assertEquals(ScanPhase.COLLECTING_SNAPSHOT, manager.progress().phase());
+
+        fingerprints.reload();
+        manager.tick();
+
+        assertEquals(ScanPhase.FAILED, manager.progress().phase());
+        assertTrue(manager.progress().detail().contains("采集期间"));
+    }
+
+    @Test
+    void reloadAfterSolveBeforeFirstStagingTickFailsScan() {
+        ReloadTrackingFingerprints fingerprints = new ReloadTrackingFingerprints();
+        CountingApplyTask task = new CountingApplyTask(10, 3);
+        ScanManager manager = ScanManager.staged(new BatchProcessor(3, false),
+                collector(data(0, 0)), snapshot -> task, TICK_BUDGET_NANOS,
+                fingerprints, null);
+
+        assertTrue(manager.requestScan());
+        manager.tick();
+        assertEquals(ScanPhase.SOLVING, manager.progress().phase());
+        manager.tick();
+        assertEquals(ScanPhase.APPLYING, manager.progress().phase(),
+                "求解完成且代次未变化时应进入 APPLYING");
+
+        fingerprints.reload();
+        manager.tick();
+
+        assertEquals(ScanPhase.FAILED, manager.progress().phase());
+        assertEquals(0, task.stageCalls(), "求解完成后 reload，首个 staging tick 不得写入");
+        assertTrue(task.cancelled(), "失败后必须取消应用任务");
+        assertTrue(manager.progress().detail().contains("重新扫描"));
+    }
+
+    @Test
+    void reloadDuringStagingAbortsRemainingBatches() {
+        ReloadTrackingFingerprints fingerprints = new ReloadTrackingFingerprints();
+        CountingApplyTask task = new CountingApplyTask(9, 3);
+        ScanManager manager = ScanManager.staged(new BatchProcessor(3, false),
+                collector(data(0, 0)), snapshot -> task, TICK_BUDGET_NANOS,
+                fingerprints, null);
+
+        assertTrue(manager.requestScan());
+        manager.tick();
+        manager.tick();
+        manager.tick();
+        assertEquals(ScanPhase.APPLYING, manager.progress().phase());
+        assertEquals(3, task.staged(), "首个 staging 批次应已写入 3 条");
+
+        fingerprints.reload();
+        manager.tick();
+
+        assertEquals(ScanPhase.FAILED, manager.progress().phase());
+        assertEquals(3, task.staged(), "reload 后不得继续写入后续批次");
+        assertTrue(task.cancelled(), "失败后必须取消应用任务并触发回滚");
+    }
+
+    @Test
+    void reloadTrackingSupplierNeverRecomputesFullFingerprint() {
+        ReloadTrackingFingerprints fingerprints = new ReloadTrackingFingerprints();
+        CountingApplyTask task = new CountingApplyTask(9, 3);
+        ScanManager manager = ScanManager.staged(new BatchProcessor(3, false),
+                collector(data(0, 0)), snapshot -> task, TICK_BUDGET_NANOS,
+                fingerprints, null);
+
+        assertTrue(manager.requestScan());
+        for (int tick = 0; tick < TICK_GUARD && manager.isRunning(); tick++) {
+            manager.tick();
+        }
+
+        assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
+        assertEquals(0, fingerprints.fullCalls(),
+                "支持 reload 代次时不得在采集/求解/应用期间重新计算完整指纹");
+    }
+
+    @Test
+    void stagedSaveFailureTurnsScanIntoFailed() {
+        ScanManager.SaveTask failing = deadlineNanos -> {
+            throw new IllegalStateException("磁盘写入失败");
+        };
+        ScanManager manager = ScanManager.staged(new BatchProcessor(10, false),
+                collector(data(0, 0)),
+                snapshot -> ScanManager.ApplyTask.completed(0, 0),
+                TICK_BUDGET_NANOS, null, () -> failing);
+
+        assertTrue(manager.requestScan());
+        for (int tick = 0; tick < TICK_GUARD && manager.isRunning(); tick++) {
+            manager.tick();
+        }
+
+        assertEquals(ScanPhase.FAILED, manager.progress().phase());
+        assertTrue(manager.progress().detail().contains("磁盘写入失败"));
+    }
+
+    /**
+     * 支持廉价 reload 代次的指纹提供器。{@link #reload()} 模拟一次 {@code /reload}；
+     * {@link #fullCalls()} 用于证明扫描过程中不会重复计算完整指纹。
+     */
+    private static final class ReloadTrackingFingerprints
+            implements ScanManager.FingerprintSupplier {
+
+        private final AtomicLong generation = new AtomicLong();
+        private final AtomicInteger fullCalls = new AtomicInteger();
+
+        @Override
+        public ScanFingerprint current() {
+            fullCalls.incrementAndGet();
+            return fingerprint("minecraft:stone");
+        }
+
+        @Override
+        public long reloadGeneration() {
+            return generation.get();
+        }
+
+        @Override
+        public boolean tracksReloadGeneration() {
+            return true;
+        }
+
+        void reload() {
+            generation.incrementAndGet();
+        }
+
+        int fullCalls() {
+            return fullCalls.get();
+        }
+    }
+
+    /**
+     * 计数用分片应用任务：每次 stage 最多写入 {@code perStage} 条。
+     */
+    private static final class CountingApplyTask implements ScanManager.ApplyTask {
+
+        private final int total;
+        private final int perStage;
+        private int staged;
+        private int stageCalls;
+        private boolean done;
+        private boolean cancelled;
+
+        CountingApplyTask(int total, int perStage) {
+            this.total = total;
+            this.perStage = perStage;
+        }
+
+        @Override
+        public boolean isSolveComplete() {
+            return true;
+        }
+
+        @Override
+        public void advanceSolve(long deadlineNanos) {
+        }
+
+        @Override
+        public int stage(int maxItems, long deadlineNanos) {
+            if (done || cancelled) {
+                return 0;
+            }
+            stageCalls++;
+            int take = Math.min(Math.min(maxItems, perStage), total - staged);
+            staged += take;
+            if (staged >= total) {
+                done = true;
+            }
+            return take;
+        }
+
+        @Override
+        public boolean isDone() {
+            return done;
+        }
+
+        @Override
+        public int solvedCount() {
+            return total;
+        }
+
+        @Override
+        public int unresolvedCount() {
+            return 0;
+        }
+
+        @Override
+        public void cancel() {
+            cancelled = true;
+        }
+
+        int stageCalls() {
+            return stageCalls;
+        }
+
+        int staged() {
+            return staged;
+        }
+
+        boolean cancelled() {
+            return cancelled;
+        }
     }
 }

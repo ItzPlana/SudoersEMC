@@ -12,6 +12,8 @@ import com.mojang.logging.LogUtils;
 import net.minecraft.server.MinecraftServer;
 import net.minecraftforge.common.ForgeConfigSpec;
 import net.minecraftforge.common.MinecraftForge;
+import net.minecraftforge.event.AddReloadListenerEvent;
+import net.minecraftforge.event.TagsUpdatedEvent;
 import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.event.server.ServerStartedEvent;
 import net.minecraftforge.event.server.ServerStoppingEvent;
@@ -36,6 +38,12 @@ import org.slf4j.Logger;
  * {@code general.alwaysRescan} is enabled). The {@link TickEvent.ServerTickEvent} listener drives
  * {@link ScanManager#tick()} on the server thread; pure solving and file writes run on the
  * pipeline's daemon worker.</p>
+ *
+ * <p><strong>Reload generation:</strong> {@link AddReloadListenerEvent} and
+ * {@link TagsUpdatedEvent} increment the pipeline's atomic reload generation at the start and end
+ * of every datapack reload. {@link ScanManager} reads it once when a scan starts and compares it
+ * cheaply in every APPLYING batch, so a {@code /reload} during a multi-tick apply fails the scan
+ * instead of writing prices derived from the previous recipe set.</p>
  */
 @Mod(Sudoersemc.MODID)
 public final class Sudoersemc {
@@ -57,6 +65,8 @@ public final class Sudoersemc {
         MinecraftForge.EVENT_BUS.addListener(this::onServerTick);
         MinecraftForge.EVENT_BUS.addListener(this::onServerStarted);
         MinecraftForge.EVENT_BUS.addListener(this::onServerStopping);
+        MinecraftForge.EVENT_BUS.addListener(this::onAddReloadListener);
+        MinecraftForge.EVENT_BUS.addListener(this::onTagsUpdated);
         MinecraftForge.EVENT_BUS.addListener(SmokeTestHook::onServerTick);
 
         // Must be registered during mod construction, before configs are loaded.
@@ -125,6 +135,31 @@ public final class Sudoersemc {
         GeneratedEntryStore store = entryStore;
         if (store != null) {
             store.saveIfDirty();
+        }
+    }
+
+    /**
+     * datapack/reload 开始：递增扫描管线的 reload 代次，使正在 APPLYING 的扫描立即停止
+     * 使用旧配方价格。该事件可能在资源加载线程触发，管线内部使用原子计数，线程安全。
+     */
+    private void onAddReloadListener(AddReloadListenerEvent event) {
+        recordDatapackReload();
+    }
+
+    /**
+     * 资源重载完成（服务端数据加载）：再次递增代次，覆盖“扫描在 reload 进行中开始”的窗口。
+     * 只处理服务端数据加载，忽略客户端同步包触发的事件。
+     */
+    private void onTagsUpdated(TagsUpdatedEvent event) {
+        if (event.getUpdateCause() == TagsUpdatedEvent.UpdateCause.SERVER_DATA_LOAD) {
+            recordDatapackReload();
+        }
+    }
+
+    private static void recordDatapackReload() {
+        ScanCollectionPipeline pipeline = scanPipeline;
+        if (pipeline != null) {
+            pipeline.onDatapackReload();
         }
     }
 
