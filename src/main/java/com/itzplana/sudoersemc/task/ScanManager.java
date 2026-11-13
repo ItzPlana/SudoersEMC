@@ -187,6 +187,23 @@ public final class ScanManager {
     }
 
     /**
+     * 扫描开始回调，在一次新的 {@link #requestScan()} 被接受后触发。
+     *
+     * <p>用于重置跨扫描状态（例如诊断报告是否已写出）。回调在扫描状态已经重置、进度
+     * 已切到 {@link ScanPhase#COLLECTING_SNAPSHOT} 之后执行，但早于首个采集 tick，因此
+     * 采集失败或采集阶段取消时，下一轮的部分报告不会被上一轮遗留状态跳过。实现方不得
+     * 抛出异常；即使抛出，本类也只记录日志并继续。</p>
+     */
+    @FunctionalInterface
+    public interface ScanStartListener {
+
+        /**
+         * 新扫描已被接受并即将进入采集阶段。
+         */
+        void onScanStarted();
+    }
+
+    /**
      * 把一次性快照包装成单批次采集会话，供过渡接线与测试使用。
      *
      * @param data 固定快照，不能为 {@code null}
@@ -271,6 +288,8 @@ public final class ScanManager {
     private final AbortListener abortListener;
     @Nullable
     private final FingerprintSupplier fingerprintSupplier;
+    @Nullable
+    private final ScanStartListener scanStartListener;
 
     private volatile ScanProgress progress = ScanProgress.idle();
     private volatile boolean cancelRequested;
@@ -301,7 +320,7 @@ public final class ScanManager {
                        SnapshotCollector collector,
                        ResultApplier applier,
                        long tickBudgetNanos) {
-        this(batchProcessor, collector, applier, tickBudgetNanos, new ScanDiagnostics(), null, null);
+        this(batchProcessor, collector, applier, tickBudgetNanos, new ScanDiagnostics(), null, null, null);
     }
 
     /**
@@ -320,7 +339,7 @@ public final class ScanManager {
                        long tickBudgetNanos,
                        @Nullable ScanDiagnostics diagnostics,
                        @Nullable AbortListener abortListener) {
-        this(batchProcessor, collector, applier, tickBudgetNanos, diagnostics, abortListener, null);
+        this(batchProcessor, collector, applier, tickBudgetNanos, diagnostics, abortListener, null, null);
     }
 
     /**
@@ -337,16 +356,30 @@ public final class ScanManager {
                        ResultApplier applier,
                        long tickBudgetNanos,
                        @Nullable FingerprintSupplier fingerprintSupplier) {
-        this(batchProcessor, collector, applier, tickBudgetNanos, null, null, fingerprintSupplier);
+        this(batchProcessor, collector, applier, tickBudgetNanos, null, null, fingerprintSupplier, null);
     }
 
-    private ScanManager(BatchProcessor batchProcessor,
-                        SnapshotCollector collector,
-                        ResultApplier applier,
-                        long tickBudgetNanos,
-                        @Nullable ScanDiagnostics diagnostics,
-                        @Nullable AbortListener abortListener,
-                        @Nullable FingerprintSupplier fingerprintSupplier) {
+    /**
+     * 创建带快照一致性校验与扫描开始回调的调度器。
+     *
+     * @param batchProcessor      批量决策器，不能为 {@code null}
+     * @param collector           分片采集会话工厂，不能为 {@code null}
+     * @param applier             结果应用回调，不能为 {@code null}
+     * @param tickBudgetNanos     每 tick 的时间预算（纳秒），不得为负
+     * @param diagnostics         耗时与内存采样器；{@code null} 时新建一个
+     * @param abortListener       取消/失败终止回调，可为 {@code null}
+     * @param fingerprintSupplier 输入指纹提供器；{@code null} 表示跳过一致性校验
+     * @param scanStartListener   扫描开始回调；{@code null} 表示跳过。生产接线用它重置
+     *                            管线的跨扫描报告状态
+     */
+    public ScanManager(BatchProcessor batchProcessor,
+                       SnapshotCollector collector,
+                       ResultApplier applier,
+                       long tickBudgetNanos,
+                       @Nullable ScanDiagnostics diagnostics,
+                       @Nullable AbortListener abortListener,
+                       @Nullable FingerprintSupplier fingerprintSupplier,
+                       @Nullable ScanStartListener scanStartListener) {
         this.batchProcessor = Objects.requireNonNull(batchProcessor, "batchProcessor");
         this.collector = Objects.requireNonNull(collector, "collector");
         this.applier = Objects.requireNonNull(applier, "applier");
@@ -357,6 +390,7 @@ public final class ScanManager {
         this.diagnostics = diagnostics == null ? new ScanDiagnostics() : diagnostics;
         this.abortListener = abortListener;
         this.fingerprintSupplier = fingerprintSupplier;
+        this.scanStartListener = scanStartListener;
     }
 
     /**
@@ -393,6 +427,7 @@ public final class ScanManager {
         diagnostics.recordMemory();
         long now = System.currentTimeMillis();
         progress = new ScanProgress(ScanPhase.COLLECTING_SNAPSHOT, 0, 0, now, now, "等待采集快照");
+        notifyScanStarted();
         return true;
     }
 
@@ -509,6 +544,18 @@ public final class ScanManager {
                 && progress.phase() == ScanPhase.COMPLETED) {
             // 完成回调放在最后一个 tick 的 recordTick 之后，保证报告能包含 APPLYING/SAVING tick。
             notifyCompleted();
+        }
+    }
+
+    private void notifyScanStarted() {
+        ScanStartListener listener = scanStartListener;
+        if (listener == null) {
+            return;
+        }
+        try {
+            listener.onScanStarted();
+        } catch (RuntimeException failure) {
+            LOGGER.warn("SudoersEMC 扫描开始回调失败，已忽略", failure);
         }
     }
 

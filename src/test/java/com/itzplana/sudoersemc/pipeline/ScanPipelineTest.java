@@ -47,6 +47,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 import net.minecraft.SharedConstants;
 import net.minecraft.resources.ResourceLocation;
@@ -1683,6 +1684,84 @@ class ScanPipelineTest {
         assertTrue(hasCounterLine(report, "tick 采样数", ticks),
                 "完整报告必须包含 APPLYING/SAVING tick，期望 " + ticks + " 个样本，实际报告:\n" + report);
     }
+    @Test
+    void successfulScanThenCollectFailureReplacesOldReport() throws IOException {
+        ReportManager reportManager = new ReportManager(tempDir.resolve("report_lifecycle_failure"));
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_report_lifecycle_failure.json"));
+        ScanPipeline pipeline = pipeline(
+                store, null, reportManager, null, null, null, genericFallback(7L));
+        ScanDiagnostics diagnostics = new ScanDiagnostics();
+        pipeline.setDiagnostics(diagnostics);
+        PipelineSnapshot snapshot = snapshot(List.of(item(RESULT, 0L)), List.of(), Map.of());
+
+        ScanManager.SnapshotCollector successfulCollector = () -> {
+            pipeline.stash(snapshot);
+            return ScanManager.oneShot(
+                    new ScanManager.SnapshotData("成功扫描", snapshot.itemCount(), 0)).begin();
+        };
+        ScanManager.SnapshotCollector failingCollector = () -> {
+            throw new IllegalStateException("模拟第二轮采集失败");
+        };
+        AtomicReference<ScanManager.SnapshotCollector> collector =
+                new AtomicReference<>(successfulCollector);
+        ScanManager manager = reportLifecycleManager(pipeline, diagnostics, collector);
+
+        assertTrue(manager.requestScan());
+        runUntilStopped(manager);
+        assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
+        String fullReport = Files.readString(reportManager.reportFile());
+        assertTrue(fullReport.contains("===== SudoersEMC 诊断报告 ====="));
+        assertFalse(fullReport.contains("部分报告"), "第一轮应写出完整报告");
+
+        collector.set(failingCollector);
+        assertTrue(manager.requestScan(), "扫描完成后必须允许再次请求");
+        runUntilStopped(manager);
+        assertEquals(ScanPhase.FAILED, manager.progress().phase());
+
+        String failedReport = Files.readString(reportManager.reportFile());
+        assertTrue(failedReport.contains("部分报告（扫描失败）"),
+                "上一轮成功报告不得让本轮采集失败报告被跳过，实际报告:\n" + failedReport);
+        assertTrue(failedReport.lines().anyMatch(line -> line.contains("scanFailed: 1")),
+                "采集失败报告必须带 scanFailed=1");
+        assertTrue(failedReport.lines().anyMatch(line -> line.contains("partialReport: 1")));
+    }
+
+    @Test
+    void successfulScanThenCancelDuringCollectionReplacesOldReport() throws IOException {
+        ReportManager reportManager = new ReportManager(tempDir.resolve("report_lifecycle_cancel"));
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_report_lifecycle_cancel.json"));
+        ScanPipeline pipeline = pipeline(
+                store, null, reportManager, null, null, null, genericFallback(7L));
+        ScanDiagnostics diagnostics = new ScanDiagnostics();
+        pipeline.setDiagnostics(diagnostics);
+        PipelineSnapshot snapshot = snapshot(List.of(item(RESULT, 0L)), List.of(), Map.of());
+
+        AtomicReference<ScanManager.SnapshotCollector> collector = new AtomicReference<>(() -> {
+            pipeline.stash(snapshot);
+            return ScanManager.oneShot(
+                    new ScanManager.SnapshotData("成功扫描", snapshot.itemCount(), 0)).begin();
+        });
+        ScanManager manager = reportLifecycleManager(pipeline, diagnostics, collector);
+
+        assertTrue(manager.requestScan());
+        runUntilStopped(manager);
+        assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
+
+        assertTrue(manager.requestScan());
+        manager.cancel();
+        runUntilStopped(manager);
+        assertEquals(ScanPhase.CANCELLED, manager.progress().phase(),
+                "取消发生在采集阶段时也必须进入 CANCELLED");
+
+        String cancelledReport = Files.readString(reportManager.reportFile());
+        assertTrue(cancelledReport.contains("部分报告（扫描已取消）"),
+                "上一轮成功报告不得让本轮取消报告被跳过，实际报告:\n" + cancelledReport);
+        assertTrue(cancelledReport.lines().anyMatch(line -> line.contains("scanCancelled: 1")));
+        assertTrue(cancelledReport.lines().anyMatch(line -> line.contains("partialReport: 1")));
+    }
+
 
     @Test
     void collectFailureProducesFailedReportInsteadOfSilentEmptyScan() throws IOException {
@@ -2092,6 +2171,48 @@ class ScanPipelineTest {
     private static FallbackPricing tagOnlyFallback() {
         return FallbackPricing.withDefaults(
                 new PricingSettings(true, false, false, false, 0L));
+    }
+
+    /**
+     * 构造生产等价的生命周期接线：扫描开始时重置报告状态、完成回调写完整报告、
+     * 取消/失败回调写部分报告。用于验证跨扫描报告状态不会残留。
+     */
+    private static ScanManager reportLifecycleManager(
+            ScanPipeline pipeline, ScanDiagnostics diagnostics,
+            AtomicReference<ScanManager.SnapshotCollector> collector) {
+        return new ScanManager(
+                new BatchProcessor(10, false),
+                () -> collector.get().begin(),
+                new ScanManager.ResultApplier() {
+                    @Override
+                    public void apply(ScanManager.SnapshotData data) {
+                        pipeline.applyStashed();
+                    }
+
+                    @Override
+                    public void onCompleted() {
+                        pipeline.writePendingReport();
+                    }
+                },
+                1_000_000L,
+                diagnostics,
+                (phase, progress, telemetry) -> {
+                    if (phase == ScanPhase.CANCELLED) {
+                        pipeline.writeCancelledReport(telemetry);
+                    } else if (phase == ScanPhase.FAILED) {
+                        pipeline.writeFailedReport(progress.detail(), telemetry);
+                    }
+                },
+                null,
+                pipeline::beginScan);
+    }
+
+    private static void runUntilStopped(ScanManager manager) {
+        int ticks = 0;
+        while (manager.isRunning() && ticks < 20) {
+            manager.tick();
+            ticks++;
+        }
     }
 
     /**

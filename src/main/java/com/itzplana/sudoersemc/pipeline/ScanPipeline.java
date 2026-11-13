@@ -127,6 +127,7 @@ public final class ScanPipeline {
     private volatile int lastSolverRoundCount;
     private volatile long lastDurationMillis;
     private volatile ScanDiagnostics diagnostics = new ScanDiagnostics();
+    /** 本轮扫描是否已经成功写出完整报告；只对单次扫描有效，由 {@link #beginScan()} 重置。 */
     private volatile boolean fullReportWritten;
     /** 最近一次采集失败的中文原因；采集成功后清空，供应用阶段写出失败报告。 */
     private volatile String lastCollectFailure;
@@ -609,6 +610,21 @@ String detail = "扫描采集失败：服务器尚未就绪";
     }
 
     /**
+     * 开始新一轮扫描前重置跨扫描的报告状态。
+     *
+     * <p>生产接线在 {@code ScanManager.requestScan()} 成功后、首个采集 tick 之前调用。
+     * {@code fullReportWritten} 与 {@code pendingReport} 只属于单次扫描：若不在扫描开始时清除，
+     * 上一轮成功写出的完整报告会让本轮“采集失败”或“采集阶段取消”的部分报告被静默跳过，
+     * 磁盘上继续保留旧的成功报告。{@code lastCollectFailure} 同理，旧扫描的失败原因不得泄漏
+     * 到新一轮。</p>
+     */
+    public void beginScan() {
+        fullReportWritten = false;
+        pendingReport = null;
+        lastCollectFailure = null;
+    }
+
+    /**
      * 暂存采集结果，等待应用阶段取用。
      *
      * <p>该方法是“stash + applyStashed”接线方式的一半，专门服务于
@@ -617,6 +633,8 @@ String detail = "扫描采集失败：服务器尚未就绪";
      * @param snapshot 采集结果，允许为 {@code null}
      */
     public void stash(@Nullable PipelineSnapshot snapshot) {
+        // 防御性重置：测试或嵌入式调用可能绕过 ScanManager 直接 stash，
+        // 但生产路径的真正重置点是每次 requestScan() 触发的 beginScan()。
         fullReportWritten = false;
         pendingReport = null;
         if (snapshot != null) {
@@ -655,7 +673,8 @@ String detail = "扫描采集失败：服务器尚未就绪";
         }
         String collectFailure = lastCollectFailure;
         if (collectFailure != null) {
-            // collect(...) 吞掉异常后返回空快照；这里不能再把它当成正常空扫描。
+            // collect(...) 失败会抛出异常且不会 stash；若暂存快照来自更早的扫描，
+            // 残留的失败原因说明本轮采集失败，不能把旧快照当成正常空扫描继续应用。
             lastCollectFailure = null;
             writeFailedReport(collectFailure, diagnostics);
             return PipelineResult.zeroed(0L);
@@ -950,7 +969,7 @@ updateScanState(data, durationMillis, applied, unresolved, roundsUsed);
                     sourceCounts,
                     extraCounters);
             // 完整报告延迟到 ScanManager 完成回调写出，确保 APPLYING/SAVING tick 已经计数。
-            pendingReport = new PendingReport(data, result);
+            pendingReport = new PendingReport(data, result, null);
             return result;
         } catch (Throwable failure) {
             long durationMillis = elapsedMillis(startedAtNanos);
@@ -960,8 +979,12 @@ updateScanState(data, durationMillis, applied, unresolved, roundsUsed);
             lastDurationMillis = durationMillis;
             LOGGER.error("SudoersEMC 扫描管线求解与应用失败，本轮返回全零结果：{}",
                     failureDetail(failure), failure);
-            // 失败也要留下部分报告；报告层自身保证不抛出异常。
-            writePartialReport(data, diagnostics, false, "扫描失败");
+            // 失败也要留下报告，但必须延迟到 ScanManager 的完成回调：APPLYING tick 的耗时
+            // 与内存在本方法返回后才由调度器统一 recordTick，立即写盘会漏掉最重 tick 的
+            // 耗时/P95 与峰值堆样本。若调度器因其它异常转入 FAILED，writeFailedReport 仍会
+            // 消费这份等待报告，不会丢失败可见性。
+            pendingReport = new PendingReport(data, PipelineResult.zeroed(durationMillis),
+                    failureDetail(failure));
             return PipelineResult.zeroed(durationMillis);
         }
     }
@@ -1620,7 +1643,7 @@ updateScanState(data, durationMillis, applied, unresolved, roundsUsed);
     }
 
     /**
-     * 写出等待中的完整诊断报告。
+     * 写出等待中的诊断报告。
      *
      * <p>必须在扫描的最后一个 tick 采样完成后调用（生产接线由
      * {@code ScanManager.ResultApplier#onCompleted()} 触发），这样 APPLYING/SAVING tick 的
@@ -1628,31 +1651,71 @@ updateScanState(data, durationMillis, applied, unresolved, roundsUsed);
      * tick 数、耗时与峰值堆可能比 {@code applyStashed()} 返回的 {@link PipelineResult#extraCounters()}
      * 更新；磁盘写入失败时 {@code fullReportWritten} 保持 {@code false}，后续取消/失败路径
      * 仍可写出部分报告。</p>
+     *
+     * <p>{@code solveAndApply} 内部失败时同样通过这里写出失败报告：异常被捕获时 APPLYING
+     * tick 尚未由 {@code ScanManager} 统一采样，立即写盘会漏掉本 tick 的耗时与 P95，
+     * 因此失败报告与完整报告共用“完成回调后再写”的时点。</p>
      */
-public void writePendingReport() {
+    public void writePendingReport() {
+        flushPendingReport(diagnostics);
+    }
+
+    /**
+     * 消费并写出等待中的报告。
+     *
+     * @param telemetry 调度器共享的诊断采样器；{@code null} 时使用管线内部实例
+     * @return {@code true} 表示等待中的报告已被处理（完整报告写出、延迟失败报告写出，
+     *         或报告开关关闭）；{@code false} 表示没有等待报告，或完整报告写盘失败、
+     *         调用方仍应回退到部分报告
+     */
+    private boolean flushPendingReport(@Nullable ScanDiagnostics telemetry) {
         PendingReport pending = pendingReport;
         pendingReport = null;
         if (pending == null) {
-            return;
+            return false;
         }
         if (!generateReportsEnabled || reportManager == null) {
-            return;
+            return true;
+        }
+        if (pending.failureReason() != null) {
+            ScanDiagnostics selected = telemetry == null ? diagnostics : telemetry;
+            writePartialReportNow(pending.snapshot(), selected, false, "扫描失败");
+            return true;
+        }
+        return writeFullReport(pending);
+    }
+
+    /**
+     * 写出完整诊断报告。
+     *
+     * @return 磁盘写入成功返回 {@code true}；写入失败或异常时返回 {@code false}
+     */
+    private boolean writeFullReport(PendingReport pending) {
+        if (!generateReportsEnabled || reportManager == null) {
+            return false;
         }
         try {
             Map<String, Long> counters = new LinkedHashMap<>(pending.result().extraCounters());
             refreshDiagnosticCounters(counters, pending.result().durationMillis(), diagnostics);
             if (reportManager.writeReport(buildReport(pending.snapshot(), pending.result(), counters))) {
                 fullReportWritten = true;
+                return true;
             }
         } catch (RuntimeException failure) {
             LOGGER.warn("写入诊断报告失败，本轮结果仍然有效", failure);
         }
+        return false;
     }
 
     /**
-     * 等待完成回调写出的完整报告参数。
+     * 等待完成回调写出的报告参数。
+     *
+     * @param snapshot      本轮采集快照
+     * @param result        本轮完整结果；失败报告时为全零结果
+     * @param failureReason 非 {@code null} 表示求解/应用阶段失败，报告必须按部分报告写出
      */
-    private record PendingReport(PipelineSnapshot snapshot, PipelineResult result) {
+    private record PendingReport(PipelineSnapshot snapshot, PipelineResult result,
+                                 @Nullable String failureReason) {
     }
 
     /**
@@ -1687,13 +1750,27 @@ public void writePendingReport() {
     private void writePartialReport(@Nullable PipelineSnapshot snapshot,
                                     @Nullable ScanDiagnostics telemetry,
                                     boolean cancelled, String reason) {
-        if (!generateReportsEnabled || reportManager == null) {
+        ScanDiagnostics selected = telemetry == null ? diagnostics : telemetry;
+        // 扫描已经完成或求解阶段失败时，等待中的报告必须包含完成回调前的全部 tick；
+        // 先消费它，既避免完整报告被部分报告覆盖，也避免延迟失败报告重复写出。
+        if (flushPendingReport(selected)) {
+            LOGGER.debug("本轮扫描已有待写报告，跳过部分报告（{}）", reason);
             return;
         }
-        // 扫描已经完成但完成回调尚未触发时，优先写出包含全部 tick 的完整报告。
-        writePendingReport();
         if (fullReportWritten) {
             LOGGER.debug("完整诊断报告已写出，跳过部分报告（{}）", reason);
+            return;
+        }
+        writePartialReportNow(snapshot, selected, cancelled, reason);
+    }
+
+    /**
+     * 立即写出部分报告。调用方必须已经消费等待中的报告，避免覆盖完整报告。
+     */
+    private void writePartialReportNow(@Nullable PipelineSnapshot snapshot,
+                                       @Nullable ScanDiagnostics telemetry,
+                                       boolean cancelled, String reason) {
+        if (!generateReportsEnabled || reportManager == null) {
             return;
         }
         ScanDiagnostics selected = telemetry == null ? diagnostics : telemetry;

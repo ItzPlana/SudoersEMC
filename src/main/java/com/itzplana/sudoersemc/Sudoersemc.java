@@ -533,6 +533,10 @@ public final class Sudoersemc {
         if (pipeline != null) {
             pipeline.setDiagnostics(diagnostics);
         }
+        // 每次 requestScan() 成功后重置管线的跨扫描报告状态：上一轮成功写出的完整报告
+        // 不得让本轮采集失败/采集阶段取消时的 scanFailed/scanCancelled 部分报告被跳过。
+        ScanManager.ScanStartListener scanStartListener =
+                pipeline == null ? null : pipeline::beginScan;
         ScanManager.ResultApplier applier = new ScanManager.ResultApplier() {
             @Override
             public void apply(ScanManager.SnapshotData data) {
@@ -562,7 +566,9 @@ public final class Sudoersemc {
                     } else if (phase == ScanPhase.FAILED) {
                         pipeline.writeFailedReport(progress.detail(), telemetry);
                     }
-                });
+                },
+                null,
+                scanStartListener);
     }
 
     /**

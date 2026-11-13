@@ -780,4 +780,33 @@ class ScanManagerTest {
         assertDoesNotThrow(manager::tick);
         assertEquals(ScanPhase.FAILED, manager.progress().phase());
     }
+    @Test
+    void requestScanInvokesScanStartListenerOnlyWhenAccepted() {
+        AtomicInteger starts = new AtomicInteger();
+        ScanManager manager = new ScanManager(new BatchProcessor(1, false),
+                ScanManager.oneShot(data(1, 1)), snapshot -> { }, TICK_BUDGET_NANOS,
+                new ScanDiagnostics(), null, null, starts::incrementAndGet);
+
+        assertTrue(manager.requestScan());
+        assertEquals(1, starts.get(), "每次成功开始扫描都必须重置跨扫描状态");
+        assertFalse(manager.requestScan(), "活动扫描期间不得重复开始");
+        assertEquals(1, starts.get(), "被拒绝的请求不得重置跨扫描状态");
+
+        manager.reset();
+        assertTrue(manager.requestScan());
+        assertEquals(2, starts.get(), "重置后新一轮扫描必须再次触发开始回调");
+    }
+
+    @Test
+    void scanStartListenerExceptionDoesNotEscape() {
+        ScanManager manager = new ScanManager(new BatchProcessor(1, false),
+                ScanManager.oneShot(data(1, 1)), snapshot -> { }, TICK_BUDGET_NANOS,
+                new ScanDiagnostics(), null, null, () -> {
+                    throw new IllegalStateException("开始回调爆炸");
+                });
+
+        assertDoesNotThrow(manager::requestScan);
+        assertTrue(manager.isRunning());
+    }
+
 }
