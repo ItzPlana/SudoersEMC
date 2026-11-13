@@ -14,6 +14,8 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.List;
 import java.util.stream.Stream;
 import net.minecraft.resources.ResourceLocation;
 import org.junit.jupiter.api.Test;
@@ -215,5 +217,61 @@ class GeneratedEntryStoreTest {
         assertNotNull(stone);
         assertEquals(7L, stone.value());
         assertEquals(STONE, stone.recipeId());
+    }
+
+    @Test
+    void failedWriteKeepsDirtyAndRetriesWithBackup() throws IOException {
+        Path file = tempDir.resolve(GeneratedEntryStore.FILE_NAME);
+        GeneratedEntryStore store = new GeneratedEntryStore(file);
+        assertTrue(store.stage(new GeneratedEmcEntry(
+                ItemKey.of(STONE), 1L, PriceSource.RECIPE, null, true, 1L)));
+        store.save();
+        assertFalse(store.isDirty());
+
+        store.load(); // 文件已存在：下一次重写前必须生成 .bak
+        assertTrue(store.stage(new GeneratedEmcEntry(
+                ItemKey.of(DIRT), 2L, PriceSource.FALLBACK, null, true, 2L)));
+
+        blockTempFile(file);
+        store.save();
+        assertTrue(store.isDirty(), "写入失败后必须保留脏标记，saveIfDirty() 才能重试");
+
+        unblockTempFile(file);
+        Files.writeString(file, "\n/* external-change-marker */", StandardCharsets.UTF_8,
+                StandardOpenOption.APPEND);
+
+        store.saveIfDirty();
+
+        assertFalse(store.isDirty());
+        GeneratedEntryStore reloaded = new GeneratedEntryStore(file);
+        reloaded.load();
+        assertEquals(2, reloaded.size());
+        assertTrue(anyBackupContains("external-change-marker"),
+                "首次写入失败后，下一次成功写入仍必须重新生成 .bak");
+    }
+
+    private boolean anyBackupContains(String marker) throws IOException {
+        List<Path> backups;
+        try (Stream<Path> files = Files.list(tempDir)) {
+            backups = files.filter(path -> path.getFileName().toString().endsWith(".bak")).toList();
+        }
+        for (Path backup : backups) {
+            if (Files.readString(backup, StandardCharsets.UTF_8).contains(marker)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void blockTempFile(Path file) throws IOException {
+        Path temp = file.resolveSibling(file.getFileName() + ".tmp");
+        Files.createDirectories(temp);
+        Files.writeString(temp.resolve("blocker"), "x", StandardCharsets.UTF_8);
+    }
+
+    private static void unblockTempFile(Path file) throws IOException {
+        Path temp = file.resolveSibling(file.getFileName() + ".tmp");
+        Files.deleteIfExists(temp.resolve("blocker"));
+        Files.deleteIfExists(temp);
     }
 }

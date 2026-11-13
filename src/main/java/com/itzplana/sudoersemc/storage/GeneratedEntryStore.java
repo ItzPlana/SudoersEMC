@@ -39,7 +39,9 @@ import org.slf4j.LoggerFactory;
  * {@link #removeOwned(ItemKey)} never throw. Corrupt entries are skipped individually. A file
  * written by a newer schema version is preserved untouched: it is neither loaded nor overwritten.
  * Before the first rewrite of a file that was read from disk, a timestamped {@code .bak} copy is
- * made.</p>
+ * made. A failed write keeps the store dirty and leaves the one-time backup flag set, so a later
+ * {@link #saveIfDirty()} retries; an existing file is never overwritten without a successful
+ * backup.</p>
  */
 public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValueSource {
 
@@ -185,8 +187,13 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
                     dto.entries.add(EntryDto.from(entry));
                 }
 
-                if (backupPending) {
-                    JsonFileIO.backupIfExists(file);
+                if (backupPending && !JsonFileIO.backupIfExists(file)) {
+                    dirty.set(true);
+                    LOGGER.warn(
+                            "Failed to save generated entries to {}: could not create a backup; "
+                                    + "keeping the store dirty for a later retry",
+                            file);
+                    return false;
                 }
                 if (!JsonFileIO.writeAtomically(file, dto)) {
                     dirty.set(true);
