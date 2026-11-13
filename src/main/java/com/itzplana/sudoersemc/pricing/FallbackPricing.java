@@ -1,0 +1,179 @@
+package com.itzplana.sudoersemc.pricing;
+
+import com.itzplana.sudoersemc.core.ItemKey;
+import com.itzplana.sudoersemc.core.PriceSource;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import net.minecraft.world.item.Rarity;
+
+/**
+ * 兜底定价链：当配方求解无法给出数值时，按固定优先级为物品选择价格来源。
+ *
+ * <p>优先级从高到低（必须与此顺序完全一致）：</p>
+ * <ol>
+ *   <li>{@link PriceSource#EXISTING}：物品已有 EMC，且大于 0；</li>
+ *   <li>{@link PriceSource#EXTERNAL_BASELINE}：外部基线值大于 0；</li>
+ *   <li>{@link PriceSource#TAG}：命中材料标签基准值（受 {@link PricingSettings#useTagPricing()} 控制）；</li>
+ *   <li>{@link PriceSource#RARITY}：按稀有度取值（受 {@link PricingSettings#useRarityPricing()} 控制）；</li>
+ *   <li>{@link PriceSource#TIER}：命中层级固定值（受 {@link PricingSettings#useTierPricing()} 控制）；</li>
+ *   <li>{@link PriceSource#FALLBACK}：通用兜底值（受
+ *       {@link PricingSettings#useFallbackForUnsolvable()} 控制）。</li>
+ * </ol>
+ *
+ * <p>层级规则返回 {@code Optional.of(0L)} 表示“明确排除”。此时本类直接返回
+ * {@link Optional#empty()}，绝不把被排除的物品当成免费物品。任何情况下都不会返回负值。</p>
+ *
+ * <p>注意：稀有度定价只要启用就总会给出数值（见 {@link RarityPricing#price}），因此层级规则
+ * 只会在稀有度定价关闭时才会生效；这是上述优先级顺序的直接结果。层级倍率规则不会单独产生
+ * 价格，需要缩放的调用方应自行使用 {@link TierPricing#multiplierFor}。</p>
+ */
+public final class FallbackPricing {
+
+    /**
+     * 一次兜底定价请求。
+     *
+     * <p>标签列表会被复制并过滤 {@code null} 元素；负数的既有值与外部基线会被视为 0，
+     * 以保证定价链不会返回负值。</p>
+     *
+     * @param item             待定价物品
+     * @param tagPaths         物品拥有的标签路径
+     * @param rarity           物品稀有度，允许为 {@code null}
+     * @param existingValue    物品当前已有的 EMC，{@code 0} 表示没有
+     * @param externalBaseline 外部基线值，{@code 0} 表示没有
+     */
+    public record PricingRequest(
+            ItemKey item,
+            List<String> tagPaths,
+            Rarity rarity,
+            long existingValue,
+            long externalBaseline
+    ) {
+
+        public PricingRequest {
+            Objects.requireNonNull(item, "item");
+            tagPaths = copyTagPaths(tagPaths);
+            existingValue = Math.max(0L, existingValue);
+            externalBaseline = Math.max(0L, externalBaseline);
+        }
+
+        private static List<String> copyTagPaths(List<String> tagPaths) {
+            if (tagPaths == null || tagPaths.isEmpty()) {
+                return List.of();
+            }
+            List<String> copy = new ArrayList<>(tagPaths.size());
+            for (String tagPath : tagPaths) {
+                if (tagPath != null) {
+                    copy.add(tagPath);
+                }
+            }
+            return List.copyOf(copy);
+        }
+    }
+
+    /**
+     * 一次兜底定价的结果。
+     *
+     * @param item   被定价的物品
+     * @param value  非负价格
+     * @param source 价格来源
+     * @param reason 供诊断使用的简短原因标记
+     */
+    public record PricedValue(ItemKey item, long value, PriceSource source, String reason) {
+
+        public PricedValue {
+            Objects.requireNonNull(item, "item");
+            Objects.requireNonNull(source, "source");
+            Objects.requireNonNull(reason, "reason");
+            value = Math.max(0L, value);
+        }
+    }
+
+    private final TagPricing tagPricing;
+    private final RarityPricing rarityPricing;
+    private final TierPricing tierPricing;
+    private final PricingSettings settings;
+
+    public FallbackPricing(TagPricing tagPricing, RarityPricing rarityPricing, TierPricing tierPricing,
+                           PricingSettings settings) {
+        this.tagPricing = Objects.requireNonNull(tagPricing, "tagPricing");
+        this.rarityPricing = Objects.requireNonNull(rarityPricing, "rarityPricing");
+        this.tierPricing = Objects.requireNonNull(tierPricing, "tierPricing");
+        this.settings = Objects.requireNonNull(settings, "settings");
+    }
+
+    /**
+     * 使用空标签配置、默认稀有度定价与默认层级规则创建定价链。
+     *
+     * @param settings 定价开关与通用兜底值
+     * @return 可直接使用的兜底定价链
+     */
+    public static FallbackPricing withDefaults(PricingSettings settings) {
+        return new FallbackPricing(
+                new TagPricing(Map.of(), Map.of()),
+                RarityPricing.defaults(),
+                TierPricing.defaults(),
+                settings
+        );
+    }
+
+    /**
+     * 按 {@code EXISTING → EXTERNAL_BASELINE → TAG → RARITY → TIER → FALLBACK} 的顺序定价。
+     *
+     * <p>只有“启用且命中”的步骤才会产生结果；层级规则的排除标记（{@code 0L}）会立即终止
+     * 整个定价链并返回 {@link Optional#empty()}，而不是继续尝试通用兜底值。</p>
+     *
+     * @param request 定价请求
+     * @return 命中的价格与来源，未定价时为空
+     */
+    public Optional<PricedValue> price(PricingRequest request) {
+        Objects.requireNonNull(request, "request");
+        ItemKey item = request.item();
+
+        long existingValue = request.existingValue();
+        if (existingValue > 0L) {
+            return Optional.of(new PricedValue(item, existingValue, PriceSource.EXISTING, "existing-value"));
+        }
+
+        long externalBaseline = request.externalBaseline();
+        if (externalBaseline > 0L) {
+            return Optional.of(new PricedValue(
+                    item, externalBaseline, PriceSource.EXTERNAL_BASELINE, "external-baseline"));
+        }
+
+        if (settings.useTagPricing()) {
+            Optional<Long> tagValue = tagPricing.price(item, request.tagPaths());
+            if (tagValue.isPresent()) {
+                return Optional.of(new PricedValue(item, tagValue.get(), PriceSource.TAG, "tag-category"));
+            }
+        }
+
+        if (settings.useRarityPricing()) {
+            long rarityValue = rarityPricing.price(request.rarity());
+            String rarityName = request.rarity() == null ? "UNKNOWN" : request.rarity().name();
+            return Optional.of(new PricedValue(
+                    item, rarityValue, PriceSource.RARITY, "rarity:" + rarityName));
+        }
+
+        if (settings.useTierPricing()) {
+            Optional<Long> tierValue = tierPricing.price(item);
+            if (tierValue.isPresent()) {
+                long value = tierValue.get();
+                if (value <= 0L) {
+                    // 明确的排除规则：宁可不定价，也不要把物品变成免费物品
+                    return Optional.empty();
+                }
+                return Optional.of(new PricedValue(item, value, PriceSource.TIER, "tier-rule"));
+            }
+        }
+
+        if (settings.useFallbackForUnsolvable()) {
+            return Optional.of(new PricedValue(
+                    item, settings.genericFallbackValue(), PriceSource.FALLBACK, "generic-fallback"));
+        }
+
+        return Optional.empty();
+    }
+}
