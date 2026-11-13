@@ -956,6 +956,39 @@ class ScanManagerTest {
     }
 
     @Test
+    void nonReloadTrackingSupplierVerifiesOncePerStagingBatch() {
+        AtomicInteger fullFingerprintCalls = new AtomicInteger();
+        ScanManager.FingerprintSupplier fingerprints = new ScanManager.FingerprintSupplier() {
+            @Override
+            public ScanFingerprint current() {
+                fullFingerprintCalls.incrementAndGet();
+                return fingerprint("minecraft:stone");
+            }
+        };
+        CountingApplyTask task = new CountingApplyTask(9, 3);
+        ScanManager manager = ScanManager.staged(new BatchProcessor(3, false),
+                collector(data(0, 0)), snapshot -> task, TICK_BUDGET_NANOS,
+                fingerprints, null);
+
+        assertTrue(manager.requestScan());
+        manager.tick(); // 采集完成 -> SOLVING
+        manager.tick(); // 求解完成 -> APPLYING
+        assertEquals(ScanPhase.APPLYING, manager.progress().phase());
+        int afterEnteringApplying = fullFingerprintCalls.get();
+
+        manager.tick(); // 第 1 批
+        assertEquals(afterEnteringApplying + 1, fullFingerprintCalls.get(),
+                "非 reloadTracking 的每个 staging 批次只应在开始前校验一次");
+        manager.tick(); // 第 2 批
+        assertEquals(afterEnteringApplying + 2, fullFingerprintCalls.get(),
+                "同一批次前后不得各计算一次完整指纹");
+        manager.tick(); // 第 3 批 + 提交门
+        assertEquals(afterEnteringApplying + 4, fullFingerprintCalls.get(),
+                "最后一批需要批次边界校验一次 + 提交门前校验一次");
+        assertEquals(ScanPhase.SAVING, manager.progress().phase());
+    }
+
+    @Test
     void reloadTrackingSupplierNeverRecomputesFullFingerprint() {
         ReloadTrackingFingerprints fingerprints = new ReloadTrackingFingerprints();
         CountingApplyTask task = new CountingApplyTask(9, 3);

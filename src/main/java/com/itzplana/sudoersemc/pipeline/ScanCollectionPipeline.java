@@ -29,7 +29,10 @@ import com.itzplana.sudoersemc.storage.SudoersemcPaths;
 import com.itzplana.sudoersemc.task.ScanFingerprint;
 import com.itzplana.sudoersemc.task.ScanManager;
 import com.itzplana.sudoersemc.task.ScanPhase;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Iterator;
@@ -80,9 +83,14 @@ import org.slf4j.LoggerFactory;
  * <p><strong>指纹与 reload 代次：</strong>物品通道使用注册表 id；配方通道使用配方 id 与完整
  * 内容（类型、输入候选与数量、输出、容器残留、催化剂与属性）；标签通道使用标签 id 与其成员
  * 物品。仅保留 id、修改配方 JSON 或标签成员都会改变完整指纹。完整指纹只在服务器启动判断
- * 增量扫描时计算一次；扫描期间由 {@link #onDatapackReload()} 维护的廉价代次负责校验，
- * 采集结束时的 {@code CollectedSnapshot.fingerprint} 直接复用已转换好的配方快照，
- * 不再调用 {@code RecipeScanner.scan()} 全量遍历配方，因此不会在服务器线程产生长 tick。</p>
+ * 增量扫描时计算一次；扫描期间由 {@link #onDatapackReload()} 维护的廉价代次负责校验。</p>
+ *
+ * <p><strong>采集期增量指纹：</strong>采集会话按通道增量累积指纹输入：物品 id 与标签成员由
+ * 游标按批次推进，配方内容在配方扫描回调中即时描述，配置/基线在收尾时只读取固定数量的条目。
+ * {@link CollectionSession#finish()} 不再构造、排序或哈希全量列表，只把已经排序的通道交给 {@link #WORKER}
+ * 计算 SHA-256；服务器线程的指纹收尾成本是 O(1)（固定条目 + 提交任务）。仍需要在收尾时复制
+ * 已扫描的物品/配方快照交给求解任务（O(n) 数据交接，与旧实现相同），但不含 O(n log n) 排序或
+ * 服务器线程上的摘要计算。</p>
  *
  * <p><strong>增量扫描：</strong>扫描成功后会把本次指纹写入
  * {@code config/sudoersemc/scan_state.json}。服务器启动时若当前指纹与文件中的指纹一致且
@@ -211,14 +219,14 @@ public final class ScanCollectionPipeline {
         this(store, itemScanner, recipeScanner, stateFile, provider, dropProtection, overflowPipeline, null);
     }
 
-    private ScanCollectionPipeline(GeneratedEntryStore store,
-                                   ItemScanner itemScanner,
-                                   RecipeScanner recipeScanner,
-                                   Path stateFile,
-                                   EmcProvider provider,
-                                   LargeDropProtection dropProtection,
-                                   OverflowPipeline overflowPipeline,
-                                   Runnable afterApply) {
+    ScanCollectionPipeline(GeneratedEntryStore store,
+                           ItemScanner itemScanner,
+                           RecipeScanner recipeScanner,
+                           Path stateFile,
+                           EmcProvider provider,
+                           LargeDropProtection dropProtection,
+                           OverflowPipeline overflowPipeline,
+                           Runnable afterApply) {
         this.store = store;
         this.itemScanner = itemScanner;
         this.recipeScanner = recipeScanner;
@@ -249,7 +257,7 @@ public final class ScanCollectionPipeline {
      * <p>该实现声明支持廉价 reload 代次：{@link ScanManager} 在扫描开始时只读取一次
      * {@link #reloadGeneration()}，采集完成、求解完成与 APPLYING 的每个批次都只比较代次。
      * 完整内容指纹不再在扫描过程中重复计算；采集结束时的 {@code CollectedSnapshot.fingerprint}
-     * 由已经转换好的配方快照生成，供持久化与下次启动的增量判断使用。</p>
+     * 由采集期按通道增量累积的输入在后台线程生成，供持久化与下次启动的增量判断使用。</p>
      *
      * @param server 当前服务器，不能为 {@code null}
      * @return 提供完整指纹与廉价 reload 代次的回调
@@ -338,9 +346,10 @@ public final class ScanCollectionPipeline {
         Objects.requireNonNull(snapshot, "snapshot");
         ApplyJob job = prepareApply(snapshot);
         job.awaitSolve();
-        while (!job.isDone()) {
+        while (!job.isStagingComplete()) {
             job.stage(Integer.MAX_VALUE, Long.MAX_VALUE);
         }
+        job.commit();
     }
 
     /**
@@ -558,27 +567,13 @@ public final class ScanCollectionPipeline {
      */
     public ScanFingerprint computeFingerprint(MinecraftServer server) {
         Objects.requireNonNull(server, "server");
-        return computeFingerprint(server, null);
-    }
-
-    /**
-     * 计算当前扫描输入指纹。
-     *
-     * @param server           当前服务器
-     * @param collectedRecipes 采集阶段已经生成的配方快照；{@code null} 时从实时 RecipeManager 重建
-     */
-    private ScanFingerprint computeFingerprint(MinecraftServer server,
-                                               List<RecipeSnapshot> collectedRecipes) {
         List<String> items = new ArrayList<>(BuiltInRegistries.ITEM.keySet().size());
         for (ResourceLocation id : BuiltInRegistries.ITEM.keySet()) {
             items.add(id.toString());
         }
 
         List<String> recipes;
-        if (collectedRecipes != null) {
-            // 采集结束路径：复用已经转换好的配方快照，避免在服务器线程再次全量 scan。
-            recipes = recipeEntries(collectedRecipes);
-        } else if (recipeScanner != null) {
+        if (recipeScanner != null) {
             try {
                 // 配方内容指纹：只做描述，不求值。相比仅 id，能捕获 /reload 后保留 id 但修改
                 // 输入/输出/类型的情况。
@@ -696,6 +691,115 @@ public final class ScanCollectionPipeline {
             entries.add(tag + "=" + String.join(",", members));
         });
         return entries;
+    }
+
+    /**
+     * 采集期增量指纹累加器。
+     *
+     * <p>每个通道维护一个“值 → 出现次数”的有序映射：物品 id、配方内容、标签描述在采集过程中
+     * 逐条加入，插入成本 O(log n) 且分摊到多个 tick；配置/基线由调用方在收尾时传入。收尾时
+     * 把映射交给 {@link #WORKER}，工作线程按自然序逐个更新 SHA-256，得到与
+     * {@link ScanFingerprint#hash(Iterable)} 完全一致的结果，但服务器线程不再构造全量字符串、
+     * 排序或哈希。</p>
+     *
+     * <p>累加器不是线程安全的：所有 {@code add*} 与 {@link #finish} 都必须在同一服务器线程
+     * 调用；{@link #finish} 之后映射不再修改，工作线程只读。</p>
+     */
+    static final class FingerprintAccumulator {
+
+        private final NavigableMap<String, Integer> itemValues = new TreeMap<>();
+        private final NavigableMap<String, Integer> recipeValues = new TreeMap<>();
+        private final NavigableMap<String, Integer> tagValues = new TreeMap<>();
+        private boolean sealed;
+
+        void addItem(String itemId) {
+            addTo(itemValues, itemId);
+        }
+
+        void addRecipe(RecipeSnapshot recipe) {
+            if (recipe != null) {
+                addTo(recipeValues, recipeEntry(recipe));
+            }
+        }
+
+        void addTag(String tagId, Iterable<String> rawMembers) {
+            if (tagId == null || rawMembers == null) {
+                return;
+            }
+            List<String> members = new ArrayList<>();
+            for (String member : rawMembers) {
+                if (member != null) {
+                    members.add(member);
+                }
+            }
+            members.sort(Comparator.naturalOrder());
+            addTo(tagValues, tagId + "=" + String.join(",", members));
+        }
+
+        private void addTo(NavigableMap<String, Integer> target, String value) {
+            if (sealed) {
+                throw new IllegalStateException("指纹累加器已经收尾，不能继续添加输入");
+            }
+            if (value != null) {
+                target.merge(value, 1, Integer::sum);
+            }
+        }
+
+        /**
+         * 封存输入并异步计算五通道摘要。服务器线程只做固定数量的配置/基线字符串读取和
+         * 一次任务提交，摘要遍历与 SHA-256 在 {@link #WORKER} 上执行。
+         *
+         * @param config   配置通道输入
+         * @param baseline 基线通道输入
+         * @return 与旧全量实现逐字节等价的指纹
+         */
+        CompletableFuture<ScanFingerprint> finish(List<String> config, List<String> baseline) {
+            if (sealed) {
+                throw new IllegalStateException("指纹累加器已经收尾，不能重复 finish");
+            }
+            sealed = true;
+            return CompletableFuture.supplyAsync(() -> new ScanFingerprint(
+                    hashCounts(itemValues),
+                    hashCounts(recipeValues),
+                    hashCounts(tagValues),
+                    ScanFingerprint.hash(config),
+                    ScanFingerprint.hash(baseline)), WORKER);
+        }
+
+        /**
+         * 与 {@link ScanFingerprint#hash(Iterable)} 等价的有序多重集摘要：
+         * 按自然序输出每个值（重复次数保留），以 {@code \u0000} 分隔，SHA-256 后取前 32 位
+         * 十六进制字符。空集合返回 {@link ScanFingerprint#EMPTY}。
+         */
+        static String hashCounts(NavigableMap<String, Integer> values) {
+            if (values == null || values.isEmpty()) {
+                return ScanFingerprint.EMPTY;
+            }
+            try {
+                MessageDigest digest = MessageDigest.getInstance("SHA-256");
+                boolean first = true;
+                for (Map.Entry<String, Integer> entry : values.entrySet()) {
+                    byte[] encoded = entry.getKey().getBytes(StandardCharsets.UTF_8);
+                    int count = entry.getValue() == null ? 0 : entry.getValue();
+                    for (int index = 0; index < count; index++) {
+                        if (!first) {
+                            digest.update((byte) 0);
+                        }
+                        digest.update(encoded);
+                        first = false;
+                    }
+                }
+                byte[] hash = digest.digest();
+                StringBuilder hex = new StringBuilder(hash.length * 2);
+                for (byte value : hash) {
+                    hex.append(Character.forDigit((value >>> 4) & 0x0F, 16));
+                    hex.append(Character.forDigit(value & 0x0F, 16));
+                }
+                return hex.substring(0, 32);
+            } catch (NoSuchAlgorithmException e) {
+                throw new IllegalStateException("当前 JVM 不支持 SHA-256", e);
+            }
+        }
     }
 
     /**
@@ -951,6 +1055,9 @@ public final class ScanCollectionPipeline {
 
     /**
      * 一次采集的完整纯数据快照。
+     *
+     * <p>指纹由采集阶段增量累积，并在 {@link FingerprintAccumulator#finish} 中提交给工作线程；
+     * 快照持有一个 future，提交/持久化阶段才读取最终摘要，因此采集收尾不必等待 SHA-256。</p>
      */
     record CollectedSnapshot(
             List<ItemSnapshot> items,
@@ -958,16 +1065,37 @@ public final class ScanCollectionPipeline {
             int unsupportedRecipes,
             int invalidRecipes,
             int failedRecipes,
-            ScanFingerprint fingerprint
+            CompletableFuture<ScanFingerprint> fingerprintFuture
     ) {
 
         CollectedSnapshot {
             items = List.copyOf(Objects.requireNonNull(items, "items"));
             recipes = List.copyOf(Objects.requireNonNull(recipes, "recipes"));
-            Objects.requireNonNull(fingerprint, "fingerprint");
+            Objects.requireNonNull(fingerprintFuture, "fingerprintFuture");
             if (unsupportedRecipes < 0 || invalidRecipes < 0 || failedRecipes < 0) {
                 throw new IllegalArgumentException("配方扫描计数不能为负数");
             }
+        }
+
+        /**
+         * 同步构造入口，供单元测试与已经持有完整指纹的调用方使用。
+         */
+        CollectedSnapshot(List<ItemSnapshot> items,
+                          List<RecipeSnapshot> recipes,
+                          int unsupportedRecipes,
+                          int invalidRecipes,
+                          int failedRecipes,
+                          ScanFingerprint fingerprint) {
+            this(items, recipes, unsupportedRecipes, invalidRecipes, failedRecipes,
+                    CompletableFuture.completedFuture(
+                            Objects.requireNonNull(fingerprint, "fingerprint")));
+        }
+
+        /**
+         * @return 本次采集的完整指纹；必要时等待工作线程完成摘要（求解阶段通常已提前完成）
+         */
+        ScanFingerprint fingerprint() {
+            return fingerprintFuture.join();
         }
     }
 
@@ -979,12 +1107,23 @@ public final class ScanCollectionPipeline {
         private final MinecraftServer server;
         private final ItemScanner.ItemScanSession itemSession;
         private final RecipeScanner.RecipeScanSession recipeSession;
+        private final FingerprintAccumulator fingerprintAccumulator = new FingerprintAccumulator();
+        private final Iterator<ResourceLocation> fingerprintItemCursor;
+        private final Iterator<TagKey<Item>> fingerprintTagCursor;
+
+        private TagKey<Item> currentTag;
+        private List<String> currentTagMembers;
+        private Iterator<Holder<Item>> currentTagMemberCursor;
+        private boolean fingerprintTagCursorDone;
         private boolean finished;
 
         private CollectionSession(MinecraftServer server) {
             this.server = server;
             this.itemSession = itemScanner.beginSession();
-            this.recipeSession = recipeScanner.beginSession(server.getRecipeManager());
+            this.recipeSession = recipeScanner.beginSession(
+                    server.getRecipeManager(), fingerprintAccumulator::addRecipe);
+            this.fingerprintItemCursor = BuiltInRegistries.ITEM.keySet().iterator();
+            this.fingerprintTagCursor = BuiltInRegistries.ITEM.getTagNames().iterator();
         }
 
         @Override
@@ -1009,7 +1148,7 @@ public final class ScanCollectionPipeline {
 
         @Override
         public boolean isDone() {
-            return itemSession.isDone() && recipeSession.isDone();
+            return itemSession.isDone() && recipeSession.isDone() && fingerprintInputsDone();
         }
 
         @Override
@@ -1019,15 +1158,71 @@ public final class ScanCollectionPipeline {
 
         @Override
         public ScanManager.StepResult step(int maxItems, long deadlineNanos) {
+            if (maxItems < 1) {
+                throw new IllegalArgumentException("maxItems 必须 >= 1，实际为 " + maxItems);
+            }
+            int actual = 0;
             if (!itemSession.isDone()) {
-                int actual = itemSession.step(maxItems, deadlineNanos);
-                return new ScanManager.StepResult(actual, isDone());
+                actual = itemSession.step(maxItems, deadlineNanos);
+            } else if (!recipeSession.isDone()) {
+                actual = recipeSession.step(maxItems, deadlineNanos);
             }
-            if (!recipeSession.isDone()) {
-                int actual = recipeSession.step(maxItems, deadlineNanos);
-                return new ScanManager.StepResult(actual, isDone());
+            // 指纹游标不占用扫描进度，但与扫描共用本 tick 的截止时间，按 maxItems 上限推进。
+            advanceFingerprintCursors(maxItems, deadlineNanos);
+            return new ScanManager.StepResult(actual, isDone());
+        }
+
+        /**
+         * 增量推进物品 id 与标签成员两个指纹通道。每步最多处理 {@code maxItems} 个单元，
+         * 并在单元之间检查截止时间；完成的标签立即折叠为一条“标签 id=成员列表”描述。
+         */
+        private void advanceFingerprintCursors(int maxItems, long deadlineNanos) {
+            int work = 0;
+            while (work < maxItems && fingerprintItemCursor.hasNext()) {
+                if (fingerprintDeadlineReached(deadlineNanos)) {
+                    return;
+                }
+                fingerprintAccumulator.addItem(fingerprintItemCursor.next().toString());
+                work++;
             }
-            return new ScanManager.StepResult(0, true);
+            while (work < maxItems && !fingerprintTagCursorDone) {
+                if (fingerprintDeadlineReached(deadlineNanos)) {
+                    return;
+                }
+                if (currentTag == null) {
+                    if (!fingerprintTagCursor.hasNext()) {
+                        fingerprintTagCursorDone = true;
+                        break;
+                    }
+                    currentTag = fingerprintTagCursor.next();
+                    currentTagMembers = new ArrayList<>();
+                    currentTagMemberCursor = BuiltInRegistries.ITEM.getTag(currentTag)
+                            .<Iterator<Holder<Item>>>map(named -> named.iterator())
+                            .orElseGet(() -> List.<Holder<Item>>of().iterator());
+                }
+                if (currentTagMemberCursor.hasNext()) {
+                    Holder<Item> holder = currentTagMemberCursor.next();
+                    ResourceLocation id = BuiltInRegistries.ITEM.getKey(holder.value());
+                    if (id != null) {
+                        currentTagMembers.add(id.toString());
+                    }
+                    work++;
+                } else {
+                    fingerprintAccumulator.addTag(
+                            currentTag.location().toString(), currentTagMembers);
+                    currentTag = null;
+                    currentTagMembers = null;
+                    currentTagMemberCursor = null;
+                }
+            }
+        }
+
+        private boolean fingerprintInputsDone() {
+            return !fingerprintItemCursor.hasNext() && fingerprintTagCursorDone;
+        }
+
+        private static boolean fingerprintDeadlineReached(long deadlineNanos) {
+            return deadlineNanos != Long.MAX_VALUE && System.nanoTime() >= deadlineNanos;
         }
 
         @Override
@@ -1042,13 +1237,15 @@ public final class ScanCollectionPipeline {
 
             List<ItemSnapshot> itemSnapshots = itemSession.snapshots();
             RecipeScanner.ScanResult recipeResult = recipeSession.result();
+            // 配置/基线只有固定十几项；摘要遍历与 SHA-256 在 WORKER 上执行。服务器线程
+            // 在这里只提交任务，不构造/排序/哈希全量物品、配方或标签字符串。
             CollectedSnapshot snapshot = new CollectedSnapshot(
                     itemSnapshots,
                     recipeResult.recipes(),
                     recipeResult.unsupported(),
                     recipeResult.invalid(),
                     recipeResult.failed(),
-                    computeFingerprint(server, recipeResult.recipes()));
+                    fingerprintAccumulator.finish(configEntries(), baselineEntries()));
             stashed.set(snapshot);
             return new ScanManager.SnapshotData(
                     "服务器注册表", itemSnapshots.size(), recipeResult.recipes().size());
@@ -1068,6 +1265,8 @@ public final class ScanCollectionPipeline {
 
         private volatile SolveResult result;
         private Iterator<Map.Entry<ItemKey, Long>> iterator;
+        private boolean stagingComplete;
+        /** 仅在 {@link #commit()} 成功后置位；未提交前 {@link #cancel()} 必须回滚。 */
         private boolean done;
         private volatile boolean cancelled;
         private boolean rolledBack;
@@ -1124,7 +1323,7 @@ public final class ScanCollectionPipeline {
 
         @Override
         public int stage(int maxItems, long deadlineNanos) {
-            if (done || cancelled) {
+            if (stagingComplete || cancelled) {
                 return 0;
             }
             SolveResult solved = result;
@@ -1148,7 +1347,9 @@ public final class ScanCollectionPipeline {
                 stageOne(entry.getKey(), entry.getValue(), solved.traces().get(entry.getKey()));
             }
             if (!iterator.hasNext()) {
-                finish();
+                // 只标记“全部写入完毕”；提交（指纹、统计、afterApply）由 ScanManager 在
+                // 后置校验通过后调用 commit()，避免最后一批留下无法回滚的窗口。
+                stagingComplete = true;
             }
             return processed;
         }
@@ -1187,21 +1388,48 @@ public final class ScanCollectionPipeline {
             }
         }
 
-        private void finish() {
-            if (done) {
+        @Override
+        public boolean isStagingComplete() {
+            return stagingComplete;
+        }
+
+        /**
+         * 提交已经全部 staging 的结果。只有 {@code ScanManager} 在最后一批的后置输入校验通过后
+         * 才会调用；在此之前 {@link #cancel()} 仍可回滚。提交内容包括：
+         * <ol>
+         *   <li>{@code afterApply}（生产为 ProjectE remap 请求）；</li>
+         *   <li>{@code lastAppliedFingerprint}，使关服 {@code persist()} 只写入已校验的结果；</li>
+         *   <li>本次扫描的统计计数。</li>
+         * </ol>
+         */
+        @Override
+        public void commit() {
+            if (done || cancelled) {
                 return;
             }
-            done = true;
-            lastAppliedFingerprint = snapshot.fingerprint();
-            lastDurationMillis = Math.max(0L, (System.nanoTime() - startedNanos) / 1_000_000L);
-            lastSolvedCount = stagedCount;
-            lastUnresolvedCount = result == null ? 0 : result.unresolvedItems().size();
-            lastQuarantinedCount = quarantinedCount;
-            lastOverflowResetCount = Math.max(0,
+            if (!stagingComplete) {
+                throw new IllegalStateException("staging 尚未完成，不能提前 commit");
+            }
+            // 先在提交前解析指纹：摘要通常在求解阶段已完成；若这里失败，done 仍未置位，
+            // ScanManager 的失败路径会通过 cancel() 回滚本任务写入的条目。
+            ScanFingerprint committedFingerprint = snapshot.fingerprint();
+            long durationMillis = Math.max(
+                    0L, (System.nanoTime() - startedNanos) / 1_000_000L);
+            int unresolved = result == null ? 0 : result.unresolvedItems().size();
+            long overflowResets = Math.max(0,
                     overflowPipeline.resetsApplied() - overflowResetsBefore);
+            // 再执行外部回调：如果它失败，异常会进入 ScanManager 的失败路径，此时 done 仍未
+            // 置位，cancel() 会回滚本任务写入的条目，不会留下“FAILED 但价格已生效”的状态。
             if (afterApply != null) {
                 afterApply.run();
             }
+            done = true;
+            lastAppliedFingerprint = committedFingerprint;
+            lastDurationMillis = durationMillis;
+            lastSolvedCount = stagedCount;
+            lastUnresolvedCount = unresolved;
+            lastQuarantinedCount = quarantinedCount;
+            lastOverflowResetCount = overflowResets;
         }
 
         @Override
@@ -1223,6 +1451,7 @@ public final class ScanCollectionPipeline {
 
         @Override
         public void cancel() {
+            // done 只在 commit() 成功后置位；staging 完成但尚未 commit 时仍必须回滚。
             if (done || cancelled) {
                 return;
             }
