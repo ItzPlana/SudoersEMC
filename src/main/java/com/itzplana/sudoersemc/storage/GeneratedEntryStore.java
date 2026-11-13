@@ -374,9 +374,6 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
         return key == null ? null : entries.get(key);
     }
 
-    /**
-     * @return number of entries currently held in memory
-     */
     public int size() {
         return entries.size();
     }

@@ -8,7 +8,7 @@ import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
 
 /**
- * {@link OnceLogger} 的限流语义测试。
+ * Rate-limiting semantics tests for {@link OnceLogger}.
  */
 class OnceLoggerTest {
 

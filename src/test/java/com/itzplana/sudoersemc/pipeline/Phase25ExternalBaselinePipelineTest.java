@@ -40,8 +40,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * Phase 25 外部基线的安全层级测试：baseline 必须走候选路径，并经过排除、最小 EMC 与
- * 大幅降价保护；默认不可用时行为与 Phase 24 一致。
+ * Phase 25 external baseline safety-layer tests: baseline must go through the candidate path and pass exclusion, minimum
+ * EMC and large-drop protection; when unavailable by default, behaviour matches Phase 24.
  */
 class Phase25ExternalBaselinePipelineTest {
 

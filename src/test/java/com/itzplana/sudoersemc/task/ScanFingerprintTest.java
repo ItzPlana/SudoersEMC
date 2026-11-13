@@ -10,10 +10,10 @@ import java.util.List;
 import org.junit.jupiter.api.Test;
 
 /**
- * {@link ScanFingerprint} 的稳定性与字段比较验证。
+ * Stability and field comparison verification for {@link ScanFingerprint}.
  *
- * <p>重点验证顺序无关性、内容敏感性、空输入常量、空元素过滤，以及
- * {@link ScanFingerprint#equalsFingerprint(ScanFingerprint)} 对五个字段的完整比较。</p>
+ * <p>Focuses on order independence, content sensitivity, the empty-input constant, null-element filtering, and
+ * {@link ScanFingerprint#equalsFingerprint(ScanFingerprint)}'s full comparison of all five fields.</p>
  */
 class ScanFingerprintTest {
 

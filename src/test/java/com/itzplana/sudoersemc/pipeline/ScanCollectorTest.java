@@ -27,7 +27,7 @@ import net.minecraft.world.item.ItemStack;
 import org.junit.jupiter.api.Test;
 
 /**
- * {@link ScanCollector} 的分页、阶段推进、取消与 NBT 变体汇总验证。
+ * Paging, stage advance, cancellation and NBT variant aggregation verification for {@link ScanCollector}.
  */
 class ScanCollectorTest {
 
@@ -220,7 +220,7 @@ class ScanCollectorTest {
     }
 
     /**
-     * 构造带真实物品扫描器与假配方页的采集会话。
+     * Builds a collection session with a real item scanner and a fake recipe page.
      */
     private static ScanCollector session(List<ResourceLocation> itemIds,
                                          List<ResourceLocation> recipeIds,

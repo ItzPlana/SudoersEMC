@@ -41,8 +41,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * Phase 25 resolver 接线测试：默认空表行为不变；resolver 值只能作为 EXTERNAL_BASELINE 候选，
- * 非正值与异常均不得制造免费物品。
+ * Phase 25 resolver wiring tests: default empty-registry behaviour is unchanged; resolver values may only become
+ * EXTERNAL_BASELINE candidates, and non-positive values or exceptions must never create free items.
  */
 class Phase25ResolverIntegrationTest {
 

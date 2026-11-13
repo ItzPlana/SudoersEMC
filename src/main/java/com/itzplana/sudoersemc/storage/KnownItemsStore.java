@@ -255,7 +255,6 @@ public final class KnownItemsStore {
         return key != null && items.containsKey(key);
     }
 
-    /** @return 目录中的物品数量 */
     public int size() {
         return items.size();
     }

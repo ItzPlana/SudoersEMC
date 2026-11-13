@@ -12,14 +12,16 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * 有序的 NBT 材料解析器注册表。
+ * Ordered registry of NBT material resolvers.
  *
- * <p>解析按注册顺序进行，第一个同时满足 {@link NbtMaterialResolver#supports(ItemStack)}
- * 且返回非空结果的解析器获胜。解析器可能来自第三方模组，因此 {@link RuntimeException}
- * 会被记录并跳过，单个解析器失败不会中断后续解析；{@link Error}（例如
- * {@link OutOfMemoryError}）不会被吞掉，会继续向上传播，避免资源耗尽后留下不一致状态。</p>
+ * <p>Resolution proceeds in registration order; the first resolver that both satisfies
+ * {@link NbtMaterialResolver#supports(ItemStack)} and returns a non-empty result wins. Resolvers may
+ * come from third-party mods, so a {@link RuntimeException} is logged and skipped — a single resolver
+ * failure does not abort subsequent resolution; an {@link Error} (e.g. {@link OutOfMemoryError}) is not
+ * swallowed and propagates upward, avoiding an inconsistent state after resource exhaustion.</p>
  *
- * <p>本类线程安全：内部使用写时复制列表，允许在扫描线程读取的同时安全注册。</p>
+ * <p>This class is thread-safe: it uses a copy-on-write list internally, allowing safe registration
+ * while the scan thread reads.</p>
  */
 public final class ResolverRegistry {
 
@@ -29,10 +31,10 @@ public final class ResolverRegistry {
     private final AtomicLong resolveCalls = new AtomicLong();
 
     /**
-     * 按顺序注册一个解析器。
+     * Registers a resolver in order.
      *
-     * @param resolver 解析器实例
-     * @throws NullPointerException 当 {@code resolver} 为 {@code null}
+     * @param resolver the resolver instance
+     * @throws NullPointerException when {@code resolver} is {@code null}
      */
     public void register(NbtMaterialResolver resolver) {
         Objects.requireNonNull(resolver, "resolver");
@@ -40,14 +42,15 @@ public final class ResolverRegistry {
     }
 
     /**
-     * 按顺序注册一个解析器，同一实例只注册一次。
+     * Registers a resolver in order, registering the same instance only once.
      *
-     * <p>第三方模组可能在构造器与 common setup 各注册一次；去重避免同一个解析器被重复调用。
-     * 方法对注册操作加锁，保证“检查 + 添加”在并发注册时也是原子的。</p>
+     * <p>A third-party mod may register once in its constructor and once in common setup; deduplication
+     * avoids the same resolver being called repeatedly. The method locks the registration operation so
+     * "check + add" is atomic even under concurrent registration.</p>
      *
-     * @param resolver 解析器实例
-     * @return {@code true} 表示本次新增，{@code false} 表示已存在
-     * @throws NullPointerException 当 {@code resolver} 为 {@code null}
+     * @param resolver the resolver instance
+     * @return {@code true} if newly added, {@code false} if already present
+     * @throws NullPointerException when {@code resolver} is {@code null}
      */
     public synchronized boolean registerIfAbsent(NbtMaterialResolver resolver) {
         Objects.requireNonNull(resolver, "resolver");
@@ -58,19 +61,21 @@ public final class ResolverRegistry {
     }
 
     /**
-     * @return 当前注册的解析器数量
+     * @return the number of currently registered resolvers
      */
     public int size() {
         return resolvers.size();
     }
 
     /**
-     * 返回稳定的注册表指纹：按注册顺序排列的 {@code resolver[index]:<class>} 列表。
+     * Returns a stable registry fingerprint: a list of {@code resolver[index]:<class>} in registration
+     * order.
      *
-     * <p>解析结果取决于注册顺序（第一个返回值大于 0 的解析器获胜），因此顺序变化必须
-     * 改变扫描基线指纹并触发重扫；新增/移除 resolver 同样会改变指纹。</p>
+     * <p>Resolution depends on registration order (the first resolver returning a value > 0 wins), so an
+     * order change must change the scan baseline fingerprint and trigger a rescan; adding/removing a
+     * resolver also changes the fingerprint.</p>
      *
-     * @return 不可变、按注册顺序排列的指纹条目
+     * @return immutable fingerprint entries in registration order
      */
     public List<String> fingerprintEntries() {
         List<String> entries = new ArrayList<>(resolvers.size());
@@ -83,13 +88,13 @@ public final class ResolverRegistry {
     }
 
     /**
-     * 依次尝试所有解析器。
+     * Tries all resolvers in turn.
      *
-     * <p>{@code supports} 或 {@code resolve} 抛出 {@link RuntimeException} 时只记录警告并
-     * 继续尝试下一个解析器，防止某个模组的错误数据破坏整个扫描流程。</p>
+     * <p>When {@code supports} or {@code resolve} throws a {@link RuntimeException}, only a warning is
+     * logged and the next resolver is tried, preventing one mod's bad data from breaking the whole scan.</p>
      *
-     * @param stack 待定价的堆叠
-     * @return 第一个成功解析出的 EMC；没有解析器能够定价时返回空
+     * @param stack the stack to price
+     * @return the first successfully resolved EMC; empty when no resolver can price
      */
     public OptionalLong resolve(ItemStack stack) {
         if (stack == null || stack.isEmpty() || resolvers.isEmpty()) {
@@ -137,12 +142,12 @@ if (value != null && value.isPresent() && DebugLog.isEnabled()) {
     }
 
     /**
-     * 创建一个空注册表。
+     * Creates an empty registry.
      *
-     * <p>内置解析器不会被自动注册，调用方需要显式注册 {@link DefaultMaterialResolver}，
-     * 这样集成层可以完全控制解析顺序。</p>
+     * <p>Built-in resolvers are not auto-registered; the caller must explicitly register
+     * {@link DefaultMaterialResolver}, so the integration layer fully controls resolution order.</p>
      *
-     * @return 不包含任何解析器的注册表
+     * @return a registry containing no resolvers
      */
     public static ResolverRegistry defaults() {
         return new ResolverRegistry();

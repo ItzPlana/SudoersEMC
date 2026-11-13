@@ -6,13 +6,14 @@ import java.util.Objects;
 import net.minecraft.world.item.Rarity;
 
 /**
- * 基于物品稀有度的兜底定价。
+ * Rarity-based fallback pricing.
  *
- * <p>稀有度是物品自带的属性，适合为“没有标签、没有配方、也没有外部基线”的物品提供一个
- * 保守的兜底价格。最终价格按 {@code 基准值 * 倍率} 计算，使用整数运算向下取整。</p>
+ * <p>Rarity is an intrinsic item attribute, suitable for giving a conservative fallback price to items
+ * with "no tag, no recipe and no external baseline". The final price is computed as
+ * {@code base * multiplier} using integer arithmetic rounded down.</p>
  *
- * <p>这是本包中唯一依赖 Minecraft 类型的定价器，因为 {@link Rarity} 是原版枚举；
- * 其余逻辑仍然保持纯计算。</p>
+ * <p>This is the only pricer in this package that depends on a Minecraft type, because {@link Rarity} is
+ * a vanilla enum; the rest of the logic remains pure calculation.</p>
  */
 public final class RarityPricing {
 
@@ -21,9 +22,9 @@ public final class RarityPricing {
     private final long fallbackValue;
 
     /**
-     * @param baseValues    各稀有度的基准值，必须为非负数
-     * @param multipliers   各稀有度的倍率，必须为有限且大于等于 0 的数值；缺失时按 {@code 1.0} 处理
-     * @param fallbackValue 稀有度缺失或为 {@code null} 时使用的基准值，必须为非负数
+     * @param baseValues    base value per rarity, must be non-negative
+     * @param multipliers   multiplier per rarity, must be finite and >= 0; missing entries are treated as {@code 1.0}
+     * @param fallbackValue base value used when rarity is missing or {@code null}, must be non-negative
      */
     public RarityPricing(Map<Rarity, Long> baseValues, Map<Rarity, Double> multipliers, long fallbackValue) {
         Objects.requireNonNull(baseValues, "baseValues");
@@ -58,15 +59,16 @@ public final class RarityPricing {
     }
 
     /**
-     * 计算稀有度对应的价格。
+     * Computes the price for a rarity.
      *
-     * <p>结果为 {@code floor(base * multiplier)}，永远不会是负数。稀有度缺失或为 {@code null}
-     * 时使用构造时提供的 {@code fallbackValue}，倍率按 {@code 1.0} 处理。结果超出 {@code long}
-     * 范围时按 Java 窄化规则饱和到 {@code Long.MAX_VALUE}，不会回绕成负数；后续安全层仍会按
-     * 溢出策略处置超过阈值的价格。</p>
+     * <p>The result is {@code floor(base * multiplier)} and is never negative. When rarity is missing or
+     * {@code null}, the {@code fallbackValue} given at construction is used and the multiplier is treated
+     * as {@code 1.0}. If the result exceeds the {@code long} range it saturates to {@code Long.MAX_VALUE}
+     * per Java narrowing rules rather than wrapping negative; the downstream safety layer still handles
+     * above-threshold prices via the overflow policy.</p>
      *
-     * @param rarity 物品稀有度，允许为 {@code null}
-     * @return 非负价格
+     * @param rarity item rarity, may be {@code null}
+     * @return non-negative price
      */
     public long price(Rarity rarity) {
         long base = rarity == null ? fallbackValue : baseValues.getOrDefault(rarity, fallbackValue);
@@ -79,9 +81,9 @@ public final class RarityPricing {
     }
 
     /**
-     * 保守的默认配置：COMMON 16、UNCOMMON 64、RARE 256、EPIC 2048，所有倍率均为 {@code 1.0}。
+     * Conservative defaults: COMMON 16, UNCOMMON 64, RARE 256, EPIC 2048, all multipliers {@code 1.0}.
      *
-     * @return 默认稀有度定价器
+     * @return the default rarity pricer
      */
     public static RarityPricing defaults() {
         EnumMap<Rarity, Long> baseValues = new EnumMap<>(Rarity.class);
@@ -98,21 +100,21 @@ public final class RarityPricing {
     }
 
     /**
-     * @return 不可变的稀有度基准值视图
+     * @return immutable view of rarity base values
      */
     public Map<Rarity, Long> baseValues() {
         return baseValues;
     }
 
     /**
-     * @return 不可变的稀有度倍率视图
+     * @return immutable view of rarity multipliers
      */
     public Map<Rarity, Double> multipliers() {
         return multipliers;
     }
 
     /**
-     * @return 稀有度缺失时使用的基准值
+     * @return the base value used when rarity is missing
      */
     public long fallbackValue() {
         return fallbackValue;

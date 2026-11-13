@@ -6,100 +6,101 @@ import net.minecraft.world.item.crafting.Ingredient;
 import org.jetbrains.annotations.Nullable;
 
 /**
- * Goety 仪式配方的字段访问接缝。
+ * Field-access seam for Goety ritual recipes.
  *
- * <p>生产实现 {@link ReflectiveGoetyRitualAccess} 通过反射读取可选依赖 Goety 的配方对象；
- * 单元测试可以注入假实现，从而在完全没有 Goety 的 JVM 中验证必需字段的失败语义。</p>
+ * <p>The production implementation {@link ReflectiveGoetyRitualAccess} reads the optional dependency
+ * Goety's recipe objects via reflection; unit tests can inject a fake implementation to verify
+ * required-field failure semantics in a JVM with no Goety at all.</p>
  *
- * <p>每个访问器返回 {@link FieldRead} 三态结果，用于区分「访问器不存在」与「调用失败」。
- * 两者在经济上都按 fail-closed 处理，但日志与排查方式不同。</p>
+ * <p>Each accessor returns a three-state {@link FieldRead} result to distinguish "accessor absent" from
+ * "call failed". Both are treated fail-closed economically, but logging and troubleshooting differ.</p>
  */
 interface GoetyRitualAccess {
 
     /**
-     * @return 四个访问器是否全部解析成功
+     * @return whether all four accessors resolved successfully
      */
     boolean available();
 
     /**
-     * 读取仪式材料列表。
+     * Reads the ritual ingredient list.
      *
-     * @param recipe Goety 仪式配方对象
-     * @return 三态读取结果；值允许为 {@code null}，由调用方判定是否为失败
+     * @param recipe the Goety ritual recipe object
+     * @return three-state read result; the value may be {@code null}, the caller decides whether that is a failure
      */
     FieldRead<List<Ingredient>> ingredients(Object recipe);
 
     /**
-     * 读取激活物品。
+     * Reads the activation item.
      *
-     * @param recipe Goety 仪式配方对象
-     * @return 三态读取结果；合法零成本时返回 {@link Ingredient#EMPTY}
+     * @param recipe the Goety ritual recipe object
+     * @return three-state read result; returns {@link Ingredient#EMPTY} for a legitimate zero cost
      */
     FieldRead<Ingredient> activationItem(Object recipe);
 
     /**
-     * 读取仪式类型标识，例如 {@code goety:craft}。
+     * Reads the ritual type identifier, e.g. {@code goety:craft}.
      *
-     * @param recipe Goety 仪式配方对象
-     * @return 三态读取结果；缺失或无法转换时由调用方跳过整条配方
+     * @param recipe the Goety ritual recipe object
+     * @return three-state read result; the caller skips the whole recipe when missing or unconvertible
      */
     FieldRead<String> ritualType(Object recipe);
 
     /**
-     * 读取仪式产物。
+     * Reads the ritual result.
      *
-     * @param recipe Goety 仪式配方对象
-     * @return 三态读取结果；空栈由调用方判定为数据异常
+     * @param recipe the Goety ritual recipe object
+     * @return three-state read result; an empty stack is judged a data anomaly by the caller
      */
     FieldRead<ItemStack> result(Object recipe);
 
     /**
-     * 单次字段读取结果。
+     * Result of a single field read.
      *
-     * @param status 读取状态
-     * @param value  读取到的值，仅 {@link Status#OK} 时有意义
-     * @param failure 调用失败的原因，仅 {@link Status#FAILED} 时非空
-     * @param <T>    字段类型
+     * @param status  read status
+     * @param value   the read value, meaningful only for {@link Status#OK}
+     * @param failure the call-failure cause, non-null only for {@link Status#FAILED}
+     * @param <T>     the field type
      */
     record FieldRead<T>(Status status, @Nullable T value, @Nullable Throwable failure) {
 
         /**
-         * 读取状态。
+         * Read status.
          */
         enum Status {
-            /** 访问器存在且调用成功；值本身允许为 {@code null}。 */
+            /** Accessor exists and the call succeeded; the value itself may be {@code null}. */
             OK,
-            /** 访问器在解析期就不存在，通常意味着版本或签名漂移。 */
+            /** Accessor was absent at resolution time, usually meaning version or signature drift. */
             ABSENT,
-            /** 访问器存在，但调用、类型转换或访问权限检查失败。 */
+            /** Accessor exists, but the call, type conversion or access check failed. */
             FAILED
         }
 
         /**
-         * @param value 读取到的值，允许为 {@code null}
-         * @return 成功结果
+         * @param value the read value, may be {@code null}
+         * @return a success result
          */
         static <T> FieldRead<T> ok(@Nullable T value) {
             return new FieldRead<>(Status.OK, value, null);
         }
 
         /**
-         * @return 访问器缺失结果
+         * @return an accessor-absent result
          */
         static <T> FieldRead<T> absent() {
             return new FieldRead<>(Status.ABSENT, null, null);
         }
 
         /**
-         * @param cause 失败原因
-         * @return 调用失败结果
+         * @param cause the failure cause
+         * @return a call-failure result
          */
         static <T> FieldRead<T> failed(Throwable cause) {
             return new FieldRead<>(Status.FAILED, null, cause);
         }
 
         /**
-         * @return 是否读取成功
+         * @return whether the read succeeded
          */
         boolean ok() {
             return status == Status.OK;
@@ -107,7 +108,7 @@ interface GoetyRitualAccess {
     }
 
     /**
-     * @return 不读取任何字段的禁用实现
+     * @return a disabled implementation that reads no fields
      */
     static GoetyRitualAccess unavailable() {
         return new GoetyRitualAccess() {

@@ -9,14 +9,15 @@ import java.util.Objects;
 import java.util.Optional;
 
 /**
- * 基于材料标签的兜底定价。
+ * Material-tag-based fallback pricing.
  *
- * <p>标签只描述材料关系，并不代表两种物品价值相同：{@code forge:ingots/iron} 与
- * {@code forge:ingots/copper} 都映射到 {@link MaterialCategory#INGOT}，但真实价值可能
- * 相差数倍。因此本类为每个 {@link MaterialCategory} 配置一个保守的基准值，再允许按物品
- * 单独覆盖。</p>
+ * <p>A tag only describes a material relationship, not that two items have equal value:
+ * {@code forge:ingots/iron} and {@code forge:ingots/copper} both map to {@link MaterialCategory#INGOT},
+ * yet their real values may differ several-fold. This class therefore configures a conservative base
+ * value per {@link MaterialCategory} and allows per-item overrides.</p>
  *
- * <p>本类只做纯计算，不读取 Minecraft 的标签注册表；标签路径由调用方解析后传入。</p>
+ * <p>This class is pure calculation and does not read Minecraft's tag registry; tag paths are resolved by
+ * the caller and passed in.</p>
  */
 public final class TagPricing {
 
@@ -24,9 +25,9 @@ public final class TagPricing {
     private final Map<ItemKey, Long> overrides;
 
     /**
-     * @param baseValues 各材料类别的基准值，必须为非负数，允许 {@link MaterialCategory#UNKNOWN}
-     *                   作为键存在，但查询时会被忽略
-     * @param overrides  按物品覆盖的固定值，优先级高于类别基准值，必须为非负数
+     * @param baseValues base value per material category, must be non-negative; {@link MaterialCategory#UNKNOWN}
+     *                   may exist as a key but is ignored on lookup
+     * @param overrides  per-item fixed overrides, taking priority over category base values, must be non-negative
      */
     public TagPricing(Map<MaterialCategory, Long> baseValues, Map<ItemKey, Long> overrides) {
         Objects.requireNonNull(baseValues, "baseValues");
@@ -50,19 +51,23 @@ public final class TagPricing {
     }
 
     /**
-     * 保守的材料类别基准值。
+     * Conservative material-category base values.
      *
-     * <p>默认值取低阶锭 {@code 64} 作为保守下限，并按 9 倍关系对齐粒与储存块：
-     * {@code NUGGET = INGOT / 9}、{@code STORAGE_BLOCK = INGOT * 9}，避免在默认锚点内部
-     * 产生“9 锭 → 1 块”的套利。其余类别同样按锭的分数或倍数取值，而不是直接采用铁系
-     * 真实值 {@code 256/2304}。精确到材料的覆盖值后续由配置提供；默认不包含任何按物品覆盖。</p>
+     * <p>The default takes a low-tier ingot {@code 64} as a conservative floor and aligns nuggets and
+     * storage blocks by a factor of 9: {@code NUGGET = INGOT / 9}, {@code STORAGE_BLOCK = INGOT * 9},
+     * avoiding a "9 ingots → 1 block" arbitrage within the default anchors. Other categories likewise take
+     * fractions or multiples of the ingot rather than the real iron values {@code 256/2304}.
+     * Material-specific overrides are supplied later by configuration; the default contains no per-item
+     * overrides.</p>
      *
-     * <p><strong>风险提示：</strong>{@link MaterialCategory} 是跨材料共享的。廉价可再生的
-     * 模组材料（例如铜、锡）仍可能相对 ProjectE 的真实值被高估；当 ProjectE 已为原料定价、
-     * 但未为对应块定价时，仍存在“低价原料 → 高价块”的套利可能。生产环境启用前应通过按物品
-     * 覆盖值或 ProjectE 手动值校正相关材料；本类目前没有按标签/材料的配置入口。</p>
+     * <p><strong>Risk note:</strong> {@link MaterialCategory} is shared across materials. Cheap renewable
+     * mod materials (e.g. copper, tin) may still be overvalued relative to ProjectE's real values; when
+     * ProjectE has priced the raw material but not the corresponding block, a "cheap raw → expensive
+     * block" arbitrage remains possible. Before enabling in production, correct such materials via
+     * per-item overrides or ProjectE manual values; this class currently has no per-tag/per-material
+     * configuration entry.</p>
      *
-     * @return 使用默认类别基准值的标签定价器
+     * @return a tag pricer using default category base values
      */
     public static TagPricing defaults() {
         EnumMap<MaterialCategory, Long> baseValues = new EnumMap<>(MaterialCategory.class);
@@ -80,15 +85,16 @@ public final class TagPricing {
     }
 
     /**
-     * 计算物品的标签基准价格。
+     * Computes an item's tag base price.
      *
-     * <p>先检查按物品配置的覆盖值；覆盖值与标签列表是否为空无关。没有覆盖值时，按传入顺序
-     * 查找第一个“能被识别且配置了基准值”的类别。无法识别的类别（{@link MaterialCategory#UNKNOWN}）
-     * 会被跳过。标签列表为空或为 {@code null} 时返回 {@link Optional#empty()}。本方法不会抛出异常。</p>
+     * <p>Checks the per-item override first; the override applies regardless of whether the tag list is
+     * empty. Without an override, looks up the first category in the given order that is recognisable and
+     * has a configured base value. Unrecognised categories ({@link MaterialCategory#UNKNOWN}) are skipped.
+     * An empty or {@code null} tag list returns {@link Optional#empty()}. This method never throws.</p>
      *
-     * @param item     待定价物品，为 {@code null} 时返回空
-     * @param tagPaths 物品拥有的标签路径，按优先级排列
-     * @return 命中的价格，未命中时为空
+     * @param item     the item to price; returns empty when {@code null}
+     * @param tagPaths tag paths the item has, in priority order
+     * @return the hit price; empty when none
      */
     public Optional<Long> price(ItemKey item, List<String> tagPaths) {
         if (item == null) {
@@ -121,14 +127,14 @@ public final class TagPricing {
     }
 
     /**
-     * @return 不可变的类别基准值视图
+     * @return immutable view of category base values
      */
     public Map<MaterialCategory, Long> baseValues() {
         return baseValues;
     }
 
     /**
-     * @return 不可变的按物品覆盖值视图
+     * @return immutable view of per-item overrides
      */
     public Map<ItemKey, Long> overrides() {
         return overrides;

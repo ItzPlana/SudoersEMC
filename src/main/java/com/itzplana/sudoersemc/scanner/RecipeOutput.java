@@ -9,7 +9,7 @@ import org.jetbrains.annotations.Nullable;
  *
  * @param item      produced item identity
  * @param count     produced amount; always {@code >= 1}
- * @param outputNbt 输出堆叠的 SNBT 表示；堆叠没有 NBT 时为 {@code null}
+ * @param outputNbt SNBT representation of the output stack; {@code null} when the stack has no NBT
  */
 public record RecipeOutput(ItemKey item, int count, @Nullable String outputNbt) {
 
@@ -19,8 +19,8 @@ public record RecipeOutput(ItemKey item, int count, @Nullable String outputNbt) 
             throw new IllegalArgumentException("Recipe output count must be >= 1, got " + count);
         }
         if (outputNbt != null) {
-            // SNBT "{}"、"{ }" 等空白形式都表示空标签；统一归一为 null，
-            // 避免下游把空标签当成真实变体生成 variantHash。
+            // Blank SNBT forms such as "{}" or "{ }" all mean an empty tag; normalise to null so
+            // downstream does not treat an empty tag as a real variant and generate a variantHash.
             String compact = outputNbt.replaceAll("\\s+", "");
             if (compact.isEmpty() || "{}".equals(compact)) {
                 outputNbt = null;
@@ -29,7 +29,7 @@ public record RecipeOutput(ItemKey item, int count, @Nullable String outputNbt) 
     }
 
     /**
-     * 向后兼容构造函数：没有输出 NBT 时等价于 {@code outputNbt = null}。
+     * Backward-compatible constructor: with no output NBT, equivalent to {@code outputNbt = null}.
      *
      * @param item  produced item identity
      * @param count produced amount; always {@code >= 1}
@@ -39,25 +39,25 @@ public record RecipeOutput(ItemKey item, int count, @Nullable String outputNbt) 
     }
 
     /**
-     * 创建不带 NBT 的单个产物。
+     * Creates a single output without NBT.
      */
     public static RecipeOutput of(ItemKey item) {
         return new RecipeOutput(item, 1, null);
     }
 
     /**
-     * 创建带 SNBT 的配方产物。
+     * Creates a recipe output with SNBT.
      *
      * @param item      produced item identity
      * @param count     produced amount; always {@code >= 1}
-     * @param outputNbt 输出堆叠的 SNBT，允许为 {@code null}
+     * @param outputNbt SNBT of the output stack, may be {@code null}
      */
     public static RecipeOutput of(ItemKey item, int count, @Nullable String outputNbt) {
         return new RecipeOutput(item, count, outputNbt);
     }
 
     /**
-     * @return 输出堆叠是否携带 NBT
+     * @return whether the output stack carries NBT
      */
     public boolean hasOutputNbt() {
         return outputNbt != null;

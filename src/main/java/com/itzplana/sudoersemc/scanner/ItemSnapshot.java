@@ -10,7 +10,8 @@ import net.minecraft.world.item.Rarity;
 /**
  * Immutable description of one registered item as seen by the scanner.
  *
- * <p>标签与稀有度在采集阶段一次性固化，后续求解与兜底定价只读取不可变快照，不再访问游戏注册表。</p>
+ * <p>Tags and rarity are frozen once during collection; later solving and fallback pricing only read
+ * the immutable snapshot and never access the game registry again.</p>
  *
  * @param key            item identity, including a variant hash when the scanner priced a variant
  * @param registryId     registry id of the item
@@ -18,8 +19,8 @@ import net.minecraft.world.item.Rarity;
  * @param path           registry path
  * @param hasExistingEmc whether the EMC backend already assigns a value
  * @param existingValue  the existing value, or {@code 0} when none
- * @param tagPaths       物品携带的标签路径（已过滤 {@code null} 与空白），不可变且不为 {@code null}
- * @param rarity         物品稀有度；{@code null} 会归一为 {@link Rarity#COMMON}
+ * @param tagPaths       tag paths the item carries ({@code null} and blanks filtered), immutable and never {@code null}
+ * @param rarity         item rarity; {@code null} is normalised to {@link Rarity#COMMON}
  */
 public record ItemSnapshot(
         ItemKey key,
@@ -45,14 +46,15 @@ public record ItemSnapshot(
     }
 
     /**
-     * 向后兼容构造函数：没有标签信息时按空列表与 {@link Rarity#COMMON} 处理。
+     * Backward-compatible constructor: with no tag information, treated as an empty list and
+     * {@link Rarity#COMMON}.
      *
-     * @param key            物品身份
-     * @param registryId     注册表 id
-     * @param namespace      命名空间
-     * @param path           注册表路径
-     * @param hasExistingEmc 是否已有 EMC
-     * @param existingValue  已有 EMC 值，{@code 0} 表示没有
+     * @param key            item identity
+     * @param registryId     registry id
+     * @param namespace      namespace
+     * @param path           registry path
+     * @param hasExistingEmc whether EMC already exists
+     * @param existingValue  existing EMC value, {@code 0} meaning none
      */
     public ItemSnapshot(ItemKey key, ResourceLocation registryId, String namespace, String path,
                         boolean hasExistingEmc, long existingValue) {
@@ -61,26 +63,26 @@ public record ItemSnapshot(
     }
 
     /**
-     * 创建不带标签信息的快照，稀有度按 {@link Rarity#COMMON} 处理。
+     * Creates a snapshot without tag information; rarity treated as {@link Rarity#COMMON}.
      *
-     * @param key            物品身份
-     * @param hasExistingEmc 是否已有 EMC
-     * @param existingValue  已有 EMC 值，{@code 0} 表示没有
-     * @return 不可变快照
+     * @param key            item identity
+     * @param hasExistingEmc whether EMC already exists
+     * @param existingValue  existing EMC value, {@code 0} meaning none
+     * @return immutable snapshot
      */
     public static ItemSnapshot of(ItemKey key, boolean hasExistingEmc, long existingValue) {
         return of(key, hasExistingEmc, existingValue, List.of(), Rarity.COMMON);
     }
 
     /**
-     * 创建带标签与稀有度信息的快照。
+     * Creates a snapshot with tag and rarity information.
      *
-     * @param key            物品身份
-     * @param hasExistingEmc 是否已有 EMC
-     * @param existingValue  已有 EMC 值，{@code 0} 表示没有
-     * @param tagPaths       标签路径列表，允许为 {@code null}
-     * @param rarity         物品稀有度，允许为 {@code null}
-     * @return 不可变快照
+     * @param key            item identity
+     * @param hasExistingEmc whether EMC already exists
+     * @param existingValue  existing EMC value, {@code 0} meaning none
+     * @param tagPaths       tag path list, may be {@code null}
+     * @param rarity         item rarity, may be {@code null}
+     * @return immutable snapshot
      */
     public static ItemSnapshot of(ItemKey key, boolean hasExistingEmc, long existingValue,
                                   List<String> tagPaths, Rarity rarity) {

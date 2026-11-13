@@ -60,9 +60,6 @@ public final class CreativeItemProtection {
         this.autoDetectPatterns = compilePatterns(settings.creativeOnlyItemPatterns());
     }
 
-    /**
-     * @return 默认的已知创造专属物品正则列表
-     */
     public static List<String> defaultAutoDetectPatterns() {
         return DEFAULT_AUTO_DETECT_PATTERNS;
     }

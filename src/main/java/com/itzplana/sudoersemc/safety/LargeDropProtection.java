@@ -294,7 +294,6 @@ public final class LargeDropProtection {
         }
     }
 
-    /** @return 当前隔离条目数量 */
     public int quarantineCount() {
         synchronized (lock) {
             return quarantine.size();

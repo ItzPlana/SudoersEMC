@@ -16,42 +16,46 @@ import net.minecraft.world.item.Item;
 import org.jetbrains.annotations.Nullable;
 
 /**
- * 把物品堆叠的 NBT 规范化为确定性的 SNBT 字符串，供 {@link ItemKey#variantHash()} 使用。
+ * Canonicalises an item stack's NBT into a deterministic SNBT string for {@link ItemKey#variantHash()}.
  *
- * <p>规范化会递归删除所有层级中的纯展示字段（{@code display}、{@code RepairCost}、
- * {@code HideFlags}、{@code CustomModelData}、{@code EnchantmentGlintOverride}），并删除
- * 根级（物品自身）的 ProjectE {@code StoredEMC} 以及所有层级的非标准 {@code stored_emc}。
- * 根级 {@code StoredEMC} 由 ProjectE 的 {@code StoredEMCProcessor} 在查询时按
- * {@code IItemEmcHolder} 动态叠加，不能进入变体身份，否则每个存储值都会产生一个新变体。</p>
+ * <p>Canonicalisation recursively removes pure display fields at every level ({@code display},
+ * {@code RepairCost}, {@code HideFlags}, {@code CustomModelData}, {@code EnchantmentGlintOverride}), and
+ * removes the root-level (the item's own) ProjectE {@code StoredEMC} plus non-standard {@code stored_emc}
+ * at every level. Root-level {@code StoredEMC} is added dynamically at query time by ProjectE's
+ * {@code StoredEMCProcessor} per {@code IItemEmcHolder} and must not enter the variant identity,
+ * otherwise every stored value would produce a new variant.</p>
  *
- * <p>容器内容物（{@code BlockEntityTag.Items[].tag}）中的 ProjectE {@code StoredEMC}
- * 是例外：ProjectE 的 processor 只处理被查询的物品本身，不会读取嵌套内容物；而
- * {@code DefaultMaterialResolver} 会把该值计入容器价格。ProjectE 的
- * {@code EMCMappingHandler.getStoredEmcValue} 对完整 {@code ItemInfo} 做精确查找，
- * 因此容器变体键必须保留这个嵌套字段，否则生成映射永远命中不到真实容器堆叠，修复不会
- * 生效。该值在扫描阶段是经济上不同的变体（不同存储量对应不同价值），由
- * {@code VariantScanner} 的 {@code maxVariantsPerItem}/{@code HARD_VARIANT_CEILING}
- * 做有界、确定性的截断。</p>
+ * <p>ProjectE {@code StoredEMC} inside container contents ({@code BlockEntityTag.Items[].tag}) is the
+ * exception: ProjectE's processor only handles the queried item itself and does not read nested
+ * contents, while {@code DefaultMaterialResolver} counts that value into the container price. ProjectE's
+ * {@code EMCMappingHandler.getStoredEmcValue} does an exact lookup on the full {@code ItemInfo}, so the
+ * container variant key must keep this nested field, otherwise the generated mapping never hits the real
+ * container stack and the fix never takes effect. During scanning this value is an economically distinct
+ * variant (different stored amounts mean different values), bounded and deterministically truncated by
+ * {@code VariantScanner}'s {@code maxVariantsPerItem}/{@code HARD_VARIANT_CEILING}.</p>
  *
- * <p>经济相关数据必须保留，包括 {@code Enchantments}、{@code StoredEnchantments}、
- * {@code Potion}/{@code CustomPotionEffects}、{@code BlockEntityTag}（容器内容）、
- * {@code Items} 与 {@code SkullOwner}。{@link #keyFor(ResourceLocation, CompoundTag)}
- * 会把可损坏物品顶层的 {@code Damage} 规范化为 {@code 0}：ProjectE 的
- * {@code DamageProcessor} 在查询时按耐久动态折价，把每个耐久值都枚举成独立变体会造成
- * 变体爆炸与重复折价；若清洗后仍有附魔等经济字段，则保留 {@code {Damage:0,...}}。
- * <strong>已知限制：</strong>真实堆叠的 {@code Damage>0} 且带其它 NBT 时，其精确
- * {@code ItemInfo} 是 {@code {Damage:d,...}}，与这里生成的 {@code {Damage:0,...}}
- * 并不相等；ProjectE 会安全地回退到无 NBT 基础价并执行 {@code DamageProcessor}，
- * 不会误用其它变体的价格。这是为避免每耐久一个变体而有意接受的限制，不是遗漏。
- * 原始标签不含 {@code Damage} 时不凭空添加，以匹配 ProjectE 的无伤害形状。</p>
+ * <p>Economically relevant data must be kept, including {@code Enchantments}, {@code StoredEnchantments},
+ * {@code Potion}/{@code CustomPotionEffects}, {@code BlockEntityTag} (container contents), {@code Items}
+ * and {@code SkullOwner}. {@link #keyFor(ResourceLocation, CompoundTag)} canonicalises a damageable
+ * item's top-level {@code Damage} to {@code 0}: ProjectE's {@code DamageProcessor} discounts dynamically
+ * by durability at query time, and enumerating every durability value as a separate variant would cause
+ * variant explosion and double discounting; if economic fields such as enchantments remain after
+ * cleaning, {@code {Damage:0,...}} is kept. <strong>Known limitation:</strong> when a real stack has
+ * {@code Damage>0} plus other NBT, its exact {@code ItemInfo} is {@code {Damage:d,...}}, which is not
+ * equal to the {@code {Damage:0,...}} generated here; ProjectE safely falls back to the no-NBT base price
+ * and runs {@code DamageProcessor}, never misusing another variant's price. This is a limitation
+ * intentionally accepted to avoid one-variant-per-durability, not an oversight. When the original tag has
+ * no {@code Damage}, none is added, to match ProjectE's no-damage shape.</p>
  *
- * <p>{@link #normalize(CompoundTag)} 不知道物品类型，因此保留 {@code Damage}，仅用于
- * 无法确定物品身份的嵌套数据。所有复合标签的键都会按字典序排序，因此相同的标签无论插入
- * 顺序如何都会得到完全相同的字符串。返回值是合法的 SNBT，可直接交给
- * {@code TagParser.parseTag}。清洗后没有任何剩余字段时返回 {@code null}，表示普通物品。</p>
+ * <p>{@link #normalize(CompoundTag)} does not know the item type, so it keeps {@code Damage} and is only
+ * used for nested data whose item identity cannot be determined. All compound-tag keys are sorted
+ * lexicographically, so identical tags yield exactly the same string regardless of insertion order. The
+ * return value is valid SNBT and can be handed directly to {@code TagParser.parseTag}. When no fields
+ * remain after cleaning, returns {@code null}, meaning a plain item.</p>
  *
- * <p>已知限制：{@code Enchantments}/{@code StoredEnchantments}/{@code AttributeModifiers}
- * 等语义无序列表仍按原有顺序参与哈希；列表顺序不同的等价物品会得到不同变体。</p>
+ * <p>Known limitation: semantically unordered lists such as
+ * {@code Enchantments}/{@code StoredEnchantments}/{@code AttributeModifiers} still participate in the hash
+ * in their original order; equivalent items with different list order get different variants.</p>
  */
 public final class VariantNormalizer {
 
@@ -61,8 +65,8 @@ public final class VariantNormalizer {
             "HideFlags",
             "CustomModelData",
             "EnchantmentGlintOverride",
-            // 非 ProjectE 的小写约定；ProjectE 只认根级 "StoredEMC"，
-            // 且根级 StoredEMC 由 StoredEMCProcessor 在查询时处理。
+            // Non-ProjectE lowercase convention; ProjectE only recognises root-level "StoredEMC",
+            // and root-level StoredEMC is handled by StoredEMCProcessor at query time.
             "stored_emc"
     );
 
@@ -75,19 +79,22 @@ public final class VariantNormalizer {
     }
 
     /**
-     * 规范化一个物品 NBT 标签。
+     * Canonicalises an item NBT tag.
      *
-     * <p>该方法不会修改传入的标签；返回的字符串可安全地长期保存。嵌套的复合标签与列表
-     * 也会递归清洗，因此容器内容中物品的自定义名称不会影响容器变体的身份。</p>
+     * <p>This method does not modify the supplied tag; the returned string is safe to store long-term.
+     * Nested compound tags and lists are also cleaned recursively, so a custom name on an item inside
+     * container contents does not affect the container variant's identity.</p>
      *
-     * <p>该方法不知道物品类型，因此不会剥离非默认的 {@code Damage}；但清洗后只剩默认
-     * {@code Damage:0} 时按无经济数据处理并返回 {@code null}。对不存在伤害语义的非可损坏
-     * 物品，若恰好只带 {@code {Damage:0}}，同样按宽松策略视为普通物品；调用方若需严格对齐
-     * ProjectE 的 {@code isDamageableItem()} 语义，应在调用前自行按物品类型限定。构建可损坏
-     * 物品的变体身份请使用 {@link #keyFor(ResourceLocation, CompoundTag)}。</p>
+     * <p>This method does not know the item type, so it does not strip non-default {@code Damage}; but
+     * when only the default {@code Damage:0} remains after cleaning it is treated as no economic data and
+     * returns {@code null}. For non-damageable items with no damage semantics, if they happen to carry
+     * only {@code {Damage:0}}, the same lenient policy treats them as a plain item; a caller needing
+     * strict alignment with ProjectE's {@code isDamageableItem()} semantics should restrict by item type
+     * before calling. Use {@link #keyFor(ResourceLocation, CompoundTag)} to build a damageable item's
+     * variant identity.</p>
      *
-     * @param tag 原始物品标签，允许为 {@code null}
-     * @return 规范化的 SNBT；清洗后没有经济相关数据时返回 {@code null}
+     * @param tag the raw item tag, may be {@code null}
+     * @return canonicalised SNBT; {@code null} when no economically relevant data remains after cleaning
      */
     public static @Nullable String normalize(@Nullable CompoundTag tag) {
         if (tag == null || tag.isEmpty()) {
@@ -103,19 +110,21 @@ public final class VariantNormalizer {
     }
 
     /**
-     * 判断标签是否只包含数值精确为 0 的 {@code Damage}（默认伤害）。
+     * Whether the tag contains only {@code Damage} with a numeric value of exactly 0 (default damage).
      *
-     * <p>配方输出常把 {@code {Damage:0}} 当作“无 NBT”写回；默认伤害值不携带任何经济信息，
-     * 若保留会为普通物品生成伪变体 {@code variantHash={Damage:0}}。只有标签中仅有该字段且
-     * 数值为 0 时才视为空；若还存在附魔、容器内容等经济字段，仍保留 {@code Damage}，
-     * 维持与旧版本一致的变体身份。</p>
+     * <p>Recipe outputs often write {@code {Damage:0}} back as "no NBT"; the default damage value carries
+     * no economic information, and keeping it would generate a fake variant
+     * {@code variantHash={Damage:0}} for a plain item. Only when the tag has solely this field with value
+     * 0 is it treated as empty; if economic fields such as enchantments or container contents remain,
+     * {@code Damage} is kept, maintaining the same variant identity as older versions.</p>
      *
-     * <p>数值判定使用 {@link NumericTag#getAsDouble()} 而不是 {@code getInt()}，避免
-     * {@code 4294967296L}、{@code 0.5d} 等非零值被整数截断成 0 后误归一。该方法同时供
-     * {@link #normalize(CompoundTag)} 与配方输出预归一使用，确保所有入口共享同一判定。</p>
+     * <p>The numeric check uses {@link NumericTag#getAsDouble()} rather than {@code getInt()}, avoiding
+     * non-zero values such as {@code 4294967296L} or {@code 0.5d} being integer-truncated to 0 and wrongly
+     * normalised. This method is shared by {@link #normalize(CompoundTag)} and recipe-output
+     * pre-normalisation so all entry points share the same decision.</p>
      *
-     * @param tag 原始或已清洗的标签，允许为 {@code null}
-     * @return 仅包含数值精确为 0 的 {@code Damage} 时返回 {@code true}
+     * @param tag the raw or already-cleaned tag, may be {@code null}
+     * @return {@code true} only when the tag contains solely {@code Damage} with a numeric value of exactly 0
      */
     public static boolean isDefaultDamageOnly(@Nullable CompoundTag tag) {
         if (tag == null || tag.size() != 1) {
@@ -126,24 +135,28 @@ public final class VariantNormalizer {
     }
 
     /**
-     * 为指定物品构建带有规范化变体哈希的物品键。
+     * Builds an item key with a canonicalised variant hash for the given item.
      *
-     * <p>可损坏物品（例如剑、工具）的顶层 {@code Damage} 会被规范化为 {@code 0}：ProjectE 的
-     * {@code DamageProcessor} 在 EMC 查询时按剩余耐久折价。若把每个耐久值都作为独立变体写入
-     * 映射，既会占满变体上限，又会在查询时被再次折价。清洗后若还有附魔等其它经济字段，则保留
-     * {@code {Damage:0,...}}。原始标签不含 {@code Damage} 时保持 ProjectE 的无伤害形状。</p>
+     * <p>A damageable item's (e.g. sword, tool) top-level {@code Damage} is canonicalised to {@code 0}:
+     * ProjectE's {@code DamageProcessor} discounts by remaining durability at EMC query time. Writing
+     * every durability value as a separate variant into the mapping would both fill the variant ceiling
+     * and be discounted again at query time. If other economic fields such as enchantments remain after
+     * cleaning, {@code {Damage:0,...}} is kept. When the original tag has no {@code Damage}, ProjectE's
+     * no-damage shape is preserved.</p>
      *
-     * <p><strong>有意限制：</strong>实际 {@code Damage>0} 且带其它 NBT 的堆叠，其精确
-     * {@code ItemInfo} 与 {@code {Damage:0,...}} 不相等，生成映射不会命中；ProjectE 会回退到
-     * 基础价并执行 {@code DamageProcessor}。这避免了每耐久一个变体，也不会把不同损坏程度
-     * 错误合并到同一变体价格；代价是这类堆叠无法使用变体溢价。</p>
+     * <p><strong>Intentional limitation:</strong> a stack with actual {@code Damage>0} plus other NBT has
+     * an exact {@code ItemInfo} unequal to {@code {Damage:0,...}}, so the generated mapping does not hit;
+     * ProjectE falls back to the base price and runs {@code DamageProcessor}. This avoids
+     * one-variant-per-durability and never wrongly merges different damage levels into one variant price;
+     * the cost is that such stacks cannot use a variant premium.</p>
      *
-     * <p>容器内容物中的嵌套 {@code StoredEMC} 会被保留（根级 {@code StoredEMC} 仍委托给
-     * ProjectE），以保证容器映射键与真实堆叠的完整 {@code ItemInfo} 精确相等。</p>
+     * <p>Nested {@code StoredEMC} in container contents is kept (root-level {@code StoredEMC} is still
+     * delegated to ProjectE), so the container mapping key is exactly equal to the real stack's full
+     * {@code ItemInfo}.</p>
      *
-     * @param itemId 物品注册 id
-     * @param tag    原始物品标签，允许为 {@code null}
-     * @return 带有变体哈希的物品键；没有可保留数据时返回普通物品键
+     * @param itemId the item registry id
+     * @param tag    the raw item tag, may be {@code null}
+     * @return an item key with a variant hash; a plain item key when there is no data to keep
      */
     public static ItemKey keyFor(ResourceLocation itemId, @Nullable CompoundTag tag) {
         Objects.requireNonNull(itemId, "itemId");
@@ -151,7 +164,8 @@ public final class VariantNormalizer {
     }
 
     /**
-     * 已解析 {@link Item} 的重载，供同一调用链复用注册表查询结果。
+     * Overload with an already-resolved {@link Item}, so the same call chain can reuse the registry
+     * lookup result.
      */
     static ItemKey keyFor(ResourceLocation itemId, @Nullable CompoundTag tag, @Nullable Item item) {
         Objects.requireNonNull(itemId, "itemId");
@@ -165,9 +179,9 @@ public final class VariantNormalizer {
         if (sanitized.isEmpty()) {
             return ItemKey.of(itemId);
         }
-        // ProjectE 的 ItemInfo 按完整 NBT 精确匹配：带其它 NBT 的可损坏物品若原本带有
-        // Damage，其默认形状是 {Damage:0,...}；若原本没有 Damage，则必须保持无伤害形状。
-        // 把 Damage 统一归一到 0 只消除“每耐久一个变体”，不会凭空改变 ItemInfo 的形状。
+        // ProjectE's ItemInfo matches on full NBT exactly: a damageable item with other NBT that originally
+        // had Damage has the default shape {Damage:0,...}; if it originally had no Damage, the no-damage shape must be kept.
+        // Normalising Damage to 0 only removes "one variant per durability"; it never changes the ItemInfo shape out of nothing.
         if (hadDamage) {
             sanitized.putInt(DAMAGE, 0);
         }
@@ -202,10 +216,12 @@ public final class VariantNormalizer {
     }
 
     /**
-     * 属性修饰符的 UUID 只是随机身份，不参与经济价值比较。
+     * An attribute modifier's UUID is only a random identity and takes no part in economic value
+     * comparison.
      *
-     * <p>原版与多数模组使用列表保存修饰符，因此对列表中的每个复合标签移除 {@code UUID}；
-     * 少数模组直接使用单个复合标签，这里也一并处理。其余字段原样保留。</p>
+     * <p>Vanilla and most mods store modifiers in a list, so {@code UUID} is removed from each compound
+     * tag in the list; a few mods use a single compound tag directly, which is handled here too. Other
+     * fields are kept as-is.</p>
      */
     private static Tag sanitizeAttributeModifiers(Tag tag) {
         if (tag instanceof ListTag list) {
@@ -241,7 +257,7 @@ public final class VariantNormalizer {
             }
             return result;
         }
-        // 基本类型与数组不会被修改，可以直接复用。
+        // Primitives and arrays are never modified, so they can be reused directly.
         return tag;
     }
 
@@ -285,10 +301,10 @@ public final class VariantNormalizer {
         } else if (tag instanceof ListTag list) {
             writeList(list, out);
         } else if (tag instanceof StringTag stringTag) {
-            // StringTag#getAsString 返回未经引号包裹的原始值，必须显式转义。
+            // StringTag#getAsString returns the raw value without surrounding quotes; it must be escaped explicitly.
             out.append(StringTag.quoteAndEscape(stringTag.getAsString()));
         } else {
-            // 基本类型与数组使用原版访问器输出合法 SNBT。
+            // Primitives and arrays use the vanilla accessor to emit valid SNBT.
             out.append(tag.getAsString());
         }
     }
@@ -302,7 +318,8 @@ public final class VariantNormalizer {
     }
 
     /**
-     * 判断键是否可以不加引号地写入 SNBT。允许的字符集与 {@code TagParser} 的非引号键规则一致。
+     * Whether a key can be written to SNBT without quotes. The allowed character set matches
+     * {@code TagParser}'s unquoted-key rules.
      */
     private static boolean isSimpleKey(String key) {
         if (key.isEmpty()) {

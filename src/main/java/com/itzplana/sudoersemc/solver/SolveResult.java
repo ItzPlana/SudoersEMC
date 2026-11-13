@@ -11,20 +11,21 @@ import java.util.TreeSet;
 import net.minecraft.resources.ResourceLocation;
 
 /**
- * 一次配方求解的最终结果。
+ * Final result of one recipe solve.
  *
- * <p>所有集合都是防御性副本并保持确定性顺序：物品按 {@link ItemKey} 升序，配方按 id 的字符串形式
- * 升序。{@code values} 只包含本次运行新生成的值，不包含运行开始前已有的 EMC。</p>
+ * <p>All collections are defensive copies with deterministic order: items ascending by {@link ItemKey},
+ * recipes ascending by their id's string form. {@code values} contains only values newly generated this
+ * run, not EMC that existed before the run.</p>
  *
- * @param values             本次运行生成的值，已有 EMC 不会出现在这里
- * @param traces             每个生成值的定价轨迹
- * @param unresolvedRecipes  结束时仍未获得可用值的配方 id，按 id 升序
- * @param unresolvedItems    结束时仍没有 EMC 且会阻塞配方的物品，按物品升序
- * @param passesUsed         实际执行的轮数；空配方列表时为 0
- * @param converged          是否在达到轮数上限前观察到“没有任何值变化”的完整一轮
- * @param elapsedMillis      求解耗时，单位毫秒
- * @param recipesEvaluated   处理配方次数（跨轮次累计，包含缓存命中与失败调用）
- * @param cyclicItems        结束时仍没有 EMC 且位于循环依赖中的物品，按物品升序；没有环时为空
+ * @param values             values generated this run; pre-existing EMC never appears here
+ * @param traces             pricing trace for each generated value
+ * @param unresolvedRecipes  recipe ids still without a usable value at the end, ascending by id
+ * @param unresolvedItems    items still without EMC at the end that block recipes, ascending by item
+ * @param passesUsed         passes actually executed; 0 for an empty recipe list
+ * @param converged          whether a full pass with "no value change" was observed before the pass limit
+ * @param elapsedMillis      solve duration in milliseconds
+ * @param recipesEvaluated   recipe evaluations (accumulated across passes, including cache hits and failed calls)
+ * @param cyclicItems        items still without EMC at the end that lie on a dependency cycle, ascending by item; empty when acyclic
  */
 public record SolveResult(
         Map<ItemKey, Long> values,
@@ -61,7 +62,8 @@ public record SolveResult(
     }
 
     /**
-     * 兼容没有循环诊断的调用方：等价于 {@code cyclicItems} 为空集的完整构造。
+     * Compatibility constructor for callers without cycle diagnostics: equivalent to the full
+     * constructor with an empty {@code cyclicItems}.
      */
     public SolveResult(Map<ItemKey, Long> values,
                        Map<ItemKey, SolveTrace> traces,
@@ -76,14 +78,14 @@ public record SolveResult(
     }
 
     /**
-     * @return 本次运行新定价的物品数量
+     * @return number of items newly priced this run
      */
     public int solvedCount() {
         return values.size();
     }
 
     /**
-     * @return 结束时仍未解析的配方数量
+     * @return number of recipes still unresolved at the end
      */
     public int unresolvedRecipeCount() {
         return unresolvedRecipes.size();

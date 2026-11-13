@@ -13,7 +13,7 @@ import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 
 /**
- * {@link SolveWorker} 的关闭语义验证。
+ * Shutdown semantics verification for {@link SolveWorker}.
  */
 class SolveWorkerTest {
 
@@ -24,13 +24,13 @@ class SolveWorkerTest {
         CountDownLatch finished = new CountDownLatch(1);
         SolveWorker worker = new SolveWorker(snapshot -> {
             started.countDown();
-            // 模拟不响应中断的纯 CPU 求解：忽略 InterruptedException 并继续占用线程。
+            // Simulate a pure CPU solve that ignores interrupts: swallow InterruptedException and keep occupying the thread.
             while (true) {
                 try {
                     release.await();
                     break;
                 } catch (InterruptedException ignored) {
-                    // 故意忽略中断，验证 shutdownNow 的 awaitTermination 兜底。
+                    // Deliberately ignore the interrupt to verify shutdownNow's awaitTermination fallback.
                 }
             }
             finished.countDown();

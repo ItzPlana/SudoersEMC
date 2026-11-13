@@ -18,13 +18,14 @@ public interface GeneratedValueSource {
     Map<ItemKey, Long> snapshotOwnedValues();
 
     /**
-     * 返回每个自有变体条目观测到的原始 SNBT，供 ProjectE 精确 NBT 注册使用。
+     * Returns the raw observed SNBT for each owned variant entry, for ProjectE's exact-NBT registration.
      *
-     * <p>{@link ItemKey#variantHash()} 是规范化后的经济身份，可能已剥离展示字段；
-     * ProjectE 按完整 NBT 精确匹配，因此注册侧需要原始值。默认实现返回空映射，
-     * 仅持久化存储需要覆盖。</p>
+     * <p>{@link ItemKey#variantHash()} is the canonicalised economic identity and may have stripped
+     * display fields; ProjectE matches on full NBT exactly, so the registration side needs the raw
+     * values. The default implementation returns an empty map; only the persistence store needs to
+     * override it.</p>
      *
-     * @return 变体身份到原始 SNBT 列表的不可变快照
+     * @return an immutable snapshot from variant identity to its list of raw SNBT
      */
     default Map<ItemKey, List<String>> snapshotOwnedVariantNbts() {
         return Map.of();

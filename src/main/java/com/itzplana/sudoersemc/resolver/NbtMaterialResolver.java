@@ -4,39 +4,43 @@ import java.util.OptionalLong;
 import net.minecraft.world.item.ItemStack;
 
 /**
- * 为带有 NBT 变体的物品堆叠提供价格解析扩展点。
+ * Price-resolution extension point for item stacks with NBT variants.
  *
- * <p>模组专属集成可以实现本接口，并通过 {@link ResolverRegistry#register(NbtMaterialResolver)}
- * 注册，从而在不修改核心定价引擎的前提下为某个变体定价。解析器必须自行判断
- * {@link #supports(ItemStack)}，只对能够识别且可定价的堆叠返回非空结果。</p>
+ * <p>Mod-specific integrations can implement this interface and register via
+ * {@link ResolverRegistry#register(NbtMaterialResolver)} to price a variant without modifying the core
+ * pricing engine. A resolver must judge {@link #supports(ItemStack)} itself and return a non-empty
+ * result only for stacks it recognises and can price.</p>
  *
- * <p>约束：{@link #resolve(ItemStack)} 返回的 EMC 必须大于 0；无法定价时应返回
- * {@link OptionalLong#empty()}，不得返回 0 或负数。实现不得修改传入的堆叠。</p>
+ * <p>Contract: the EMC returned by {@link #resolve(ItemStack)} must be greater than 0; when it cannot
+ * price, return {@link OptionalLong#empty()}, never 0 or a negative number. Implementations must not
+ * modify the supplied stack.</p>
  *
- * <p>线程约束：实现通常会访问 {@link ItemStack} 与物品注册表，因此只应在 server thread
- * 调用；若调用方在其他线程执行，必须自行传入不会被并发修改的不可变快照。</p>
+ * <p>Threading: implementations typically access {@link ItemStack} and the item registry, so they should
+ * only be called on the server thread; if a caller runs on another thread it must supply an immutable
+ * snapshot that will not be concurrently modified.</p>
  */
 public interface NbtMaterialResolver {
 
     /**
-     * 判断当前解析器是否认识这个堆叠。
+     * Whether this resolver recognises the stack.
      *
-     * <p>该方法应保持轻量，只检查标签结构或模组标记，不要执行完整的配方计算。实现可以
-     * 在返回 {@code true} 后仍让 {@link #resolve(ItemStack)} 返回空结果。</p>
+     * <p>Keep this lightweight: only check tag structure or mod markers, do not run a full recipe
+     * calculation. An implementation may return {@code true} here and still have
+     * {@link #resolve(ItemStack)} return empty.</p>
      *
-     * @param stack 待检查的堆叠，可能为 {@code null}
-     * @return 解析器是否愿意尝试为这个堆叠定价
+     * @param stack the stack to check, may be {@code null}
+     * @return whether the resolver is willing to try pricing this stack
      */
     boolean supports(ItemStack stack);
 
     /**
-     * 计算堆叠的 EMC。
+     * Computes the stack's EMC.
      *
-     * <p>只有在 {@link #supports(ItemStack)} 返回 {@code true} 时注册表才会调用本方法。
-     * 返回值必须大于 0；无法确定价格时必须返回空结果。</p>
+     * <p>The registry calls this only when {@link #supports(ItemStack)} returned {@code true}. The return
+     * value must be greater than 0; when the price cannot be determined, return empty.</p>
      *
-     * @param stack 待定价的堆叠，可能为 {@code null}
-     * @return 大于 0 的 EMC，或空结果
+     * @param stack the stack to price, may be {@code null}
+     * @return EMC greater than 0, or empty
      */
     OptionalLong resolve(ItemStack stack);
 }

@@ -60,7 +60,6 @@ public record PriceDropDecision(
         return new PriceDropDecision(true, previousValue, proposedValue, dropRatio, reason);
     }
 
-    /** @return 旧值与拟写入值是否不同 */
     public boolean changed() {
         return previousValue != proposedValue;
     }

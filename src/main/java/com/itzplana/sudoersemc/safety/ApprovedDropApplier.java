@@ -28,7 +28,11 @@ import org.jetbrains.annotations.Nullable;
  */
 public final class ApprovedDropApplier {
 
-    /** 申请结果状态。 */
+    /**
+     * Outcome of an approval attempt. Only {@link #APPLIED} writes an entry; every other
+     * status leaves the generated-entry store untouched. {@link #REFUSED_DISABLED} is the
+     * audit-mode signal: the caller records approval without applying a value.
+     */
     public enum Status {
         /** 已写入生成条目存储。 */
         APPLIED,

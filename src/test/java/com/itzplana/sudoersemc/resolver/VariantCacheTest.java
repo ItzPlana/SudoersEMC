@@ -10,7 +10,7 @@ import net.minecraft.resources.ResourceLocation;
 import org.junit.jupiter.api.Test;
 
 /**
- * {@link VariantCache} 的单元测试，覆盖计数、LRU 淘汰与清空语义。
+ * Unit tests for {@link VariantCache}, covering counting, LRU eviction and clear semantics.
  */
 class VariantCacheTest {
 

@@ -12,36 +12,38 @@ import java.util.Map;
 import org.jetbrains.annotations.Nullable;
 
 /**
- * 单次扫描的轻量诊断收集器。
+ * Lightweight diagnostics collector for a single scan.
  *
- * <p>用法是“阶段结束打点”：每次 {@link #mark(String)} 会把距离上一次打点的耗时累加到
- * 指定阶段，因此同一阶段可以重复标记并正确累加。内部以纳秒保存，读取时再换算为毫秒，
- * 避免多次短阶段被逐次截断为零。峰值堆内存由 {@link #recordMemory()} 主动采样，
- * 未采样时报告显示 0.0 MiB。</p>
+ * <p>Usage is "mark at phase end": each {@link #mark(String)} adds the elapsed time since the previous
+ * mark to the given phase, so the same phase can be marked repeatedly and accumulate correctly. Time is
+ * stored internally in nanos and converted to millis on read, avoiding many short phases being truncated
+ * to zero one by one. Peak heap memory is actively sampled by {@link #recordMemory()}; without sampling
+ * the report shows 0.0 MiB.</p>
  *
- * <p>逐 tick 耗时通过 {@link #recordTick(long)} 记录。P95 使用最近秩法（nearest-rank）：
- * 对 {@code n} 个样本升序排序后取第 {@code ceil(0.95 * n)} 个值（1 基序号）。因此
- * 0 个样本返回 0，1 个样本返回该样本本身，多值不会做插值。</p>
+ * <p>Per-tick elapsed time is recorded via {@link #recordTick(long)}. P95 uses the nearest-rank method:
+ * sort {@code n} samples ascending and take the {@code ceil(0.95 * n)}-th value (1-based). Thus 0 samples
+ * return 0, 1 sample returns itself, and multiple values are not interpolated.</p>
  *
- * <p><strong>线程约定：</strong>本类面向单线程使用。扫描由服务器线程驱动，诊断读取通常
- * 也在同一线程完成，因此没有为并发写入做额外同步。所有公开方法都不会抛出异常：
- * {@code null} 或空白阶段名会被忽略，查询未知阶段返回 0。</p>
+ * <p><strong>Threading:</strong> this class is for single-threaded use. The scan is driven by the server
+ * thread and diagnostics reads usually happen on the same thread, so no extra synchronisation is done
+ * for concurrent writes. No public method throws: a {@code null} or blank phase name is ignored, and
+ * querying an unknown phase returns 0.</p>
  */
 public final class ScanDiagnostics {
 
     private static final long NANOS_PER_MILLI = 1_000_000L;
     private static final double BYTES_PER_MIB = 1024.0 * 1024.0;
 
-    /** 最近秩法使用的 P95 比例。 */
+    /** P95 ratio used by the nearest-rank method. */
     private static final double P95_RATIO = 0.95D;
 
-    /** 复用同一个管理接口代理，tick 采样只调用 getHeapMemoryUsage()。 */
+    /** Reuse one management-interface proxy; tick sampling only calls getHeapMemoryUsage(). */
     private static final MemoryMXBean MEMORY_MX_BEAN = resolveMemoryBean();
 
-    /** 按首次出现顺序保序，便于报告稳定输出。 */
+    /** Preserves first-appearance order for stable report output. */
     private final Map<String, Long> stageNanos = new LinkedHashMap<>();
 
-    /** 每个 tick 的耗时样本，单位纳秒；按调用顺序保存。 */
+    /** Per-tick elapsed samples in nanos, stored in call order. */
     private final List<Long> tickNanos = new ArrayList<>();
 
     private long lastMarkNanos;
@@ -52,7 +54,8 @@ public final class ScanDiagnostics {
     private long heapBytes;
 
     /**
-     * 创建诊断收集器，并以当前时刻作为第一次打点与整次扫描计时的基准。
+     * Creates the diagnostics collector, using the current moment as the baseline for the first mark and
+     * the whole-scan timing.
      */
     public ScanDiagnostics() {
         long now = System.nanoTime();
@@ -61,12 +64,13 @@ public final class ScanDiagnostics {
     }
 
     /**
-     * 记录一个阶段的结束，并把距离上一次打点的耗时累加到该阶段。
+     * Records the end of a phase, adding the elapsed time since the previous mark to that phase.
      *
-     * <p>{@code null}、空串或仅含空白的阶段名会被静默忽略，计时基准不会前移，从而避免
-     * 无效打点吞掉真实耗时。单次打点永远不会产生负时长。</p>
+     * <p>A {@code null}, empty or whitespace-only phase name is silently ignored and the timing baseline
+     * does not advance, so an invalid mark cannot swallow real elapsed time. A single mark never produces
+     * a negative duration.</p>
      *
-     * @param stage 阶段名称，通常使用 {@link ScanPhase#label()} 或稳定的英文标识
+     * @param stage phase name, usually {@link ScanPhase#label()} or a stable English identifier
      */
     public void mark(String stage) {
         if (stage == null || stage.isBlank()) {
@@ -79,10 +83,10 @@ public final class ScanDiagnostics {
     }
 
     /**
-     * 查询指定阶段的累计耗时。
+     * Queries a phase's accumulated elapsed time.
      *
-     * @param stage 阶段名称，可为 {@code null}
-     * @return 累计毫秒数；未知阶段或 {@code null} 返回 0
+     * @param stage phase name, may be {@code null}
+     * @return accumulated millis; 0 for an unknown phase or {@code null}
      */
     public long stageMillis(String stage) {
         if (stage == null) {
@@ -93,12 +97,12 @@ public final class ScanDiagnostics {
     }
 
     /**
-     * 返回所有阶段耗时的只读快照。
+     * Returns a read-only snapshot of all phase elapsed times.
      *
-     * <p>返回的映射按阶段首次打点顺序排列，修改它会抛出
-     * {@link UnsupportedOperationException}，因此调用方可以安全地跨方法传递。</p>
+     * <p>The returned map is ordered by each phase's first mark; modifying it throws
+     * {@link UnsupportedOperationException}, so callers can safely pass it across methods.</p>
      *
-     * @return 不可变的“阶段名 → 毫秒”映射
+     * @return immutable "phase name → millis" map
      */
     public Map<String, Long> stageMillis() {
         Map<String, Long> snapshot = new LinkedHashMap<>();
@@ -109,7 +113,7 @@ public final class ScanDiagnostics {
     }
 
     /**
-     * @return 所有已记录阶段的累计毫秒数之和
+     * @return sum of accumulated millis across all recorded phases
      */
     public long totalMillis() {
         long totalNanos = 0L;
@@ -120,12 +124,13 @@ public final class ScanDiagnostics {
     }
 
     /**
-     * 记录一个 tick 的实际耗时。
+     * Records one tick's actual elapsed time.
      *
-     * <p>负数按 0 处理，样本数量不设硬上限；扫描器按 tick 批量推进，实际样本量受扫描
-     * 时长约束。P95 只在读取时排序，不影响 tick 主路径。</p>
+     * <p>Negatives are treated as 0; the sample count has no hard cap — the scanner advances in tick
+     * batches, so the actual sample count is bounded by scan duration. P95 sorts only on read and does not
+     * affect the tick hot path.</p>
      *
-     * @param elapsedNanos 本 tick 实际耗时（纳秒）
+     * @param elapsedNanos this tick's actual elapsed time (nanos)
      */
     public void recordTick(long elapsedNanos) {
         long sample = Math.max(0L, elapsedNanos);
@@ -135,40 +140,40 @@ public final class ScanDiagnostics {
     }
 
     /**
-     * @return 已记录的 tick 样本数量
+     * @return number of recorded tick samples
      */
     public int tickCount() {
         return tickNanos.size();
     }
 
     /**
-     * @return 所有 tick 样本的累计耗时（纳秒）
+     * @return accumulated elapsed time of all tick samples (nanos)
      */
     public long totalTickNanos() {
         return totalTickNanos;
     }
 
     /**
-     * @return 最大 tick 耗时（纳秒）；没有样本时为 0
+     * @return maximum tick elapsed time (nanos); 0 when there are no samples
      */
     public long maxTickNanos() {
         return maxTickNanos;
     }
 
     /**
-     * @return 平均 tick 耗时（纳秒）；没有样本时为 0.0
+     * @return average tick elapsed time (nanos); 0.0 when there are no samples
      */
     public double averageTickNanos() {
         return tickNanos.isEmpty() ? 0.0D : totalTickNanos / (double) tickNanos.size();
     }
 
     /**
-     * 返回 P95 tick 耗时（纳秒，最近秩法）。
+     * Returns the P95 tick elapsed time (nanos, nearest-rank).
      *
-     * <p>0 个样本返回 0；1 个样本返回该值；多值取升序后的
-     * {@code ceil(0.95 * n)} 个样本，不做线性插值。</p>
+     * <p>0 samples return 0; 1 sample returns that value; multiple values take the
+     * {@code ceil(0.95 * n)}-th sample after ascending sort, with no linear interpolation.</p>
      *
-     * @return P95 耗时（纳秒）
+     * @return P95 elapsed time (nanos)
      */
     public long p95TickNanos() {
         int size = tickNanos.size();
@@ -186,32 +191,33 @@ public final class ScanDiagnostics {
     }
 
     /**
-     * @return 最大 tick 耗时（毫秒）
+     * @return maximum tick elapsed time (millis)
      */
     public long maxTickMillis() {
         return maxTickNanos / NANOS_PER_MILLI;
     }
 
     /**
-     * @return 平均 tick 耗时（毫秒）
+     * @return average tick elapsed time (millis)
      */
     public double averageTickMillis() {
         return averageTickNanos() / NANOS_PER_MILLI;
     }
 
     /**
-     * @return P95 tick 耗时（毫秒）
+     * @return P95 tick elapsed time (millis)
      */
     public long p95TickMillis() {
         return p95TickNanos() / NANOS_PER_MILLI;
     }
 
     /**
-     * 采样当前已使用的堆内存，并更新峰值。
+     * Samples the currently used heap memory and updates the peak.
      *
-     * <p>使用 {@link MemoryMXBean#getHeapMemoryUsage()} 的 {@code used} 字段；该值来自
-     * JVM 内存管理接口，比 {@code Runtime} 的近似计算更直接。若管理接口不可用，退回
-     * {@code totalMemory() - freeMemory()}，保证诊断采样永远不会影响扫描主路径。</p>
+     * <p>Uses the {@code used} field of {@link MemoryMXBean#getHeapMemoryUsage()}; this value comes from
+     * the JVM memory management interface and is more direct than {@code Runtime}'s approximation. If the
+     * management interface is unavailable, falls back to {@code totalMemory() - freeMemory()}, ensuring
+     * diagnostics sampling never affects the scan hot path.</p>
      */
     public void recordMemory() {
         long used;
@@ -239,34 +245,34 @@ public final class ScanDiagnostics {
     }
 
     /**
-     * @return 已观察到的峰值堆内存字节数；尚未采样时为 0
+     * @return observed peak heap memory in bytes; 0 before any sampling
      */
     public long peakHeapBytes() {
         return peakHeapBytes;
     }
 
     /**
-     * @return 最近一次 {@link #recordMemory()} 采样到的堆内存字节数；尚未采样时为 0
+     * @return heap memory in bytes from the most recent {@link #recordMemory()} sample; 0 before any sampling
      */
     public long heapBytes() {
         return heapBytes;
     }
 
     /**
-     * @return 从 {@link #reset()} 或构造时刻到现在的墙钟耗时毫秒数
+     * @return wall-clock millis from {@link #reset()} or construction until now
      */
     public long elapsedSinceResetMillis() {
         return Math.max(0L, (System.nanoTime() - scanStartedNanos) / NANOS_PER_MILLI);
     }
 
     /**
-     * 生成多行中文诊断报告。
+     * Produces a multi-line Chinese diagnostic report.
      *
-     * <p>依次输出每个阶段的毫秒耗时、总计耗时、逐 tick 统计（最大/平均/P95），以及保留
-     * 一位小数的峰值与当前堆内存 MiB。即使没有任何阶段或 tick 记录，报告仍然包含固定行，
-     * 方便日志解析。</p>
+     * <p>Outputs each phase's millis, the total, per-tick statistics (max/average/P95), and peak and
+     * current heap MiB to one decimal place. Even with no phase or tick records the report still contains
+     * fixed lines for easy log parsing.</p>
      *
-     * @return 以换行分隔的中文报告文本
+     * @return newline-separated Chinese report text
      */
     public String formatReport() {
         StringBuilder report = new StringBuilder();
@@ -302,11 +308,12 @@ public final class ScanDiagnostics {
     }
 
     /**
-     * 清空所有阶段耗时、tick 样本与内存采样，并以当前时刻重新开始计时。
+     * Clears all phase elapsed times, tick samples and memory samples, and restarts timing from the
+     * current moment.
      *
-     * <p>用于在复用同一个诊断实例开始下一次扫描前丢弃旧数据；调用后
-     * {@link #stageMillis()} 为空，{@link #totalMillis()}、{@link #tickCount()} 与
-     * {@link #peakHeapBytes()} 均为 0。</p>
+     * <p>Used to discard old data before reusing the same diagnostics instance for the next scan; after
+     * the call {@link #stageMillis()} is empty and {@link #totalMillis()}, {@link #tickCount()} and
+     * {@link #peakHeapBytes()} are all 0.</p>
      */
     public void reset() {
         stageNanos.clear();

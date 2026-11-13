@@ -24,31 +24,33 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * {@link ScanPipeline.CollectSession} 的真实分片实现。
+ * The real sharded implementation of {@link ScanPipeline.CollectSession}.
  *
- * <p>采集严格按“物品批次 → 配方批次 → NBT 变体观测批次 → 变体生成批次 → 既有 EMC 读取批次”
- * 推进。物品与配方 id 在开始阶段固化并排序，后续只按游标前进，因此跨 tick 的分页不会因注册表
- * 或配方管理器迭代顺序变化而漂移。</p>
+ * <p>Collection advances strictly in the order "item batches → recipe batches → NBT variant observation
+ * batches → variant generation batches → existing EMC read batches". Item and recipe ids are frozen and
+ * sorted at the start phase, and afterwards only advance by cursor, so cross-tick paging does not drift
+ * when the registry or recipe manager iteration order changes.</p>
  *
- * <p><strong>线程约定：</strong>本类所有方法必须在服务器线程调用。生成的
- * {@link ItemSnapshot} / {@link RecipeSnapshot} 本身不可变；{@link #finish()} 返回的
- * {@link PipelineSnapshot} 也对所有集合做防御性复制，可以安全地交给工作线程。</p>
+ * <p><strong>Threading:</strong> all methods of this class must be called on the server thread. The
+ * generated {@link ItemSnapshot} / {@link RecipeSnapshot} are themselves immutable; the
+ * {@link PipelineSnapshot} returned by {@link #finish()} also defensively copies all collections, so it
+ * can be safely handed to a worker thread.</p>
  */
 final class ScanCollector implements ScanPipeline.CollectSession {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("sudoersemc/pipeline/ScanCollector");
 
-    /** 与 {@link RecipeScanner} 保持一致的失败明细上限。 */
+    /** Failure-detail cap kept consistent with {@link RecipeScanner}. */
     private static final int MAX_FAILED_DETAILS = 50;
 
-    /** 物品分页扫描函数；生产实现委托 {@link ItemScanner#scanBatch}. */
+    /** Item paged-scan function; the production implementation delegates to {@link ItemScanner#scanBatch}. */
     @FunctionalInterface
     interface ItemPage {
 
         ItemScanner.Batch scan(List<ResourceLocation> ids);
     }
 
-    /** 配方分页扫描函数；生产实现委托 {@link RecipeScanner#scanBatch}. */
+    /** Recipe paged-scan function; the production implementation delegates to {@link RecipeScanner#scanBatch}. */
     @FunctionalInterface
     interface RecipePage {
 
@@ -128,7 +130,8 @@ final class ScanCollector implements ScanPipeline.CollectSession {
     }
 
     /**
-     * 构造生产采集会话：在服务器线程固化物品/配方顺序并捕获管线配置。
+     * Constructs a production collection session: freezes item/recipe order on the server thread and
+     * captures pipeline configuration.
      */
     static ScanCollector begin(ScanPipeline pipeline, MinecraftServer server) {
         Objects.requireNonNull(pipeline, "pipeline");
@@ -160,7 +163,7 @@ final class ScanCollector implements ScanPipeline.CollectSession {
     }
 
     /**
-     * @return 已经完成的空会话，用于服务器未就绪等场景
+     * @return an already-completed empty session, for scenarios such as the server not being ready
      */
     static ScanCollector completed(PipelineSnapshot snapshot) {
         ScanCollector collector = new ScanCollector(
@@ -173,7 +176,7 @@ final class ScanCollector implements ScanPipeline.CollectSession {
     }
 
     /**
-     * 测试/嵌入式构造器：直接注入分页函数，不访问服务器。
+     * Test/embedded constructor: injects paging functions directly without accessing the server.
      */
     static ScanCollector forTesting(List<ResourceLocation> itemIds,
                                     ItemPage itemPage,
@@ -213,7 +216,7 @@ final class ScanCollector implements ScanPipeline.CollectSession {
     }
 
     /**
-     * @return 当前阶段名称，供测试与进度日志使用
+     * @return the current stage name, for tests and progress logs
      */
     String stageName() {
         return stage.name();
@@ -237,7 +240,7 @@ final class ScanCollector implements ScanPipeline.CollectSession {
             case VARIANTS_BUILD -> stepBuildVariants(effectiveBudget);
             case EXISTING -> stepExistingValues(effectiveBudget);
             case DONE -> {
-                // 已在上方返回。
+                // Already returned above.
             }
         }
     }
@@ -377,7 +380,7 @@ final class ScanCollector implements ScanPipeline.CollectSession {
             Map.Entry<ResourceLocation, List<String>> entry = observedEntries.get(index);
             ItemSnapshot base = baseByItem == null ? null : baseByItem.get(entry.getKey());
             if (base == null) {
-                // 基础物品未被扫描（被忽略或未注册）时不生成变体，避免绕过排除规则。
+                // Do not generate variants when the base item was not scanned (ignored or unregistered), to avoid bypassing exclusion rules.
                 continue;
             }
             List<ItemKey> variantKeys = ScanPipeline.variantKeysFor(
@@ -426,8 +429,8 @@ final class ScanCollector implements ScanPipeline.CollectSession {
             }
         }
         existingCursor += take;
-        // 每个批次结束时都检查取消。此前用 cursor % 256 作为门控，批次通常不是 256 的倍数，
-        // 该检查点实际上几乎不会触发；批次边界本身就是低成本的取消时机。
+        // Check cancellation at the end of every batch. Previously cursor % 256 was used as the gate, but batches are
+        // usually not multiples of 256, so that checkpoint almost never fired; the batch boundary itself is a low-cost cancellation point.
         if (cancellation.getAsBoolean()) {
             finishPartial();
             return;
@@ -478,7 +481,7 @@ final class ScanCollector implements ScanPipeline.CollectSession {
                 partialExisting.put(item.key(), item.existingValue());
             }
         }
-        // 部分快照仍要保留已扫描到的配方失败统计与明细；此前一律置零会让取消后的诊断报告低报。
+        // The partial snapshot must still keep the recipe failure statistics and details already scanned; zeroing them would under-report the post-cancel diagnostic report.
         snapshot = new PipelineSnapshot(partialItems, recipes, partialExisting,
                 unsupportedRecipes, invalidRecipes, failedRecipes + recipeEnumerationFailures,
                 failedRecipeDetails);

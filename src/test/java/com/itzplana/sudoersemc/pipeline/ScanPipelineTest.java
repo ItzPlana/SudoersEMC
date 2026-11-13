@@ -56,10 +56,11 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * {@link ScanPipeline} 的核心行为测试。
+ * Core behaviour tests for {@link ScanPipeline}.
  *
- * <p>测试全部通过手工构造的 {@link PipelineSnapshot} 驱动，不启动服务器，也不访问物品注册表或
- * 配方管理器。存储、报告与审计日志使用 JUnit 的临时目录，确保测试之间没有磁盘状态泄漏。</p>
+ * <p>All tests are driven by hand-built {@link PipelineSnapshot}s; no server is started and neither the item registry nor
+ * the recipe manager is accessed. Stores, reports and audit logs use JUnit's temporary directory, ensuring no disk state
+ * leaks between tests.</p>
  */
 class ScanPipelineTest {
 
@@ -105,7 +106,7 @@ class ScanPipelineTest {
     private static final ItemKey MANUAL_OVERFLOW = ItemKey.of(MANUAL_OVERFLOW_ID);
 
     static {
-        // 变体扫描需要 BuiltInRegistries.ITEM，因此在测试类初始化时完成原版引导。
+        // Variant scanning needs BuiltInRegistries.ITEM, so complete vanilla bootstrap when the test class initialises.
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
     }
@@ -1341,7 +1342,7 @@ class ScanPipelineTest {
     }
 
     /**
-     * 构造带 NBT 输出的单输入单输出配方。
+     * Builds a single-input single-output recipe with NBT output.
      */
     private static RecipeSnapshot recipeWithNbt(ItemKey output, String outputNbt) {
         return RecipeSnapshot.of(
@@ -1352,7 +1353,7 @@ class ScanPipelineTest {
     }
 
     /**
-     * 把变体快照追加到基础物品之后，保持与生产管线一致的顺序。
+     * Appends variant snapshots after the base item, keeping the same order as the production pipeline.
      */
     private static List<ItemSnapshot> itemsWithVariants(ItemSnapshot base,
                                                         List<ItemSnapshot> variants) {
@@ -1363,7 +1364,7 @@ class ScanPipelineTest {
     }
 
     /**
-     * 创建使用默认求解参数的管线，未提供的协作者由管线自行采用安全默认值。
+     * Creates a pipeline with default solve parameters; collaborators not provided adopt the pipeline's safe defaults.
      */
     private static ScanPipeline pipeline(GeneratedEntryStore store,
                                          ScanStateStore stateStore,
@@ -1377,7 +1378,7 @@ class ScanPipelineTest {
     }
 
     /**
-     * 创建使用指定求解参数的管线，其余未提供的协作者使用安全默认值。
+     * Creates a pipeline with the given solve parameters; other collaborators not provided use safe defaults.
      */
     private static ScanPipeline pipeline(GeneratedEntryStore store,
                                          ScanStateStore stateStore,
@@ -1399,7 +1400,7 @@ class ScanPipelineTest {
     }
 
     /**
-     * 关闭所有兜底来源的定价链，用于只验证配方求解路径的测试。
+     * A pricing chain with all fallback sources disabled, for tests that only verify the recipe solve path.
      */
     private static FallbackPricing disabledFallback() {
         return FallbackPricing.withDefaults(
@@ -1407,7 +1408,7 @@ class ScanPipelineTest {
     }
 
     /**
-     * 只启用通用兜底值的定价链。
+     * A pricing chain with only the generic fallback value enabled.
      */
     private static FallbackPricing genericFallback(long value) {
         return FallbackPricing.withDefaults(
@@ -1415,7 +1416,7 @@ class ScanPipelineTest {
     }
 
     /**
-     * 构造启用 ENTIRE_CUSTOM_EMC 语义的溢出管线，阈值与回落区间与测试数据对应。
+     * Builds an overflow pipeline with ENTIRE_CUSTOM_EMC semantics; threshold and reset range match the test data.
      */
     private static OverflowPipeline customEmcOverflowPipeline(OverflowResetLog resetLog) {
         return new OverflowPipeline(
@@ -1433,7 +1434,7 @@ class ScanPipelineTest {
     }
 
     /**
-     * 构造一个自有条目与一个非自有条目的存储，用于验证 custom_emc.json 的归属判定。
+     * Builds a store with one owned and one non-owned entry, to verify custom_emc.json ownership decisions.
      */
     private GeneratedEntryStore customEmcStore() {
         GeneratedEntryStore store = new GeneratedEntryStore(
@@ -1446,7 +1447,7 @@ class ScanPipelineTest {
     }
 
     /**
-     * 写出一份包含自有、非自有与等于阈值条目的 ProjectE 风格 custom_emc.json。
+     * Writes a ProjectE-style custom_emc.json containing owned, non-owned and at-threshold entries.
      */
     private Path writeCustomEmc(String name) throws IOException {
         Path file = tempDir.resolve(name);
@@ -1464,7 +1465,7 @@ class ScanPipelineTest {
     }
 
     /**
-     * 统计目标文件对应的时间戳备份数量。
+     * Counts the timestamped backups for the target file.
      */
     private static long countBackups(Path file) throws IOException {
         Path parent = file.toAbsolutePath().getParent();
@@ -1488,7 +1489,7 @@ class ScanPipelineTest {
     }
 
     /**
-     * 构造一条单输入单输出的确定性配方。
+     * Builds a deterministic single-input single-output recipe.
      */
     private static RecipeSnapshot recipe(ItemKey input, ItemKey output) {
         return RecipeSnapshot.of(
@@ -1499,7 +1500,7 @@ class ScanPipelineTest {
     }
 
     /**
-     * 构造链式夹具中的“矿石 → 锭”配方。
+     * Builds the "ore → ingot" recipe in the chain fixture.
      */
     private static RecipeSnapshot oreToIngotRecipe() {
         return RecipeSnapshot.of(
@@ -1510,7 +1511,7 @@ class ScanPipelineTest {
     }
 
     /**
-     * 构造链式夹具中的“4 锭 → 1 齿轮”配方。
+     * Builds the "4 ingots → 1 gear" recipe in the chain fixture.
      */
     private static RecipeSnapshot gearRecipe() {
         return RecipeSnapshot.of(
@@ -1521,7 +1522,8 @@ class ScanPipelineTest {
     }
 
     /**
-     * 只启用标签定价的兜底链：稀有度与通用兜底关闭，确保中间产物必须由配方定价。
+     * A fallback chain with only tag pricing enabled: rarity and generic fallback are off, ensuring intermediates must be
+     * priced by recipes.
      */
     private static FallbackPricing tagOnlyFallback() {
         return FallbackPricing.withDefaults(
@@ -1529,14 +1531,14 @@ class ScanPipelineTest {
     }
 
     /**
-     * 判断报告文本中是否存在给定标签且计数匹配的行。
+     * Determines whether the report text contains a line with the given label and matching count.
      */
     private static boolean hasCounterLine(String report, String label, long value) {
         String suffix = ": " + value;
         return report.lines().anyMatch(line -> line.startsWith(label) && line.endsWith(suffix));
     }
     // ------------------------------------------------------------------
-    // Phase 27：solveOnly / applySolved 拆分
+    // Phase 27: solveOnly / applySolved split
     // ------------------------------------------------------------------
 
     @Test

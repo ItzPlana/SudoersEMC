@@ -9,9 +9,10 @@ import net.minecraft.world.item.Rarity;
 import org.junit.jupiter.api.Test;
 
 /**
- * 稀有度定价测试。
+ * Rarity pricing tests.
  *
- * <p>稀有度是兜底启发式，不是权威经济值：只验证基准值、倍率、向下取整与非负约束。</p>
+ * <p>Rarity is a fallback heuristic, not an authoritative economic value: only verifies base values, multipliers,
+ * flooring and the non-negative constraint.</p>
  */
 class RarityPricingTest {
 
@@ -48,7 +49,7 @@ class RarityPricingTest {
                 Map.of(Rarity.COMMON, 0.5D),
                 0L);
 
-        // 33 * 0.5 = 16.5，向下取整为 16
+        // 33 * 0.5 = 16.5, floored to 16
         assertEquals(16L, fractional.price(Rarity.COMMON));
     }
 

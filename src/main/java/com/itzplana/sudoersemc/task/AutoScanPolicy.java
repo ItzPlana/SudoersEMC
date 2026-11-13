@@ -1,10 +1,11 @@
 package com.itzplana.sudoersemc.task;
 
 /**
- * 服务器启动时自动扫描的纯策略判定。
+ * Pure policy decision for auto-scanning at server startup.
  *
- * <p>本类不依赖 Minecraft 类型，只根据配置开关、上次扫描时刻与已生成条目数量回答
- * “本次启动是否应请求一次扫描”。实际扫描仍由 {@link ScanManager} 调度，本类不产生副作用。</p>
+ * <p>This class depends on no Minecraft type; it answers "should this startup request a scan" based only
+ * on config switches, the last scan time and the number of generated entries. The actual scan is still
+ * scheduled by {@link ScanManager}; this class has no side effects.</p>
  */
 public final class AutoScanPolicy {
 
@@ -12,52 +13,54 @@ public final class AutoScanPolicy {
     }
 
     /**
-     * 判断服务器启动时是否应请求自动扫描。
+     * Whether an auto scan should be requested at server startup.
      *
-     * <p>判定顺序固定：</p>
+     * <p>Fixed decision order:</p>
      * <ol>
-     *   <li>{@code enabled == false}：自动扫描总开关关闭，返回 {@code false}；</li>
-     *   <li>{@code alwaysRescan == true}：管理员要求每次启动都重扫，返回 {@code true}；</li>
-     *   <li>{@code lastScanEpochMillis <= 0}：从未扫描过，返回 {@code true}；</li>
-     *   <li>{@code generatedEntryCount <= 0}：没有任何已生成条目（例如缓存缺失或被清空），
-     *       返回 {@code true}；</li>
-     *   <li>其余情况视为已有可用缓存，返回 {@code false}。</li>
+     *   <li>{@code enabled == false}: the auto-scan master switch is off, return {@code false};</li>
+     *   <li>{@code alwaysRescan == true}: the admin requires a rescan on every startup, return {@code true};</li>
+     *   <li>{@code lastScanEpochMillis <= 0}: never scanned, return {@code true};</li>
+     *   <li>{@code generatedEntryCount <= 0}: no generated entries at all (e.g. cache missing or cleared),
+     *       return {@code true};</li>
+     *   <li>otherwise a usable cache is assumed, return {@code false}.</li>
      * </ol>
      *
-     * @param enabled             自动扫描总开关
-     * @param alwaysRescan        是否每次启动都强制重扫
-     * @param lastScanEpochMillis 上次扫描完成的 epoch 毫秒，{@code 0} 表示从未扫描
-     * @param generatedEntryCount 当前已生成条目数量
-     * @return 应请求自动扫描时返回 {@code true}
+     * @param enabled             auto-scan master switch
+     * @param alwaysRescan        whether to force a rescan on every startup
+     * @param lastScanEpochMillis epoch millis of the last completed scan; {@code 0} means never scanned
+     * @param generatedEntryCount current number of generated entries
+     * @return {@code true} when an auto scan should be requested
      */
     public static boolean shouldScan(boolean enabled, boolean alwaysRescan,
                                      long lastScanEpochMillis, int generatedEntryCount) {
-        // 旧调用点无法计算指纹，保持 Phase 22 的行为：有缓存即跳过。
+        // Older callers cannot compute a fingerprint; keep Phase 22 behaviour: skip when a cache exists.
         return shouldScan(enabled, alwaysRescan, lastScanEpochMillis, generatedEntryCount, true);
     }
 
     /**
-     * 判断服务器启动时是否应请求自动扫描，并把当前输入指纹是否变化纳入判定。
+     * Whether an auto scan should be requested at server startup, taking into account whether the
+     * current input fingerprint changed.
      *
-     * <p>判定顺序固定：</p>
+     * <p>Fixed decision order:</p>
      * <ol>
-     *   <li>{@code enabled == false}：自动扫描总开关关闭，返回 {@code false}；</li>
-     *   <li>{@code alwaysRescan == true}：管理员要求每次启动都重扫，返回 {@code true}；</li>
-     *   <li>{@code lastScanEpochMillis <= 0}：从未扫描过，返回 {@code true}；</li>
-     *   <li>{@code generatedEntryCount <= 0}：没有任何已生成条目，返回 {@code true}；</li>
-     *   <li>{@code fingerprintsMatch == false}：物品、配方、标签、配置或外部基线发生变化，
-     *       返回 {@code true}；</li>
-     *   <li>其余情况视为输入未变化且已有可用缓存，返回 {@code false}。</li>
+     *   <li>{@code enabled == false}: the auto-scan master switch is off, return {@code false};</li>
+     *   <li>{@code alwaysRescan == true}: the admin requires a rescan on every startup, return {@code true};</li>
+     *   <li>{@code lastScanEpochMillis <= 0}: never scanned, return {@code true};</li>
+     *   <li>{@code generatedEntryCount <= 0}: no generated entries at all, return {@code true};</li>
+     *   <li>{@code fingerprintsMatch == false}: items, recipes, tags, config or external baseline changed,
+     *       return {@code true};</li>
+     *   <li>otherwise inputs are unchanged and a usable cache exists, return {@code false}.</li>
      * </ol>
      *
-     * <p>指纹计算失败时调用方应传入 {@code false}，让本方法退化为“需要扫描”，绝不阻止启动。</p>
+     * <p>When fingerprint computation fails the caller should pass {@code false}, degrading this method
+     * to "scan needed"; it never blocks startup.</p>
      *
-     * @param enabled              自动扫描总开关
-     * @param alwaysRescan         是否每次启动都强制重扫
-     * @param lastScanEpochMillis  上次扫描完成的 epoch 毫秒，{@code 0} 表示从未扫描
-     * @param generatedEntryCount  当前已生成条目数量
-     * @param fingerprintsMatch    当前输入指纹是否与保存的指纹完全一致
-     * @return 应请求自动扫描时返回 {@code true}
+     * @param enabled              auto-scan master switch
+     * @param alwaysRescan         whether to force a rescan on every startup
+     * @param lastScanEpochMillis  epoch millis of the last completed scan; {@code 0} means never scanned
+     * @param generatedEntryCount  current number of generated entries
+     * @param fingerprintsMatch    whether the current input fingerprint exactly matches the saved one
+     * @return {@code true} when an auto scan should be requested
      */
     public static boolean shouldScan(boolean enabled, boolean alwaysRescan,
                                      long lastScanEpochMillis, int generatedEntryCount,

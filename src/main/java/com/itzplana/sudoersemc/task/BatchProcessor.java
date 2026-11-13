@@ -1,40 +1,41 @@
 package com.itzplana.sudoersemc.task;
 
 /**
- * 固定批量与自适应批量之间的纯决策组件。
+ * Pure decision component between fixed and adaptive batching.
  *
- * <p>本类不依赖 Minecraft，也不执行任何扫描工作。它只根据上一批的实际耗时与每 tick 预算
- * 推荐下一批的大小；真实工作由服务器线程完成后，再通过
- * {@link #recordBatch(int, long)} 回写实际批量与耗时。</p>
+ * <p>This class depends on no Minecraft type and performs no scan work. It only recommends the next
+ * batch size from the previous batch's actual elapsed time and the per-tick budget; after the real work
+ * is done on the server thread, the actual batch size and elapsed time are written back via
+ * {@link #recordBatch(int, long)}.</p>
  *
- * <h2>自适应算法</h2>
+ * <h2>Adaptive algorithm</h2>
  * <ul>
- *   <li><strong>固定模式：</strong>{@link #nextBatchSize(long, long)} 永远返回构造时传入的
- *       {@code configuredItemsPerTick}，完全忽略耗时样本。</li>
- *   <li><strong>没有有效样本：</strong>自适应模式下，上一批耗时或预算小于等于 0 时，
- *       直接沿用当前批量，避免在数据不足时做出错误调整。</li>
- *   <li><strong>扩容：</strong>上一批耗时不超过预算的 50% 时，按
- *       {@code size * 5 / 4} 扩大 25%（整数除法向零截断）。</li>
- *   <li><strong>缩容：</strong>上一批耗时严格超过预算的 100% 时，按 {@code size / 2}
- *       缩小 50%（整数除法向零截断）。</li>
- *   <li><strong>保持：</strong>耗时落在 {@code (50%, 100%]} 区间时维持当前批量。</li>
- *   <li><strong>上下界：</strong>扩容与缩容的结果都会被夹到
- *       {@code [1, configuredItemsPerTick * 8]}。下界防止批量归零导致扫描停滞；上界防止
- *       单 tick 的服务器停顿过长。{@code configuredItemsPerTick * 8} 使用 64 位计算，
- *       并在接近 {@link Integer#MAX_VALUE} 时饱和。</li>
+ *   <li><strong>Fixed mode:</strong> {@link #nextBatchSize(long, long)} always returns the
+ *       {@code configuredItemsPerTick} passed at construction, ignoring elapsed-time samples entirely.</li>
+ *   <li><strong>No valid sample:</strong> in adaptive mode, when the previous batch elapsed time or
+ *       budget is <= 0, the current batch size is kept to avoid a wrong adjustment on insufficient data.</li>
+ *   <li><strong>Grow:</strong> when the previous batch elapsed time is at most 50% of the budget, grow by
+ *       25% via {@code size * 5 / 4} (integer division truncates toward zero).</li>
+ *   <li><strong>Shrink:</strong> when the previous batch elapsed time strictly exceeds 100% of the budget,
+ *       shrink by 50% via {@code size / 2} (integer division truncates toward zero).</li>
+ *   <li><strong>Hold:</strong> when elapsed time falls in {@code (50%, 100%]}, keep the current batch size.</li>
+ *   <li><strong>Bounds:</strong> grow and shrink results are clamped to
+ *       {@code [1, configuredItemsPerTick * 8]}. The lower bound prevents a zero batch stalling the scan;
+ *       the upper bound prevents an over-long single-tick server pause. {@code configuredItemsPerTick * 8}
+ *       is computed in 64 bits and saturates near {@link Integer#MAX_VALUE}.</li>
  * </ul>
  *
- * <p>{@link #nextBatchSize(long, long)} 不修改内部状态；只有
- * {@link #recordBatch(int, long)} 会推进批量与批次计数。这一分离使调用方可以先询问建议
- * 批量、执行工作，再记录实际结果。</p>
+ * <p>{@link #nextBatchSize(long, long)} does not modify internal state; only
+ * {@link #recordBatch(int, long)} advances the batch size and batch count. This separation lets callers
+ * ask for a suggested batch, do the work, then record the actual result.</p>
  */
 public final class BatchProcessor {
 
-    /** 扩容系数 {@code 5 / 4}，即增长 25%。 */
+    /** Growth factor {@code 5 / 4}, i.e. a 25% increase. */
     private static final int GROWTH_NUMERATOR = 5;
     private static final int GROWTH_DENOMINATOR = 4;
 
-    /** 自适应批量的上限倍率。 */
+    /** Upper-bound multiplier for the adaptive batch size. */
     private static final int MAX_MULTIPLIER = 8;
 
     private final int configuredItemsPerTick;
@@ -45,9 +46,9 @@ public final class BatchProcessor {
     private long lastBatchNanos;
 
     /**
-     * @param configuredItemsPerTick 配置的每 tick 基础处理量，必须大于等于 1
-     * @param adaptive               是否根据耗时样本自动调整批量
-     * @throws IllegalArgumentException 当 {@code configuredItemsPerTick < 1} 时
+     * @param configuredItemsPerTick configured base per-tick amount, must be >= 1
+     * @param adaptive               whether to auto-adjust the batch size from elapsed-time samples
+     * @throws IllegalArgumentException when {@code configuredItemsPerTick < 1}
      */
     public BatchProcessor(int configuredItemsPerTick, boolean adaptive) {
         if (configuredItemsPerTick < 1) {
@@ -60,16 +61,16 @@ public final class BatchProcessor {
     }
 
     /**
-     * 计算下一批建议处理量。
+     * Computes the suggested amount for the next batch.
      *
-     * <p>非自适应模式直接返回配置值。自适应模式根据 {@code lastBatchNanos} 占
-     * {@code budgetNanos} 的比例决定扩容、缩容或保持，具体规则见类文档。方法没有副作用，
-     * 同一状态下重复调用会得到相同结果；只有 {@link #recordBatch(int, long)} 会改变
-     * 后续计算的基准批量。</p>
+     * <p>Non-adaptive mode returns the configured value directly. Adaptive mode decides grow, shrink or
+     * hold based on the ratio of {@code lastBatchNanos} to {@code budgetNanos}; see the class docs for the
+     * exact rules. The method has no side effects — repeated calls in the same state yield the same
+     * result; only {@link #recordBatch(int, long)} changes the base batch size for later calculations.</p>
      *
-     * @param lastBatchNanos 上一批实际耗时（纳秒）；小于等于 0 表示没有有效样本
-     * @param budgetNanos    本 tick 允许用于扫描的时间预算（纳秒）；小于等于 0 表示预算未知
-     * @return 建议批量，范围始终为 {@code [1, configuredItemsPerTick * 8]}
+     * @param lastBatchNanos previous batch actual elapsed time (nanos); <= 0 means no valid sample
+     * @param budgetNanos    time budget allowed for scanning this tick (nanos); <= 0 means budget unknown
+     * @return suggested batch size, always in {@code [1, configuredItemsPerTick * 8]}
      */
     public int nextBatchSize(long lastBatchNanos, long budgetNanos) {
         if (!adaptive) {
@@ -80,9 +81,9 @@ public final class BatchProcessor {
         }
 
         long maximum = maximumBatchSize();
-        // 用 budgetNanos / 2 比较，避免 lastBatchNanos * 2 溢出。
+        // Compare against budgetNanos / 2 to avoid overflowing lastBatchNanos * 2.
         if (lastBatchNanos <= budgetNanos / 2L) {
-            // 至少增加 1：整数除法下 size=1 时 1*5/4 仍为 1，会导致自适应批量永远无法增长。
+            // Grow by at least 1: under integer division size=1 gives 1*5/4 == 1, which would stop the adaptive batch ever growing.
             long grown = Math.max((long) currentBatchSize + 1L,
                     (long) currentBatchSize * GROWTH_NUMERATOR / GROWTH_DENOMINATOR);
             return (int) clamp(grown, maximum);
@@ -95,13 +96,13 @@ public final class BatchProcessor {
     }
 
     /**
-     * 记录一批工作的实际结果，供后续自适应计算使用。
+     * Records the actual result of one batch of work for later adaptive calculations.
      *
-     * <p>批量会被夹到 {@code [1, configuredItemsPerTick * 8]}；耗时负数按 0 处理。
-     * 每次调用都会让 {@link #batchesProcessed()} 加一。</p>
+     * <p>The batch size is clamped to {@code [1, configuredItemsPerTick * 8]}; a negative elapsed time is
+     * treated as 0. Each call increments {@link #batchesProcessed()} by one.</p>
      *
-     * @param size         本批实际处理量
-     * @param elapsedNanos 本批实际耗时（纳秒）
+     * @param size         actual amount processed this batch
+     * @param elapsedNanos actual elapsed time this batch (nanos)
      */
     public void recordBatch(int size, long elapsedNanos) {
         this.currentBatchSize = (int) clamp(size, maximumBatchSize());
@@ -110,42 +111,43 @@ public final class BatchProcessor {
     }
 
     /**
-     * @return 当前自适应基准批量；尚未记录任何批次时等于配置值
+     * @return the current adaptive base batch size; equals the configured value before any batch is recorded
      */
     public int currentBatchSize() {
         return currentBatchSize;
     }
 
     /**
-     * @return 已记录的批次总数
+     * @return total number of batches recorded
      */
     public long batchesProcessed() {
         return batchesProcessed;
     }
 
     /**
-     * @return 构造时配置的基础处理量
+     * @return the base amount configured at construction
      */
     public int configuredItemsPerTick() {
         return configuredItemsPerTick;
     }
 
     /**
-     * @return 是否启用自适应批量
+     * @return whether adaptive batching is enabled
      */
     public boolean adaptive() {
         return adaptive;
     }
 
     /**
-     * @return 最近一次记录的批次耗时（纳秒）；尚未记录时为 0
+     * @return the most recently recorded batch elapsed time (nanos); 0 before any recording
      */
     public long lastBatchNanos() {
         return lastBatchNanos;
     }
 
     /**
-     * 计算自适应批量上限，使用 64 位中间值避免 {@code configuredItemsPerTick * 8} 溢出。
+     * Computes the adaptive batch upper bound, using a 64-bit intermediate to avoid overflowing
+     * {@code configuredItemsPerTick * 8}.
      */
     private int maximumBatchSize() {
         long maximum = (long) configuredItemsPerTick * MAX_MULTIPLIER;
@@ -153,7 +155,7 @@ public final class BatchProcessor {
     }
 
     /**
-     * 将批量夹到 {@code [1, maximum]}。
+     * Clamps the batch size to {@code [1, maximum]}.
      */
     private static long clamp(long value, long maximum) {
         return Math.max(1L, Math.min(maximum, value));

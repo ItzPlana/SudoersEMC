@@ -41,7 +41,7 @@ public final class RecipeScanner {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("sudoersemc/scanner/RecipeScanner");
 
-    /** 单个扫描结果最多保留的失败明细条数，避免异常配方数量失控时占用过多内存。 */
+    /** Maximum failure details kept per scan result, avoiding excess memory when anomalous recipe counts run away. */
     static final int MAX_FAILED_DETAILS = 50;
 
     private final GoetyRitualReader goetyReader;
@@ -68,7 +68,7 @@ public final class RecipeScanner {
         this.scanContainerRemainders = scanContainerRemainders;
     }
 
-    /** 每扫描多少条配方检查一次取消信号。 */
+    /** How many recipes are scanned between cancellation checks. */
     public static final int CANCELLATION_CHECK_INTERVAL = 256;
 
     /**
@@ -82,11 +82,12 @@ public final class RecipeScanner {
     /**
      * Scans recipes with a cooperative cancellation checkpoint.
      *
-     * <p>每 {@value #CANCELLATION_CHECK_INTERVAL} 条配方检查一次取消信号。取消时返回已经描述的
-     * 部分配方与对应计数器；列表不可变，可用于部分诊断报告。</p>
+     * <p>Checks the cancellation signal every {@value #CANCELLATION_CHECK_INTERVAL} recipes. On
+     * cancellation returns the partial recipes already described and the corresponding counters; the
+     * list is immutable and usable for a partial diagnostic report.</p>
      *
      * @param manager      the active recipe manager
-     * @param cancellation 取消检查；返回 {@code true} 时停止继续扫描
+     * @param cancellation cancellation check; stop scanning when it returns {@code true}
      * @return every processed recipe this build can describe, plus counters for what it skipped
      */
     public ScanResult scan(RecipeManager manager, BooleanSupplier cancellation) {
@@ -104,34 +105,36 @@ public final class RecipeScanner {
     }
 
     /**
-     * 返回按 {@link ResourceLocation} 自然顺序排序的配方 id。
+     * Returns recipe ids sorted in {@link ResourceLocation} natural order.
      *
-     * <p>采集会话在开始配方阶段时固化一次顺序，随后按页推进；这样配方管理器的迭代顺序
-     * 变化不会导致跨 tick 游标漂移。</p>
+     * <p>The collection session freezes the order once when the recipe phase begins, then advances by
+     * page; this way a change in the recipe manager's iteration order cannot drift the cross-tick
+     * cursor.</p>
      *
-     * @param manager 当前配方管理器
-     * @return 不可变、排序后的配方 id 列表
+     * @param manager the current recipe manager
+     * @return immutable, sorted recipe id list
      */
     public List<ResourceLocation> orderedRecipeIds(RecipeManager manager) {
         Objects.requireNonNull(manager, "manager");
-        // Stream.toList() 返回不可变列表，必须先复制再排序；真实服务器上直接 sort 会抛
-        // UnsupportedOperationException 并导致整轮配方扫描退化为 0 条可用配方。
+        // Stream.toList() returns an immutable list; it must be copied before sorting. On a real server
+        // sorting directly throws UnsupportedOperationException and degrades the whole recipe scan to 0 usable recipes.
         List<ResourceLocation> ids = new ArrayList<>(manager.getRecipeIds().toList());
         ids.sort(ResourceLocation::compareTo);
         return List.copyOf(ids);
     }
 
     /**
-     * 扫描一页已经排好序的配方 id。
+     * Scans one page of already-sorted recipe ids.
      *
-     * <p>本方法不修改扫描器状态，调用方负责维护游标与累计计数器。每
-     * {@value #CANCELLATION_CHECK_INTERVAL} 条配方检查一次取消信号；取消时返回本页已经描述的
-     * 部分配方。失败明细每页最多保留 {@link #MAX_FAILED_DETAILS} 条，跨页合并由调用方负责。</p>
+     * <p>This method does not modify scanner state; the caller maintains the cursor and accumulated
+     * counters. Checks the cancellation signal every {@value #CANCELLATION_CHECK_INTERVAL} recipes; on
+     * cancellation returns the partial recipes already described in this page. Failure details keep at
+     * most {@link #MAX_FAILED_DETAILS} per page; cross-page merging is the caller's responsibility.</p>
      *
-     * @param manager      当前配方管理器
-     * @param orderedIds   稳定顺序的配方 id 列表
-     * @param cancellation 取消检查；返回 {@code true} 时停止本页
-     * @return 本页可用配方与跳过计数
+     * @param manager      the current recipe manager
+     * @param orderedIds   recipe id list in stable order
+     * @param cancellation cancellation check; stop this page when it returns {@code true}
+     * @return this page's usable recipes and skip counts
      */
     public ScanResult scanBatch(RecipeManager manager, List<ResourceLocation> orderedIds,
                                 BooleanSupplier cancellation) {
@@ -190,10 +193,10 @@ public final class RecipeScanner {
     }
 
     /**
-     * 把一条失败配方整理成稳定、可读的单行明细。
+     * Formats one failed recipe into a stable, readable single-line detail.
      *
-     * <p>明细数量达到 {@link #MAX_FAILED_DETAILS} 后停止记录，但调用方仍会继续累加失败
-     * 总数，因此报告可以显示“已记录 X / 共 Y 条”。</p>
+     * <p>Recording stops once the detail count reaches {@link #MAX_FAILED_DETAILS}, but the caller still
+     * accumulates the total failure count, so the report can show "recorded X / total Y".</p>
      */
     private static void addFailureDetail(List<String> details, ResourceLocation id,
                                          RuntimeException failure) {
@@ -325,10 +328,11 @@ public final class RecipeScanner {
     }
 
     /**
-     * 判断配方能否放入其实际声明的合成网格。
+     * Whether the recipe fits its actually declared crafting grid.
      *
-     * <p>旧实现无条件要求 3x3，会丢弃模组提供的 4x1、4x4 等工作台配方。这里先保留 3x3
-     * 兼容路径，再按配方自己声明的 width×height 检查，绝不把“大于 3x3”直接当成非法。</p>
+     * <p>The old implementation unconditionally required 3x3, discarding mod-provided 4x1, 4x4 etc.
+     * workbench recipes. Here the 3x3 compatibility path is kept first, then checked against the
+     * recipe's own declared width×height; "larger than 3x3" is never treated as illegal outright.</p>
      */
     private static boolean fitsCraftingGrid(CraftingRecipe recipe, int width, int height) {
         try {
@@ -343,10 +347,13 @@ public final class RecipeScanner {
     }
 
     /**
-     * 使用配方输入的代表性物品构造临时合成网格，并读取 remaining items。
+     * Builds a temporary crafting grid from representative items of the recipe inputs and reads the
+     * remaining items.
      *
-     * <p>标签输入可能有多个候选；扫描阶段没有玩家选择，因此固定使用第一个候选。计算结果只用于
-     * 成本抵扣，不会发布为产物。无法计算余量时返回空列表，配方仍然参与定价。</p>
+     * <p>A tag input may have multiple candidates; the scan phase has no player choice, so the first
+     * candidate is used fixed. The result is only used for cost credit and is never published as an
+     * output. When remainders cannot be computed, returns an empty list and the recipe still participates
+     * in pricing.</p>
      */
     private static List<RecipeOutput> containerRemainderOutputs(CraftingRecipe recipe,
                                                                NonNullList<Ingredient> ingredients,
@@ -409,9 +416,9 @@ public final class RecipeScanner {
     }
 
     /**
-     * 把输出堆叠转换为不可变产物，并保留其 SNBT。
+     * Converts an output stack into an immutable output, preserving its SNBT.
      *
-     * <p>该方法为包级可见，便于单元测试直接验证 SNBT 保留与空标签语义。</p>
+     * <p>Package-visible so unit tests can directly verify SNBT preservation and empty-tag semantics.</p>
      */
     @Nullable
     static RecipeOutput convertStack(@Nullable ItemStack stack) {
@@ -426,10 +433,10 @@ public final class RecipeScanner {
     }
 
     /**
-     * 把输出堆叠的 NBT 序列化为 SNBT。
+     * Serialises an output stack's NBT to SNBT.
      *
-     * <p>没有标签时返回 {@code null}；序列化失败时记录调试日志并返回 {@code null}，
-     * 绝不因为单个损坏的标签中断整轮配方扫描。</p>
+     * <p>Returns {@code null} when there is no tag; on serialisation failure logs a debug message and
+     * returns {@code null}, never aborting the whole recipe scan because of a single corrupt tag.</p>
      */
     @Nullable
     private static String serializeTag(ItemStack stack) {
@@ -442,14 +449,14 @@ public final class RecipeScanner {
             if (snbt == null) {
                 return null;
             }
-            // 某些实现可能把空 CompoundTag 序列化成 "{}" 或带空白的等价形式；
-            // 去除全部空白后仍为 "{}" 时按无 NBT 处理，避免下游生成伪变体。
+            // Some implementations may serialise an empty CompoundTag as "{}" or a whitespace-bearing equivalent;
+            // when still "{}" after removing all whitespace, treat as no NBT to avoid downstream fake variants.
             String compact = snbt.replaceAll("\\s+", "");
             if (compact.isEmpty() || "{}".equals(compact)) {
                 return null;
             }
-            // 可损坏物品默认携带 {Damage:0}，它只表示「未受损」，不是经济变体。
-            // 与 VariantNormalizer 保持一致，避免下游把默认伤害当成真实差异。
+            // Damageable items carry {Damage:0} by default; it only means "undamaged", not an economic variant.
+            // Stay consistent with VariantNormalizer so downstream does not treat default damage as a real difference.
             return "{Damage:0}".equals(compact) ? null : snbt;
         } catch (RuntimeException failure) {
             LOGGER.debug("序列化配方输出 NBT 失败，按无 NBT 处理", failure);
@@ -478,7 +485,7 @@ public final class RecipeScanner {
      * @param unsupported         recipes whose type this build cannot evaluate
      * @param invalid             recipes missing an id, inputs or outputs
      * @param failed              recipes that threw while being described
-     * @param failedRecipeDetails 失败配方的可读明细；最多保留 {@link RecipeScanner#MAX_FAILED_DETAILS} 条
+     * @param failedRecipeDetails readable details of failed recipes; at most {@link RecipeScanner#MAX_FAILED_DETAILS} kept
      */
     public record ScanResult(List<RecipeSnapshot> recipes, int unsupported, int invalid, int failed,
                              List<String> failedRecipeDetails) {
@@ -491,7 +498,7 @@ public final class RecipeScanner {
         }
 
         /**
-         * 兼容旧调用点的构造器：不携带失败明细。
+         * Compatibility constructor for older callers: carries no failure details.
          */
         public ScanResult(List<RecipeSnapshot> recipes, int unsupported, int invalid, int failed) {
             this(recipes, unsupported, invalid, failed, List.of());
@@ -508,8 +515,8 @@ public final class RecipeScanner {
     }
 
     /**
-     * @param scanContainerRemainders 是否读取 crafting remaining items
-     * @return 已接入 Goety 的扫描器；Goety 不可用时为空
+     * @param scanContainerRemainders whether to read crafting remaining items
+     * @return a scanner wired to Goety; empty when Goety is unavailable
      */
     public static Optional<RecipeScanner> withGoety(boolean scanContainerRemainders) {
         return GoetyRitualReader.available()

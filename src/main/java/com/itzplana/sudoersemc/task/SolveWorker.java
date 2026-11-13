@@ -14,35 +14,37 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * 单线程守护线程池，专门执行不接触游戏状态的纯计算求解。
+ * Single-thread daemon pool dedicated to pure computation solving that never touches game state.
  *
- * <p>线程名固定为 {@value #THREAD_NAME}，便于日志、线程转储与测试断言。提交任务返回
- * {@link Future}，异常通过 {@link Future#get()} 的 {@code ExecutionException} 传回主线程；
- * 本类绝不在工作线程里吞掉异常。</p>
+ * <p>The thread name is fixed at {@value #THREAD_NAME} for logs, thread dumps and test assertions.
+ * Submitting a task returns a {@link Future}; exceptions are passed back to the main thread via
+ * {@link Future#get()}'s {@code ExecutionException}; this class never swallows exceptions on the worker
+ * thread.</p>
  *
- * <p><strong>线程契约：</strong>求解函数不得访问 Minecraft 注册表、RecipeManager、
- * IProjectEMCProxy 或文件系统。调用方应在服务器线程完成所有权快照、手工值判定器解析与
- * resolver 预计算，再提交不可变快照。</p>
+ * <p><strong>Thread contract:</strong> the solve function must not access the Minecraft registry,
+ * RecipeManager, IProjectEMCProxy or the file system. Callers should complete the ownership snapshot,
+ * manual-value detector resolution and resolver pre-computation on the server thread, then submit an
+ * immutable snapshot.</p>
  */
 public final class SolveWorker implements AutoCloseable {
 
-    /** 工作线程固定名称。 */
+    /** Fixed worker thread name. */
     public static final String THREAD_NAME = "sudoersemc-solver";
 
-    /** 关闭时等待工作线程退出的最长时间（秒）。 */
+    /** Maximum time (seconds) to wait for the worker thread to exit on shutdown. */
     private static final long SHUTDOWN_TIMEOUT_SECONDS = 5L;
 
     private static final Logger LOGGER = LoggerFactory.getLogger("sudoersemc/task/SolveWorker");
 
     /**
-     * 纯求解函数。
+     * Pure solve function.
      */
     @FunctionalInterface
     public interface Solver {
 
         /**
-         * @param snapshot 不可变采集快照，可为 {@code null}
-         * @return 纯计算结果
+         * @param snapshot immutable collection snapshot, may be {@code null}
+         * @return the pure computation result
          */
         SolveOutcome solve(@Nullable PipelineSnapshot snapshot);
     }
@@ -61,11 +63,11 @@ public final class SolveWorker implements AutoCloseable {
     }
 
     /**
-     * 提交一次异步求解。
+     * Submits one asynchronous solve.
      *
-     * @param snapshot 不可变快照，可为 {@code null}
-     * @return 求解 future；异常通过 {@code ExecutionException} 传播
-     * @throws IllegalStateException 工作线程池已关闭
+     * @param snapshot immutable snapshot, may be {@code null}
+     * @return the solve future; exceptions propagate via {@code ExecutionException}
+     * @throws IllegalStateException the worker pool is already closed
      */
     public Future<SolveOutcome> submit(@Nullable PipelineSnapshot snapshot) {
         if (closed.get()) {
@@ -79,11 +81,12 @@ public final class SolveWorker implements AutoCloseable {
     }
 
     /**
-     * 在调用线程同步执行纯求解，供 {@code solveOffThread=false} 的分片模式使用。
+     * Runs the pure solve synchronously on the calling thread, for the sharded mode with
+     * {@code solveOffThread=false}.
      *
-     * @param snapshot 不可变快照，可为 {@code null}
-     * @return 求解结果
-     * @throws IllegalStateException 工作线程池已关闭
+     * @param snapshot immutable snapshot, may be {@code null}
+     * @return the solve result
+     * @throws IllegalStateException the worker pool is already closed
      */
     public SolveOutcome solveNow(@Nullable PipelineSnapshot snapshot) {
         if (closed.get()) {
@@ -93,15 +96,16 @@ public final class SolveWorker implements AutoCloseable {
     }
 
     /**
-     * @return 工作线程池是否已经关闭
+     * @return whether the worker pool is already closed
      */
     public boolean isShutdown() {
         return closed.get();
     }
 
     /**
-     * 立即关闭线程池并中断正在执行的任务，最多等待 {@value #SHUTDOWN_TIMEOUT_SECONDS} 秒让
-     * 工作线程退出。重复调用没有副作用。
+     * Immediately closes the pool and interrupts running tasks, waiting at most
+     * {@value #SHUTDOWN_TIMEOUT_SECONDS} seconds for the worker thread to exit. Repeated calls have no
+     * side effect.
      */
     public void shutdownNow() {
         if (closed.compareAndSet(false, true)) {

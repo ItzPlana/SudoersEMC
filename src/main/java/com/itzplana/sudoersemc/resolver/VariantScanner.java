@@ -10,38 +10,40 @@ import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.item.ItemStack;
 
 /**
- * 从观测到的 NBT 变体列表生成去重后的 {@link ItemKey} 列表。
+ * Generates a deduplicated {@link ItemKey} list from observed NBT variants.
  *
- * <p>每个标签先经 {@link VariantNormalizer#keyFor(ResourceLocation, CompoundTag)} 规范化；
- * 没有经济变体数据的标签（例如只包含自定义名称，或只包含可损坏物品的 {@code Damage}）
- * 会被丢弃。相同规范化结果只保留一个键。扫描最多返回 {@code maxVariantsPerItem} 个键，
- * 并额外受 {@link #HARD_VARIANT_CEILING} 限制；超过上限时保留字典序最小的键，因此结果
- * 与输入顺序无关，避免世界遍历顺序影响 EMC 归属。结果按
- * {@link ItemKey#compareTo(ItemKey)} 排序且不可变。</p>
+ * <p>Each tag is first canonicalised by {@link VariantNormalizer#keyFor(ResourceLocation, CompoundTag)};
+ * tags with no economic variant data (e.g. only a custom name, or only a damageable item's
+ * {@code Damage}) are discarded. Identical canonical results keep a single key. A scan returns at most
+ * {@code maxVariantsPerItem} keys, additionally bounded by {@link #HARD_VARIANT_CEILING}; when over the
+ * limit the lexicographically smallest keys are kept, so the result is independent of input order and
+ * world traversal order cannot affect EMC ownership. The result is sorted by
+ * {@link ItemKey#compareTo(ItemKey)} and immutable.</p>
  */
 public final class VariantScanner {
 
     /**
-     * 单个物品允许生成的变体硬上限，防止损坏的数据源拖垮扫描流程。
+     * Hard per-item variant ceiling, preventing a corrupt data source from overwhelming the scan.
      */
     public static final int HARD_VARIANT_CEILING = 1000;
 
     /**
-     * 一次扫描允许生成的变体总数硬上限。
+     * Hard ceiling on the total number of variants generated in one scan.
      *
-     * <p>每个物品的上限只能约束单项；缺少全局预算时，大量不同物品同时携带 NBT
-     * 仍会让采集阶段和持久化条目无限增长。达到该预算后按物品 id 升序停止采集。</p>
+     * <p>The per-item limit only constrains a single item; without a global budget, many distinct items
+     * carrying NBT at once would still grow collection and persistence entries without bound. Once this
+     * budget is reached, collection stops in ascending item-id order.</p>
      */
     public static final int HARD_TOTAL_VARIANT_CEILING = 10_000;
 
     /**
-     * 扫描并规范化观测到的变体。
+     * Scans and canonicalises observed variants.
      *
-     * @param baseStack           用于确定物品注册 id 的基础堆叠，不能为空
-     * @param observedVariants    观测到的原始标签列表，允许为 {@code null} 或包含 {@code null} 元素
-     * @param maxVariantsPerItem  每个物品最多保留的变体数，必须大于等于 1
-     * @return 按物品键排序的不可变列表
-     * @throws IllegalArgumentException 当 {@code maxVariantsPerItem < 1}、基础堆叠为空或物品未注册
+     * @param baseStack           base stack used to determine the item registry id, must not be empty
+     * @param observedVariants    observed raw tag list, may be {@code null} or contain {@code null} elements
+     * @param maxVariantsPerItem  maximum variants kept per item, must be >= 1
+     * @return immutable list sorted by item key
+     * @throws IllegalArgumentException when {@code maxVariantsPerItem < 1}, the base stack is empty, or the item is unregistered
      */
     public List<ItemKey> scan(ItemStack baseStack, List<CompoundTag> observedVariants, int maxVariantsPerItem) {
         Objects.requireNonNull(baseStack, "baseStack");

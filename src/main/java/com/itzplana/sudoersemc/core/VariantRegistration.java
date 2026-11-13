@@ -6,22 +6,24 @@ import java.util.Objects;
 import java.util.TreeSet;
 
 /**
- * 构造 ProjectE 精确 NBT 注册所需的 SNBT 列表。
+ * Builds the SNBT list required for ProjectE's exact-NBT registration.
  *
- * <p>{@link ItemKey#variantHash()} 只保存规范化后的经济身份：展示字段、可损坏物品的
- * {@code Damage} 等会被剥离。ProjectE 的 {@code EMCMappingHandler} 以完整
- * {@code ItemInfo(item, nbt)} 做精确匹配，因此注册侧必须同时保留观测到的原始 SNBT；
- * 规范 SNBT 只用于去重、归属与持久化身份。</p>
+ * <p>{@link ItemKey#variantHash()} stores only the canonicalised economic identity: display fields and,
+ * for damageable items, {@code Damage} etc. are stripped. ProjectE's {@code EMCMappingHandler} matches
+ * exactly on the full {@code ItemInfo(item, nbt)}, so the registration side must also keep the observed
+ * raw SNBT; the canonical SNBT is used only for deduplication, ownership and persistence identity.</p>
  *
- * <p>同一经济变体可能对应多个原始 SNBT（例如仅自定义名称不同）。这里对原始值做稳定排序、
- * 去重与数量封顶，避免异常数据把持久化文件撑大。</p>
+ * <p>One economic variant may correspond to several raw SNBTs (e.g. differing only by custom name). Raw
+ * values are stably sorted, deduplicated and capped here so anomalous data cannot bloat the persistence
+ * file.</p>
  */
 public final class VariantRegistration {
 
     /**
-     * 单个经济变体最多保留的原始 SNBT 数量。
+     * Maximum number of raw SNBTs kept per economic variant.
      *
-     * <p>仅影响 ProjectE 精确 NBT 注册的覆盖面；经济身份本身仍由规范 hash 去重。</p>
+     * <p>Only affects the coverage of ProjectE exact-NBT registration; the economic identity itself is
+     * still deduplicated by the canonical hash.</p>
      */
     public static final int MAX_OBSERVED_NBT_PER_VARIANT = 64;
 
@@ -29,11 +31,11 @@ public final class VariantRegistration {
     }
 
     /**
-     * 清洗观测到的原始 SNBT：过滤空值、排序、去重并截断到
-     * {@link #MAX_OBSERVED_NBT_PER_VARIANT}。
+     * Cleans observed raw SNBT: filters blanks, sorts, deduplicates and truncates to
+     * {@link #MAX_OBSERVED_NBT_PER_VARIANT}.
      *
-     * @param observed 原始 SNBT 列表，允许为 {@code null}
-     * @return 不可变的稳定列表
+     * @param observed raw SNBT list, may be {@code null}
+     * @return an immutable, stable list
      */
     public static List<String> sanitizeObserved(List<String> observed) {
         if (observed == null || observed.isEmpty()) {
@@ -53,14 +55,15 @@ public final class VariantRegistration {
     }
 
     /**
-     * 构造需要注册到 ProjectE 的 SNBT 列表。
+     * Builds the SNBT list to register with ProjectE.
      *
-     * <p>返回顺序固定为“规范 SNBT，然后按字典序排列的原始 SNBT”，并做精确字符串去重。
-     * 基础物品没有 NBT，返回空列表，由调用方按无 NBT 栈注册。</p>
+     * <p>The returned order is fixed as "canonical SNBT, then raw SNBTs in lexicographic order", with
+     * exact string deduplication. A base item has no NBT and returns an empty list; the caller registers
+     * it as a no-NBT stack.</p>
      *
-     * @param key               经济身份
-     * @param observedVariantNbts 观测到的原始 SNBT，允许为 {@code null}
-     * @return 不可变的 SNBT 列表；基础物品返回空列表
+     * @param key               economic identity
+     * @param observedVariantNbts observed raw SNBT, may be {@code null}
+     * @return immutable SNBT list; empty for a base item
      */
     public static List<String> registrationNbts(ItemKey key, List<String> observedVariantNbts) {
         Objects.requireNonNull(key, "key");

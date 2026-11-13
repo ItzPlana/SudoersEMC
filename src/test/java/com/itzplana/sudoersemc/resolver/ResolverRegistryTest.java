@@ -13,14 +13,14 @@ import net.minecraft.world.item.Items;
 import org.junit.jupiter.api.Test;
 
 /**
- * {@link ResolverRegistry} 的单元测试，重点验证解析顺序与异常隔离。
+ * Unit tests for {@link ResolverRegistry}, focusing on resolution order and exception isolation.
  */
 class ResolverRegistryTest {
 
     private static final ItemStack STACK;
 
     static {
-        // Forge 的 ItemStack 静态初始化需要 BuiltInRegistries，因此测试前必须先完成引导。
+        // Forge's ItemStack static initialisation needs BuiltInRegistries, so bootstrap must complete before the test.
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
         STACK = new ItemStack(Items.STONE);

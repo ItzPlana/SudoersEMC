@@ -111,9 +111,6 @@ public final class ConfigWatcher {
         return lastResult;
     }
 
-    /**
-     * @return 当前已注册的监听器数量
-     */
     public int listenerCount() {
         return listeners.size();
     }

@@ -9,25 +9,28 @@ import java.util.List;
 import java.util.Objects;
 
 /**
- * 一次扫描输入指纹的不可变集合。
+ * Immutable collection of one scan's input fingerprints.
  *
- * <p>五个字段分别覆盖物品、配方、标签、配置与基线来源。每个字段都是对应输入集合经过
- * “过滤空值 → 升序排序 → 以 {@code \u0000} 拼接 → SHA-256 → 取十六进制前 32 位”得到的
- * 摘要。排序保证同一组输入不受遍历顺序影响，空字节分隔避免 {@code ["ab","c"]} 与
- * {@code ["a","bc"]} 产生相同摘要。</p>
+ * <p>The five fields cover items, recipes, tags, config and baseline sources respectively. Each field is
+ * a digest of its input set obtained by "filter nulls → sort ascending → join with {@code \u0000} →
+ * SHA-256 → take the first 32 hex chars". Sorting makes the same input set independent of traversal
+ * order; the null-byte separator avoids {@code ["ab","c"]} and {@code ["a","bc"]} producing the same
+ * digest.</p>
  *
- * <p>本类只提供指纹计算与比较能力；持久化与启动缓存复用由 {@code ScanStateStore} 和入口层
- * 决定，Phase 7 的 {@code ScanCollectionPipeline} 与 Phase 12 的 {@code ScanPipeline} 都会把
- * 指纹写入 {@code scan_state.json} 并在服务器启动时比较以跳过未变化的扫描。本类自身不访问
- * 磁盘；调用方负责保证各通道覆盖实际影响定价的输入内容（包括配方/标签内容与外部基线）。
- * 指纹只描述输入内容，不含时间戳、随机数或对象身份，因此同一组输入在任何进程中都会得到
- * 相同结果。</p>
+ * <p>This class only provides fingerprint computation and comparison; persistence and startup cache
+ * reuse are decided by {@code ScanStateStore} and the entry layer. Both Phase 7's
+ * {@code ScanCollectionPipeline} and Phase 12's {@code ScanPipeline} write the fingerprint to
+ * {@code scan_state.json} and compare it at server startup to skip unchanged scans. This class itself does
+ * not access disk; callers must ensure each channel covers the input content that actually affects
+ * pricing (including recipe/tag content and external baselines). The fingerprint describes only input
+ * content — no timestamps, random numbers or object identity — so the same input set yields the same
+ * result in any process.</p>
  *
- * @param itemFingerprint     物品注册表输入摘要
- * @param recipeFingerprint   配方输入摘要
- * @param tagFingerprint      标签输入摘要
- * @param configFingerprint   影响定价的配置摘要
- * @param baselineFingerprint 外部基线来源摘要
+ * @param itemFingerprint     item registry input digest
+ * @param recipeFingerprint   recipe input digest
+ * @param tagFingerprint      tag input digest
+ * @param configFingerprint   digest of config affecting pricing
+ * @param baselineFingerprint external baseline source digest
  */
 public record ScanFingerprint(
         String itemFingerprint,
@@ -38,12 +41,12 @@ public record ScanFingerprint(
 ) {
 
     /**
-     * 空输入集合的固定摘要。使用固定字符串而不是空串，便于日志中区分“没有输入”与
-     * “摘要计算失败”。
+     * Fixed digest for an empty input set. A fixed string rather than an empty string is used so logs can
+     * distinguish "no input" from "digest computation failed".
      */
     public static final String EMPTY = "empty";
 
-    /** SHA-256 十六进制摘要保留的字符数。 */
+    /** Number of characters kept from the SHA-256 hex digest. */
     private static final int HASH_LENGTH = 32;
 
     private static final char[] HEX_DIGITS = "0123456789abcdef".toCharArray();
@@ -57,14 +60,15 @@ public record ScanFingerprint(
     }
 
     /**
-     * 计算一组字符串输入的稳定摘要。
+     * Computes a stable digest for a set of string inputs.
      *
-     * <p>{@code null} 元素会被跳过；剩余元素按自然顺序升序排序后以空字节拼接。输入为空、
-     * 只包含 {@code null}，或 {@code values} 本身为 {@code null} 时返回
-     * {@link #EMPTY}。重复元素不会被去重，因为重复本身也是输入内容的一部分。</p>
+     * <p>{@code null} elements are skipped; the rest are sorted ascending in natural order then joined
+     * with a null byte. Returns {@link #EMPTY} when the input is empty, contains only {@code null}, or
+     * {@code values} itself is {@code null}. Duplicates are not deduplicated, because duplication is itself
+     * part of the input content.</p>
      *
-     * @param values 输入值集合，可为 {@code null}
-     * @return 32 位小写十六进制摘要，或 {@link #EMPTY}
+     * @param values input value set, may be {@code null}
+     * @return a 32-char lowercase hex digest, or {@link #EMPTY}
      */
     public static String hash(Iterable<String> values) {
         if (values == null) {
@@ -100,14 +104,14 @@ public record ScanFingerprint(
     }
 
     /**
-     * 构建五个通道的指纹。
+     * Builds the fingerprints for the five channels.
      *
-     * @param items    物品输入
-     * @param recipes  配方输入
-     * @param tags     标签输入
-     * @param config   配置输入
-     * @param baseline 基线输入
-     * @return 各通道分别取摘要后的指纹集合
+     * @param items    item inputs
+     * @param recipes  recipe inputs
+     * @param tags     tag inputs
+     * @param config   config inputs
+     * @param baseline baseline inputs
+     * @return the fingerprint collection with each channel digested separately
      */
     public static ScanFingerprint of(Iterable<String> items,
                                      Iterable<String> recipes,
@@ -123,11 +127,10 @@ public record ScanFingerprint(
     }
 
     /**
-     * 比较两个指纹是否描述同一组扫描输入。
+     * Whether two fingerprints describe the same set of scan inputs.
      *
-     * @param other 待比较对象，可为 {@code null}
-     * @return 五个字段全部相等时返回 {@code true}；{@code other} 为 {@code null} 时返回
-     *         {@code false}
+     * @param other the object to compare, may be {@code null}
+     * @return {@code true} when all five fields are equal; {@code false} when {@code other} is {@code null}
      */
     public boolean equalsFingerprint(ScanFingerprint other) {
         return other != null
@@ -139,13 +142,14 @@ public record ScanFingerprint(
     }
 
     /**
-     * 返回与另一个指纹相比发生变化的通道名称。
+     * Returns the names of channels that changed compared to another fingerprint.
      *
-     * <p>名称固定为 {@code item}、{@code recipe}、{@code tag}、{@code config}、{@code baseline}，
-     * 便于日志与诊断稳定解析。{@code other} 为 {@code null} 时五个通道都视为变化。</p>
+     * <p>Names are fixed as {@code item}, {@code recipe}, {@code tag}, {@code config}, {@code baseline} for
+     * stable parsing in logs and diagnostics. When {@code other} is {@code null}, all five channels are
+     * treated as changed.</p>
      *
-     * @param other 待比较指纹，可为 {@code null}
-     * @return 发生变化的通道名称列表；完全相同时为空列表
+     * @param other the fingerprint to compare, may be {@code null}
+     * @return list of changed channel names; empty when fully equal
      */
     public List<String> changedChannels(ScanFingerprint other) {
         if (other == null) {
@@ -171,7 +175,7 @@ public record ScanFingerprint(
     }
 
     /**
-     * @return 五个通道都等于 {@link #EMPTY} 时返回 {@code true}
+     * @return {@code true} when all five channels equal {@link #EMPTY}
      */
     public boolean isEmpty() {
         return EMPTY.equals(itemFingerprint)
@@ -182,15 +186,16 @@ public record ScanFingerprint(
     }
 
     /**
-     * 将 {@code null} 归一化为空摘要；空串保持原样，因为它不是由 {@link #hash} 产生的值。
+     * Normalises {@code null} to the empty digest; an empty string is kept as-is, since it is not a value
+     * produced by {@link #hash}.
      */
     private static String normalize(String value) {
         return value == null ? EMPTY : value;
     }
 
     /**
-     * 计算 SHA-256。JDK 必须提供该算法；缺失属于运行环境损坏，因此转换为
-     * {@link IllegalStateException} 而不是受检异常。
+     * Computes SHA-256. The JDK must provide this algorithm; its absence means a broken runtime, so it is
+     * converted to {@link IllegalStateException} rather than a checked exception.
      */
     private static byte[] sha256(String value) {
         try {
