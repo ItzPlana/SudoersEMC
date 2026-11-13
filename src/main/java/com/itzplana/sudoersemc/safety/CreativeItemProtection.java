@@ -22,9 +22,12 @@ import net.minecraft.resources.ResourceLocation;
  * {@link Settings#creativeOnlyItemPatterns()} / {@link Settings#autoDetectCreativeOnlyNamespaces()}
  * 的保守自动识别规则。绝不能因为“算不出价值”就假定物品是创造专属的。</p>
  *
- * <p>判定顺序固定：保护禁用、显式排除、创造专属命名空间、自动识别、特殊固定值、无解兜底、
- * 普通物品。显式排除与自动识别都优先于特殊固定值，因此管理员无法用固定值让被排除或已被识别
- * 为创造专属的物品重新进入自动定价。</p>
+ * <p>判定顺序固定：显式排除、创造专属命名空间与自动识别（两者仅在保护启用时生效）、
+ * 特殊固定值、保护禁用、无解兜底、普通物品。显式排除与自动识别都优先于特殊固定值，
+ * 因此管理员无法用固定值让被排除或已被识别为创造专属的物品重新进入自动定价。</p>
+ *
+ * <p>显式排除与特殊固定值不随 {@code protectCreativeOnlyItems} 总开关关闭而失效：管理员
+ * 关闭该开关时只放弃“创造专属命名空间”的自动识别，明确的排除项与固定值仍然生效。</p>
  */
 public final class CreativeItemProtection {
 
@@ -42,6 +45,9 @@ public final class CreativeItemProtection {
             "^minecraft:(barrier|chain_command_block|command_block|command_block_minecart|"
                     + "debug_stick|jigsaw|knowledge_book|light|repeating_command_block|"
                     + "structure_block|structure_void)$");
+
+    /** 合法资源路径：小写字母、数字、下划线、连字符、点与斜杠。 */
+    private static final Pattern PATH_PATTERN = Pattern.compile("[a-z0-9_./-]+");
 
     private final Settings settings;
     private final List<Pattern> autoDetectPatterns;
@@ -207,7 +213,17 @@ public final class CreativeItemProtection {
             return null;
         }
         String value = raw.trim();
-        return value.isEmpty() ? null : ResourceLocation.tryParse(value);
+        int separator = value.indexOf(':');
+        if (separator <= 0 || separator != value.lastIndexOf(':')
+                || separator == value.length() - 1) {
+            return null;
+        }
+        String namespace = value.substring(0, separator);
+        String path = value.substring(separator + 1);
+        if (!isValidNamespace(namespace) || !isValidPath(path)) {
+            return null;
+        }
+        return ResourceLocation.tryParse(value);
     }
 
     /**
@@ -262,6 +278,15 @@ public final class CreativeItemProtection {
         } catch (PatternSyntaxException failure) {
             return false;
         }
+    }
+
+    /**
+     * @return 是否为合法的资源路径（与 {@code ConfigValidator} 的规则保持一致）
+     */
+    private static boolean isValidPath(String path) {
+        return path != null
+                && !path.isEmpty()
+                && PATH_PATTERN.matcher(path).matches();
     }
 
     /**
@@ -391,22 +416,22 @@ public final class CreativeItemProtection {
      */
     public Decision decide(ItemKey item, boolean hasRecipe, boolean hasTagPricing) {
         Objects.requireNonNull(item, "item");
-        if (!settings.enabled()) {
-            return new Decision(true, 0L, "protection-disabled");
-        }
         ResourceLocation itemId = item.itemId();
         if (settings.explicitExclusions().contains(itemId)) {
             return new Decision(false, 0L, "explicit-exclusion");
         }
-        if (settings.creativeOnlyNamespaces().contains(itemId.getNamespace())) {
+        if (settings.enabled() && settings.creativeOnlyNamespaces().contains(itemId.getNamespace())) {
             return new Decision(false, 0L, "creative-only-namespace");
         }
-        if (isAutoDetectedCreativeOnly(itemId)) {
+        if (settings.enabled() && isAutoDetectedCreativeOnly(itemId)) {
             return new Decision(false, 0L, "auto-detected-creative-only");
         }
         Long specialValue = settings.specialValues().get(itemId);
         if (specialValue != null) {
             return new Decision(true, specialValue, "special-value");
+        }
+        if (!settings.enabled()) {
+            return new Decision(true, 0L, "protection-disabled");
         }
         if (!hasRecipe && !hasTagPricing) {
             return new Decision(true, 0L, "unsolvable-fallback");

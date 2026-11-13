@@ -37,7 +37,7 @@ SudoersEMC 是一个**独立实现**的 Minecraft Forge 1.20.1 模组。它扫�
 
 ## 当前状态
 
-项目按阶段推进。当前代码基线为 Phase 25 复审修复提交（分支 `phase-25-config-baseline`），**701 个单元测试通过**（0 failures / 0 errors / 0 skipped）；Phase 18–25 已完成，Goety 与 NBT 变体的真实环境验证、真实模组创造物品识别、Phase 23 取消路径的实机触发、以及 ProjectE-Integration 外部基线的真实数据验证仍待进行。
+项目按阶段推进。当前代码基线为 Phase 25 复审修复提交（分支 `phase-25-config-baseline`），**917 个单元测试通过**（0 failures / 0 errors / 0 skipped）；Phase 18–25 已完成，Goety 与 NBT 变体的真实环境验证、真实模组创造物品识别、Phase 23 取消路径的实机触发、以及 ProjectE-Integration 外部基线的真实数据验证仍待进行。
 
 | 阶段       | 内容                                                                                                                                                                                                                                                                                                                         | 状态                                                                               |
 | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
@@ -70,8 +70,8 @@ Phase 1 曾在专用服务器上验证写入生效、重启后自动恢复、手
 - **诊断报告计数器与失败明细** —— Phase 22 完成。`last_report.txt` 新增配方扫描区块，输出总数/可用/不支持/无效/失败计数，并展示最多 10 条失败配方明细（超出部分只显示剩余总数）；`PipelineResult.extraCounters` 同时承载求解轮数、隔离/清理数量、干跑标记等计数器。
 - **扫描耗时与峰值堆采样** —— Phase 22 完成。`ScanManager` 在每个 tick 边界采样耗时与堆内存；报告输出扫描总耗时、tick 采样数、tick 最大/平均/P95 耗时（最近秩法）以及峰值堆内存和报告时瞬时堆内存。
 - **取消/失败部分报告** —— Phase 22 完成。`ScanManager.AbortListener` 在取消或失败时通知管线，由 `ScanPipeline.writeCancelledReport` / `writeFailedReport` 写出部分报告，标记 `partialReport=1`、`scanCancelled`/`scanFailed` 与 `scanAborts`。
-- **五通道增量指纹与启动跳过** —— Phase 23 完成。`ScanFingerprint` 分别对物品（注册表 id + 稀有度，条目去重）、配方（完整内容摘要）、标签（物品标签并集）、配置（影响定价的配置白名单）与基线（ProjectE 手动值/标签）排序后计算 SHA-256 截断摘要；`ScanStateStore.compare(...)` 返回发生变化的通道。服务器启动时，在「已有缓存且未开启 `alwaysRescan`」的情况下计算当前指纹并比较，完全一致则跳过扫描；指纹计算失败退化为需要扫描。`/sudoemc rescan-all` 直接请求扫描，不受该跳过逻辑影响。
-- **协作式取消** —— Phase 23 完成。`ScanCancellation` 令牌由 `ScanManager` 与 `ScanPipeline` 共享；物品/配方扫描、NBT 变体生成、既有值读取、求解与应用循环均设有检查点。取消时不更新扫描指纹、不执行陈旧条目清理与 `custom_emc.json` 改写；已 stage 的条目可能保留，报告写出 `scanCancelled` / `partialReport` 标记。开发服扫描 <1s，实机取消未触发，该路径由单元测试覆盖。
+- **五通道增量指纹与启动跳过** —— Phase 23 完成。`ScanFingerprint` 分别对物品（注册表 id + 稀有度，条目去重）、配方（完整内容摘要）、标签（物品 → 标签映射，而不是所有标签的并集）、配置（影响定价的配置白名单 + 指纹/定价语义版本盐）与基线（ProjectE 手动值/标签 + ProjectE 版本）排序后计算 SHA-256 截断摘要；`ScanStateStore.compare(...)` 返回发生变化的通道。服务器启动时，在「已有缓存且未开启 `alwaysRescan`」的情况下计算当前指纹并比较，完全一致则跳过扫描；指纹计算失败退化为需要扫描。`/sudoemc rescan-all` 直接请求扫描，不受该跳过逻辑影响。
+- **协作式取消** —— Phase 23 完成。`ScanCancellation` 令牌由 `ScanManager` 与 `ScanPipeline` 共享；物品/配方扫描、NBT 变体生成、既有值读取、求解与应用循环均设有检查点。取消或失败时显式让持久化扫描指纹失效（而不是写入未完成结果），确保下一次启动必然重扫；不执行陈旧条目清理与 `custom_emc.json` 改写，已 stage 的条目可能保留。报告写出 `scanCancelled` / `partialReport` 标记。开发服扫描 <1s，实机取消未触发，该路径由单元测试覆盖。
 - **有界 LRU 求解缓存** —— Phase 23 完成。`RecipeSolver` 使用默认容量 8192 的访问序 LRU，键包含配方内容、评估策略、评估器注册表与输入值快照；`ScanPipeline` 持有单个 `RecipeSolver` 实例并跨求解轮次复用。报告新增 `solverCacheHits` / `solverCacheMisses` 计数器。
 - **配方选择策略** —— Phase 23 完成。新增 `[recipe] selectionStrategy`，支持 `lowest_cost`（默认，成本相同按配方 id）、`prefer_simple`（成本相同优先输入/输出/容器返还更少且非催化剂的配方，最后按 id）与 `stable_id`（成本相同按配方 id）。所有策略都以成本为第一排序键；非法值回退 `lowest_cost` 并只警告一次。
 - **降价保护豁免** —— Phase 24 完成。新增 `safety.dropProtectionExemptNamespaces` / `safety.dropProtectionExemptItems`，接入 `LargeDropProtection.Settings` 与 `Sudoersemc.createDropProtection()`；按命名空间（忽略 path）或精确物品 id 跳过大幅降价隔离，非法条目会被跳过并汇总为一条警告。
@@ -230,7 +230,7 @@ randomSeed = 0                  # 0 = 每次启动重新随机
 
 [nbt]
 scanNbtVariants = true          # Phase 17 已接线；真实环境尚未验证
-maxNbtVariantsPerItem = 100     # Phase 17 已接线；实际扫描受硬上限 1000 限制
+maxNbtVariantsPerItem = 100     # Phase 17 已接线；范围 [1, 1000]，真实环境尚未验证
 
 [diagnostic]
 debugLogging = false            # Phase 25 已生效；开启后按类别每秒最多 20 条
@@ -243,6 +243,15 @@ Phase 24 新增的 `[recipe]` 键：`scanContainerRemainders`（默认 `true`）
 
 Phase 24 新增的 `[safety]` 键：`dropProtectionExemptNamespaces` / `dropProtectionExemptItems` 分别按命名空间和精确物品 id 跳过大幅降价隔离（非法条目跳过并汇总警告）；`autoDetectCreativeOnlyItems`（默认 `true`）启用自动识别，`creativeOnlyItemPatterns` 默认只匹配原版 command/structure 物品，`autoDetectCreativeOnlyNamespaces` 默认空，自动识别不会隐式影响普通模组物品；显式排除、固定值与 `creativeNamespaces` 规则保持原有语义。`preserveExternallyModifiedValues`（默认 `true`）在应用前检测 owned 条目被外部/ProjectE 手动值修改，命中后释放所有权并保留外部值，阻止本轮自动值覆盖。真实模组创造物品仍需显式配置。
 Phase 25 新增/更新的配置键：根级 `schemaVersion` 默认 `1`（legacy），当前构建支持 `2`，请勿手动修改；模块会在 Forge 解析前把旧文件迁移到当前版本并备份原文件。`fallback.useProjectEIntegrationBaselines`（默认 `true`）已实际生效：仅当 ProjectE-Integration 已安装且 ProjectE provider 可用时，读取 `pe_custom_conversions` 数据包中的 `values.before` 作为外部基线，否则返回空基线。`diagnostic.debugLogging`（默认 `false`）已实际生效：开启后按类别输出调试日志，每类别每秒最多 20 条，被抑制条目在扫描结束时汇总；关闭时高频路径只做一次 volatile 读取。
+
+> **[nbt] 说明**：`scanNbtVariants = false` 会跳过变体生成；`maxNbtVariantsPerItem`
+> 的 Forge 范围为 `[1, 1000]`，与 `VariantScanner.HARD_VARIANT_CEILING = 1000` 一致。
+
+### 标签兜底定价的风险
+
+`fallback.useTagPricing = true` 时，未定价物品会按材料标签类别使用默认锚点（默认按铁系取值）。
+标签只表示材料关系，不保证同一类别内不同材料的真实价值相同；在 ProjectE 已为廉价可再生产材料定价、但未为对应块/锭定价的模组包中，可能出现 EMC 套利。
+当前版本尚未提供按材料/标签的覆盖配置；如发现异常定价，建议关闭 `useTagPricing`，或先用 ProjectE 手动 EMC 值（`custom_emc.json`）覆盖相关材料，使 EXISTING 优先命中。
 
 ### 溢出保护
 
@@ -292,7 +301,7 @@ ProjectE 原生值与 `custom_emc.json` 中的手动值不会进入这条候选�
 - 非法的 `recipe.selectionStrategy` 会在解析时回退为 `lowest_cost` 并只记录一次警告，不会拒绝重建；该键参与配置指纹，修改后会在下一次服务器启动时触发增量扫描。
 - Phase 24 新增的列表键 `safety.dropProtectionExemptNamespaces` / `dropProtectionExemptItems` / `creativeOnlyItemPatterns` / `autoDetectCreativeOnlyNamespaces` 由 `ConfigValidator` 逐条校验；非法条目只会被跳过并汇总警告，不会拒绝重建。
 - `safety.maxAllowedDropRatio` 的 Forge 范围是 `[0.0, 1.0]`；若设为 `0.0`，`LargeDropProtection.Settings` 构造会失败，扫描管线回退到默认 `0.5`（不是拒绝整个配置）。
-- `nbt.maxNbtVariantsPerItem` 的 Forge 范围是 `[1, Integer.MAX_VALUE]`；运行时不拒绝大于 `1000` 的值，但 `VariantScanner` 会用硬上限 `1000` 截断实际扫描数量。
+- `nbt.maxNbtVariantsPerItem` 的 Forge 范围是 `[1, 1000]`；越界值在加载时被纠正，运行时校验也会拒绝重建并保留上一份有效组件。
 - 启动时若溢出设置构造失败，扫描管线会回退到内置默认值；运行期重建采用「全有或全无」：新组件全部构建成功后才替换旧组件。
 - `/sudoemc reload` 会用当前已加载的配置值重建运行时组件；扫描进行中时返回「将在扫描结束后生效」，校验失败时返回「已保留上一份有效配置」。它不会主动重新读取磁盘上的 TOML；直接编辑配置文件后，Forge 检测到变化时会触发 `ModConfigEvent.Reloading`，走同一重建路径。
 - `ConfigValidator` 与 `ConfigWatcher` 已接入生产配置加载流程；`ConfigMigrations` 已由 `ConfigTomlMigration` 接入：模块加载时在 Forge 解析前迁移磁盘 TOML，`ModConfigEvent` 内的入口作为 reload/兜底。
@@ -332,16 +341,16 @@ ProjectE 原生值与 `custom_emc.json` 中的手动值不会进入这条候选�
 
 ### 交叉字段校验（Phase 16 已接线）
 
-| 条件                                                                       | 当前行为                                                                |
-| -------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| `overflow.threshold <= resetMax`                                           | 加载阶段记录警告；运行时重建被拒绝，保留上一份有效组件                  |
-| `overflow.resetMin > resetMax`                                             | 同上                                                                    |
-| `overflow.resetMin < 1` / `bucketCount < 1` / `weightCap < 1`              | Forge `defineInRange` 在加载时纠正越界值；运行时校验也会拒绝重建        |
-| `overwriteScope = entire_custom_emc` 且 `allowProjectEFileRewrite = false` | 只记录警告；不改写 `custom_emc.json`                                    |
-| 非法 `overwriteScope`                                                      | 回退为 `owned_only` 并记录警告；不拒绝重建                              |
-| `nbt.maxNbtVariantsPerItem > 1000`                                         | 运行时不拒绝；`VariantScanner` 以硬上限 `1000` 截断实际扫描数量         |
-| `safety.maxAllowedDropRatio = 0.0`                                         | Forge 接受；`LargeDropProtection.Settings` 构造失败，管线回退默认 `0.5` |
-| `fallback.minEmc < 0`                                                      | Forge `defineInRange` 在加载时纠正到 `0`                                |
+| 条件                                                                       | 当前行为                                                                 |
+| -------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `overflow.threshold <= resetMax`                                           | 加载阶段记录警告；运行时重建被拒绝，保留上一份有效组件                   |
+| `overflow.resetMin > resetMax`                                             | 同上                                                                     |
+| `overflow.resetMin < 1` / `bucketCount < 1` / `weightCap < 1`              | Forge `defineInRange` 在加载时纠正越界值；运行时校验也会拒绝重建         |
+| `overwriteScope = entire_custom_emc` 且 `allowProjectEFileRewrite = false` | 只记录警告；不改写 `custom_emc.json`                                     |
+| 非法 `overwriteScope`                                                      | 回退为 `owned_only` 并记录警告；不拒绝重建                               |
+| `nbt.maxNbtVariantsPerItem` 不在 `[1, 1000]` 内                            | Forge `defineInRange` 在加载时纠正越界值；运行时校验拒绝重建并保留旧组件 |
+| `safety.maxAllowedDropRatio = 0.0`                                         | Forge 接受；`LargeDropProtection.Settings` 构造失败，管线回退默认 `0.5`  |
+| `fallback.minEmc < 0`                                                      | Forge `defineInRange` 在加载时纠正到 `0`                                 |
 
 ### 警告条件
 
@@ -397,7 +406,7 @@ Forge 1.20.1 没有公开的「解析前」配置钩子。Phase 25 在 `Sudoerse
 1. **查询** — 通过 `IEMCProxy` 判断物品是否已有 EMC；已有值（SudoersEMC 自有条目除外）会被视为已定价。
 2. **计算** — 从配方、标签、稀有度、层级与兜底规则推导候选值；标签与稀有度取自实际物品快照（`getTags()` / `getRarity()`）。同一物品有多个配方时，按多轮求解（含循环检测）取最低的有效确定性成本，成本相同时按 `[recipe] selectionStrategy` 取舍；Phase 23 起 `RecipeSolver` 使用有界 LRU 评估缓存并在配方循环中检查取消令牌。Phase 24 起 `RecipeScanner` 区分 shaped/shapeless 并按实际 width×height 支持非 3x3，容器返还写入配方快照；`StandardRecipeEvaluator` 在 `recipe.creditContainerRemainders` 开启时抵扣返还容器价值，并在 `recipe.priceSecondaryOutputs` 开启时按全部产出的总单位拆分净成本。Phase 17 起，配方输出中观测到的 NBT 会生成带 `variantHash` 的变体快照并进入同一求解流程；Phase 19/20 起空 NBT 与仅含默认 `{Damage:0}` 的标签按普通物品处理。Phase 25 起，兜底链可在 TAG/RARITY 之前使用 ProjectE-Integration 外部基线或第三方 NBT resolver 的 `EXTERNAL_BASELINE` 候选，并同样先经过排除、手动值、最小 EMC 与溢出阈值检查。原版配方不产生 NBT 输出，真实环境未验证。求解只读取不可变快照、在服务器线程执行，当前没有后台线程。
 3. **安全** — 对生成候选值应用降价保护（超过阈值的降价写入隔离记录并等待审批，支持按命名空间/物品豁免）、创造专属物品保护（支持显式配置与自动识别，自动识别默认只匹配原版 command/structure 物品）与溢出保护；应用前检测 owned 条目是否被外部或 ProjectE 手动值修改，命中则释放所有权并保留外部值，阻止本轮覆盖；双开关开启时另做 `custom_emc.json` 的受控文件改写。
-4. **持久化** — 把结果写入 `generated_entries.json`，并标记归属（`owned=true`）；后续扫描会先清空自有条目再重新求解，并清理不再参与定价的陈旧自有条目，使配方或标签变化能够反映到生成值上。Phase 24 检测到外部修改的条目会以 `owned=false` 保留外部值，本轮不再覆盖。取消的扫描不会更新 `scan_state.json` 指纹，并跳过陈旧条目清理与 `custom_emc.json` 改写。
+4. **持久化** — 把结果写入 `generated_entries.json`，并标记归属（`owned=true`）；后续扫描会先清空自有条目再重新求解，并清理不再参与定价的陈旧自有条目，使配方或标签变化能够反映到生成值上。Phase 24 检测到外部修改的条目会以 `owned=false` 保留外部值，本轮不再覆盖。取消或失败的扫描会让 `scan_state.json` 指纹失效，并跳过陈旧条目清理与 `custom_emc.json` 改写。
 5. **写入** — 通过 ProjectE 官方的 `@EMCMapper(priority = -1000)` 扩展点，在 ProjectE 重算 EMC 时以 `setValueBefore` 注入自有条目；手动值会被跳过。
 6. **重算** — 在服务器线程触发一次资源重载，ProjectE 随即重建 EMC 映射。
 7. **诊断** — 扫描管线把配方扫描统计、求解轮数、求解缓存命中/未命中、隔离/清理数量、tick 耗时与堆内存采样集中到 `PipelineResult.extraCounters`，扫描结束后写入 `last_report.txt`；Phase 24 另输出 `shapedRecipes` / `shapelessRecipes`、`multiOutputRecipes` / `containerRemainderRecipes` 与 `ownershipExternalModifications` / `ownershipReleasedEntries`；Phase 25 另输出 `externalBaselineAvailable` / `externalBaselineEntries` / `externalBaselineApplied` 与 `resolverRegistered` / `resolverApplied` 计数器。取消或失败时由 `AbortListener` 写出部分报告，保留已采集快照的统计与终止原因标记。
@@ -414,7 +423,7 @@ Forge 1.20.1 没有公开的「解析前」配置钩子。Phase 25 在 `Sudoerse
 ./gradlew test
 ```
 
-测试覆盖：加权采样分布与权重重置、阈值边界、幂等性、持久化往返、损坏文件容错、schema 版本保护（含 v1→v2 兼容）、归属刷新、陈旧条目清理、`custom_emc.json` 受控改写（备份、原子替换、未知字段保留）、配置热重载决策、NBT 变体规范化（含空 NBT 与默认 `{Damage:0}`）、隔离记录存储与审批、备选成本持久化与 `explain` 输出、Goety 读取失败语义、Phase 22 的诊断报告计数器与失败明细、tick 耗时最大/平均/P95（最近秩法）、峰值堆采样、`extraCounters` 持久化、取消/失败部分报告、Phase 23 的五通道指纹与变化通道、启动跳过策略、协作式取消检查点、有界 LRU 求解缓存命中/未命中与配方选择策略（含非法值回退），以及扫描接线、Phase 24 的降价豁免解析与判定、创造物品自动识别与优先级、外部修改检测与所有权释放、shaped/shapeless 统计、非 3x3 网格、容器返还扫描与成本抵扣、多输出拆分计价，以及配置校验/报告计数器、Phase 25 的解析前配置迁移（默认版本、备份、原子替换失败路径、拒绝/失败路径备份、高版本/超大版本/非法版本拒绝、quoted numeric、幂等、未知键保留）、外部基线 JSON 解析与不可用退化、`#tag` 展开与直接条目优先、skipped-tag 计数、PEI 文件遍历顺序、基础候选优先级/排除/最小 EMC/降价隔离/溢出阈值、debug 日志开关与每秒限流及扫描结束 summary 输出、resolver 注册顺序/异常隔离/非正值忽略/指纹变化与注册顺序指纹，以及诊断报告外部基线计数。当前基线共 **701 个单元测试通过**（0 failures / 0 errors / 0 skipped）。
+测试覆盖：加权采样分布与权重重置、阈值边界、幂等性、持久化往返、损坏文件容错、schema 版本保护（含 v1→v2 兼容）、归属刷新、陈旧条目清理、`custom_emc.json` 受控改写（备份、原子替换、未知字段保留）、配置热重载决策、NBT 变体规范化（含空 NBT 与默认 `{Damage:0}`）、隔离记录存储与审批、备选成本持久化与 `explain` 输出、Goety 读取失败语义、Phase 22 的诊断报告计数器与失败明细、tick 耗时最大/平均/P95（最近秩法）、峰值堆采样、`extraCounters` 持久化、取消/失败部分报告、Phase 23 的五通道指纹与变化通道、启动跳过策略、协作式取消检查点、有界 LRU 求解缓存命中/未命中与配方选择策略（含非法值回退），以及扫描接线、Phase 24 的降价豁免解析与判定、创造物品自动识别与优先级、外部修改检测与所有权释放、shaped/shapeless 统计、非 3x3 网格、容器返还扫描与成本抵扣、多输出拆分计价，以及配置校验/报告计数器、Phase 25 的解析前配置迁移（默认版本、备份、原子替换失败路径、拒绝/失败路径备份、高版本/超大版本/非法版本拒绝、quoted numeric、幂等、未知键保留）、外部基线 JSON 解析与不可用退化、`#tag` 展开与直接条目优先、skipped-tag 计数、PEI 文件遍历顺序、基础候选优先级/排除/最小 EMC/降价隔离/溢出阈值、debug 日志开关与每秒限流及扫描结束 summary 输出、resolver 注册顺序/异常隔离/非正值忽略/指纹变化与注册顺序指纹，以及诊断报告外部基线计数。当前基线共 **917 个单元测试通过**（0 failures / 0 errors / 0 skipped）。
 
 ---
 
@@ -430,7 +439,7 @@ Forge 1.20.1 没有公开的「解析前」配置钩子。Phase 25 在 `Sudoerse
 
 ## English Summary
 
-SudoersEMC is an independent Minecraft Forge 1.20.1 mod that generates EMC values for items that ProjectE does not price. Current baseline: Phase 25 review-fix commit (branch `phase-25-config-baseline`), **701 unit tests passing** (0 failures / 0 errors / 0 skipped); Phases 18–25 are complete, while live Goety and NBT-variant verification, real modded creative-item coverage, a live cancellation trigger, and real ProjectE-Integration baseline data (including `#tag` expansion) are still pending.
+SudoersEMC is an independent Minecraft Forge 1.20.1 mod that generates EMC values for items that ProjectE does not price. Current baseline: Phase 25 review-fix commit (branch `phase-25-config-baseline`), **917 unit tests passing** (0 failures / 0 errors / 0 skipped); Phases 18–25 are complete, while live Goety and NBT-variant verification, real modded creative-item coverage, a live cancellation trigger, and real ProjectE-Integration baseline data (including `#tag` expansion) are still pending.
 
 - **Queries** go through ProjectE's public `IEMCProxy`.
 - **Writes** use ProjectE's official `@EMCMapper` extension point (`priority = -1000`, `setValueBefore`), never ProjectE internals.
@@ -439,6 +448,9 @@ SudoersEMC is an independent Minecraft Forge 1.20.1 mod that generates EMC value
 - **Incremental scanning**: Phase 23 computes a five-channel input fingerprint (item registry id + rarity, full recipe content, item-tag union, pricing-config whitelist, and ProjectE manual values/tags), stores it in `scan_state.json`, and compares it at startup. With an existing cache and `alwaysRescan=false`, an unchanged fingerprint skips the scan; fingerprint calculation failures fall back to scanning. `/sudoemc rescan-all` always requests a scan. Dev-server runs covered a cold scan, an unchanged-input skip, and a config-change rescan.
 - **Scanning** advances phase by phase across server ticks and samples tick duration and heap usage at every tick boundary, but collection, solving and application still run as single server-thread calls. There is no worker thread and no true work slicing. Phase 23 adds cooperative cancellation checkpoints inside item/recipe scanning, NBT variant generation, existing-value reads, solving and apply loops; a cancelled scan does not update the fingerprint or retire stale entries, and writes a partial report. Basic scan metrics were measured on a dev server, but performance on a representative modpack has not been measured. Live cancellation was not triggered because dev-server scans finished in under one second; that path is covered by unit tests.
 - **Pricing**: multi-pass recipe solving with cycle detection and lowest-cost selection per item, a configurable tie-break strategy (`lowest_cost` default, `prefer_simple`, `stable_id`), and a bounded LRU evaluation cache (default 8192 entries keyed by recipe content, evaluation policy, evaluator registry and input-value snapshot) reused across solve rounds, plus a TAG → TIER → RARITY → FALLBACK chain using real item tags and rarity. `fallback.minEmc` is a real TOML key wired into the solver's minimum value. Phase 24 adds container-remainder crediting (default true) and optional multi-output unit splitting (`priceSecondaryOutputs=false` by default, which keeps the whole net cost on the primary output). Phase 25 adds an `EXTERNAL_BASELINE` source fed by ProjectE-Integration `pe_custom_conversions` (`values.before`) or third-party NBT resolvers; it runs after the exclusion check and before TAG/RARITY, and values above the overflow threshold are discarded before seeding.
+- **Incremental scanning**: Phase 23 computes a five-channel input fingerprint (item registry id + rarity, full recipe content, item→tag mapping, pricing-config whitelist plus a fingerprint/pricing-semantics version salt, and ProjectE manual values/tags plus the ProjectE version), stores it in `scan_state.json`, and compares it at startup. With an existing cache and `alwaysRescan=false`, an unchanged fingerprint skips the scan; fingerprint calculation failures fall back to scanning. `/sudoemc rescan-all` always requests a scan. Dev-server runs covered a cold scan, an unchanged-input skip, and a config-change rescan.
+- **Scanning** advances phase by phase across server ticks and samples tick duration and heap usage at every tick boundary, but collection, solving and application still run as single server-thread calls. There is no worker thread and no true work slicing. Phase 23 adds cooperative cancellation checkpoints inside item/recipe scanning, NBT variant generation, existing-value reads, solving and apply loops; a cancelled or failed scan invalidates the persisted fingerprint and does not retire stale entries, and it writes a partial report. Basic scan metrics were measured on a dev server, but performance on a representative modpack has not been measured. Live cancellation was not triggered because dev-server scans finished in under one second; that path is covered by unit tests.
+- **Pricing**: multi-pass recipe solving with cycle detection and lowest-cost selection per item, a configurable tie-break strategy (`lowest_cost` default, `prefer_simple`, `stable_id`), and a bounded LRU evaluation cache (default 8192 entries keyed by recipe content, evaluation policy, evaluator registry and input-value snapshot) reused across solve rounds, plus a TAG → TIER → RARITY → FALLBACK chain using real item tags and rarity. `fallback.minEmc` is a real TOML key wired into the solver's minimum value. Phase 24 adds container-remainder crediting (default true) and optional multi-output unit splitting (`priceSecondaryOutputs=false` by default, which keeps the whole net cost on the primary output).
 - **NBT variants**: Phase 17 wires recipe-output NBT into `VariantScanner` and `ItemSnapshot.variantHash`, and the `[nbt]` keys are effective. Phases 19/20 normalize empty NBT and the default `{Damage:0}` tag to a plain item. However, vanilla recipes produce no NBT output, so this path has not been verified in a real environment; `/sudoemc explain` still only accepts a plain item id.
 - **Overflow protection** resets generated candidate values above `999999` into a weighted range of `100..999000` with a hard per-bucket weight cap; ProjectE-native and manual values are not touched by this path.
 - **Diagnostics**: `last_report.txt` after each scan, `overflow_resets.json` persisted on server stop, `quarantined_drops.json` for large price drops, and `/sudoemc status|rescan-all|cancel|reload|report|explain|approve`. `explain` shows up to five alternative recipe costs; `approve` only marks a quarantine record as approved and never changes EMC. Phase 22 adds recipe-scan totals with up to 10 failed-recipe details, tick max/avg/P95 timing (nearest-rank), peak heap sampling, all counters in `PipelineResult.extraCounters`, and partial reports on cancellation/failure via `ScanManager.AbortListener`. Phase 23 adds solver rounds and solver-cache hit/miss counters to the report, and marks cooperative-cancellation partial reports with `scanCancelled` / `partialReport`. Phase 24 adds `shapedRecipes` / `shapelessRecipes`, `multiOutputRecipes` / `containerRemainderRecipes` and `ownershipExternalModifications` / `ownershipReleasedEntries` counters. Phase 25 adds `externalBaselineAvailable` / `externalBaselineEntries` / `externalBaselineApplied` and `resolverRegistered` / `resolverApplied` counters.

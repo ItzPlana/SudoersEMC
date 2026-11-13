@@ -47,6 +47,9 @@ import net.minecraft.resources.ResourceLocation;
  * <h2>不抬价规则（精确语义）</h2>
  * <ul>
  *   <li>运行开始前已有 EMC 的物品永远不发布新值，种子值完全胜出。</li>
+ *   <li>已有种子值的物品：永远胜出，不发布生成值。</li>
+ *   <li>{@link SolveContext#isDenied(ItemKey)} 为 {@code true} 的物品：不发布生成值，且其数值
+ *       不会作为下游配方的输入。</li>
  *   <li>本次运行中尚未生成值的物品：直接发布本轮最低有效成本。</li>
  *   <li>本次运行中已经生成值的物品：更低成本总是替换旧值；相同成本不产生变化；
  *       更高成本仅在 {@link SolveSettings#allowValueIncrease()} 为 {@code true} 时替换，
@@ -295,6 +298,10 @@ public final class RecipeSolver {
                     // 已有 EMC 永远胜出，连轨迹都不生成。
                     continue;
                 }
+                if (context.isDenied(item)) {
+                    // 安全层禁止定价的物品不发布，也不会成为下游配方的输入。
+                    continue;
+                }
                 List<CostCandidate> candidates = entry.getValue();
                 candidates.sort(candidateOrder);
                 long bestCost = candidates.get(0).cost();
@@ -435,7 +442,9 @@ public final class RecipeSolver {
      *
      * <p>默认策略只给主输出定价；显式开启副产物定价时，所有不同输出物品都会收到同一个单位值。</p>
      */
-    private static List<ItemKey> publicationTargets(RecipeSnapshot recipe, EvaluationPolicy policy) {
+    public static List<ItemKey> publicationTargets(RecipeSnapshot recipe, EvaluationPolicy policy) {
+        Objects.requireNonNull(recipe, "recipe");
+        Objects.requireNonNull(policy, "policy");
         if (!recipe.hasOutputs()) {
             return List.of();
         }

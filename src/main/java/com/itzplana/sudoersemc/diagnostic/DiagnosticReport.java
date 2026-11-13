@@ -20,7 +20,7 @@ import java.util.Map;
  * {@code extraCounters} 按名称字典序追加在固定指标之后，保证不同调用顺序下报告文本一致。</p>
  *
  * @param totalRegisteredItems    本次扫描遍历到的注册物品总数
- * @param itemsWithExistingEmc    其中已经有 EMC 值的物品数量
+ * @param itemsWithExistingEmc    受保护的非自有既有值数量（自有条目会先被分离并重新求解）
  * @param itemsSolvedByRecipe     通过配方求解得到价格的物品数量
  * @param itemsSolvedByExternalBaseline 通过外部基线（PEI/解析器）得到价格的物品数量
  * @param itemsSolvedByTag        通过标签定价得到价格的物品数量
@@ -29,7 +29,7 @@ import java.util.Map;
  * @param itemsSolvedByFallback   通过兜底规则得到价格的物品数量
  * @param unresolvedItems         最终仍未解析出价格的物品数量
  * @param quarantinedDrops        因降幅超阈值而被隔离的降价数量
- * @param failedRecipes           扫描或求解失败的配方数量
+ * @param failedRecipes           配方扫描阶段失败的配方数量；求解器异常不计入此字段
  * @param totalDurationMillis     本次扫描总耗时毫秒数
  * @param peakHeapBytes           扫描期间观察到的峰值堆内存字节数
  * @param extraCounters           额外的具名计数器；不能包含 {@code null} 键或负值
@@ -204,7 +204,7 @@ public record DiagnosticReport(
         StringBuilder text = new StringBuilder();
         text.append("===== SudoersEMC 诊断报告 =====\n");
         appendLine(text, "注册物品总数", Long.toString(totalRegisteredItems));
-        appendLine(text, "已有 EMC", Long.toString(itemsWithExistingEmc));
+        appendLine(text, "受保护的非自有既有值", Long.toString(itemsWithExistingEmc));
         appendLine(text, "配方求解", Long.toString(itemsSolvedByRecipe));
         appendLine(text, "外部基线定价", Long.toString(itemsSolvedByExternalBaseline));
         appendLine(text, "标签定价", Long.toString(itemsSolvedByTag));
@@ -245,6 +245,17 @@ public record DiagnosticReport(
 
     private void appendRecipeScanSection(StringBuilder text) {
         long failedTotal = Math.max(failedRecipes, counter("failedRecipes", 0L));
+
+        // 枚举失败时总数与分类计数都不可信；明确显示“不可用”，绝不伪造 0 或 1。
+        if (counter("recipeEnumerationFailed", 0L) > 0L) {
+            text.append("----- 配方扫描 -----\n");
+            appendLine(text, "配方扫描统计", "不可用（配方枚举失败）");
+            if (!failedRecipeDetails.isEmpty()) {
+                appendFailedRecipeDetails(text, failedRecipeDetails.size());
+            }
+            return;
+        }
+
         boolean hasCounters = hasAnyCounter("totalRecipes", "usableRecipes",
                 "unsupportedRecipes", "invalidRecipes", "failedRecipes");
         boolean hasDetails = !failedRecipeDetails.isEmpty();
@@ -273,7 +284,7 @@ public record DiagnosticReport(
         appendLine(text, "可用配方", Long.toString(usable));
         appendLine(text, "不支持配方", Long.toString(unsupported));
         appendLine(text, "无效配方", Long.toString(invalid));
-        appendLine(text, "失败配方", Long.toString(failedTotal));
+        appendLine(text, "扫描失败配方", Long.toString(failedTotal));
         appendFailedRecipeDetails(text, failedTotal);
     }
 

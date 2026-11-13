@@ -43,7 +43,7 @@ class ReportManagerTest {
         ReportManager manager = new ReportManager(tempDir);
         DiagnosticReport report = report(1234L);
 
-        manager.writeReport(report);
+        assertTrue(manager.writeReport(report), "成功写入必须返回 true");
 
         Optional<String> text = manager.readLastReport();
         assertTrue(text.isPresent());
@@ -89,7 +89,18 @@ class ReportManagerTest {
         ReportManager manager = new ReportManager(tempDir);
 
         assertDoesNotThrow(() -> manager.writeReport(null));
+        assertFalse(manager.writeReport(null), "null 报告必须返回 false");
         assertFalse(Files.exists(manager.reportFile()));
+    }
+
+    @Test
+    void writeReportReturnsFalseWhenTargetCannotBeCreated() throws IOException {
+        Path blocked = tempDir.resolve("blocked_report_dir");
+        Files.writeString(blocked, "not a directory");
+        ReportManager manager = new ReportManager(blocked);
+
+        assertFalse(manager.writeReport(report(1L)), "磁盘写入失败必须返回 false");
+        assertTrue(manager.readLastReport().isEmpty());
     }
 
     @Test

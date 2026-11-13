@@ -16,6 +16,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.BooleanSupplier;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.item.Item;
@@ -50,6 +51,8 @@ public final class CommandService {
     private final @Nullable GeneratedEntryStore entryStore;
     private final @Nullable ScanStateStore scanStateStore;
     private final @Nullable ReloadAction reloadAction;
+    private final @Nullable BooleanSupplier scanRequestAction;
+    private final @Nullable QuarantineApprovalAction quarantineApprovalAction;
     private final @Nullable QuarantinedDropsStore quarantinedDropsStore;
     private final @Nullable EmcProvider emcProvider;
     private final @Nullable ProjectEManualValues manualValues;
@@ -69,7 +72,7 @@ public final class CommandService {
                           @Nullable ReportManager reportManager,
                           @Nullable GeneratedEntryStore entryStore,
                           @Nullable ScanStateStore scanStateStore) {
-        this(scanManager, reportManager, entryStore, scanStateStore, null, null, null, null);
+        this(scanManager, reportManager, entryStore, scanStateStore, null, null, null);
     }
 
     /**
@@ -84,7 +87,7 @@ public final class CommandService {
                           @Nullable GeneratedEntryStore entryStore,
                           @Nullable ScanStateStore scanStateStore,
                           @Nullable ReloadAction reloadAction) {
-        this(scanManager, reportManager, entryStore, scanStateStore, reloadAction, null, null, null);
+        this(scanManager, reportManager, entryStore, scanStateStore, reloadAction, null, null);
     }
 
     /**
@@ -108,7 +111,7 @@ public final class CommandService {
     }
 
     /**
-     * 完整构造器。
+     * 完整构造器：同时支持直接隔离存储审批与 explain 的手动值/外部后端查询。
      *
      * @param scanManager           扫描状态机，可为 {@code null}
      * @param reportManager         诊断报告管理器，可为 {@code null}
@@ -127,11 +130,103 @@ public final class CommandService {
                           @Nullable QuarantinedDropsStore quarantinedDropsStore,
                           @Nullable EmcProvider emcProvider,
                           @Nullable ProjectEManualValues manualValues) {
+        this(scanManager, reportManager, entryStore, scanStateStore, reloadAction,
+                null, null, quarantinedDropsStore, emcProvider, manualValues);
+    }
+
+    /**
+     * @param scanManager              扫描状态机，可为 {@code null}
+     * @param reportManager            诊断报告管理器，可为 {@code null}
+     * @param entryStore               已生成条目的存储，可为 {@code null}
+     * @param scanStateStore           上一次扫描状态的存储，可为 {@code null}
+     * @param reloadAction             真实配置重载动作，可为 {@code null}（视为不可用）
+     * @param quarantineApprovalAction 隔离降价审批动作，可为 {@code null}（视为不可用）
+     */
+    public CommandService(@Nullable ScanManager scanManager,
+                          @Nullable ReportManager reportManager,
+                          @Nullable GeneratedEntryStore entryStore,
+                          @Nullable ScanStateStore scanStateStore,
+                          @Nullable ReloadAction reloadAction,
+                          @Nullable QuarantineApprovalAction quarantineApprovalAction) {
+        this(scanManager, reportManager, entryStore, scanStateStore, reloadAction,
+                quarantineApprovalAction, null);
+    }
+
+    /**
+     * @param scanManager              扫描状态机，可为 {@code null}
+     * @param reportManager            诊断报告管理器，可为 {@code null}
+     * @param entryStore               已生成条目的存储，可为 {@code null}
+     * @param scanStateStore           上一次扫描状态的存储，可为 {@code null}
+     * @param reloadAction             真实配置重载动作，可为 {@code null}（视为不可用）
+     * @param quarantineApprovalAction 隔离降价审批动作，可为 {@code null}（视为不可用）
+     * @param scanRequestAction        扫描请求动作；生产接线传入与重建共享运行时锁的入口，
+     *                                 {@code null} 时退回直接调用 {@code scanManager.requestScan()}
+     */
+    public CommandService(@Nullable ScanManager scanManager,
+                          @Nullable ReportManager reportManager,
+                          @Nullable GeneratedEntryStore entryStore,
+                          @Nullable ScanStateStore scanStateStore,
+                          @Nullable ReloadAction reloadAction,
+                          @Nullable QuarantineApprovalAction quarantineApprovalAction,
+                          @Nullable BooleanSupplier scanRequestAction) {
+        this(scanManager, reportManager, entryStore, scanStateStore, reloadAction,
+                quarantineApprovalAction, scanRequestAction, null, null, null);
+    }
+
+    /**
+     * 生产用完整构造器：审批回调、扫描请求回调与 explain 查询接口同时注入。
+     *
+     * @param scanManager              扫描状态机，可为 {@code null}
+     * @param reportManager            诊断报告管理器，可为 {@code null}
+     * @param entryStore               已生成条目的存储，可为 {@code null}
+     * @param scanStateStore           上一次扫描状态的存储，可为 {@code null}
+     * @param reloadAction             真实配置重载动作，可为 {@code null}
+     * @param quarantineApprovalAction 隔离降价审批动作，可为 {@code null}
+     * @param scanRequestAction        扫描请求动作，可为 {@code null}
+     * @param emcProvider              ProjectE（或其它后端）的 EMC 查询接口，可为 {@code null}
+     * @param manualValues             ProjectE 手动值视图，可为 {@code null}
+     */
+    public CommandService(@Nullable ScanManager scanManager,
+                          @Nullable ReportManager reportManager,
+                          @Nullable GeneratedEntryStore entryStore,
+                          @Nullable ScanStateStore scanStateStore,
+                          @Nullable ReloadAction reloadAction,
+                          @Nullable QuarantineApprovalAction quarantineApprovalAction,
+                          @Nullable BooleanSupplier scanRequestAction,
+                          @Nullable EmcProvider emcProvider,
+                          @Nullable ProjectEManualValues manualValues) {
         this.scanManager = scanManager;
         this.reportManager = reportManager;
         this.entryStore = entryStore;
         this.scanStateStore = scanStateStore;
         this.reloadAction = reloadAction;
+        this.quarantineApprovalAction = quarantineApprovalAction;
+        this.scanRequestAction = scanRequestAction;
+        this.quarantinedDropsStore = null;
+        this.emcProvider = emcProvider;
+        this.manualValues = manualValues;
+    }
+
+    /**
+     * 直接注入隔离存储的私有完整构造器。
+     */
+    private CommandService(@Nullable ScanManager scanManager,
+                           @Nullable ReportManager reportManager,
+                           @Nullable GeneratedEntryStore entryStore,
+                           @Nullable ScanStateStore scanStateStore,
+                           @Nullable ReloadAction reloadAction,
+                           @Nullable QuarantineApprovalAction quarantineApprovalAction,
+                           @Nullable BooleanSupplier scanRequestAction,
+                           @Nullable QuarantinedDropsStore quarantinedDropsStore,
+                           @Nullable EmcProvider emcProvider,
+                           @Nullable ProjectEManualValues manualValues) {
+        this.scanManager = scanManager;
+        this.reportManager = reportManager;
+        this.entryStore = entryStore;
+        this.scanStateStore = scanStateStore;
+        this.reloadAction = reloadAction;
+        this.quarantineApprovalAction = quarantineApprovalAction;
+        this.scanRequestAction = scanRequestAction;
         this.quarantinedDropsStore = quarantinedDropsStore;
         this.emcProvider = emcProvider;
         this.manualValues = manualValues;
@@ -140,8 +235,8 @@ public final class CommandService {
     /**
      * 查询当前扫描状态与上一次扫描结果。
      *
-     * <p>输出固定五个字段：阶段、当前阶段进度、是否运行中、上次耗时与上次结果。扫描服务
-     * 缺失时只返回一行“扫描服务不可用”。</p>
+     * <p>输出阶段、当前阶段进度、是否运行中、非空时的阶段详情，以及上次耗时与上次结果。
+     * 扫描失败时阶段详情会保留失败原因。扫描服务缺失时只返回一行“扫描服务不可用”。</p>
      *
      * @return 状态文本；永不抛出异常
      */
@@ -156,10 +251,13 @@ public final class CommandService {
             }
 
             long percent = Math.round(progress.fraction() * 100.0D);
-            List<String> lines = new ArrayList<>(5);
+            List<String> lines = new ArrayList<>(6);
             lines.add("扫描状态: " + progress.phase().label());
             lines.add("进度    : " + progress.processed() + "/" + progress.total() + " (" + percent + "%)");
             lines.add("运行中  : " + (progress.isRunning() ? "是" : "否"));
+            if (!progress.detail().isBlank()) {
+                lines.add("详情    : " + progress.detail());
+            }
             appendLastScanLines(lines);
             return CommandResult.ok(lines);
         } catch (RuntimeException e) {
@@ -180,7 +278,9 @@ public final class CommandService {
             if (scanManager.isRunning()) {
                 return CommandResult.failure(DUPLICATE_SCAN);
             }
-            boolean started = scanManager.requestScan();
+            boolean started = scanRequestAction == null
+                    ? scanManager.requestScan()
+                    : scanRequestAction.getAsBoolean();
             if (!started) {
                 return CommandResult.failure(DUPLICATE_SCAN);
             }
@@ -245,8 +345,9 @@ public final class CommandService {
     /**
      * 批准某个物品当前被隔离的降价记录。
      *
-     * <p>本操作只把隔离记录标记为已批准并立即落盘，不会修改 {@link GeneratedEntryStore} 中的
-     * 任何 EMC 数值，也不会触发重扫。参数必须是普通物品 id；带 NBT 的变体暂不支持。</p>
+     * <p>生产接线会注入 {@link QuarantineApprovalAction}，由模组入口完成“持久化审批 →
+     * 清理内存隔离 → 应用数值 → 落盘/重映射”的完整闭环；只注入隔离存储时退化为仅标记
+     * 审批状态并落盘，不修改任何 EMC 数值。参数必须是普通物品 id；带 NBT 的变体暂不支持。</p>
      *
      * @param itemId 物品 id 原文，例如 {@code minecraft:stone}
      * @return 明确的中文结果：已批准、无此记录或 id 非法；永不抛出异常
@@ -257,22 +358,33 @@ public final class CommandService {
                 return CommandResult.failure("请提供物品 id，例如 minecraft:stone");
             }
             String trimmed = itemId.trim();
+            if (quarantineApprovalAction != null) {
+                CommandResult result = quarantineApprovalAction.approve(trimmed);
+                return result == null
+                        ? CommandResult.failure("隔离审批失败: NullPointerException")
+                        : result;
+            }
+
             ResourceLocation parsed = ResourceLocation.tryParse(trimmed);
             if (parsed == null) {
                 return CommandResult.failure("无效的物品 id: " + itemId);
             }
-            if (quarantinedDropsStore == null) {
+            QuarantinedDropsStore store = quarantinedDropsStore;
+            if (store == null) {
                 return CommandResult.failure(QUARANTINE_UNAVAILABLE);
             }
 
             ItemKey key = ItemKey.of(parsed);
-            if (!quarantinedDropsStore.approve(key)) {
+            if (!store.approve(key)) {
                 return CommandResult.failure("未找到 " + trimmed + " 的隔离降价记录");
             }
             // 审批语义只落盘标记，不修改生成值，也不请求重扫。
-            quarantinedDropsStore.saveIfDirty();
+            if (!store.saveIfDirty()) {
+                return CommandResult.failure(
+                        "已批准 " + trimmed + " 的隔离降价记录，但保存到磁盘失败；将在下次保存时重试");
+            }
             return CommandResult.ok(
-                    "已批准 " + trimmed + " 的隔离降价记录（仅标记审批状态，不修改 EMC 数值）");
+                    "已批准 " + trimmed + " 的隔离降价记录（仅标记审批状态，不修改 EMC，也不改变后续扫描判定）");
         } catch (RuntimeException e) {
             return unexpectedFailure(e);
         }
@@ -369,11 +481,12 @@ public final class CommandService {
      * 查询 ProjectE 手动值文件中的普通物品条目。
      */
     private @Nullable Long lookupManualValue(ResourceLocation itemId) {
-        if (manualValues == null) {
+        ProjectEManualValues values = manualValues;
+        if (values == null) {
             return null;
         }
         try {
-            return manualValues.manualValues().get(ItemKey.of(itemId));
+            return values.manualValues().get(ItemKey.of(itemId));
         } catch (RuntimeException | LinkageError failure) {
             return null;
         }
@@ -383,11 +496,12 @@ public final class CommandService {
      * 查询外部 EMC 后端当前值。
      */
     private @Nullable Long lookupProviderValue(ResourceLocation itemId) {
-        if (emcProvider == null) {
+        EmcProvider provider = emcProvider;
+        if (provider == null) {
             return null;
         }
         try {
-            if (!emcProvider.isAvailable()) {
+            if (!provider.isAvailable()) {
                 return null;
             }
             Item item = BuiltInRegistries.ITEM.get(itemId);
@@ -395,13 +509,39 @@ public final class CommandService {
                 return null;
             }
             ItemStack stack = new ItemStack(item);
-            if (!emcProvider.hasValue(stack)) {
+            if (!provider.hasValue(stack)) {
                 return null;
             }
-            long value = emcProvider.getValue(stack);
+            long value = provider.getValue(stack);
             return value > 0L ? value : null;
         } catch (RuntimeException | LinkageError failure) {
             return null;
+        }
+    }
+
+    /**
+     * 批准并应用某个物品当前的隔离降价。
+     *
+     * <p>这是“隔离 → 审批 → 应用/回读”闭环的生产入口；具体动作由模组入口注入。缺少审批动作
+     * 或动作抛出异常时返回中文失败提示，绝不向命令调度器传播异常。</p>
+     *
+     * @param itemId 物品 id 原文，例如 {@code minecraft:stone}
+     * @return 审批回执；永不抛出异常
+     */
+    public CommandResult approveQuarantine(String itemId) {
+        try {
+            if (quarantineApprovalAction == null) {
+                return CommandResult.failure("隔离审批服务不可用");
+            }
+            if (itemId == null || itemId.isBlank()) {
+                return CommandResult.failure("请提供物品 id，例如 minecraft:stone");
+            }
+            CommandResult result = quarantineApprovalAction.approve(itemId.trim());
+            return result == null
+                    ? CommandResult.failure("隔离审批失败: NullPointerException")
+                    : result;
+        } catch (RuntimeException e) {
+            return unexpectedFailure(e);
         }
     }
 
@@ -427,7 +567,7 @@ public final class CommandService {
 
     /**
      * 追加“上次扫描”相关的两行。没有状态存储或从未成功记录过扫描时统一显示“无记录”，
-     * 避免把默认的 0 毫秒误读为一次真实扫描。
+     * 避免把默认的 0 毫秒误读为一次真实扫描。旧版本状态文件没有求解轮数字段时省略该后缀。
      */
     private void appendLastScanLines(List<String> lines) {
         if (scanStateStore == null || scanStateStore.lastScanEpochMillis() <= 0L) {
@@ -436,8 +576,10 @@ public final class CommandService {
             return;
         }
         lines.add("上次扫描: " + scanStateStore.lastScanDurationMillis() + " ms");
+        int solverRounds = scanStateStore.lastSolverRounds();
+        String roundsSuffix = solverRounds > 0 ? "，求解轮数 " + solverRounds : "";
         lines.add("上次结果: 已定价 " + scanStateStore.lastSolvedCount()
-                + " 项，未解析 " + scanStateStore.lastUnresolvedCount() + " 项");
+                + " 项，未解析 " + scanStateStore.lastUnresolvedCount() + " 项" + roundsSuffix);
     }
 
     /**

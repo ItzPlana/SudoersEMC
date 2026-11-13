@@ -2,6 +2,7 @@ package com.itzplana.sudoersemc.integration;
 
 import com.itzplana.sudoersemc.core.ItemKey;
 import com.itzplana.sudoersemc.core.PriceSource;
+import java.util.concurrent.CompletableFuture;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.item.ItemStack;
@@ -32,6 +33,21 @@ public interface EmcProvider {
     long getValue(ItemStack stack);
 
     /**
+     * 查询完整 NBT 对应的精确 EMC 值，不回退到基础物品。
+     *
+     * <p>ProjectE 的 {@link #getValue(ItemStack)} 对带 NBT 的堆叠会先查精确映射，
+     * 未命中时回退基础物品值并叠加 NBT 处理器。变体扫描需要区分“该 NBT 自身已有值”
+     * 与“仅继承基础物品值”，因此提供该精确查询。默认实现退回 {@link #getValue(ItemStack)}，
+     * 供没有精确 NBT 概念的后端使用。</p>
+     *
+     * @param stack 待查询堆叠
+     * @return 精确 NBT 映射值；没有 NBT 专属映射时返回 {@code 0}
+     */
+    default long getExactValue(ItemStack stack) {
+        return getValue(stack);
+    }
+
+    /**
      * Records a generated value as owned by SudoersEMC.
      *
      * <p>This only stages the value in the ownership store. The actual ProjectE write happens
@@ -47,4 +63,23 @@ public interface EmcProvider {
      * Requests a backend EMC recalculation. Must be called on the server thread.
      */
     void requestRemap(MinecraftServer server);
+
+    /**
+     * 请求一次后端 EMC 重映射，并返回“写入已生效”的完成信号。
+     *
+     * <p>默认实现退化为同步请求且无法报告完成（返回 {@code null}），调用方应把
+     * {@code null} 视为“无法确认”，不要据此放宽外部修改检测。实现方若能提供资源重载的
+     * {@link CompletableFuture}，应覆盖本方法，让调用方在重映射完成前跳过外部修改释放，
+     * 避免把 SudoersEMC 自己刚写入、但后端尚未重映射的值误判为外部修改。</p>
+     *
+     * <p>Must be called on the server thread.</p>
+     *
+     * @param server 当前服务器，允许为 {@code null}
+     * @return 重映射完成信号；无法提供完成信号时返回 {@code null}
+     */
+    @Nullable
+    default CompletableFuture<?> requestRemapAsync(@Nullable MinecraftServer server) {
+        requestRemap(server);
+        return null;
+    }
 }

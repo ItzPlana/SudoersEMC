@@ -7,6 +7,7 @@ import com.itzplana.sudoersemc.core.OwnedEntrySink;
 import com.itzplana.sudoersemc.core.PriceSource;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonPrimitive;
+import com.itzplana.sudoersemc.core.VariantRegistration;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -17,6 +18,7 @@ import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import net.minecraft.resources.ResourceLocation;
+import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -63,6 +65,13 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
     private final Path file;
 
     private final ConcurrentHashMap<ItemKey, GeneratedEmcEntry> entries = new ConcurrentHashMap<>();
+    /**
+     * 变体身份到观测到的原始 SNBT 列表。
+     *
+     * <p>{@link ItemKey#variantHash()} 是规范化后的经济身份，ProjectE 注册需要完整 NBT。
+     * 该映射只对变体条目有内容，并与 {@link #entries} 同步落盘。</p>
+     */
+    private final ConcurrentHashMap<ItemKey, List<String>> variantNbts = new ConcurrentHashMap<>();
     private final AtomicBoolean dirty = new AtomicBoolean(false);
     private final Object loadSaveLock = new Object();
 
@@ -100,6 +109,7 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
     public void load() {
         synchronized (loadSaveLock) {
             entries.clear();
+            variantNbts.clear();
             dirty.set(false);
             unsupportedSchemaVersion = false;
             loadedSchemaVersion = SCHEMA_VERSION;
@@ -143,12 +153,17 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
                         continue;
                     }
                     entries.put(entry.item(), entry);
+                    List<String> observedNbts = VariantRegistration.sanitizeObserved(dtoEntry.variantNbts);
+                    if (entry.item().hasVariant() && !observedNbts.isEmpty()) {
+                        variantNbts.put(entry.item(), observedNbts);
+                    }
                 }
                 if (skipped > 0) {
                     LOGGER.warn("Skipped {} malformed entries while loading {}", skipped, file);
                 }
             } catch (RuntimeException e) {
                 entries.clear();
+                variantNbts.clear();
                 LOGGER.warn("Failed to load generated entries from {}; starting empty", file, e);
             }
         }
@@ -156,11 +171,14 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
 
     /**
      * Writes the current state if at least one entry changed since the last save.
+     *
+     * @return 没有待写内容或写入成功时返回 {@code true}；写入失败返回 {@code false}
      */
-    public void saveIfDirty() {
-        if (dirty.get()) {
-            save();
+    public boolean saveIfDirty() {
+        if (!dirty.get()) {
+            return true;
         }
+        return save();
     }
 
     /**
@@ -168,14 +186,16 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
      *
      * <p>No-op when the loaded file had an unsupported schema version, because overwriting it
      * could destroy data produced by a newer build.</p>
+     *
+     * @return 写入成功返回 {@code true}；schema 不受支持或写入失败返回 {@code false}
      */
-    public void save() {
+    public boolean save() {
         synchronized (loadSaveLock) {
             if (unsupportedSchemaVersion) {
                 LOGGER.warn(
                         "Not saving {} because it was written with unsupported schemaVersion {}",
                         file, loadedSchemaVersion);
-                return;
+                return false;
             }
             // Clear first: a stage that races with this save sets the flag again and is picked up
             // by the next save instead of being silently dropped.
@@ -188,7 +208,7 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
                 dto.schemaVersion = SCHEMA_VERSION;
                 dto.entries = new ArrayList<>(ordered.size());
                 for (GeneratedEmcEntry entry : ordered) {
-                    dto.entries.add(EntryDto.from(entry));
+                    dto.entries.add(EntryDto.from(entry, variantNbts.get(entry.item())));
                 }
 
                 if (backupPending && !JsonFileIO.backupIfExists(file)) {
@@ -197,22 +217,39 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
                             "Failed to save generated entries to {}: could not create a backup; "
                                     + "keeping the store dirty for a later retry",
                             file);
-                    return;
+                    return false;
                 }
                 if (!JsonFileIO.writeAtomically(file, dto)) {
                     dirty.set(true);
-                    return;
+                    return false;
                 }
                 backupPending = false;
+                return true;
             } catch (RuntimeException e) {
                 dirty.set(true);
                 LOGGER.warn("Failed to save generated entries to {}", file, e);
+                return false;
             }
         }
     }
 
     @Override
     public boolean stage(GeneratedEmcEntry entry) {
+        return stage(entry, List.of());
+    }
+
+    /**
+     * 暂存一个生成值，并记录该变体观测到的原始 SNBT。
+     *
+     * <p>原始 SNBT 只在 {@link ItemKey#hasVariant()} 时保存；它用于 ProjectE 的精确 NBT
+     * 注册，避免规范化后的经济身份匹配不到带展示字段的真实堆叠。传入空列表时保留已有
+     * 原始值，防止一次缺少观测数据的刷新擦掉可用的注册信息。</p>
+     *
+     * @param entry      生成值条目
+     * @param rawVariantNbts 观测到的原始 SNBT，允许为 {@code null}
+     * @return {@code true} 表示条目被接受
+     */
+    public boolean stage(GeneratedEmcEntry entry, List<String> rawVariantNbts) {
         if (entry == null || entry.item() == null || entry.value() < 0) {
             return false;
         }
@@ -225,6 +262,14 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
                 return false;
             }
             entries.put(entry.item(), entry);
+            if (entry.item().hasVariant()) {
+                List<String> sanitized = VariantRegistration.sanitizeObserved(rawVariantNbts);
+                if (!sanitized.isEmpty()) {
+                    variantNbts.put(entry.item(), sanitized);
+                }
+            } else {
+                variantNbts.remove(entry.item());
+            }
             dirty.set(true);
             return true;
         } catch (RuntimeException e) {
@@ -249,6 +294,7 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
                 return false;
             }
             entries.remove(key);
+            variantNbts.remove(key);
             dirty.set(true);
             return true;
         } catch (RuntimeException e) {
@@ -280,6 +326,26 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
             return Map.copyOf(owned);
         } catch (RuntimeException e) {
             LOGGER.warn("Failed to snapshot owned EMC values", e);
+            return Map.of();
+        }
+    }
+
+    @Override
+    public Map<ItemKey, List<String>> snapshotOwnedVariantNbts() {
+        try {
+            Map<ItemKey, List<String>> owned = new ConcurrentHashMap<>();
+            for (Map.Entry<ItemKey, GeneratedEmcEntry> entry : entries.entrySet()) {
+                if (!entry.getValue().owned()) {
+                    continue;
+                }
+                List<String> observed = variantNbts.get(entry.getKey());
+                if (observed != null && !observed.isEmpty()) {
+                    owned.put(entry.getKey(), observed);
+                }
+            }
+            return Map.copyOf(owned);
+        } catch (RuntimeException e) {
+            LOGGER.warn("Failed to snapshot owned variant NBT registrations", e);
             return Map.of();
         }
     }
@@ -430,6 +496,12 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
     static final class EntryDto {
         String item;
         String variant;
+        /**
+         * 观测到的原始 SNBT，仅变体条目使用。
+         *
+         * <p>旧版本文件没有该字段，加载时为 {@code null}；此时回退到规范 variant 注册。</p>
+         */
+        List<String> variantNbts;
         long value;
         String source;
         String recipe;
@@ -437,10 +509,12 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
         long timestamp;
         List<JsonElement> alternatives = new ArrayList<>();
 
-        static EntryDto from(GeneratedEmcEntry entry) {
+        static EntryDto from(GeneratedEmcEntry entry, @Nullable List<String> observedVariantNbts) {
             EntryDto dto = new EntryDto();
             dto.item = entry.item().itemId().toString();
             dto.variant = entry.item().variantHash();
+            List<String> sanitized = VariantRegistration.sanitizeObserved(observedVariantNbts);
+            dto.variantNbts = sanitized.isEmpty() ? null : sanitized;
             dto.value = entry.value();
             dto.source = entry.source().name();
             dto.recipe = entry.recipeId() == null ? null : entry.recipeId().toString();

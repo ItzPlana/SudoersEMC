@@ -57,7 +57,7 @@ class ScanStateStoreTest {
         ScanStateStore store = new ScanStateStore(file);
         ScanFingerprint fingerprint = fingerprint();
 
-        store.update(fingerprint, 1234L, 100, 5);
+        store.update(fingerprint, 1234L, 100, 5, 3);
         assertTrue(store.isDirty());
 
         store.save();
@@ -68,6 +68,7 @@ class ScanStateStoreTest {
         assertTrue(json.contains("\"lastScanDurationMillis\": 1234"));
         assertTrue(json.contains("\"lastSolvedCount\": 100"));
         assertTrue(json.contains("\"lastUnresolvedCount\": 5"));
+        assertTrue(json.contains("\"lastSolverRounds\": 3"));
 
         ScanStateStore reloaded = new ScanStateStore(file);
         reloaded.load();
@@ -77,6 +78,7 @@ class ScanStateStoreTest {
         assertEquals(1234L, reloaded.lastScanDurationMillis());
         assertEquals(100, reloaded.lastSolvedCount());
         assertEquals(5, reloaded.lastUnresolvedCount());
+        assertEquals(3, reloaded.lastSolverRounds());
         assertTrue(reloaded.lastScanEpochMillis() > 0L);
         assertFalse(reloaded.isDirty());
     }
@@ -108,6 +110,37 @@ class ScanStateStoreTest {
         assertTrue(reloaded.matches(sameContent));
         assertFalse(reloaded.matches(differentItems));
         assertFalse(reloaded.matches(null));
+    }
+
+    @Test
+    void invalidateClearsFingerprintAndPersistsUnmatchableState() throws IOException {
+        Path file = tempDir.resolve(ScanStateStore.FILE_NAME);
+        ScanStateStore store = new ScanStateStore(file);
+        ScanFingerprint fingerprint = fingerprint();
+        store.update(fingerprint, 1234L, 100, 5, 3);
+        store.save();
+        assertFalse(store.isDirty());
+        assertEquals(3, store.lastSolverRounds());
+
+        store.invalidate();
+
+        assertTrue(store.isDirty());
+        assertTrue(store.fingerprint().isEmpty());
+        assertFalse(store.matches(fingerprint));
+        assertEquals(0L, store.lastScanEpochMillis());
+        assertEquals(0L, store.lastScanDurationMillis());
+        assertEquals(0, store.lastSolvedCount());
+        assertEquals(0, store.lastUnresolvedCount());
+        assertEquals(0, store.lastSolverRounds(), "失效后求解轮数也必须归零");
+
+        store.saveIfDirty();
+        ScanStateStore reloaded = new ScanStateStore(file);
+        reloaded.load();
+        assertFalse(reloaded.matches(fingerprint), "失效状态落盘后必须让下一次启动重扫");
+        assertTrue(reloaded.fingerprint().isEmpty());
+        assertEquals(0L, reloaded.lastScanEpochMillis());
+        assertEquals(0, reloaded.lastSolvedCount());
+        assertEquals(0, reloaded.lastSolverRounds());
     }
 
     @Test

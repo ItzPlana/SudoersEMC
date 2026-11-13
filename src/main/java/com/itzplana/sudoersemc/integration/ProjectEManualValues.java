@@ -1,6 +1,7 @@
 package com.itzplana.sudoersemc.integration;
 
 import com.itzplana.sudoersemc.core.ItemKey;
+import com.itzplana.sudoersemc.task.ScanFingerprint;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
@@ -59,6 +60,8 @@ public final class ProjectEManualValues {
     private final Set<ResourceLocation> unresolvedTagWarned = ConcurrentHashMap.newKeySet();
 
     private volatile Snapshot snapshot = Snapshot.EMPTY;
+    /** 手工值文件内容的稳定摘要，用于扫描输入指纹的基线通道。 */
+    private volatile String contentFingerprint = "missing";
 
     // Cache key: file mtime + size. Guarded by "this".
     private boolean loaded;
@@ -103,6 +106,7 @@ public final class ProjectEManualValues {
                     lastModified = Long.MIN_VALUE;
                     lastSize = Long.MIN_VALUE;
                     snapshot = Snapshot.EMPTY;
+                    contentFingerprint = "missing";
                 }
                 LOGGER.warn("ProjectE manual EMC file {} is missing; SudoersEMC will not treat any value as manually set until it appears",
                         configFile);
@@ -131,6 +135,7 @@ public final class ProjectEManualValues {
                     LOGGER.warn("Could not inspect ProjectE manual EMC file {}; keeping the last loaded manual values (empty if never loaded)",
                             configFile, t);
                 }
+                contentFingerprint = "unreadable";
             }
         }
     }
@@ -138,6 +143,7 @@ public final class ProjectEManualValues {
     private void loadLocked(long modified, long size) {
         if (size > MAX_FILE_BYTES) {
             snapshot = Snapshot.EMPTY;
+            contentFingerprint = "oversized";
             LOGGER.warn("ProjectE manual EMC file {} is {} bytes, above the {} byte safety limit; ignoring it",
                     configFile, size, MAX_FILE_BYTES);
             return;
@@ -148,6 +154,7 @@ public final class ProjectEManualValues {
             json = Files.readString(configFile, StandardCharsets.UTF_8);
         } catch (Throwable t) {
             snapshot = Snapshot.EMPTY;
+            contentFingerprint = "unreadable";
             if (!readFailureWarned) {
                 readFailureWarned = true;
                 LOGGER.warn("Could not read ProjectE manual EMC file {}; assuming no manual values", configFile, t);
@@ -158,11 +165,13 @@ public final class ProjectEManualValues {
         try {
             Snapshot parsed = parse(json);
             snapshot = parsed;
+            contentFingerprint = "sha256:" + ScanFingerprint.hash(List.of(json));
             LOGGER.info("Loaded {} manual ProjectE EMC entries from {} ({} item, {} tag)",
                     parsed.itemEntryCount() + parsed.tagEntryCount(), configFile,
                     parsed.itemEntryCount(), parsed.tagEntryCount());
         } catch (Throwable t) {
             snapshot = Snapshot.EMPTY;
+            contentFingerprint = "unparsable";
             // One warning per distinct file version (the cache prevents retries until mtime/size change).
             LOGGER.warn("Failed to parse ProjectE manual EMC file {}; assuming no manual values", configFile, t);
         }
@@ -239,6 +248,20 @@ public final class ProjectEManualValues {
     public Set<ResourceLocation> manualTagIds() {
         refreshIfChanged();
         return snapshot.tagIds();
+    }
+
+    /**
+     * 返回手工值文件内容的稳定摘要，供扫描输入指纹的基线通道使用。
+     *
+     * <p>摘要覆盖原始 JSON，因此同一 item id 的数值变化、tag 条目变化以及格式之外的内容变化
+     * 都会使指纹失效。文件缺失、超限、不可读或无法解析时返回固定降级标记，绝不把“读不到”
+     * 当作“未变化”。</p>
+     *
+     * @return 以 {@code sha256:} 开头的摘要或固定降级标记
+     */
+    public String contentFingerprint() {
+        refreshIfChanged();
+        return contentFingerprint;
     }
 
     private static boolean matchesVariant(Snapshot current, ItemKey key) {
