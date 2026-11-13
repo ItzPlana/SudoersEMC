@@ -136,6 +136,33 @@ class ConfigValidatorTest {
     }
 
     @Test
+    void crossFieldValidationRejectsOutOfRangeNbtVariantLimit() {
+        assertTrue(ConfigValidator.validateCrossField(base().build()).valid());
+
+        assertEquals(
+                List.of("maxNbtVariantsPerItem 必须在 [1, 1000] 内，当前为 0"),
+                ConfigValidator.validateCrossField(
+                        base().maxNbtVariantsPerItem(0).build()).errors());
+        assertEquals(
+                List.of("maxNbtVariantsPerItem 必须在 [1, 1000] 内，当前为 1001"),
+                ConfigValidator.validateCrossField(
+                        base().maxNbtVariantsPerItem(1001).build()).errors());
+    }
+
+    @Test
+    void crossFieldValidationRejectsZeroAndNaNDropRatio() {
+        ConfigValidationResult zero = ConfigValidator.validateCrossField(
+                base().maxAllowedDropRatio(0.0D).build());
+        assertFalse(zero.valid());
+        assertEquals(
+                List.of("maxAllowedDropRatio 必须在 (0.0, 1.0] 内，当前为 0.0"),
+                zero.errors());
+
+        assertFalse(ConfigValidator.validateCrossField(
+                base().maxAllowedDropRatio(Double.NaN).build()).valid());
+    }
+
+    @Test
     void entireCustomEmcWithoutFileRewriteWarns() {
         ConfigValidationResult result = ConfigValidator.validate(
                 base().overwriteScope("entire_custom_emc").build());
@@ -274,6 +301,70 @@ class ConfigValidatorTest {
                 ConfigValidator.parseScope(" Entire_Custom_EMC "));
         assertEquals(OverflowScope.OWNED_ONLY, ConfigValidator.parseScope("unknown"));
         assertEquals(OverflowScope.OWNED_ONLY, ConfigValidator.parseScope(null));
+    }
+
+    @Test
+    void currentConfigAdapterAcceptsValidValues() {
+        ConfigValidationResult result = ConfigValidator.validateCurrent(() -> base().build());
+
+        assertTrue(result.valid());
+        assertEquals(List.of(), result.errors());
+    }
+
+    @Test
+    void currentConfigAdapterRejectsThresholdNotAboveResetMax() {
+        ConfigValidationResult result = ConfigValidator.validateCurrent(
+                () -> base().overflowThreshold(999_000L).build());
+
+        assertFalse(result.valid());
+        assertEquals(List.of("overflow.threshold 必须大于 resetMax"), result.errors());
+    }
+
+    @Test
+    void currentConfigAdapterRejectsResetMinAboveResetMax() {
+        ConfigValidationResult result = ConfigValidator.validateCurrent(
+                () -> base().resetMin(1_000L).resetMax(999L).build());
+
+        assertFalse(result.valid());
+        assertEquals(List.of("overflow.resetMin 不能大于 resetMax"), result.errors());
+    }
+
+    @Test
+    void currentConfigAdapterRejectsZeroBucketCount() {
+        ConfigValidationResult result = ConfigValidator.validateCurrent(
+                () -> base().bucketCount(0).build());
+
+        assertFalse(result.valid());
+        assertEquals(List.of("overflow.bucketCount 必须 >= 1，当前为 0"), result.errors());
+    }
+
+    @Test
+    void currentConfigAdapterRejectsZeroDropRatio() {
+        ConfigValidationResult result = ConfigValidator.validateCurrent(
+                () -> base().maxAllowedDropRatio(0.0D).build());
+
+        assertFalse(result.valid());
+        assertEquals(
+                List.of("maxAllowedDropRatio 必须在 (0.0, 1.0] 内，当前为 0.0"),
+                result.errors());
+    }
+
+    @Test
+    void currentConfigAdapterConvertsReadFailureToInvalidResult() {
+        ConfigValidationResult result = ConfigValidator.validateCurrent(() -> {
+            throw new IllegalStateException("not loaded");
+        });
+
+        assertFalse(result.valid());
+        assertEquals(List.of("无法读取当前配置：not loaded"), result.errors());
+    }
+
+    @Test
+    void currentConfigAdapterRejectsNullSnapshot() {
+        ConfigValidationResult result = ConfigValidator.validateCurrent(() -> null);
+
+        assertFalse(result.valid());
+        assertEquals(List.of("当前配置快照为空"), result.errors());
     }
 
     private static final class ValuesBuilder {

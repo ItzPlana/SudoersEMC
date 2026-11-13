@@ -109,6 +109,8 @@ public final class ScanPipeline {
     private final FallbackPricing fallbackPricing;
     private final TierPricing tierPricing;
     private final SolveSettings solveSettings;
+    private volatile boolean solveRecipesEnabled = true;
+    private volatile boolean generateReportsEnabled = true;
 
     private final AtomicReference<PipelineSnapshot> stashedSnapshot = new AtomicReference<>();
     private final AtomicReference<CompletableFuture<Computation>> pendingSolve = new AtomicReference<>();
@@ -117,8 +119,6 @@ public final class ScanPipeline {
     private volatile OverflowScope overflowScope = OverflowScope.OWNED_ONLY;
     private volatile boolean allowProjectEFileRewrite;
     private volatile Path projectECustomEmcFile;
-    private volatile boolean solveRecipesEnabled = true;
-    private volatile boolean generateReportsEnabled = true;
     private volatile boolean useProjectEIntegrationBaselines = true;
 
     /**
@@ -212,6 +212,30 @@ public final class ScanPipeline {
     }
 
     /**
+     * 设置是否启用配方求解。
+     *
+     * <p>关闭后管线不再运行 {@link RecipeSolver}，只使用快照中的既有值与兜底定价链。
+     * 该开关在每次扫描开始时读取，重建管线后立即生效。</p>
+     *
+     * @param enabled {@code true} 表示启用配方求解；默认启用
+     */
+    public void setSolveRecipesEnabled(boolean enabled) {
+        this.solveRecipesEnabled = enabled;
+    }
+
+    /**
+     * 设置是否写出诊断报告。
+     *
+     * <p>关闭后 {@code last_report.txt} 不再更新，但本轮扫描的计数、状态存储与持久化
+     * 行为保持不变。该开关在每次扫描开始时读取，重建管线后立即生效。</p>
+     *
+     * @param enabled {@code true} 表示写出诊断报告；默认启用
+     */
+    public void setGenerateReportsEnabled(boolean enabled) {
+        this.generateReportsEnabled = enabled;
+    }
+
+    /**
      * 覆盖 ProjectE 手动 EMC 文件路径，主要用于测试或嵌入式场景。
      *
      * <p>传入 {@code null} 时恢复生产路径（{@code config/ProjectE/custom_emc.json}）。</p>
@@ -220,29 +244,6 @@ public final class ScanPipeline {
      */
     public void setProjectECustomEmcFile(@Nullable Path file) {
         this.projectECustomEmcFile = file;
-    }
-
-    /**
-     * 控制是否运行配方求解。
-     *
-     * <p>{@code recipe.solveRecipes=false} 时求解阶段直接跳过，只保留兜底定价；关闭求解不会
-     * 清空既有值，也不会阻止安全层与报告继续工作。</p>
-     *
-     * @param enabled 是否启用配方求解
-     */
-    public void setSolveRecipesEnabled(boolean enabled) {
-        this.solveRecipesEnabled = enabled;
-    }
-
-    /**
-     * 控制是否写出诊断报告。
-     *
-     * <p>{@code diagnostic.generateReports=false} 时仍然更新扫描状态与存储，只跳过报告文件。</p>
-     *
-     * @param enabled 是否写报告
-     */
-    public void setGenerateReportsEnabled(boolean enabled) {
-        this.generateReportsEnabled = enabled;
     }
 
     /**
@@ -1056,6 +1057,16 @@ public final class ScanPipeline {
     }
 
     /**
+     * 构造“跳过配方求解”的空结果。
+     *
+     * <p>该结果不包含任何生成值、轨迹或未解析物品，表示本轮没有评估配方；用于
+     * {@code recipe.solveRecipes=false} 时保持下游候选收集与诊断计数结构不变。</p>
+     */
+    private static SolveResult skippedSolveResult() {
+        return new SolveResult(Map.of(), Map.of(), List.of(), Set.of(), 0, false, 0L, 0);
+    }
+
+    /**
      * 为求解器没有覆盖的物品追加兜底候选。
      *
      * <p>只处理既不在既有 EMC 中、也不在求解结果中的物品。创造物品保护决定物品是否允许自动
@@ -1066,6 +1077,7 @@ public final class ScanPipeline {
     private int addFallbackCandidates(PipelineSnapshot snapshot, SolveResult solveResult,
                                       List<Candidate> candidates) {
         int added = 0;
+        long minimumEmc = solveSettings.minimumEmc();
         for (ItemSnapshot itemSnapshot : snapshot.items()) {
             ItemKey item = itemSnapshot.key();
             if (snapshot.existingValues().containsKey(item) || solveResult.values().containsKey(item)) {
@@ -1073,6 +1085,9 @@ public final class ScanPipeline {
             }
             Optional<Candidate> fallback = fallbackCandidate(itemSnapshot);
             if (fallback.isEmpty()) {
+                continue;
+            }
+            if (fallback.get().value() < minimumEmc) {
                 continue;
             }
             candidates.add(fallback.get());

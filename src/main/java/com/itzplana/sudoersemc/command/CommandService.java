@@ -11,7 +11,9 @@ import com.itzplana.sudoersemc.task.ScanManager;
 import com.itzplana.sudoersemc.task.ScanProgress;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.function.BooleanSupplier;
 import net.minecraft.resources.ResourceLocation;
 import org.jetbrains.annotations.Nullable;
 
@@ -22,9 +24,8 @@ import org.jetbrains.annotations.Nullable;
  * 所有协作者都可以为 {@code null}：缺失的服务只会让对应子命令返回中文失败提示，而不会
  * 让异常穿透到命令调度器。</p>
  *
- * <p>状态查询与 {@code explain} 只访问内存；{@code report} 优先返回最近一次写入的缓存；
- * {@code reload} 由管理员显式触发，会同步重读配置文件。真正的扫描由 {@link ScanManager}
- * 在服务器 tick 中分片推进。所有方法都捕获运行时异常并转换为
+ * <p>公开方法均不阻塞：只读取内存中的扫描进度、存储快照与最后一次报告文件，真正的扫描
+ * 由 {@link ScanManager} 在服务器 tick 中分片推进。所有方法都捕获运行时异常并转换为
  * {@link CommandResult#failure(String)}，因此调用方无需再额外防御。</p>
  */
 public final class CommandService {
@@ -39,6 +40,7 @@ public final class CommandService {
     private final @Nullable GeneratedEntryStore entryStore;
     private final @Nullable ScanStateStore scanStateStore;
     private final @Nullable ReloadAction reloadAction;
+    private final @Nullable BooleanSupplier scanRequestAction;
     private final @Nullable QuarantineApprovalAction quarantineApprovalAction;
 
     /**
@@ -56,7 +58,7 @@ public final class CommandService {
                           @Nullable ReportManager reportManager,
                           @Nullable GeneratedEntryStore entryStore,
                           @Nullable ScanStateStore scanStateStore) {
-        this(scanManager, reportManager, entryStore, scanStateStore, null, null);
+        this(scanManager, reportManager, entryStore, scanStateStore, null, null, null);
     }
 
     /**
@@ -71,15 +73,15 @@ public final class CommandService {
                           @Nullable GeneratedEntryStore entryStore,
                           @Nullable ScanStateStore scanStateStore,
                           @Nullable ReloadAction reloadAction) {
-        this(scanManager, reportManager, entryStore, scanStateStore, reloadAction, null);
+        this(scanManager, reportManager, entryStore, scanStateStore, reloadAction, null, null);
     }
 
     /**
-     * @param scanManager             扫描状态机，可为 {@code null}
-     * @param reportManager           诊断报告管理器，可为 {@code null}
-     * @param entryStore              已生成条目的存储，可为 {@code null}
-     * @param scanStateStore          上一次扫描状态的存储，可为 {@code null}
-     * @param reloadAction            真实配置重载动作，可为 {@code null}（视为不可用）
+     * @param scanManager              扫描状态机，可为 {@code null}
+     * @param reportManager            诊断报告管理器，可为 {@code null}
+     * @param entryStore               已生成条目的存储，可为 {@code null}
+     * @param scanStateStore           上一次扫描状态的存储，可为 {@code null}
+     * @param reloadAction             真实配置重载动作，可为 {@code null}（视为不可用）
      * @param quarantineApprovalAction 隔离降价审批动作，可为 {@code null}（视为不可用）
      */
     public CommandService(@Nullable ScanManager scanManager,
@@ -88,19 +90,41 @@ public final class CommandService {
                           @Nullable ScanStateStore scanStateStore,
                           @Nullable ReloadAction reloadAction,
                           @Nullable QuarantineApprovalAction quarantineApprovalAction) {
+        this(scanManager, reportManager, entryStore, scanStateStore, reloadAction,
+                quarantineApprovalAction, null);
+    }
+
+    /**
+     * @param scanManager              扫描状态机，可为 {@code null}
+     * @param reportManager            诊断报告管理器，可为 {@code null}
+     * @param entryStore               已生成条目的存储，可为 {@code null}
+     * @param scanStateStore           上一次扫描状态的存储，可为 {@code null}
+     * @param reloadAction             真实配置重载动作，可为 {@code null}（视为不可用）
+     * @param quarantineApprovalAction 隔离降价审批动作，可为 {@code null}（视为不可用）
+     * @param scanRequestAction        扫描请求动作；生产接线传入与重建共享运行时锁的入口，
+     *                                 {@code null} 时退回直接调用 {@code scanManager.requestScan()}
+     */
+    public CommandService(@Nullable ScanManager scanManager,
+                          @Nullable ReportManager reportManager,
+                          @Nullable GeneratedEntryStore entryStore,
+                          @Nullable ScanStateStore scanStateStore,
+                          @Nullable ReloadAction reloadAction,
+                          @Nullable QuarantineApprovalAction quarantineApprovalAction,
+                          @Nullable BooleanSupplier scanRequestAction) {
         this.scanManager = scanManager;
         this.reportManager = reportManager;
         this.entryStore = entryStore;
         this.scanStateStore = scanStateStore;
         this.reloadAction = reloadAction;
         this.quarantineApprovalAction = quarantineApprovalAction;
+        this.scanRequestAction = scanRequestAction;
     }
 
     /**
      * 查询当前扫描状态与上一次扫描结果。
      *
-     * <p>输出固定五个字段：阶段、当前阶段进度、是否运行中、上次耗时与上次结果。扫描服务
-     * 缺失时只返回一行“扫描服务不可用”。</p>
+     * <p>输出阶段、当前阶段进度、是否运行中、非空时的阶段详情，以及上次耗时与上次结果。
+     * 扫描失败时阶段详情会保留失败原因。扫描服务缺失时只返回一行“扫描服务不可用”。</p>
      *
      * @return 状态文本；永不抛出异常
      */
@@ -142,7 +166,9 @@ public final class CommandService {
             if (scanManager.isRunning()) {
                 return CommandResult.failure(DUPLICATE_SCAN);
             }
-            boolean started = scanManager.requestScan();
+            boolean started = scanRequestAction == null
+                    ? scanManager.requestScan()
+                    : scanRequestAction.getAsBoolean();
             if (!started) {
                 return CommandResult.failure(DUPLICATE_SCAN);
             }
@@ -155,9 +181,9 @@ public final class CommandService {
     /**
      * 提交配置重载请求并返回真实结果。
      *
-     * <p>重载由注入的 {@link ReloadAction} 执行：立即生效、扫描结束后生效以及校验失败
-     * 分别对应成功、延后与失败三种回执。缺少重载动作或重载抛出运行时异常时返回中文
-     * 失败提示，绝不向命令调度器传播异常，也不再把未执行的动作报告为成功。</p>
+     * <p>重建由注入的 {@link ReloadAction} 执行：立即生效、扫描结束后生效以及校验失败
+     * 分别对应成功、延后与失败三种回执。缺少重载动作或重建抛出运行时异常时返回中文
+     * 失败提示，绝不向命令调度器传播异常。</p>
      *
      * @return 真实的重载结果；永不抛出异常
      */
@@ -230,7 +256,8 @@ public final class CommandService {
             }
 
             ItemKey key = ItemKey.of(parsed);
-            GeneratedEmcEntry entry = entryStore.get(key);
+            Map<ItemKey, GeneratedEmcEntry> snapshot = entryStore.snapshotAll();
+            GeneratedEmcEntry entry = snapshot == null ? null : snapshot.get(key);
             if (entry == null) {
                 return CommandResult.failure("未找到 " + trimmed + " 的定价记录");
             }

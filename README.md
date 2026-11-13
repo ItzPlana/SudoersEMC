@@ -149,7 +149,7 @@ allowRecipeValueIncrease = false
 useFallbackForUnsolvable = true
 useTagPricing = true
 useRarityPricing = true
-useProjectEIntegrationBaselines = true
+useProjectEIntegrationBaselines = true   # Phase 25 接线；Phase 16 构建暂不读取
 
 [safety]
 largeDropProtection = true
@@ -168,13 +168,17 @@ allowProjectEFileRewrite = false
 randomSeed = 0                  # 0 = 非确定性
 
 [nbt]
-scanNbtVariants = true
-maxNbtVariantsPerItem = 100
+scanNbtVariants = true                   # Phase 17 接线；Phase 16 构建暂不读取
+maxNbtVariantsPerItem = 100              # Phase 17 接线；Phase 16 仅做范围校验
 
 [diagnostic]
-debugLogging = false
+debugLogging = false                     # Phase 25 接线；Phase 16 构建暂不读取
 generateReports = true
 ```
+
+> **[nbt] 说明**：Phase 16 只校验 `maxNbtVariantsPerItem` 的 `[1, 1000]` 范围，
+> `scanNbtVariants` 与 `maxNbtVariantsPerItem` 的扫描行为均由 Phase 17 接线；
+> 当前构建开启/关闭这两个键不会改变扫描结果。
 
 ### 自动扫描开关
 
@@ -211,19 +215,19 @@ generateReports = true
 
 ### 默认值
 
-| 配置项                              | 默认值       | 说明                                              |
-| ----------------------------------- | ------------ | ------------------------------------------------- |
-| `performance.itemsPerTick`          | `100`        | 服务端线程每 tick 最多处理的物品数                |
-| `recipe.maxRecipePasses`            | `20`         | 单次扫描的配方求解遍数上限                        |
-| `overflow.threshold`                | `999999`     | 严格大于该值的 EMC 会被重置                       |
-| `overflow.resetMin`                 | `100`        | 重置区间下界（含）                                |
-| `overflow.resetMax`                 | `999000`     | 重置区间上界（含）                                |
-| `overflow.bucketCount`              | `100`        | 加权采样桶数量                                    |
-| `overflow.weightCap`                | `20`         | 单个桶的权重上限                                  |
-| `overflow.overwriteScope`           | `owned_only` | 重置范围，可选 `owned_only` / `entire_custom_emc` |
-| `overflow.allowProjectEFileRewrite` | `false`      | 是否允许改写 ProjectE 的 `custom_emc.json`        |
-| `nbt.maxNbtVariantsPerItem`         | `100`        | 每个物品最多扫描的 NBT 变体数                     |
-| `safety.maxAllowedDropRatio`        | `0.5`        | 单次生成值允许的最大相对跌幅                      |
+| 配置项                              | 默认值       | 说明                                                                |
+| ----------------------------------- | ------------ | ------------------------------------------------------------------- |
+| `performance.itemsPerTick`          | `100`        | 服务端线程每 tick 最多处理的物品数                                  |
+| `recipe.maxRecipePasses`            | `20`         | 单次扫描的配方求解遍数上限                                          |
+| `overflow.threshold`                | `999999`     | 严格大于该值的 EMC 会被重置                                         |
+| `overflow.resetMin`                 | `100`        | 重置区间下界（含）                                                  |
+| `overflow.resetMax`                 | `999000`     | 重置区间上界（含）                                                  |
+| `overflow.bucketCount`              | `100`        | 加权采样桶数量                                                      |
+| `overflow.weightCap`                | `20`         | 单个桶的权重上限                                                    |
+| `overflow.overwriteScope`           | `owned_only` | 重置范围，可选 `owned_only` / `entire_custom_emc`                   |
+| `overflow.allowProjectEFileRewrite` | `false`      | 是否允许改写 `custom_emc.json` 中归 SudoersEMC 所有的条目           |
+| `nbt.maxNbtVariantsPerItem`         | `100`        | 每个物品最多扫描的 NBT 变体数（Phase 17 消费；Phase 16 仅校验范围） |
+| `safety.maxAllowedDropRatio`        | `0.5`        | 单次生成值允许的最大相对跌幅                                        |
 
 > **`minEmc` 说明**：当前构建没有 `minEmc` 配置键。求解器下限固定为
 > `SolveSettings.DEFAULT_MINIMUM_EMC = 1`（与 `EvaluationPolicy.DEFAULT_MINIMUM_EMC` 相同）。
@@ -254,12 +258,15 @@ generateReports = true
 不会放宽配置合法性。`OverflowProtection.Settings` 即使关闭也会构造采样器并强制这些不变量，
 因此校验器必须在关闭时继续拒绝非法区间，否则非法配置会在组件重建时抛异常。
 
-接线方式：`SudoersemcConfig.onConfigLoading` / `onConfigReloading` 会从当前 Forge 值构造
-`ConfigValidator.Values`，调用 `ConfigValidator.validate(...)`，再交给
-`ConfigWatcher.fireReload(...)`。校验通过时重建并缓存不可变快照（`overflowSettings()` 返回该
-快照）；失败时 `fireReload` 不通知监听器，上一份有效快照继续生效，首次加载即非法时使用内置
-安全默认值。事件可能由配置加载线程触发，处理器只读取配置并交换 volatile 不可变快照，不访问
-服务器或世界状态。
+接线方式：`SudoersemcConfig.onConfigLoading` / `onConfigReloading` 在 `SNAPSHOT_LOCK` 内
+一次性读取全部运行时消费键，构造 `ConfigValidator.Values` 并调用 `ConfigValidator.validate(...)`；
+校验通过后发布带 generation 的不可变 `RuntimeConfigSnapshot`，再交给 `ConfigWatcher.fireReload(...)`。
+配置事件监听器只把重建请求调度到服务器线程（`MinecraftServer.execute`），不直接替换组件。
+`Sudoersemc.rebuildRuntimeFromConfig` 在 `RUNTIME_LOCK` 内检查扫描状态并一次性发布新的
+`ScanPipeline` / `ScanManager` / `CommandService`；所有组件只消费同一份快照，不会混用两个配置
+版本。扫描进行中返回 `DEFER`，扫描结束后由服务器 tick 重试；命令重载与 `requestScan` 共用同一
+把运行时锁，旧调度器会被 `retire()`，不会留下仍可启动扫描的孤儿 manager。校验失败时
+`fireReload` 不通知监听器，上一份有效快照继续生效；首次加载即非法时使用内置保守默认快照。
 
 ### 警告条件
 
@@ -340,7 +347,7 @@ generateReports = true
 
 测试覆盖：加权采样分布与权重重置、阈值边界、幂等性、持久化往返、损坏文件容错、schema 版本保护、分片扫描管线、双扫描器 API 兼容、命令层、扫描状态机、General 开关降级与停服清理。
 
-当前共 **651** 个单元/组件测试（54 个测试类），0 failure / 0 error；尚未加入专用服务器端到端测试。
+当前共 **667** 个单元/组件测试（54 个测试类），0 failure / 0 error；尚未加入专用服务器端到端测试。
 
 ---
 

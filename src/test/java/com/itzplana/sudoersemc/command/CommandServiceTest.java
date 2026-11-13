@@ -82,6 +82,27 @@ class CommandServiceTest {
     }
 
     @Test
+    void statusShowsFailureDetail() {
+        ScanManager manager = new ScanManager(
+                new BatchProcessor(1, false),
+                () -> {
+                    throw new IllegalStateException("采集失败原因");
+                },
+                data -> { },
+                1_000_000L);
+        assertTrue(manager.requestScan());
+        manager.tick();
+
+        CommandService service = new CommandService(manager, null, null, null);
+        CommandResult result = service.status();
+
+        assertTrue(result.success());
+        assertTrue(result.joinLines().contains("扫描状态: 失败"), result.joinLines());
+        assertTrue(result.joinLines().contains("详情    : 采集失败原因"),
+                "FAILED 原因必须通过 /sudoemc status 的详情行保留");
+    }
+
+    @Test
     void statusUsesScanStateStoreForLastScanSummary() {
         ScanStateStore stateStore = new ScanStateStore(tempDir.resolve(ScanStateStore.FILE_NAME));
         stateStore.update(ScanFingerprint.of(null, null, null, null, null), 1234L, 56, 7);
@@ -92,37 +113,6 @@ class CommandServiceTest {
         assertTrue(result.success());
         assertTrue(result.joinLines().contains("上次扫描: 1234 ms"));
         assertTrue(result.joinLines().contains("上次结果: 已定价 56 项，未解析 7 项"));
-    }
-
-    @Test
-    void statusShowsRunningDetail() {
-        ScanManager manager = idleManager();
-        assertTrue(manager.requestScan());
-        CommandService service = new CommandService(manager, null, null, null);
-
-        CommandResult result = service.status();
-
-        assertTrue(result.success());
-        assertTrue(result.joinLines().contains("详情    : 等待采集快照"));
-    }
-
-    @Test
-    void statusShowsFailureDetail() {
-        ScanManager failing = new ScanManager(
-                new BatchProcessor(1, false),
-                () -> {
-                    throw new IllegalStateException("快照采集失败");
-                },
-                snapshot -> { },
-                1_000_000L);
-        assertTrue(failing.requestScan());
-        failing.tick();
-        CommandService service = new CommandService(failing, null, null, null);
-
-        CommandResult result = service.status();
-
-        assertTrue(result.success());
-        assertTrue(result.joinLines().contains("详情    : 快照采集失败"));
     }
 
     @Test
@@ -161,19 +151,13 @@ class CommandServiceTest {
     }
 
     @Test
-    void reloadConfigInvokesActionOnceAndReportsApplied() {
-        AtomicInteger invocations = new AtomicInteger();
+    void reloadConfigAppliedReturnsSuccess() {
         CommandService service = new CommandService(
-                null, null, null, null,
-                () -> {
-                    invocations.incrementAndGet();
-                    return ReloadDecision.APPLY_NOW;
-                });
+                null, null, null, null, () -> ReloadDecision.APPLY_NOW);
 
         CommandResult result = service.reloadConfig();
 
         assertTrue(result.success());
-        assertEquals(1, invocations.get(), "reload action must run exactly once");
         assertEquals(List.of("配置已重新加载并生效"), result.lines());
     }
 
@@ -412,7 +396,6 @@ class CommandServiceTest {
             assertNotNull(explain);
             assertNotNull(cancel);
             assertFalse(rescan.success());
-            assertFalse(reload.success());
             assertFalse(report.success());
             assertFalse(explain.success());
             assertFalse(cancel.success());

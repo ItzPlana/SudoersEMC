@@ -28,6 +28,7 @@ import com.itzplana.sudoersemc.scanner.RecipeInput;
 import com.itzplana.sudoersemc.scanner.RecipeKind;
 import com.itzplana.sudoersemc.scanner.RecipeOutput;
 import com.itzplana.sudoersemc.scanner.RecipeSnapshot;
+import com.itzplana.sudoersemc.solver.SolveSettings;
 import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
 import com.itzplana.sudoersemc.storage.OverflowResetLog;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
@@ -987,6 +988,72 @@ class ScanPipelineTest {
     }
 
     @Test
+    void solveRecipesDisabledSkipsRecipeSource() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_solve_disabled.json"));
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 5L), item(RESULT, 0L)),
+                List.of(recipe(INGOT, RESULT)),
+                Map.of(INGOT, 5L));
+        ScanPipeline pipeline = pipeline(store, null, null, null, null, null, genericFallback(7L));
+        pipeline.setSolveRecipesEnabled(false);
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(0, result.solvedByRecipe());
+        assertEquals(1, result.solvedByFallback());
+        assertEquals(1, result.applied());
+        assertFalse(result.sourceBreakdown().containsKey(PriceSource.RECIPE.name()));
+        GeneratedEmcEntry staged = store.snapshotAll().get(RESULT);
+        assertNotNull(staged);
+        assertEquals(7L, staged.value());
+        assertEquals(PriceSource.FALLBACK, staged.source());
+    }
+
+    @Test
+    void generateReportsDisabledSkipsReportFile() {
+        ReportManager reportManager = new ReportManager(tempDir);
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_report_disabled.json"));
+        ScanPipeline pipeline = pipeline(
+                store, null, reportManager, null, null, null, genericFallback(7L));
+        pipeline.setGenerateReportsEnabled(false);
+
+        PipelineResult result = pipeline.solveAndApply(
+                snapshot(List.of(item(RESULT, 0L)), List.of(), Map.of()));
+
+        assertEquals(1, result.applied());
+        assertFalse(Files.exists(reportManager.reportFile()), "禁用后不得写出 last_report.txt");
+    }
+
+    @Test
+    void minimumEmcFiltersFallbackCandidatesBelowLowerBound() {
+        SolveSettings minEmcTen = new SolveSettings(20, false, 10L, 8);
+
+        GeneratedEntryStore filteredStore = new GeneratedEntryStore(
+                tempDir.resolve("generated_min_emc_filtered.json"));
+        ScanPipeline filteredPipeline = pipeline(
+                filteredStore, null, null, null, null, null, genericFallback(7L), minEmcTen);
+        PipelineResult filtered = filteredPipeline.solveAndApply(
+                snapshot(List.of(item(RESULT, 0L)), List.of(), Map.of()));
+
+        assertEquals(0, filtered.solvedByFallback());
+        assertEquals(0, filtered.applied());
+        assertEquals(0, filteredStore.size());
+
+        GeneratedEntryStore acceptedStore = new GeneratedEntryStore(
+                tempDir.resolve("generated_min_emc_accepted.json"));
+        ScanPipeline acceptedPipeline = pipeline(
+                acceptedStore, null, null, null, null, null, genericFallback(10L), minEmcTen);
+        PipelineResult accepted = acceptedPipeline.solveAndApply(
+                snapshot(List.of(item(RESULT, 0L)), List.of(), Map.of()));
+
+        assertEquals(1, accepted.solvedByFallback());
+        assertEquals(1, accepted.applied());
+        assertEquals(10L, acceptedStore.snapshotAll().get(RESULT).value());
+    }
+
+    @Test
     void fallbackUsesCollectedRarity() {
         ItemKey epic = ItemKey.of(new ResourceLocation("sudoersemc", "epic_item"));
         ItemSnapshot epicSnapshot = ItemSnapshot.of(
@@ -1030,6 +1097,7 @@ class ScanPipelineTest {
         assertNotNull(store.snapshotAll().get(RESULT),
                 "应用阶段必须在调用线程写入求解结果");
     }
+
     /**
      * 创建使用默认求解参数的管线，未提供的协作者由管线自行采用安全默认值。
      */
@@ -1040,6 +1108,21 @@ class ScanPipelineTest {
                                          CreativeItemProtection creativeProtection,
                                          OverflowPipeline overflowPipeline,
                                          FallbackPricing fallbackPricing) {
+        return pipeline(store, stateStore, reportManager, dropProtection, creativeProtection,
+                overflowPipeline, fallbackPricing, null);
+    }
+
+    /**
+     * 创建使用指定求解参数的管线，其余未提供的协作者使用安全默认值。
+     */
+    private static ScanPipeline pipeline(GeneratedEntryStore store,
+                                         ScanStateStore stateStore,
+                                         ReportManager reportManager,
+                                         LargeDropProtection dropProtection,
+                                         CreativeItemProtection creativeProtection,
+                                         OverflowPipeline overflowPipeline,
+                                         FallbackPricing fallbackPricing,
+                                         SolveSettings solveSettings) {
         return new ScanPipeline(
                 store,
                 stateStore,
@@ -1048,7 +1131,7 @@ class ScanPipelineTest {
                 creativeProtection,
                 overflowPipeline,
                 fallbackPricing,
-                null);
+                solveSettings);
     }
 
     /**
