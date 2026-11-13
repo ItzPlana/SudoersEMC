@@ -31,6 +31,8 @@ private static final ResourceLocation SUDOERSEMC_TOKEN =
             new ResourceLocation("sudoersemc", "token");
     private static final ResourceLocation DIAMOND_SWORD_ID =
             new ResourceLocation("minecraft", "diamond_sword");
+    private static final ResourceLocation SHULKER_BOX_ID =
+            new ResourceLocation("minecraft", "shulker_box");
 
 
     @Test
@@ -145,6 +147,47 @@ private static final ResourceLocation SUDOERSEMC_TOKEN =
         assertEquals("{BlockEntityTag:{id:\"minecraft:chest\"}}", VariantNormalizer.normalize(tag));
     }
 
+    @Test
+    void projectEStoredEmcIsStripped() {
+        CompoundTag tag = new CompoundTag();
+        tag.putLong("StoredEMC", 4096L);
+        tag.putLong("stored_emc", 4096L);
+        tag.putString("Potion", "minecraft:healing");
+
+        assertEquals("{Potion:\"minecraft:healing\"}", VariantNormalizer.normalize(tag));
+    }
+
+    @Test
+    void rootStoredEmcIsStrippedWhileContainerContentStoredEmcIsPreserved() throws Exception {
+        CompoundTag contentTag = new CompoundTag();
+        contentTag.putLong("StoredEMC", 2048L);
+        contentTag.putLong("stored_emc", 512L);
+        CompoundTag entry = new CompoundTag();
+        entry.putString("id", "projecte:klein_star_omega");
+        entry.putByte("Count", (byte) 1);
+        entry.put("tag", contentTag);
+        ListTag items = new ListTag();
+        items.add(entry);
+        CompoundTag blockEntity = new CompoundTag();
+        blockEntity.put("Items", items);
+        CompoundTag tag = new CompoundTag();
+        tag.putLong("StoredEMC", 4096L);
+        tag.putLong("stored_emc", 1024L);
+        tag.put("BlockEntityTag", blockEntity);
+
+        CompoundTag parsed = TagParser.parseTag(VariantNormalizer.normalize(tag));
+
+        // 根级 StoredEMC/stored_emc 仍由 ProjectE 处理；容器内容物的 StoredEMC 必须保留，
+        // 否则真实容器的精确 ItemInfo 查找会 miss。
+        assertFalse(parsed.contains("StoredEMC"));
+        assertFalse(parsed.contains("stored_emc"));
+        CompoundTag parsedContentTag = parsed.getCompound("BlockEntityTag")
+                .getList("Items", 10)
+                .getCompound(0)
+                .getCompound("tag");
+        assertEquals(2048L, parsedContentTag.getLong("StoredEMC"));
+        assertFalse(parsedContentTag.contains("stored_emc"));
+    }
 
     @Test
     void insertionOrderDoesNotAffectResult() {
@@ -285,6 +328,9 @@ private static final ResourceLocation SUDOERSEMC_TOKEN =
         CompoundTag tag = new CompoundTag();
         tag.putInt("Damage", 17);
         tag.put("Enchantments", sharpnessFive());
+        // 有意限制：实际 Damage>0 的精确 ItemInfo 是 {Damage:17,...}，与这里生成的
+        // {Damage:0,...} 不匹配；ProjectE 会回退到基础价 + DamageProcessor，不会误用变体价。
+        // 端到端断言见 GeneratedEmcMapperKeyTest#damagedVariantKeyIsIntentionallyNotExactProjectEInfo。
 
         assertEquals(ItemKey.of(DIAMOND_SWORD_ID,
                         "{Damage:0,Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}"),
@@ -338,6 +384,34 @@ private static final ResourceLocation SUDOERSEMC_TOKEN =
         assertEquals(ItemKey.of(DIAMOND_SWORD_ID,
                         "{Damage:0,Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}"),
                 VariantNormalizer.keyFor(DIAMOND_SWORD_ID, tag));
+    }
+
+    @Test
+    void keyForContainerPreservesContentStoredEmcButStripsRootStoredEmc() throws Exception {
+        CompoundTag contentTag = new CompoundTag();
+        contentTag.putLong("StoredEMC", 4096L);
+        CompoundTag entry = new CompoundTag();
+        entry.putString("id", "projecte:klein_star_omega");
+        entry.putByte("Count", (byte) 1);
+        entry.put("tag", contentTag);
+        ListTag items = new ListTag();
+        items.add(entry);
+        CompoundTag blockEntity = new CompoundTag();
+        blockEntity.put("Items", items);
+        CompoundTag tag = new CompoundTag();
+        tag.putLong("StoredEMC", 123L);
+        tag.put("BlockEntityTag", blockEntity);
+
+        ItemKey key = VariantNormalizer.keyFor(SHULKER_BOX_ID, tag);
+
+        assertTrue(key.hasVariant());
+        CompoundTag parsed = TagParser.parseTag(key.variantHash());
+        assertFalse(parsed.contains("StoredEMC"));
+        assertEquals(4096L, parsed.getCompound("BlockEntityTag")
+                .getList("Items", 10)
+                .getCompound(0)
+                .getCompound("tag")
+                .getLong("StoredEMC"));
     }
 
     @Test

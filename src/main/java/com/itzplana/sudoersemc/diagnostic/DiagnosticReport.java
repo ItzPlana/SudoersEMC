@@ -18,7 +18,7 @@ import java.util.Map;
  * {@code extraCounters} 按名称字典序追加在固定指标之后，保证不同调用顺序下报告文本一致。</p>
  *
  * @param totalRegisteredItems    本次扫描遍历到的注册物品总数
- * @param itemsWithExistingEmc    其中已经有 EMC 值的物品数量
+ * @param itemsWithExistingEmc    受保护的非自有既有值数量（自有条目会先被分离并重新求解）
  * @param itemsSolvedByRecipe     通过配方求解得到价格的物品数量
  * @param itemsSolvedByTag        通过标签定价得到价格的物品数量
  * @param itemsSolvedByRarity     通过稀有度定价得到价格的物品数量
@@ -125,7 +125,7 @@ public record DiagnosticReport(
         StringBuilder text = new StringBuilder();
         text.append("===== SudoersEMC 诊断报告 =====\n");
         appendLine(text, "注册物品总数", Long.toString(totalRegisteredItems));
-        appendLine(text, "已有 EMC", Long.toString(itemsWithExistingEmc));
+        appendLine(text, "受保护的非自有既有值", Long.toString(itemsWithExistingEmc));
         appendLine(text, "配方求解", Long.toString(itemsSolvedByRecipe));
         appendLine(text, "标签定价", Long.toString(itemsSolvedByTag));
         appendLine(text, "稀有度定价", Long.toString(itemsSolvedByRarity));
