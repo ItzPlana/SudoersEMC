@@ -1,6 +1,7 @@
 package com.itzplana.sudoersemc.resolver;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -112,6 +113,20 @@ class VariantScannerTest {
                 "{Damage:0,Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}")), keys);
     }
 
+    @Test
+    void containerContentStoredEmcProducesDistinctBoundedVariants() {
+        ItemStack shulker = new ItemStack(Items.SHULKER_BOX);
+        List<ItemKey> keys = scanner.scan(shulker, List.of(
+                containerTag("projecte:klein_star_omega", 100L),
+                containerTag("projecte:klein_star_omega", 200L)), 10);
+
+        // 不同存储量对应不同容器价值，必须保留为不同变体；数量仍受 scan limit 约束。
+        assertEquals(2, keys.size());
+        assertTrue(keys.get(0).variantHash().contains("StoredEMC"));
+        assertTrue(keys.get(1).variantHash().contains("StoredEMC"));
+        assertNotEquals(keys.get(0), keys.get(1));
+    }
+
     private static CompoundTag enchantedSwordTag(int damage) {
         CompoundTag enchantment = new CompoundTag();
         enchantment.putString("id", "minecraft:sharpness");
@@ -175,5 +190,21 @@ class VariantScannerTest {
         CompoundTag tag = new CompoundTag();
         tag.putInt("Marker", marker);
         return tag;
+    }
+
+    private static CompoundTag containerTag(String itemId, long storedEmc) {
+        CompoundTag contentTag = new CompoundTag();
+        contentTag.putLong("StoredEMC", storedEmc);
+        CompoundTag entry = new CompoundTag();
+        entry.putString("id", itemId);
+        entry.putByte("Count", (byte) 1);
+        entry.put("tag", contentTag);
+        ListTag items = new ListTag();
+        items.add(entry);
+        CompoundTag blockEntity = new CompoundTag();
+        blockEntity.put("Items", items);
+        CompoundTag root = new CompoundTag();
+        root.put("BlockEntityTag", blockEntity);
+        return root;
     }
 }

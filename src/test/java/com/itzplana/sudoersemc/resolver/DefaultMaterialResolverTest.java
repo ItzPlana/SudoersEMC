@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.itzplana.sudoersemc.core.ItemKey;
 import java.util.OptionalLong;
+import java.util.function.ToLongFunction;
 import net.minecraft.SharedConstants;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
@@ -92,7 +93,7 @@ class DefaultMaterialResolverTest {
 
     @Test
     void containerAddsStoredEmcFromContainedItemTag() {
-        DefaultMaterialResolver resolver = new DefaultMaterialResolver(
+        DefaultMaterialResolver resolver = storedEmcResolver(
                 key -> key.equals(DIAMOND_KEY) ? 128L : 0L);
         CompoundTag entry = itemEntry("minecraft:diamond", 1);
         entry.put("tag", storedEmcTag(500L));
@@ -102,7 +103,7 @@ class DefaultMaterialResolverTest {
 
     @Test
     void containedStoredEmcIsAddedAfterDamageDiscount() {
-        DefaultMaterialResolver resolver = new DefaultMaterialResolver(
+        DefaultMaterialResolver resolver = storedEmcResolver(
                 key -> key.equals(DIAMOND_SWORD_KEY) ? 1000L : 0L);
         int maxDamage = new ItemStack(Items.DIAMOND_SWORD).getMaxDamage();
         int damage = maxDamage / 2;
@@ -117,7 +118,7 @@ class DefaultMaterialResolverTest {
 
     @Test
     void containedStoredEmcSaturatesInsteadOfOverflowing() {
-        DefaultMaterialResolver resolver = new DefaultMaterialResolver(
+        DefaultMaterialResolver resolver = storedEmcResolver(
                 key -> key.equals(DIAMOND_KEY) ? Long.MAX_VALUE : 0L);
         CompoundTag entry = itemEntry("minecraft:diamond", 1);
         entry.put("tag", storedEmcTag(1L));
@@ -127,7 +128,7 @@ class DefaultMaterialResolverTest {
 
     @Test
     void unknownContainedBaseValueWithStoredEmcReturnsEmpty() {
-        DefaultMaterialResolver resolver = new DefaultMaterialResolver(key -> 0L);
+        DefaultMaterialResolver resolver = storedEmcResolver(key -> 0L);
         CompoundTag entry = itemEntry("minecraft:diamond", 1);
         entry.put("tag", storedEmcTag(4096L));
 
@@ -136,7 +137,7 @@ class DefaultMaterialResolverTest {
 
     @Test
     void negativeContainedStoredEmcIsIgnored() {
-        DefaultMaterialResolver resolver = new DefaultMaterialResolver(
+        DefaultMaterialResolver resolver = storedEmcResolver(
                 key -> key.equals(DIAMOND_KEY) ? 128L : 0L);
         CompoundTag entry = itemEntry("minecraft:diamond", 1);
         entry.put("tag", storedEmcTag(-4096L));
@@ -148,7 +149,7 @@ class DefaultMaterialResolverTest {
     void containedEnchantedVariantUsesVariantKeyAndStoredEmc() {
         ItemKey enchantedKey = ItemKey.of(DIAMOND_SWORD_ID,
                 "{Damage:0,Enchantments:[{id:\"minecraft:sharpness\",lvl:5s}]}");
-        DefaultMaterialResolver resolver = new DefaultMaterialResolver(
+        DefaultMaterialResolver resolver = storedEmcResolver(
                 key -> key.equals(enchantedKey) ? 2000L : 0L);
         CompoundTag enchantment = new CompoundTag();
         enchantment.putString("id", "minecraft:sharpness");
@@ -168,6 +169,45 @@ class DefaultMaterialResolverTest {
         CompoundTag tag = new CompoundTag();
         tag.putLong("StoredEMC", storedEmc);
         return tag;
+    }
+
+    private static DefaultMaterialResolver storedEmcResolver(ToLongFunction<ItemKey> lookup) {
+        // 测试用：显式接受任意内容物为 EMC holder，以便用原版物品验证叠加/饱和逻辑。
+        return new DefaultMaterialResolver(lookup, stack -> true);
+    }
+
+    @Test
+    void storedEmcOnNonHolderItemIsIgnoredByDefault() {
+        DefaultMaterialResolver resolver = new DefaultMaterialResolver(
+                key -> key.equals(DIAMOND_KEY) ? 128L : 0L);
+        CompoundTag entry = itemEntry("minecraft:diamond", 1);
+        entry.put("tag", storedEmcTag(500L));
+
+        assertEquals(OptionalLong.of(128L), resolver.resolve(container(entry)));
+    }
+
+    @Test
+    void storedEmcIsIgnoredWhenInjectedHolderPredicateRejects() {
+        DefaultMaterialResolver resolver = new DefaultMaterialResolver(
+                key -> key.equals(DIAMOND_KEY) ? 128L : 0L,
+                stack -> false);
+        CompoundTag entry = itemEntry("minecraft:diamond", 1);
+        entry.put("tag", storedEmcTag(500L));
+
+        assertEquals(OptionalLong.of(128L), resolver.resolve(container(entry)));
+    }
+
+    @Test
+    void defaultHolderWhitelistRecognisesProjectEKleinStarsOnly() {
+        String[] kleinStars = {
+                "klein_star_ein", "klein_star_zwei", "klein_star_drei",
+                "klein_star_vier", "klein_star_sphere", "klein_star_omega"
+        };
+        for (String name : kleinStars) {
+            assertTrue(DefaultMaterialResolver.isKnownProjectEEmcHolder(
+                    new ResourceLocation("projecte", name)), name);
+        }
+        assertFalse(DefaultMaterialResolver.isKnownProjectEEmcHolder(DIAMOND_ID));
     }
 
     @Test
