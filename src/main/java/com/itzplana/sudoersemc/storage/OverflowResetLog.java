@@ -11,6 +11,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import net.minecraft.resources.ResourceLocation;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -21,7 +22,8 @@ import org.slf4j.LoggerFactory;
  *
  * <p>The log is kept in memory and rewritten atomically on {@link #save()}. History is capped:
  * once more than {@code maxEntries} records exist the oldest are dropped, so a pathological server
- * can never grow the file without bound.</p>
+ * can never grow the file without bound. Every dropped record increments {@link #droppedEntries()}
+ * and the first drop (then every thousand) is logged at WARN level.</p>
  *
  * <h2>Threading model</h2>
  * <p>{@link #record(OverflowReset)}, {@link #entries()} and the snapshot phase of
@@ -53,6 +55,7 @@ public final class OverflowResetLog {
     private final Object lock = new Object();
     private final ArrayDeque<OverflowReset> resets = new ArrayDeque<>();
     private final AtomicBoolean dirty = new AtomicBoolean(false);
+    private final AtomicLong droppedEntries = new AtomicLong();
 
     private volatile boolean unsupportedSchemaVersion;
     private volatile int loadedSchemaVersion = SCHEMA_VERSION;
@@ -127,7 +130,11 @@ public final class OverflowResetLog {
                         continue;
                     }
                     resets.addLast(reset);
-                    trimToLimit();
+                }
+                if (trimToLimit() > 0) {
+                    // Persist the compacted history on the next save so the file no longer exceeds
+                    // the configured cap after a restart.
+                    dirty.set(true);
                 }
             }
             if (skipped > 0) {
@@ -182,6 +189,14 @@ public final class OverflowResetLog {
     }
 
     /**
+     * @return total number of oldest records dropped because the in-memory capacity was exceeded;
+     *         includes records dropped while recording and while loading an oversized file
+     */
+    public long droppedEntries() {
+        return droppedEntries.get();
+    }
+
+    /**
      * @return the backing file, mainly for diagnostics and tests
      */
     public Path file() {
@@ -198,7 +213,7 @@ public final class OverflowResetLog {
     }
 
     /**
-     * @return {@code true} when records were added or the last save failed and needs a retry
+     * @return {@code true} when records were added, loading dropped oversized history, or the last save failed
      */
     public boolean isDirty() {
         return dirty.get();
@@ -252,10 +267,23 @@ public final class OverflowResetLog {
         }
     }
 
-    private void trimToLimit() {
+    private int trimToLimit() {
+        int dropped = 0;
         while (resets.size() > maxEntries) {
             resets.removeFirst();
+            dropped++;
         }
+        if (dropped > 0) {
+            long totalDropped = droppedEntries.addAndGet(dropped);
+            long previous = totalDropped - dropped;
+            if (previous == 0L || totalDropped / 1_000L > previous / 1_000L) {
+                LOGGER.warn(
+                        "Overflow reset log {} reached its {} entry limit; dropped {} oldest record(s) "
+                                + "({} dropped in total)",
+                        file, maxEntries, dropped, totalDropped);
+            }
+        }
+        return dropped;
     }
 
     private static OverflowReset toReset(ResetDto dto) {

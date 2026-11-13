@@ -38,6 +38,7 @@ import com.itzplana.sudoersemc.task.ScanPhase;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -117,6 +118,38 @@ class ScanPipelineTest {
     }
 
     @Test
+    void solveAndApplyPropagatesRuntimeFailures() {
+        ScanPipeline pipeline = pipeline(null, null, null, null, null, null, disabledFallback());
+        Map<ItemKey, Long> corruptExistingValues = new HashMap<>();
+        corruptExistingValues.put(RESULT, null);
+        PipelineSnapshot snapshot = new PipelineSnapshot(
+                List.of(item(RESULT, 0L)), List.of(), corruptExistingValues, 0, 0, 0);
+
+        assertThrows(IllegalStateException.class, () -> pipeline.solveAndApply(snapshot),
+                "同步求解路径也必须上抛失败，而不是返回全零结果");
+    }
+
+    @Test
+    void fingerprintSupplierFailureAbortsInsteadOfWritingIncompleteState() {
+        ScanStateStore stateStore = new ScanStateStore(
+                tempDir.resolve("scan_state_fingerprint_failure.json"));
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_fingerprint_failure.json"));
+        ScanPipeline pipeline = pipeline(store, stateStore, null, null, null, null, disabledFallback());
+        pipeline.setInputFingerprintSupplier(() -> {
+            throw new IllegalStateException("broken fingerprint supplier");
+        });
+
+        PipelineSnapshot snapshot = snapshot(List.of(item(RESULT, 0L)), List.of(), Map.of());
+
+        assertThrows(IllegalStateException.class, () -> pipeline.solveAndApply(snapshot),
+                "生产指纹提供器失败时必须上抛，而不是退回不完整指纹");
+        assertEquals(0L, stateStore.lastScanEpochMillis(),
+                "指纹计算失败时不得写入扫描状态");
+        assertEquals(0, store.size(), "指纹计算失败时不得写入生成值");
+    }
+
+    @Test
     void failedCollectionDoesNotRecordCompletedScanState() {
         ScanStateStore stateStore = new ScanStateStore(tempDir.resolve("scan_state_failure.json"));
         ScanPipeline pipeline = pipeline(null, stateStore, null, null, null, null, disabledFallback());
@@ -157,8 +190,8 @@ class ScanPipelineTest {
         assertEquals(0, store.size());
 
         String report = Files.readString(reportManager.reportFile());
-        assertTrue(hasCounterLine(report, "已有 EMC", 1L),
-                "诊断报告应记录一个已有 EMC 的物品");
+        assertTrue(hasCounterLine(report, "受保护的非自有既有值", 1L),
+                "诊断报告应记录一个受保护的非自有既有值");
     }
 
     @Test
@@ -297,6 +330,56 @@ class ScanPipelineTest {
         assertTrue(Files.isRegularFile(auditFile), "扫描应用后审计日志必须已原子落盘");
         OverflowResetLog persisted = new OverflowResetLog(auditFile);
         assertEquals(1, persisted.entries().size(), "本轮溢出重置必须在扫描结束时持久化");
+    }
+
+    @Test
+    void overflowAuditCapacityDropsAreReported() throws IOException {
+        ReportManager reportManager = new ReportManager(tempDir);
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_overflow_dropped.json"));
+        OverflowProtection.Settings overflowSettings = new OverflowProtection.Settings(
+                true, 100L, 1L, 10L, 10, 5, OverflowScope.OWNED_ONLY, false, 42L);
+        OverflowResetLog resetLog = new OverflowResetLog(
+                tempDir.resolve("overflow_resets_dropped.json"), 1);
+        OverflowPipeline overflowPipeline =
+                new OverflowPipeline(new OverflowProtection(overflowSettings), resetLog);
+
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(RESULT, 0L), item(DUST, 0L)), List.of(), Map.of());
+        ScanPipeline pipeline = pipeline(
+                store, null, reportManager, null, null, overflowPipeline, genericFallback(200L));
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(2, result.overflowResets());
+        assertEquals(2, result.applied());
+        assertEquals(1L, overflowPipeline.auditDroppedCount(), "容量上限丢弃必须可观测");
+        assertEquals(1L, resetLog.droppedEntries());
+
+        String report = Files.readString(reportManager.reportFile());
+        assertTrue(hasCounterLine(report, "overflowAuditDropped", 1L),
+                "诊断报告必须暴露审计日志容量丢弃数");
+    }
+
+    @Test
+    void staleOwnedEntriesAreExposedInReport() throws IOException {
+        ReportManager reportManager = new ReportManager(tempDir);
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_stale_owned.json"));
+        store.stage(new GeneratedEmcEntry(DUST, 5L, PriceSource.RECIPE, null, true, 0L));
+
+        PipelineSnapshot snapshot = snapshot(List.of(item(RESULT, 0L)), List.of(), Map.of());
+        ScanPipeline pipeline = pipeline(store, null, reportManager, null, null, null,
+                genericFallback(7L));
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1, result.applied());
+        assertTrue(store.snapshotAll().containsKey(DUST),
+                "诊断暴露不得擅自删除或迁移 stale owned 记录");
+        String report = Files.readString(reportManager.reportFile());
+        assertTrue(hasCounterLine(report, "staleOwnedEntries", 1L),
+                "诊断报告必须暴露本轮未刷新的自有条目数");
     }
 
     @Test
@@ -511,24 +594,69 @@ class ScanPipelineTest {
 
         GeneratedEmcEntry rawEntry = store.snapshotAll().get(RAW);
         assertNotNull(rawEntry);
-        assertEquals(128L, rawEntry.value(), "自有原料应按 RAW_MATERIAL 标签刷新");
+        // phase-13 的保守标签锚点：INGOT=64，RAW_MATERIAL=INGOT/2=32。
+        assertEquals(32L, rawEntry.value(), "自有原料应按 RAW_MATERIAL 标签刷新");
         assertEquals(PriceSource.TAG, rawEntry.source());
 
         GeneratedEmcEntry ingotEntry = store.snapshotAll().get(INGOT);
         assertNotNull(ingotEntry);
-        assertEquals(128L, ingotEntry.value(), "一级产物必须使用原料的新兜底值");
+        assertEquals(32L, ingotEntry.value(), "一级产物必须使用原料的新兜底值");
         assertEquals(PriceSource.RECIPE, ingotEntry.source());
 
         GeneratedEmcEntry blockEntry = store.snapshotAll().get(RESULT);
         assertNotNull(blockEntry);
-        assertEquals(128L, blockEntry.value(), "二级产物必须在同一轮沿链条刷新");
+        assertEquals(32L, blockEntry.value(), "二级产物必须在同一轮沿链条刷新");
         assertEquals(PriceSource.RECIPE, blockEntry.source());
 
         String report = Files.readString(reportManager.reportFile());
-        assertTrue(hasCounterLine(report, "已有 EMC", 0L),
+        assertTrue(hasCounterLine(report, "受保护的非自有既有值", 0L),
                 "分离后标准字段只统计非自有值");
         assertTrue(hasCounterLine(report, "ownedRefreshed", 3L),
                 "诊断报告必须单独暴露本轮刷新的自有条目数");
+    }
+
+    @Test
+    void ownedSecondaryOutputIsSeededForDownstreamRecipe() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_owned_byproduct.json"));
+        ItemKey source = ItemKey.of(new ResourceLocation("sudoersemc", "iron_ore_seed"));
+        ItemKey primary = ItemKey.of(new ResourceLocation("sudoersemc", "iron_ingot_byproduct"));
+        ItemKey nugget = ItemKey.of(new ResourceLocation("sudoersemc", "iron_nugget"));
+        ItemKey block = ItemKey.of(new ResourceLocation("sudoersemc", "iron_block_from_nugget"));
+        store.stage(new GeneratedEmcEntry(nugget, 1L, PriceSource.RECIPE, null, true, 0L));
+        store.stage(new GeneratedEmcEntry(block, 1L, PriceSource.RECIPE, null, true, 0L));
+
+        ItemSnapshot nuggetSnapshot = ItemSnapshot.of(
+                nugget, true, 1L, List.of("forge:nuggets/iron"), Rarity.COMMON);
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(source, 63L), item(primary, 0L), nuggetSnapshot, item(block, 1L)),
+                List.of(
+                        RecipeSnapshot.of(
+                                new ResourceLocation("sudoersemc", "ingot_with_nugget_byproduct"),
+                                RecipeKind.SHAPED,
+                                List.of(RecipeInput.of(IngredientOption.of(source))),
+                                List.of(RecipeOutput.of(primary), RecipeOutput.of(nugget))),
+                        recipe(new ResourceLocation("sudoersemc", "block_from_nugget"), nugget, block)),
+                Map.of(source, 63L, nugget, 1L, block, 1L));
+        ScanPipeline pipeline = pipeline(store, null, null, null, null, null,
+                FallbackPricing.withDefaults(PricingSettings.defaults()));
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(2, result.solvedByRecipe());
+        assertEquals(1, result.solvedByFallback());
+        assertEquals(0, result.unresolved());
+
+        GeneratedEmcEntry nuggetEntry = store.snapshotAll().get(nugget);
+        assertNotNull(nuggetEntry);
+        assertEquals(7L, nuggetEntry.value(),
+                "自有副产物必须按 NUGGET 标签兜底预置，供下游配方使用");
+        assertEquals(PriceSource.TAG, nuggetEntry.source());
+
+        GeneratedEmcEntry blockEntry = store.snapshotAll().get(block);
+        assertNotNull(blockEntry);
+        assertEquals(7L, blockEntry.value(), "下游配方必须消费副产物的本轮预置值");
+        assertEquals(PriceSource.RECIPE, blockEntry.source());
     }
 
     @Test
@@ -590,7 +718,111 @@ class ScanPipelineTest {
         assertEquals(1, result.applied());
         GeneratedEmcEntry staged = store.snapshotAll().get(RESULT);
         assertNotNull(staged);
-        assertEquals(256L, staged.value(), "forge:ingots/iron 应命中默认 INGOT 锚点");
+        assertEquals(64L, staged.value(), "forge:ingots/iron 应命中默认 INGOT 保守锚点");
+        assertEquals(PriceSource.TAG, staged.source());
+    }
+
+    @Test
+    void ownedExistingValueIsRefreshedOnRescan() {
+        GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("generated_owned_refresh.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 1_000L, PriceSource.RECIPE, RECIPE_ID, true, 0L));
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 900L), item(RESULT, 1_000L)),
+                List.of(recipe(INGOT, RESULT)),
+                Map.of(INGOT, 900L, RESULT, 1_000L));
+        ScanPipeline pipeline = pipeline(store, null, null, null, null, null, disabledFallback());
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1, result.solvedByRecipe(),
+                "自有条目必须重新进入求解，而不是被既有值冻结");
+        assertEquals(1, result.applied());
+        assertEquals(900L, store.snapshotAll().get(RESULT).value(),
+                "rescan 必须刷新 SudoersEMC 自有值");
+    }
+
+    @Test
+    void externallyModifiedOwnedEntryReleasesOwnershipAndIsNotOverwritten() {
+        GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("generated_external_edit.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 1_000L, PriceSource.RECIPE, RECIPE_ID, true, 0L));
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 900L), item(RESULT, 700L)),
+                List.of(recipe(INGOT, RESULT)),
+                Map.of(INGOT, 900L, RESULT, 700L));
+        ScanPipeline pipeline = pipeline(store, null, null, null, null, null, disabledFallback());
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        GeneratedEmcEntry entry = store.snapshotAll().get(RESULT);
+        assertNotNull(entry);
+        assertFalse(entry.owned(),
+                "ProjectE 当前值与自有记录不一致时必须释放所有权");
+        assertEquals(0, result.solvedByRecipe(),
+                "外部值必须作为种子保护，不得被配方重新定价");
+        assertEquals(0, result.applied());
+    }
+
+    @Test
+    void creativeSpecialValueOverridesResolvedRecipeValue() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_special_recipe.json"));
+        CreativeItemProtection protection = new CreativeItemProtection(
+                new CreativeItemProtection.Settings(
+                        true, Set.of(), Map.of(RESULT_ID, 999L), Set.of()));
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 5L), item(RESULT, 0L)),
+                List.of(recipe(INGOT, RESULT)),
+                Map.of(INGOT, 5L));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, protection, null, disabledFallback());
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1, result.applied());
+        GeneratedEmcEntry staged = store.snapshotAll().get(RESULT);
+        assertNotNull(staged, "specialValue 必须在配方候选路径生成写入");
+        assertEquals(999L, staged.value(),
+                "固定值必须覆盖求解器产出的配方值");
+        assertEquals(PriceSource.TIER, staged.source());
+        assertNull(staged.recipeId(), "固定值不应关联配方 id");
+    }
+
+    @Test
+    void excludedItemWithRecipeIsNotPriced() {
+        ItemKey spawnEgg = ItemKey.of(new ResourceLocation("minecraft", "spawn_egg"));
+        GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("generated_excluded_recipe.json"));
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 5L), item(spawnEgg, 0L)),
+                List.of(recipe(INGOT, spawnEgg)),
+                Map.of(INGOT, 5L));
+        ScanPipeline pipeline = pipeline(store, null, null, null, null, null, disabledFallback());
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(0, result.solvedByRecipe(),
+                "被排除物品即使存在配方也不得生成候选");
+        assertEquals(0, result.applied());
+        assertNull(store.snapshotAll().get(spawnEgg),
+                "被排除物品不得写入生成值存储");
+    }
+
+    @Test
+    void fallbackUsesCollectedTagPaths() {
+        ItemKey tagged = ItemKey.of(new ResourceLocation("sudoersemc", "tagged_ingot"));
+        ItemSnapshot taggedSnapshot = ItemSnapshot.of(
+                tagged, false, 0L, List.of("forge:ingots/iron"), net.minecraft.world.item.Rarity.COMMON);
+        GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("generated_tag_pricing.json"));
+        FallbackPricing tagPricing = FallbackPricing.withDefaults(
+                new PricingSettings(true, false, false, false, 0L));
+        ScanPipeline pipeline = pipeline(store, null, null, null, null, null, tagPricing);
+
+        PipelineResult result = pipeline.solveAndApply(
+                snapshot(List.of(taggedSnapshot), List.of(), Map.of()));
+
+        assertEquals(1, result.applied());
+        GeneratedEmcEntry staged = store.snapshotAll().get(tagged);
+        assertNotNull(staged);
+        assertEquals(64L, staged.value(), "TAG 定价必须使用采集阶段写入的标签路径");
         assertEquals(PriceSource.TAG, staged.source());
     }
 
@@ -754,6 +986,50 @@ class ScanPipelineTest {
         assertTrue(resetLog.entries().isEmpty());
     }
 
+    @Test
+    void fallbackUsesCollectedRarity() {
+        ItemKey epic = ItemKey.of(new ResourceLocation("sudoersemc", "epic_item"));
+        ItemSnapshot epicSnapshot = ItemSnapshot.of(
+                epic, false, 0L, List.of(), net.minecraft.world.item.Rarity.EPIC);
+        GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("generated_rarity_pricing.json"));
+        FallbackPricing rarityPricing = FallbackPricing.withDefaults(
+                new PricingSettings(false, true, false, false, 0L));
+        ScanPipeline pipeline = pipeline(store, null, null, null, null, null, rarityPricing);
+
+        PipelineResult result = pipeline.solveAndApply(
+                snapshot(List.of(epicSnapshot), List.of(), Map.of()));
+
+        assertEquals(1, result.applied());
+        GeneratedEmcEntry staged = store.snapshotAll().get(epic);
+        assertNotNull(staged);
+        assertEquals(2_048L, staged.value(), "稀有度定价必须使用采集阶段写入的 Rarity");
+        assertEquals(PriceSource.RARITY, staged.source());
+    }
+
+    @Test
+    void asyncSolveComputesOffThreadAndAppliesOnCallerThread() throws InterruptedException {
+        GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("generated_async.json"));
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 5L), item(RESULT, 0L)),
+                List.of(recipe(INGOT, RESULT)),
+                Map.of(INGOT, 5L));
+        ScanPipeline pipeline = pipeline(store, null, null, null, null, null, disabledFallback());
+        pipeline.stash(snapshot);
+
+        assertTrue(pipeline.startStashedSolve(), "存在暂存快照时应提交后台求解");
+        long deadline = System.currentTimeMillis() + 5_000L;
+        while (!pipeline.isSolveComplete() && System.currentTimeMillis() < deadline) {
+            Thread.sleep(5L);
+        }
+        assertTrue(pipeline.isSolveComplete(), "后台求解必须在 5 秒内完成");
+        assertEquals(0, store.size(), "纯计算阶段不得直接写入生成值存储");
+
+        PipelineResult result = pipeline.applyCompletedSolve();
+
+        assertEquals(1, result.applied());
+        assertNotNull(store.snapshotAll().get(RESULT),
+                "应用阶段必须在调用线程写入求解结果");
+    }
     /**
      * 创建使用默认求解参数的管线，未提供的协作者由管线自行采用安全默认值。
      */
