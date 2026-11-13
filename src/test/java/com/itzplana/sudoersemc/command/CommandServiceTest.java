@@ -46,7 +46,7 @@ class CommandServiceTest {
     private static ScanManager idleManager() {
         return new ScanManager(
                 new BatchProcessor(1, false),
-                () -> new ScanManager.SnapshotData("主世界", 0, 0),
+                () -> ScanManager.oneShot(new ScanManager.SnapshotData("主世界", 0, 0)).begin(),
                 snapshot -> { },
                 1_000_000L);
     }

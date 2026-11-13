@@ -87,7 +87,7 @@ class DiagnosticReportTest {
         assertTrue(text.contains("================================"));
 
         assertLine(text, "注册物品总数", "1000");
-        assertLine(text, "已有 EMC", "100");
+        assertLine(text, "受保护的非自有既有值", "100");
         assertLine(text, "配方求解", "10");
         assertLine(text, "标签定价", "20");
         assertLine(text, "稀有度定价", "30");
@@ -167,6 +167,7 @@ class DiagnosticReportTest {
         assertLine(text, "不支持配方", "2");
         assertLine(text, "无效配方", "1");
         assertLine(text, "失败配方", "3");
+        assertLine(text, "扫描失败配方", "3");
         assertTrue(text.contains("recipe:boom"), "失败明细必须出现在报告中");
         assertTrue(text.contains("retiredEntries: 3"), "全部额外计数器都必须输出");
         assertTrue(text.contains("quarantinedDrops: 2"));
@@ -179,6 +180,22 @@ class DiagnosticReportTest {
         assertTrue(text.contains("1.0 MiB"));
         assertTrue(text.contains("扫描总耗时"));
         assertTrue(text.contains("999 ms"));
+    }
+
+    @Test
+    void recipeEnumerationFailureShowsUnknownStatistics() {
+        DiagnosticReport report = new DiagnosticReport(
+                1L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 1L, 0L,
+                Map.of("recipeEnumerationFailed", 1L),
+                List.of("recipe-manager: boom"));
+
+        String text = report.formatText();
+
+        assertTrue(text.contains("不可用（配方枚举失败）"),
+                "枚举失败时必须明确标注统计不可用");
+        assertFalse(text.lines().anyMatch(line -> line.startsWith("配方扫描总数")),
+                "枚举失败时不得输出伪造的配方总数");
+        assertTrue(text.contains("recipe-manager: boom"));
     }
 
     @Test

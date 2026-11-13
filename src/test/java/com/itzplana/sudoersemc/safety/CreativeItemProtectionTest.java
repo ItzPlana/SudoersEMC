@@ -20,6 +20,7 @@ class CreativeItemProtectionTest {
     private static final ResourceLocation BEDROCK_ID = new ResourceLocation("minecraft", "bedrock");
     private static final ResourceLocation DIAMOND_ID = new ResourceLocation("minecraft", "diamond");
     private static final ResourceLocation STICK_ID = new ResourceLocation("minecraft", "stick");
+    private static final ResourceLocation STONE_ID = new ResourceLocation("minecraft", "stone");
     private static final ResourceLocation CREATIVE_CRATE_ID =
             new ResourceLocation("create", "creative_crate");
     private static final ResourceLocation DARK_ALTAR_ID =
@@ -82,17 +83,35 @@ class CreativeItemProtectionTest {
     }
 
     @Test
-    void disabledProtectionAlwaysAllowsPricing() {
+    void disabledProtectionOnlyDisablesCreativeNamespaces() {
         CreativeItemProtection protection = protection(false);
 
         CreativeItemProtection.Decision excluded = protection.decide(BEDROCK, false, false);
         CreativeItemProtection.Decision creativeNamespace =
                 protection.decide(CREATIVE_CRATE, false, false);
+        CreativeItemProtection.Decision special = protection.decide(DIAMOND, true, false);
 
-        assertTrue(excluded.priceable());
-        assertEquals("protection-disabled", excluded.reason());
-        assertTrue(creativeNamespace.priceable());
+        assertFalse(excluded.priceable(), "显式排除不随总开关关闭而失效");
+        assertEquals("explicit-exclusion", excluded.reason());
+        assertTrue(creativeNamespace.priceable(), "总开关关闭后创造命名空间不再拦截");
         assertEquals("protection-disabled", creativeNamespace.reason());
+        assertTrue(special.priceable(), "固定值不随总开关关闭而失效");
+        assertEquals(64L, special.specialValue());
+        assertEquals("special-value", special.reason());
+    }
+
+    @Test
+    void parsedItemIdsRequireNamespaceAndValidPath() {
+        CreativeItemProtection.ParsedSettings parsed = CreativeItemProtection.parseSettings(
+                true,
+                List.of("stone", "minecraft:", "Minecraft:Stone", "minecraft:stone"),
+                List.of("stone=5", "minecraft:stone=5"),
+                List.of());
+
+        assertEquals(Set.of(STONE_ID), parsed.settings().explicitExclusions());
+        assertEquals(Map.of(STONE_ID, 5L), parsed.settings().specialValues());
+        assertEquals(4, parsed.skippedEntries().size(),
+                "无命名空间、空 path、大小写非法与特殊值缺少命名空间都必须被忽略");
     }
 
     @Test
@@ -254,5 +273,34 @@ class CreativeItemProtectionTest {
         assertEquals(Set.of("^minecraft:command_block$"),
                 parsed.settings().creativeOnlyItemPatterns());
         assertTrue(parsed.settings().autoDetectCreativeOnlyNamespaces().isEmpty());
+    }
+
+    @Test
+    void configStringsAreParsedAndInvalidEntriesAreSkipped() {
+        CreativeItemProtection.ParsedSettings parsed = CreativeItemProtection.parseSettings(
+                true,
+                List.of("minecraft:bedrock", "not a valid id"),
+                List.of("minecraft:diamond=64", "minecraft:emerald=0", "broken"),
+                List.of("create", "Invalid Namespace"));
+
+        assertEquals(Set.of(BEDROCK_ID), parsed.settings().explicitExclusions());
+        assertEquals(Map.of(DIAMOND_ID, 64L), parsed.settings().specialValues());
+        assertEquals(Set.of("create"), parsed.settings().creativeOnlyNamespaces());
+        assertEquals(4, parsed.skippedEntries().size(),
+                "非法条目必须被跳过并进入诊断列表");
+    }
+
+    @Test
+    void parsedSettingsAreWiredIntoProductionDecisions() {
+        CreativeItemProtection protection = new CreativeItemProtection(
+                CreativeItemProtection.parseSettings(
+                        true,
+                        List.of("minecraft:bedrock"),
+                        List.of("minecraft:diamond=64"),
+                        List.of("create")).settings());
+
+        assertFalse(protection.decide(BEDROCK, true, true).priceable());
+        assertEquals(64L, protection.decide(DIAMOND, true, true).specialValue());
+        assertFalse(protection.decide(CREATIVE_CRATE, true, true).priceable());
     }
 }

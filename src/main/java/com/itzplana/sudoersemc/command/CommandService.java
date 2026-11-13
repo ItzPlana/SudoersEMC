@@ -64,6 +64,9 @@ public final class CommandService {
     private final @Nullable QuarantinedDropsStore quarantinedDropsStore;
     private final @Nullable EmcProvider emcProvider;
     private final @Nullable ProjectEManualValues manualValues;
+    @Nullable
+    private QuarantineApprovalAction approvalAction;
+
     private final boolean approveAppliesImmediately;
     private final @Nullable Supplier<Predicate<ItemKey>> pricingExclusionSupplier;
     private final @Nullable LongSupplier minimumEmcSupplier;
@@ -100,6 +103,26 @@ public final class CommandService {
                           @Nullable ScanStateStore scanStateStore,
                           @Nullable ReloadAction reloadAction) {
         this(scanManager, reportManager, entryStore, scanStateStore, reloadAction, null, null, null);
+    }
+
+    /**
+     * 兼容构造器：注入审批动作（命令层只做参数解析，审批语义由动作实现）。
+     *
+     * @param scanManager     扫描状态机，可为 {@code null}
+     * @param reportManager   诊断报告管理器，可为 {@code null}
+     * @param entryStore      已生成条目的存储，可为 {@code null}
+     * @param scanStateStore  上一次扫描状态的存储，可为 {@code null}
+     * @param reloadAction    真实配置重载动作，可为 {@code null}
+     * @param approvalAction  审批动作；{@code null} 表示不可用
+     */
+    public CommandService(@Nullable ScanManager scanManager,
+                          @Nullable ReportManager reportManager,
+                          @Nullable GeneratedEntryStore entryStore,
+                          @Nullable ScanStateStore scanStateStore,
+                          @Nullable ReloadAction reloadAction,
+                          @Nullable QuarantineApprovalAction approvalAction) {
+        this(scanManager, reportManager, entryStore, scanStateStore, reloadAction, null, null, null);
+        this.approvalAction = approvalAction;
     }
 
     /**
@@ -343,6 +366,11 @@ public final class CommandService {
             }
             QuarantinedDropsStore store = quarantinedDropsStore;
             if (store == null) {
+                QuarantineApprovalAction action = approvalAction;
+                if (action != null) {
+                    CommandResult delegated = action.approve(trimmed);
+                    return delegated == null ? CommandResult.failure("审批动作返回 null") : delegated;
+                }
                 return CommandResult.failure(QUARANTINE_UNAVAILABLE);
             }
 

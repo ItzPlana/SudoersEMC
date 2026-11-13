@@ -53,7 +53,7 @@ class ProjectECustomEmcFileTest {
                 """);
 
         ProjectECustomEmcFile.RewriteResult result = new ProjectECustomEmcFile(file)
-                .rewriteAboveThreshold(protection(), key -> true, false);
+                .rewriteAboveThreshold(protection(), key -> true);
 
         assertEquals(1, result.rewritten());
         assertEquals(0, result.skipped());
@@ -83,7 +83,7 @@ class ProjectECustomEmcFileTest {
                 """);
 
         ProjectECustomEmcFile.RewriteResult result = new ProjectECustomEmcFile(file)
-                .rewriteAboveThreshold(protection(), key -> true, false);
+                .rewriteAboveThreshold(protection(), key -> true);
         assertTrue(result.wroteFile());
 
         String rewritten = Files.readString(file, StandardCharsets.UTF_8);
@@ -107,7 +107,7 @@ class ProjectECustomEmcFileTest {
         String original = Files.readString(file, StandardCharsets.UTF_8);
 
         ProjectECustomEmcFile.RewriteResult first = new ProjectECustomEmcFile(file)
-                .rewriteAboveThreshold(protection(), key -> true, false);
+                .rewriteAboveThreshold(protection(), key -> true);
 
         assertNotNull(first.backup());
         assertTrue(Files.isRegularFile(first.backup()));
@@ -119,7 +119,7 @@ class ProjectECustomEmcFileTest {
                 { "entries": [ { "item": "minecraft:stone", "emc": 1 } ] }
                 """);
         ProjectECustomEmcFile.RewriteResult second = new ProjectECustomEmcFile(stable)
-                .rewriteAboveThreshold(protection(), key -> true, false);
+                .rewriteAboveThreshold(protection(), key -> true);
 
         assertFalse(second.wroteFile());
         assertNull(second.backup());
@@ -127,38 +127,63 @@ class ProjectECustomEmcFileTest {
     }
 
     @Test
-    void nonOwnedEntriesFollowAllowNonOwner() throws IOException {
+    void nonOwnedEntriesAreAlwaysPreserved() throws IOException {
         Predicate<ItemKey> owned = key -> key.itemId().equals(STONE);
-        String json = """
+        Path file = write("non_owned.json", """
                 {
                   "entries": [
                     { "item": "minecraft:stone", "emc": 5000 },
                     { "item": "minecraft:dirt", "emc": 4000 }
                   ]
                 }
-                """;
+                """);
 
-        Path blocked = write("blocked.json", json);
-        ProjectECustomEmcFile.RewriteResult blockedResult = new ProjectECustomEmcFile(blocked)
-                .rewriteAboveThreshold(protection(), owned, false);
+        ProjectECustomEmcFile.RewriteResult result = new ProjectECustomEmcFile(file)
+                .rewriteAboveThreshold(protection(), owned);
 
-        assertEquals(1, blockedResult.rewritten());
-        assertEquals(1, blockedResult.notOwned());
-        JsonArray blockedEntries = readObject(blocked).getAsJsonArray("entries");
-        assertTrue(blockedEntries.get(0).getAsJsonObject().get("emc").getAsLong() <= RESET_MAX);
-        assertEquals(4000L, blockedEntries.get(1).getAsJsonObject().get("emc").getAsLong(),
-                "未放行时非自有条目必须保持原值");
+        assertEquals(1, result.rewritten());
+        assertEquals(1, result.notOwned());
+        assertTrue(result.wroteFile());
+        JsonArray entries = readObject(file).getAsJsonArray("entries");
+        assertTrue(entries.get(0).getAsJsonObject().get("emc").getAsLong() <= RESET_MAX);
+        assertEquals(4000L, entries.get(1).getAsJsonObject().get("emc").getAsLong(),
+                "管理员手动条目必须保持原值");
+    }
 
-        Path allowed = write("allowed.json", json);
-        ProjectECustomEmcFile.RewriteResult allowedResult = new ProjectECustomEmcFile(allowed)
-                .rewriteAboveThreshold(protection(), owned, true);
+    @Test
+    void onlyNonOwnedOverflowEntriesDoNotTouchDisk() throws IOException {
+        Path file = write("only_non_owned.json", """
+                { "entries": [ { "item": "minecraft:dirt", "emc": 4000 } ] }
+                """);
+        String original = Files.readString(file, StandardCharsets.UTF_8);
 
-        assertEquals(2, allowedResult.rewritten());
-        assertEquals(1, allowedResult.notOwned(), "放行后仍应统计非自有条目数量");
-        JsonArray allowedEntries = readObject(allowed).getAsJsonArray("entries");
-        long dirt = allowedEntries.get(1).getAsJsonObject().get("emc").getAsLong();
-        assertTrue(dirt >= RESET_MIN && dirt <= RESET_MAX,
-                "放行后非自有条目也必须回落到重置区间");
+        ProjectECustomEmcFile.RewriteResult result = new ProjectECustomEmcFile(file)
+                .rewriteAboveThreshold(protection(), key -> false);
+
+        assertEquals(0, result.rewritten());
+        assertEquals(1, result.notOwned());
+        assertFalse(result.wroteFile());
+        assertNull(result.backup());
+        assertEquals(0L, countBackups(file));
+        assertEquals(original, Files.readString(file, StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void ownershipPredicateFailureIsFailClosed() throws IOException {
+        Path file = write("predicate_failure.json", """
+                { "entries": [ { "item": "minecraft:stone", "emc": 5000 } ] }
+                """);
+        String original = Files.readString(file, StandardCharsets.UTF_8);
+
+        ProjectECustomEmcFile.RewriteResult result = new ProjectECustomEmcFile(file)
+                .rewriteAboveThreshold(protection(), key -> {
+                    throw new IllegalStateException("ownership unavailable");
+                });
+
+        assertEquals(0, result.rewritten());
+        assertEquals(1, result.notOwned());
+        assertFalse(result.wroteFile());
+        assertEquals(original, Files.readString(file, StandardCharsets.UTF_8));
     }
 
     @Test
@@ -167,11 +192,11 @@ class ProjectECustomEmcFileTest {
                 { "entries": [ { "item": "minecraft:stone", "emc": 5000 } ] }
                 """);
         ProjectECustomEmcFile custom = new ProjectECustomEmcFile(file);
-        assertTrue(custom.rewriteAboveThreshold(protection(), key -> true, false).wroteFile());
+        assertTrue(custom.rewriteAboveThreshold(protection(), key -> true).wroteFile());
         String afterFirst = Files.readString(file, StandardCharsets.UTF_8);
 
         ProjectECustomEmcFile.RewriteResult second =
-                custom.rewriteAboveThreshold(protection(), key -> true, false);
+                custom.rewriteAboveThreshold(protection(), key -> true);
 
         assertEquals(0, second.rewritten());
         assertFalse(second.wroteFile());
@@ -185,7 +210,7 @@ class ProjectECustomEmcFileTest {
         String original = Files.readString(file, StandardCharsets.UTF_8);
 
         ProjectECustomEmcFile.RewriteResult result = new ProjectECustomEmcFile(file)
-                .rewriteAboveThreshold(protection(), key -> true, false);
+                .rewriteAboveThreshold(protection(), key -> true);
 
         assertEquals(0, result.rewritten());
         assertEquals(0, result.skipped());
@@ -201,7 +226,7 @@ class ProjectECustomEmcFileTest {
         Path file = tempDir.resolve("missing.json");
 
         ProjectECustomEmcFile.RewriteResult result = new ProjectECustomEmcFile(file)
-                .rewriteAboveThreshold(protection(), key -> true, false);
+                .rewriteAboveThreshold(protection(), key -> true);
 
         assertEquals(0, result.rewritten());
         assertFalse(result.wroteFile());
@@ -210,7 +235,7 @@ class ProjectECustomEmcFileTest {
     }
 
     @Test
-    void nonIntegerValuesArePreservedAndCountedAsSkipped() throws IOException {
+    void numericAndStringEmcAreParsedLikeProjectEManualValues() throws IOException {
         Path file = write("custom_emc.json", """
                 {
                   "entries": [
@@ -222,13 +247,15 @@ class ProjectECustomEmcFileTest {
                 """);
 
         ProjectECustomEmcFile.RewriteResult result = new ProjectECustomEmcFile(file)
-                .rewriteAboveThreshold(protection(), key -> true, false);
+                .rewriteAboveThreshold(protection(), key -> true);
 
-        assertEquals(1, result.rewritten());
-        assertEquals(2, result.skipped());
+        assertEquals(3, result.rewritten());
+        assertEquals(0, result.skipped());
         JsonArray entries = readObject(file).getAsJsonArray("entries");
-        assertEquals(5000.5D, entries.get(0).getAsJsonObject().get("emc").getAsDouble(), 0.0001D);
-        assertEquals("6000", entries.get(1).getAsJsonObject().get("emc").getAsString());
+        assertTrue(entries.get(0).getAsJsonObject().get("emc").getAsLong() <= RESET_MAX,
+                "JSON 小数按 ProjectE 的 long 语义截断后参与溢出判定");
+        assertTrue(entries.get(1).getAsJsonObject().get("emc").getAsLong() <= RESET_MAX,
+                "数字字符串 EMC 与 ProjectEManualValues 口径一致，应参与溢出判定");
         assertTrue(entries.get(2).getAsJsonObject().get("emc").getAsLong() <= RESET_MAX);
     }
 
@@ -244,7 +271,7 @@ class ProjectECustomEmcFileTest {
                 """);
 
         ProjectECustomEmcFile.RewriteResult result = new ProjectECustomEmcFile(file)
-                .rewriteAboveThreshold(protection(), key -> true, false);
+                .rewriteAboveThreshold(protection(), key -> true);
 
         assertEquals(1, result.rewritten());
         assertEquals(1, result.skipped());

@@ -139,7 +139,7 @@ public record PriceExplanation(
     private static String formatSource(PriceSource source) {
         return switch (source) {
             case APPROVED -> "APPROVED（管理员批准）";
-            case EXISTING, EXTERNAL_BASELINE, RECIPE, TAG, RARITY, TIER, FALLBACK -> source.name();
+            case EXISTING, EXTERNAL_BASELINE, RECIPE, TAG, RARITY, TIER, SPECIAL_VALUE, FALLBACK -> source.name();
         };
     }
 

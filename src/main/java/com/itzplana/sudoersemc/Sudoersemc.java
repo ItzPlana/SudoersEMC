@@ -7,6 +7,7 @@ import com.itzplana.sudoersemc.config.ConfigValidationResult;
 import com.itzplana.sudoersemc.config.ConfigValidator;
 import com.itzplana.sudoersemc.config.ConfigWatcher;
 import com.itzplana.sudoersemc.config.ReloadDecision;
+import com.itzplana.sudoersemc.config.RuntimeConfigSnapshot;
 import com.itzplana.sudoersemc.config.SudoersemcConfig;
 import com.itzplana.sudoersemc.core.ItemKey;
 import com.itzplana.sudoersemc.core.OverflowScope;
@@ -38,15 +39,26 @@ import com.itzplana.sudoersemc.task.ScanDiagnostics;
 import com.itzplana.sudoersemc.task.ScanFingerprint;
 import com.itzplana.sudoersemc.task.ScanManager;
 import com.itzplana.sudoersemc.task.ScanPhase;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.tags.TagKey;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.crafting.Ingredient;
+import net.minecraft.world.item.crafting.Recipe;
+import net.minecraft.world.item.crafting.RecipeManager;
 import com.mojang.logging.LogUtils;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.stream.Stream;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
 import java.util.function.Predicate;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraftforge.common.ForgeConfigSpec;
@@ -95,6 +107,15 @@ public final class Sudoersemc {
      * 因此绝不能每次重建都新建实例。
      */
     private static final ResolverRegistry RESOLVER_REGISTRY = new ResolverRegistry();
+
+    /** 跨实例共享的重映射确认状态；配置重载会重建管线，失败保护不能随旧实例丢失。 */
+    private static final ScanPipeline.RemapTracker REMAP_TRACKER = new ScanPipeline.RemapTracker();
+
+    /** 运行时组件替换与扫描请求共用的锁。 */
+    private static final Object RUNTIME_LOCK = new Object();
+
+    /** 已应用到运行时组件的配置快照代次，用于去重同一代次的重建请求。 */
+    private static volatile long appliedSnapshotGeneration;
 
     /** 进程级 ProjectE-Integration 外部基线来源；配置关闭时改用不可用实例。 */
     private static final ExternalBaselineSource PROJECTE_INTEGRATION_BASELINE =
@@ -201,7 +222,7 @@ public final class Sudoersemc {
                 LOGGER.info("SudoersEMC wired its generated-value mapper into ProjectE");
             }
 
-            if (!rebuildRuntimeFromConfig("common-setup")) {
+            if (rebuildRuntimeFromConfig("common-setup") == ReloadDecision.REJECT) {
                 // 即使初始配置非法，也安装一个只带重载动作的命令服务，便于管理员修正配置后
                 // 通过 /sudoemc reload 或配置文件热重载恢复；扫描相关子命令会返回服务不可用。
                 commandService = new CommandService(
@@ -238,7 +259,7 @@ public final class Sudoersemc {
      * @param reason 触发原因，仅用于日志
      * @return 立即重建成功或已成功登记延迟重建时返回 {@code true}
      */
-    private static synchronized boolean rebuildRuntimeFromConfig(String reason) {
+    static synchronized ReloadDecision rebuildRuntimeFromConfig(String reason) {
         String label = reason == null || reason.isBlank() ? "unknown" : reason;
         GeneratedEntryStore store = entryStore;
         QuarantinedDropsStore quarantineStore = quarantinedDropsStore;
@@ -247,17 +268,30 @@ public final class Sudoersemc {
         if (store == null || stateStore == null || reports == null) {
             lastReloadDecision = ReloadDecision.REJECT;
             LOGGER.debug("SudoersEMC 配置重建跳过（{}）：common setup 尚未完成", label);
-            return false;
+            return ReloadDecision.REJECT;
         }
 
         ConfigValidationResult validation;
         try {
-            validation = ConfigValidator.validateCurrent();
+            // 已发布的配置快照优先：配置事件路径会把同一份快照交给重建，
+            // 此时再读取“当前 Forge 配置”既冗余又可能在测试/重载窗口中不一致。
+            validation = SudoersemcConfig.activeSnapshot() != null
+                    ? ConfigValidationResult.ok()
+                    : ConfigValidator.validateCurrent();
         } catch (RuntimeException failure) {
             lastReloadDecision = ReloadDecision.REJECT;
             LOGGER.warn("SudoersEMC 配置重建校验异常（{}），保留上一份有效配置", label, failure);
-            return false;
+            return ReloadDecision.REJECT;
         }
+        RuntimeConfigSnapshot activeSnapshot = SudoersemcConfig.activeSnapshot();
+        long generation = activeSnapshot == null ? 0L : activeSnapshot.generation();
+        if (scanPipeline != null && generation > 0L && generation <= appliedSnapshotGeneration) {
+            LOGGER.debug("SudoersEMC 配置快照 generation={} 不新于已应用 generation={}，跳过重复重建（{}）",
+                    generation, appliedSnapshotGeneration, label);
+            return lastReloadDecision == ReloadDecision.REJECT
+                    ? ReloadDecision.REJECT : ReloadDecision.APPLY_NOW;
+        }
+
         boolean scanRunning = scanManager != null && scanManager.isRunning();
         ReloadDecision decision = ReloadDecision.decide(scanRunning, validation.valid());
         lastReloadDecision = decision;
@@ -265,13 +299,13 @@ public final class Sudoersemc {
         if (decision == ReloadDecision.REJECT) {
             // fireReload 负责输出一条去重后的汇总警告，其中已包含全部警告文本。
             CONFIG_WATCHER.fireReload(validation);
-            return false;
+            return ReloadDecision.REJECT;
         }
         CONFIG_WATCHER.logConflictWarnings(validation);
         if (decision == ReloadDecision.DEFER) {
             pendingReload = true;
             LOGGER.info("SudoersEMC 扫描进行中，配置重建已延后（{}），将在扫描结束后应用", label);
-            return true;
+            return ReloadDecision.DEFER;
         }
 
         try {
@@ -282,17 +316,43 @@ public final class Sudoersemc {
             overflowPipeline = components.overflowPipeline();
             largeDropProtection = components.dropProtection();
             creativeItemProtection = components.creativeProtection();
+            appliedSnapshotGeneration = generation;
+            ScanManager previousManager = scanManager;
             scanPipeline = components.pipeline();
             scanManager = components.scanManager();
             commandService = components.commandService();
             SudoemcCommands.setService(commandService);
             pendingReload = false;
+            if (previousManager != null && previousManager != scanManager) {
+                // 旧调度器被替换后必须退役，避免遗留引用继续推进状态机。
+                previousManager.retire();
+            }
             LOGGER.info("SudoersEMC 运行时组件已重建（{}）", label);
-            return true;
+            return ReloadDecision.APPLY_NOW;
         } catch (RuntimeException failure) {
             lastReloadDecision = ReloadDecision.REJECT;
             LOGGER.warn("SudoersEMC 重建运行时组件失败（{}），保留上一份有效配置", label, failure);
-            return false;
+            return ReloadDecision.REJECT;
+        }
+    }
+
+    /**
+     * 在锁内检查当前调度器并请求扫描，避免与配置重建交错。
+     *
+     * @return 成功启动返回 {@code true}
+     */
+    static boolean requestScanSynchronized() {
+        synchronized (RUNTIME_LOCK) {
+            ScanManager current = scanManager;
+            if (current == null || current.isRunning()) {
+                return false;
+            }
+            boolean started = current.requestScan();
+            if (started && scanManager != current) {
+                current.cancel();
+                return false;
+            }
+            return started;
         }
     }
 
@@ -303,11 +363,7 @@ public final class Sudoersemc {
      * @return 立即生效、延迟到扫描结束或拒绝
      */
     private static ReloadDecision requestReload(String reason) {
-        boolean rebuilt = rebuildRuntimeFromConfig(reason);
-        if (!rebuilt) {
-            return ReloadDecision.REJECT;
-        }
-        return lastReloadDecision;
+        return rebuildRuntimeFromConfig(reason);
     }
 
     /**
@@ -324,7 +380,7 @@ public final class Sudoersemc {
         if (manager != null && manager.isRunning()) {
             return;
         }
-        if (!rebuildRuntimeFromConfig("pending-scan-end")) {
+        if (rebuildRuntimeFromConfig("pending-scan-end") == ReloadDecision.REJECT) {
             pendingReload = false;
             LOGGER.warn("SudoersEMC 扫描结束后的延迟配置重建失败，已清除待处理标记并继续使用旧组件");
         }
@@ -516,6 +572,9 @@ public final class Sudoersemc {
                 newSolveSettings);
         pipeline.setEmcProvider(OptionalIntegrationManager.provider().orElse(null));
         pipeline.setQuarantinedDropsStore(quarantineStore);
+        // Phase 23/24：五通道指纹与跨实例重映射确认必须随每次重建注入。
+        pipeline.setInputFingerprintSupplier(Sudoersemc::currentScanFingerprint);
+        pipeline.setRemapTracker(REMAP_TRACKER);
         pipeline.setConfigFingerprintSupplier(SudoersemcConfig::scanFingerprintEntries);
         pipeline.setBaselineFingerprintSupplier(Sudoersemc::baselineFingerprintEntries);
         pipeline.setExternalBaselineSource(externalBaselineSource());
@@ -670,7 +729,7 @@ public final class Sudoersemc {
         }
         return new ScanManager(
                 processor,
-                () -> collectSnapshot(pipeline),
+                () -> ScanManager.oneShot(collectSnapshot(pipeline)).begin(),
                 data -> applySnapshot(pipeline),
                 TICK_BUDGET_NANOS,
                 diagnostics,
@@ -697,6 +756,133 @@ public final class Sudoersemc {
                 LOGGER.warn("SudoersEMC 无法读取外部基线开关，按禁用处理", failure);
             }
             return ExternalBaselineSource.unavailable();
+        }
+    }
+
+    /**
+     * 计算本次扫描的完整输入指纹（五通道）。
+     *
+     * @return 非空指纹
+     * @throws IllegalStateException 服务器、配方管理器或扫描管线尚未就绪时抛出
+     */
+    static ScanFingerprint currentScanFingerprint() {
+        MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
+        if (server == null) {
+            throw new IllegalStateException("服务器尚未就绪，无法计算扫描指纹");
+        }
+        if (server.getRecipeManager() == null) {
+            throw new IllegalStateException("配方管理器尚未就绪，无法计算扫描指纹");
+        }
+        ScanPipeline pipeline = scanPipeline;
+        if (pipeline == null) {
+            throw new IllegalStateException("扫描管线尚未就绪，无法计算扫描指纹");
+        }
+        ScanFingerprint fingerprint = pipeline.collectFingerprint(server);
+        if (fingerprint == null) {
+            throw new IllegalStateException("无法计算扫描指纹");
+        }
+        return fingerprint;
+    }
+
+    /**
+     * @param enabled      是否启用自动扫描
+     * @param alwaysRescan 是否总是重扫
+     */
+    record StartupScanSettings(boolean enabled, boolean alwaysRescan) {
+
+        /**
+         * 读取启动自动扫描配置。任一读取失败都按禁用处理（fail-closed）。
+         *
+         * @param enabledSupplier      读取器
+         * @param alwaysRescanSupplier 读取器
+         * @return 启动自动扫描配置
+         */
+        static StartupScanSettings read(BooleanSupplier enabledSupplier,
+                                        BooleanSupplier alwaysRescanSupplier) {
+            try {
+                return new StartupScanSettings(
+                        enabledSupplier.getAsBoolean(), alwaysRescanSupplier.getAsBoolean());
+            } catch (RuntimeException e) {
+                LOGGER.warn("SudoersEMC 无法读取自动扫描配置，自动扫描按禁用处理", e);
+                return new StartupScanSettings(false, false);
+            }
+        }
+    }
+
+    /**
+     * 把已校验的溢出配置快照应用到扫描管线。
+     *
+     * @param pipeline 扫描管线，不能为 {@code null}
+     * @param settings 已校验的溢出配置
+     */
+    static void applyOverflowSettings(ScanPipeline pipeline,
+                                      OverflowProtection.Settings settings) {
+        pipeline.setOverflowScope(settings.scope());
+        pipeline.setProjectEFileRewriteEnabled(settings.allowProjectEFileRewrite());
+    }
+
+    /**
+     * 把配方求解与诊断报告开关应用到管线。
+     *
+     * @param pipeline        目标管线，不能为 {@code null}
+     * @param solveRecipes    是否启用配方求解
+     * @param generateReports 是否写出诊断报告
+     */
+    static void applyRuntimeSwitches(ScanPipeline pipeline,
+                                     boolean solveRecipes,
+                                     boolean generateReports) {
+        pipeline.setSolveRecipesEnabled(solveRecipes);
+        pipeline.setGenerateReportsEnabled(generateReports);
+    }
+
+    /**
+     * 判断启动缓存是否可以复用。
+     *
+     * @param stateStore  扫描状态存储，可为 {@code null}
+     * @param store       生成值存储，可为 {@code null}
+     * @param fingerprint 当前完整输入指纹，可为 {@code null}
+     * @return 可以跳过启动扫描时返回 {@code true}
+     */
+    static boolean hasReusableScanCache(@Nullable ScanStateStore stateStore,
+                                        @Nullable GeneratedEntryStore store,
+                                        @Nullable ScanFingerprint fingerprint) {
+        if (stateStore == null || store == null || fingerprint == null) {
+            return false;
+        }
+        if (store.size() <= 0 || stateStore.lastScanEpochMillis() <= 0L) {
+            return false;
+        }
+        return stateStore.matches(fingerprint);
+    }
+
+    /**
+     * 把配置中的最大允许降幅夹到 {@link LargeDropProtection.Settings} 接受的 {@code (0.0, 1.0]} 区间。
+     *
+     * @param configured 配置读取到的最大允许降幅
+     * @return 位于 {@code (0.0, 1.0]} 的可用值
+     */
+    static double sanitizeMaxAllowedDropRatio(double configured) {
+        if (!Double.isFinite(configured) || configured <= 0.0D || configured > 1.0D) {
+            return Double.MIN_VALUE;
+        }
+        return configured;
+    }
+
+    /**
+     * 统计归 SudoersEMC 所有的已生成条目数量。
+     *
+     * @param store 生成值存储，可为 {@code null}
+     * @return 自有条目数量；读取失败时按 0 处理
+     */
+    static int countOwnedGeneratedEntries(@Nullable GeneratedEntryStore store) {
+        if (store == null) {
+            return 0;
+        }
+        try {
+            return store.snapshotOwnedValues().size();
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法统计已生成条目，按 0 处理", e);
+            return 0;
         }
     }
 
@@ -1016,5 +1202,140 @@ public final class Sudoersemc {
             ScanManager scanManager,
             CommandService commandService
     ) {
+    }
+
+    /**
+     * 与生产接线一致的异步应用器：提交暂存求解并轮询完成。
+     */
+    public static final class PipelineApplier implements ScanManager.ResultApplier {
+
+        @Nullable
+        private final ScanPipeline pipeline;
+        private boolean started;
+        private boolean finished;
+
+        PipelineApplier(@Nullable ScanPipeline pipeline) {
+            this.pipeline = pipeline;
+        }
+
+        @Override
+        public void apply(ScanManager.SnapshotData data) {
+            if (finished || pipeline == null) {
+                return;
+            }
+            if (!started) {
+                started = true;
+                if (!pipeline.startStashedSolve()) {
+                    throw new IllegalStateException("扫描应用失败：没有可用的暂存快照");
+                }
+                return;
+            }
+            if (!pipeline.isSolveComplete()) {
+                return;
+            }
+            pipeline.applyCompletedSolve();
+            finished = true;
+        }
+
+        @Override
+        public boolean isComplete(ScanManager.SnapshotData data) {
+            return finished;
+        }
+
+        @Override
+        public boolean usesAsyncSolve() {
+            return true;
+        }
+
+        @Override
+        public boolean isReadyToApply(ScanManager.SnapshotData data) {
+            return pipeline != null && pipeline.isSolveComplete();
+        }
+
+        @Override
+        public void onCompleted() {
+            if (pipeline != null) {
+                pipeline.writePendingReport();
+            }
+        }
+
+        @Override
+        public void reset() {
+            if (pipeline != null) {
+                pipeline.cancelPendingSolve();
+            }
+            started = false;
+            finished = false;
+        }
+    }
+
+    /**
+     * 配方内容通道：每个配方一条稳定字符串（id + 类型 + 输入候选）。
+     *
+     * @param manager    配方管理器，可为 {@code null}
+     * @param registries 注册表访问，可为 {@code null}
+     * @return 每个配方一条稳定字符串
+     */
+    static List<String> recipeContentEntries(@Nullable RecipeManager manager,
+                                             @Nullable net.minecraft.core.RegistryAccess registries) {
+        if (manager == null) {
+            return List.of();
+        }
+        List<String> entries = new ArrayList<>();
+        for (ResourceLocation id : manager.getRecipeIds().sorted().toList()) {
+            Optional<? extends Recipe<?>> maybeRecipe = manager.byKey(id);
+            if (maybeRecipe.isEmpty()) {
+                entries.add(id + "|missing");
+                continue;
+            }
+            Recipe<?> recipe = maybeRecipe.get();
+            StringBuilder entry = new StringBuilder(id.toString())
+                    .append('|').append(recipe.getClass().getName());
+            for (Ingredient ingredient : recipe.getIngredients()) {
+                entry.append('|');
+                if (ingredient == null || ingredient.isEmpty()) {
+                    entry.append('-');
+                    continue;
+                }
+                List<String> candidates = new ArrayList<>();
+                for (ItemStack stack : ingredient.getItems()) {
+                    if (stack.isEmpty()) {
+                        continue;
+                    }
+                    ResourceLocation key = BuiltInRegistries.ITEM.getKey(stack.getItem());
+                    if (key != null) {
+                        candidates.add(key.toString());
+                    }
+                }
+                java.util.Collections.sort(candidates);
+                entry.append(String.join(",", candidates));
+            }
+            entries.add(entry.toString());
+        }
+        return List.copyOf(entries);
+    }
+
+    /**
+     * 标签成员通道：每个标签一条稳定字符串（标签 id + 排序后的成员 id）。
+     *
+     * @param tags    标签流
+     * @param members 标签成员读取器
+     * @return 每个标签一条稳定字符串
+     */
+    static List<String> tagContentEntries(Stream<TagKey<Item>> tags,
+                                          Function<TagKey<Item>, List<Item>> members) {
+        List<String> entries = new ArrayList<>();
+        tags.forEach(tag -> {
+            List<String> ids = new ArrayList<>();
+            for (Item item : members.apply(tag)) {
+                ResourceLocation id = BuiltInRegistries.ITEM.getKey(item);
+                if (id != null) {
+                    ids.add(id.toString());
+                }
+            }
+            java.util.Collections.sort(ids);
+            entries.add(tag.location() + "|" + String.join(",", ids));
+        });
+        return List.copyOf(entries);
     }
 }

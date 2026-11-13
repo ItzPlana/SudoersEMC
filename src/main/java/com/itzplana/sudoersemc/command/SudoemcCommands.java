@@ -75,6 +75,10 @@ public final class SudoemcCommands {
                 .then(Commands.literal("approve")
                         .then(Commands.argument("item", StringArgumentType.string())
                                 .executes(SudoemcCommands::approve)))
+                .then(Commands.literal("quarantine")
+                        .then(Commands.literal("approve")
+                                .then(Commands.argument("item", StringArgumentType.greedyString())
+                                        .executes(SudoemcCommands::approve))))
                 .then(Commands.literal("cancel")
                         .executes(context -> execute(context.getSource(), CommandService::cancel)));
     }

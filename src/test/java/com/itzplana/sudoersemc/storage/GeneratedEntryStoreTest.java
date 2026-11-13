@@ -349,6 +349,32 @@ class GeneratedEntryStoreTest {
                 "首次写入失败后，下一次成功写入仍必须重新生成 .bak");
     }
 
+    @Test
+    void variantNbtsSurviveReloadAndStayOwnedOnly() throws IOException {
+        Path file = tempDir.resolve(GeneratedEntryStore.FILE_NAME);
+        GeneratedEntryStore store = new GeneratedEntryStore(file);
+        ItemKey ownedKey = ItemKey.of(STONE, "{Marker:1}");
+        ItemKey externalKey = ItemKey.of(DIRT, "{Marker:2}");
+        String rawA = "{Marker:1,display:{Name:\"a\"}}";
+        String rawB = "{Marker:1,display:{Name:\"b\"}}";
+
+        assertTrue(store.stage(new GeneratedEmcEntry(
+                        ownedKey, 5L, PriceSource.RECIPE, null, true, 1L),
+                List.of(rawB, rawA, rawA, " ")));
+        assertTrue(store.stage(new GeneratedEmcEntry(
+                        externalKey, 3L, PriceSource.EXTERNAL_BASELINE, null, false, 2L),
+                List.of("{Marker:2}")));
+        store.save();
+
+        GeneratedEntryStore reloaded = new GeneratedEntryStore(file);
+        reloaded.load();
+
+        assertEquals(List.of(rawA, rawB), reloaded.snapshotOwnedVariantNbts().get(ownedKey),
+                "原始 SNBT 必须排序、去重并跨重启保留");
+        assertFalse(reloaded.snapshotOwnedVariantNbts().containsKey(externalKey),
+                "非自有条目的 NBT 注册信息不得暴露给映射器");
+    }
+
     private boolean anyBackupContains(String marker) throws IOException {
         List<Path> backups;
         try (Stream<Path> files = Files.list(tempDir)) {

@@ -17,6 +17,8 @@ public enum PriceSource {
     RARITY,
     /** Computed from an explicit tier rule. */
     TIER,
+    /** Explicit fixed value from {@code safety.creativeItemSpecialValues}. */
+    SPECIAL_VALUE,
     /** Generic configurable fallback value. */
     FALLBACK,
     /**

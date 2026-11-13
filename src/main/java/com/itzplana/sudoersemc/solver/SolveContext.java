@@ -6,16 +6,22 @@ import java.util.Collections;
 import java.util.Map;
 import java.util.NavigableMap;
 import java.util.Objects;
+import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import net.minecraft.resources.ResourceLocation;
 import org.jetbrains.annotations.Nullable;
 
 /**
  * 一次求解运行的可变工作状态，同时实现 {@link EmcLookup} 以便直接交给评估器。
  *
- * <p>状态分为两层：{@code knownValues} 是运行开始前就存在的 EMC 快照，整个运行期间只读；
- * {@code generatedValues} 是本次运行产出的值。查找时生成值优先于已有值，但在发布阶段求解器会
- * 先检查 {@link #hasSeedValue(ItemKey)}，因此已有 EMC 永远不会被覆盖。</p>
+ * <p>状态分为三层：{@code knownValues} 是运行开始前就存在的 EMC 快照，整个运行期间只读；
+ * {@code provisionalValues} 是为自有叶子条目预置的兜底定价，只参与输入查找、不会阻止配方覆盖；
+ * {@code generatedValues} 是本次运行产出的值。查找时生成值优先于预置值，预置值优先于已有值，
+ * 但在发布阶段求解器会先检查 {@link #hasSeedValue(ItemKey)}，因此已有 EMC 永远不会被覆盖。</p>
+ *
+ * <p>{@code deniedItems} 是安全层禁止定价的物品集合：查找时一律返回 {@code 0}，求解器也不会为它们
+ * 发布生成值。这样被排除物品的数值不会作为下游配方的输入，避免绕过创造物品保护。</p>
  *
  * <p>该类不做线程安全承诺；求解在单个线程内完成。物品映射使用 {@link TreeMap}，保证诊断输出顺序
  * 只取决于物品身份，而不依赖哈希表迭代顺序。</p>
@@ -23,6 +29,8 @@ import org.jetbrains.annotations.Nullable;
 public final class SolveContext implements EmcLookup {
 
     private final Map<ItemKey, Long> knownValues;
+    private final Set<ItemKey> deniedItems;
+    private final NavigableMap<ItemKey, Long> provisionalValues = new TreeMap<>();
     private final NavigableMap<ItemKey, Long> generatedValues = new TreeMap<>();
     private final NavigableMap<ItemKey, SolveTrace> traces = new TreeMap<>();
     private int currentPass = 1;
@@ -35,6 +43,19 @@ public final class SolveContext implements EmcLookup {
      * @param knownValues 运行开始前已存在的 EMC；允许为空
      */
     public SolveContext(Map<ItemKey, Long> knownValues) {
+        this(knownValues, Set.of());
+    }
+
+    /**
+     * 使用已有 EMC 快照与禁止定价物品集合创建上下文。
+     *
+     * <p>已有值只保留正值：EMC 为 0 或负数的条目等同于“没有值”，保留它们会错误地遮蔽后续配方计算。
+     * 禁止定价物品既不能作为评估器输入，也不会被求解器发布。</p>
+     *
+     * @param knownValues 运行开始前已存在的 EMC；允许为空
+     * @param deniedItems 安全层禁止定价的物品；允许为空
+     */
+    public SolveContext(Map<ItemKey, Long> knownValues, Set<? extends ItemKey> deniedItems) {
         Objects.requireNonNull(knownValues, "knownValues");
         NavigableMap<ItemKey, Long> copy = new TreeMap<>();
         for (Map.Entry<ItemKey, Long> entry : knownValues.entrySet()) {
@@ -45,6 +66,39 @@ public final class SolveContext implements EmcLookup {
             }
         }
         this.knownValues = Collections.unmodifiableMap(copy);
+
+        Set<ItemKey> deniedCopy = new TreeSet<>();
+        if (deniedItems != null) {
+            for (ItemKey item : deniedItems) {
+                deniedCopy.add(Objects.requireNonNull(item, "deniedItems 的元素不能为 null"));
+            }
+        }
+        this.deniedItems = Collections.unmodifiableSet(deniedCopy);
+    }
+
+    /**
+     * 使用已有 EMC 快照与“本次运行开始时已由本模组拥有”的生成值创建上下文。
+     *
+     * <p>owned 值放入 {@code generatedValues} 而不是 {@code knownValues}：它们仍是本次求解的
+     * 生成值，求解器可以在新配方成本更低时替换它们，也不会被 {@link #hasSeedValue(ItemKey)}
+     * 当成永远胜出的种子。旧值到新值的降价/溢出保护由调用方在写入前执行。</p>
+     *
+     * @param knownValues             运行开始前由外部来源提供的 EMC；允许为空
+     * @param initialGeneratedValues  运行开始前由本模组拥有、允许本次更新的生成值；允许为空
+     */
+    public SolveContext(Map<ItemKey, Long> knownValues,
+                        Map<ItemKey, Long> initialGeneratedValues) {
+        this(knownValues);
+        Objects.requireNonNull(initialGeneratedValues, "initialGeneratedValues");
+        for (Map.Entry<ItemKey, Long> entry : initialGeneratedValues.entrySet()) {
+            ItemKey item = Objects.requireNonNull(
+                    entry.getKey(), "initialGeneratedValues 的键不能为 null");
+            Long value = Objects.requireNonNull(
+                    entry.getValue(), "initialGeneratedValues 的值不能为 null");
+            if (value > 0L) {
+                generatedValues.put(item, value);
+            }
+        }
     }
 
     /**
@@ -61,12 +115,16 @@ public final class SolveContext implements EmcLookup {
      */
     @Override
     public long emcOf(ItemKey item) {
-        if (item == null) {
+        if (item == null || deniedItems.contains(item)) {
             return 0L;
         }
         Long generated = generatedValues.get(item);
         if (generated != null) {
             return generated;
+        }
+        Long provisional = provisionalValues.get(item);
+        if (provisional != null) {
+            return provisional;
         }
         return knownValues.getOrDefault(item, 0L);
     }
@@ -84,6 +142,20 @@ public final class SolveContext implements EmcLookup {
      */
     public boolean hasSeedValue(ItemKey item) {
         return item != null && knownValues.containsKey(item);
+    }
+
+    /**
+     * @return {@code true} 当物品被安全层禁止定价，求解器不得发布其数值
+     */
+    public boolean isDenied(ItemKey item) {
+        return item != null && deniedItems.contains(item);
+    }
+
+    /**
+     * @return 禁止定价物品的只读集合，按 {@link ItemKey} 升序排列
+     */
+    public Set<ItemKey> deniedItems() {
+        return deniedItems;
     }
 
     /**
@@ -106,6 +178,32 @@ public final class SolveContext implements EmcLookup {
      */
     public Map<ItemKey, Long> generatedValues() {
         return Collections.unmodifiableMap(generatedValues);
+    }
+
+    /**
+     * 预置一个仅供输入查找使用的兜底值。
+     *
+     * <p>预置值与 {@code knownValues} 的区别：它不会让 {@link #hasSeedValue(ItemKey)} 返回
+     * {@code true}，因此求解器仍可为同一物品发布配方值并覆盖预置值；它也不会出现在
+     * {@link #generatedValues()} 中，最终候选仍由调用方按兜底定价链生成。该能力用于把自有
+     * 叶子条目的新鲜兜底价传给同一轮的多级配方链。</p>
+     *
+     * @param item  物品身份，不能为 {@code null}
+     * @param value 兜底值，必须 {@code > 0}
+     */
+    public void putProvisional(ItemKey item, long value) {
+        Objects.requireNonNull(item, "item");
+        if (value <= 0L) {
+            throw new IllegalArgumentException("预置值必须 > 0，实际为 " + value);
+        }
+        provisionalValues.put(item, value);
+    }
+
+    /**
+     * @return 预置值的只读视图，按 {@link ItemKey} 升序排列
+     */
+    public Map<ItemKey, Long> provisionalValues() {
+        return Collections.unmodifiableMap(provisionalValues);
     }
 
     /**
@@ -172,6 +270,10 @@ public final class SolveContext implements EmcLookup {
         }
         if (pass < 1) {
             throw new IllegalArgumentException("轮次必须从 1 开始，实际为 " + pass);
+        }
+        if (deniedItems.contains(item)) {
+            // 被安全层排除的物品不得进入生成值，否则后续 pass 会把它当作下游输入。
+            return;
         }
         generatedValues.put(item, value);
         traces.put(item, new SolveTrace(item, value, source, recipeId, pass, alternativeCosts));
