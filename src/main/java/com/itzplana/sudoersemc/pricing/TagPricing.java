@@ -52,27 +52,30 @@ public final class TagPricing {
     /**
      * 保守的材料类别基准值。
      *
-     * <p>这些数值只是让未定价物品落入合理量级的锚点，并不代表同一类别内所有材料价值相同；
-     * 精确到材料的覆盖值后续由配置提供。默认不包含任何按物品覆盖。</p>
+     * <p>默认值取低阶锭 {@code 64} 作为保守下限，并按 9 倍关系对齐粒与储存块：
+     * {@code NUGGET = INGOT / 9}、{@code STORAGE_BLOCK = INGOT * 9}，避免在默认锚点内部
+     * 产生“9 锭 → 1 块”的套利。其余类别同样按锭的分数或倍数取值，而不是直接采用铁系
+     * 真实值 {@code 256/2304}。精确到材料的覆盖值后续由配置提供；默认不包含任何按物品覆盖。</p>
      *
-     * <p><strong>风险提示：</strong>默认锚点按铁系基准取值，而 {@link MaterialCategory} 是跨材料
-     * 共享的。廉价可再生的模组材料（例如铜、锡）可能因此被高估；当 ProjectE 已为原料定价、
-     * 但未为对应块定价时，存在“低价原料 → 高价块”的套利可能。生产环境启用前应通过按物品
+     * <p><strong>风险提示：</strong>{@link MaterialCategory} 是跨材料共享的。廉价可再生的
+     * 模组材料（例如铜、锡）仍可能相对 ProjectE 的真实值被高估；当 ProjectE 已为原料定价、
+     * 但未为对应块定价时，仍存在“低价原料 → 高价块”的套利可能。生产环境启用前应通过按物品
      * 覆盖值或 ProjectE 手动值校正相关材料；本类目前没有按标签/材料的配置入口。</p>
      *
      * @return 使用默认类别基准值的标签定价器
      */
     public static TagPricing defaults() {
         EnumMap<MaterialCategory, Long> baseValues = new EnumMap<>(MaterialCategory.class);
-        baseValues.put(MaterialCategory.INGOT, 256L);
-        baseValues.put(MaterialCategory.NUGGET, 28L);
-        baseValues.put(MaterialCategory.STORAGE_BLOCK, 2304L);
-        baseValues.put(MaterialCategory.GEM, 512L);
-        baseValues.put(MaterialCategory.DUST, 64L);
-        baseValues.put(MaterialCategory.RAW_MATERIAL, 128L);
-        baseValues.put(MaterialCategory.PLATE, 256L);
-        baseValues.put(MaterialCategory.ROD, 128L);
-        baseValues.put(MaterialCategory.ORE, 128L);
+        long ingot = 64L;
+        baseValues.put(MaterialCategory.INGOT, ingot);
+        baseValues.put(MaterialCategory.NUGGET, ingot / 9L);
+        baseValues.put(MaterialCategory.STORAGE_BLOCK, ingot * 9L);
+        baseValues.put(MaterialCategory.GEM, ingot * 2L);
+        baseValues.put(MaterialCategory.DUST, ingot / 4L);
+        baseValues.put(MaterialCategory.RAW_MATERIAL, ingot / 2L);
+        baseValues.put(MaterialCategory.PLATE, ingot);
+        baseValues.put(MaterialCategory.ROD, ingot / 2L);
+        baseValues.put(MaterialCategory.ORE, ingot / 2L);
         return new TagPricing(baseValues, Map.of());
     }
 

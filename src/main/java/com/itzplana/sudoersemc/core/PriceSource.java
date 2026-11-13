@@ -18,5 +18,7 @@ public enum PriceSource {
     /** Computed from an explicit tier rule. */
     TIER,
     /** Generic configurable fallback value. */
-    FALLBACK
+    FALLBACK,
+    /** Administrator explicitly approved a previously quarantined large price drop. */
+    APPROVED
 }
