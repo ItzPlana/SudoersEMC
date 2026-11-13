@@ -9,7 +9,6 @@ import com.itzplana.sudoersemc.config.ConfigWatcher;
 import com.itzplana.sudoersemc.config.ReloadDecision;
 import com.itzplana.sudoersemc.config.SudoersemcConfig;
 import com.itzplana.sudoersemc.core.ItemKey;
-import com.itzplana.sudoersemc.core.OverflowScope;
 import com.itzplana.sudoersemc.diagnostic.DebugLog;
 import com.itzplana.sudoersemc.diagnostic.ReportManager;
 import com.itzplana.sudoersemc.diagnostic.SmokeTestHook;
@@ -43,14 +42,18 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraftforge.common.ForgeConfigSpec;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.RegisterCommandsEvent;
+import net.minecraftforge.event.AddReloadListenerEvent;
+import net.minecraftforge.event.TagsUpdatedEvent;
 import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.event.server.ServerStartedEvent;
 import net.minecraftforge.event.server.ServerStoppingEvent;
@@ -101,6 +104,9 @@ public final class Sudoersemc {
 
     private static final AtomicBoolean BASELINE_CONFIG_WARNED = new AtomicBoolean(false);
 
+    /** datapack/reload 代次；扫描开始时读取一次，采集/求解/应用前只比较该值。 */
+    private static final AtomicLong DATAPACK_RELOAD_GENERATION = new AtomicLong();
+
     static {
         CONFIG_WATCHER.register(result -> rebuildRuntimeFromConfig("config-event"));
     }
@@ -131,6 +137,8 @@ public final class Sudoersemc {
         MinecraftForge.EVENT_BUS.addListener(this::onServerTick);
         MinecraftForge.EVENT_BUS.addListener(this::onServerStarted);
         MinecraftForge.EVENT_BUS.addListener(this::onServerStopping);
+        MinecraftForge.EVENT_BUS.addListener(this::onAddReloadListener);
+        MinecraftForge.EVENT_BUS.addListener(this::onTagsUpdated);
         MinecraftForge.EVENT_BUS.addListener(SmokeTestHook::onServerTick);
 
         // 真正的“解析前迁移”：Forge 会在 ModConfigEvent 之前按 spec 重写 TOML（补 schemaVersion、
@@ -537,18 +545,15 @@ public final class Sudoersemc {
         applyDebugLogging(readBoolean(
                 "diagnostic.debugLogging", SudoersemcConfig.DIAGNOSTIC_DEBUG_LOGGING, false));
 
-        OverflowScope overflowScope = OverflowScope.OWNED_ONLY;
-        boolean allowProjectEFileRewrite = false;
+        OverflowProtection.Settings overflowSettings;
         try {
-            overflowScope = SudoersemcConfig.parseOverflowScope(
-                    SudoersemcConfig.OVERFLOW_OVERWRITE_SCOPE.get());
-            allowProjectEFileRewrite = SudoersemcConfig.OVERFLOW_ALLOW_PROJECTE_FILE_REWRITE.get();
+            overflowSettings = SudoersemcConfig.overflowSettings();
         } catch (RuntimeException e) {
             // 配置尚未加载或读取失败时回退到最保守的组合，绝不阻止模组启动。
-            LOGGER.warn("SudoersEMC 无法读取溢出作用域配置，回退 owned_only 并禁用 ProjectE 文件改写", e);
+            LOGGER.warn("SudoersEMC 无法读取溢出配置，回退安全默认值", e);
+            overflowSettings = new OverflowProtection.Settings();
         }
-        pipeline.setOverflowScope(overflowScope);
-        pipeline.setProjectEFileRewriteEnabled(allowProjectEFileRewrite);
+        applyOverflowSettings(pipeline, overflowSettings);
         pipeline.setSolveRecipesEnabled(readBoolean(
                 "recipe.solveRecipes", SudoersemcConfig.RECIPE_SOLVE_RECIPES, true));
         pipeline.setGenerateReportsEnabled(readBoolean(
@@ -572,6 +577,47 @@ public final class Sudoersemc {
         pipeline.setManualValueDetectorSupplier(
                 () -> OptionalIntegrationManager.manualValues().snapshotPredicate());
         return pipeline;
+    }
+
+    /**
+     * 把已校验的溢出配置快照应用到扫描管线。
+     *
+     * @param pipeline 扫描管线，不能为 {@code null}
+     * @param settings 已校验的溢出配置，不能为 {@code null}
+     */
+    static void applyOverflowSettings(ScanPipeline pipeline,
+                                      OverflowProtection.Settings settings) {
+        Objects.requireNonNull(pipeline, "pipeline");
+        Objects.requireNonNull(settings, "settings");
+        pipeline.setOverflowScope(settings.scope());
+        pipeline.setProjectEFileRewriteEnabled(settings.allowProjectEFileRewrite());
+    }
+
+    /**
+     * 生产指纹提供器：完整指纹用于启动缓存；扫描期间使用廉价的 datapack reload 代次。
+     */
+    private static ScanManager.FingerprintSupplier scanFingerprintSupplier(ScanPipeline pipeline) {
+        return new ScanManager.FingerprintSupplier() {
+            @Override
+            public ScanFingerprint current() {
+                ScanFingerprint fingerprint = pipeline.collectFingerprint(
+                        ServerLifecycleHooks.getCurrentServer());
+                if (fingerprint == null) {
+                    throw new IllegalStateException("服务器或配方管理器尚未就绪，无法计算扫描指纹");
+                }
+                return fingerprint;
+            }
+
+            @Override
+            public long reloadGeneration() {
+                return DATAPACK_RELOAD_GENERATION.get();
+            }
+
+            @Override
+            public boolean tracksReloadGeneration() {
+                return true;
+            }
+        };
     }
 
     /**
@@ -667,7 +713,7 @@ public final class Sudoersemc {
         // 调度器与管线共享同一个取消令牌：cancel() 后采集/求解/应用循环都能在检查点提前退出。
         ScanCancellation cancellation = new ScanCancellation();
         pipeline.setCancellationCheck(cancellation::isRequested);
-        return new ScanManager(
+        ScanManager manager = new ScanManager(
                 processor,
                 () -> pipeline.beginCollect(ServerLifecycleHooks.getCurrentServer()),
                 (snapshot, outcome) -> {
@@ -689,6 +735,8 @@ public final class Sudoersemc {
                 solveOffThread,
                 pipeline::stash,
                 pipeline::beginScanCycle);
+        manager.setFingerprintSupplier(scanFingerprintSupplier(pipeline));
+        return manager;
     }
 
     /**
@@ -802,6 +850,26 @@ public final class Sudoersemc {
     private void onRegisterCommands(RegisterCommandsEvent event) {
         event.getDispatcher().register(SudoemcCommands.register());
         LOGGER.debug("SudoersEMC registered /sudoemc command tree");
+    }
+
+    /**
+     * datapack/reload 开始：递增扫描输入的 reload 代次。
+     */
+    private void onAddReloadListener(AddReloadListenerEvent event) {
+        recordDatapackReload();
+    }
+
+    /**
+     * 资源重载完成（服务端数据加载）：再次递增代次，覆盖“扫描在 reload 进行中开始”的窗口。
+     */
+    private void onTagsUpdated(TagsUpdatedEvent event) {
+        if (event.getUpdateCause() == TagsUpdatedEvent.UpdateCause.SERVER_DATA_LOAD) {
+            recordDatapackReload();
+        }
+    }
+
+    private static void recordDatapackReload() {
+        DATAPACK_RELOAD_GENERATION.incrementAndGet();
     }
 
     private void onServerTick(TickEvent.ServerTickEvent event) {

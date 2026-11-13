@@ -2250,6 +2250,22 @@ public final class ScanPipeline {
     }
 
     /**
+     * 批准某个物品当前的内存隔离决策。
+     *
+     * <p>命令层在批准持久化记录后调用本方法，确保 {@link LargeDropProtection#approve} 有生产
+     * 调用方；返回的决策只用于诊断与回执，数值应用由命令层依据持久化记录完成。</p>
+     *
+     * @param item 被批准物品；{@code null} 会被忽略
+     * @return 本次从内存隔离列表移除的决策，按加入顺序排列
+     */
+    public List<PriceDropDecision> approveQuarantined(@Nullable ItemKey item) {
+        if (item == null) {
+            return List.of();
+        }
+        return dropProtection.approve(item);
+    }
+
+    /**
      * 把一次被隔离的降价写入持久化隔离记录。
      *
      * <p>干跑模式（生成条目存储为 {@code null}）或未注入隔离存储时不产生任何磁盘写入，原有

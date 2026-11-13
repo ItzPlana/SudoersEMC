@@ -18,6 +18,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -33,6 +34,10 @@ class ScanManagerTest {
 
     private static ScanManager.SnapshotData data(int itemCount, int recipeCount) {
         return new ScanManager.SnapshotData("主世界", itemCount, recipeCount);
+    }
+
+    private static ScanFingerprint fingerprint(String itemId) {
+        return ScanFingerprint.of(List.of(itemId), List.of(), List.of(), List.of(), List.of());
     }
 
     private static ScanManager manager(BatchProcessor processor,
@@ -385,6 +390,81 @@ class ScanManagerTest {
         }
         assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
         assertEquals(1, applied.get(), "应用回调只能执行一次");
+        worker.shutdownNow();
+    }
+
+    @Test
+    void reloadGenerationChangeDuringCollectionFailsScan() {
+        AtomicLong generation = new AtomicLong();
+        SolveWorker worker = new SolveWorker(snapshot -> emptyOutcome());
+        AtomicInteger applied = new AtomicInteger();
+        ScanManager manager = pipelineManager(worker, false,
+                pipelineSession(5, 0, new AtomicInteger()), applied);
+        manager.setFingerprintSupplier(new ScanManager.FingerprintSupplier() {
+            @Override
+            public ScanFingerprint current() {
+                return fingerprint("minecraft:stone");
+            }
+
+            @Override
+            public long reloadGeneration() {
+                return generation.get();
+            }
+
+            @Override
+            public boolean tracksReloadGeneration() {
+                return true;
+            }
+        });
+
+        assertTrue(manager.requestScan());
+        manager.tick();
+        assertEquals(ScanPhase.COLLECTING_SNAPSHOT, manager.progress().phase());
+        generation.incrementAndGet();
+
+        int ticks = 0;
+        while (manager.isRunning() && ticks < TICK_GUARD) {
+            manager.tick();
+            ticks++;
+        }
+
+        assertEquals(ScanPhase.FAILED, manager.progress().phase());
+        assertTrue(manager.progress().detail().contains("reload 代次"),
+                "失败详情应标明 reload 代次变化：" + manager.progress().detail());
+        assertEquals(0, applied.get(), "reload 变化后不得应用任何候选");
+        worker.shutdownNow();
+    }
+
+    @Test
+    void fingerprintChangeAfterCollectionFailsScan() {
+        AtomicReference<ScanFingerprint> current =
+                new AtomicReference<>(fingerprint("minecraft:stone"));
+        SolveWorker worker = new SolveWorker(snapshot -> emptyOutcome());
+        AtomicInteger applied = new AtomicInteger();
+        ScanManager manager = pipelineManager(worker, false,
+                pipelineSession(5, 0, new AtomicInteger()), applied);
+        manager.setFingerprintSupplier(new ScanManager.FingerprintSupplier() {
+            @Override
+            public ScanFingerprint current() {
+                return current.get();
+            }
+        });
+
+        assertTrue(manager.requestScan());
+        manager.tick();
+        assertEquals(ScanPhase.COLLECTING_SNAPSHOT, manager.progress().phase());
+        current.set(fingerprint("minecraft:dirt"));
+
+        int ticks = 0;
+        while (manager.isRunning() && ticks < TICK_GUARD) {
+            manager.tick();
+            ticks++;
+        }
+
+        assertEquals(ScanPhase.FAILED, manager.progress().phase());
+        assertTrue(manager.progress().detail().contains("快照采集完成时扫描输入发生变化"),
+                "失败详情应标明采集完成时输入变化：" + manager.progress().detail());
+        assertEquals(0, applied.get(), "输入变化后不得应用任何候选");
         worker.shutdownNow();
     }
 

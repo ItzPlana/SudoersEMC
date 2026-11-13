@@ -147,8 +147,8 @@ class ScanPipelineTest {
         assertEquals(0, store.size());
 
         String report = Files.readString(reportManager.reportFile());
-        assertTrue(hasCounterLine(report, "已有 EMC", 1L),
-                "诊断报告应记录一个已有 EMC 的物品");
+        assertTrue(hasCounterLine(report, "受保护的非自有既有值", 1L),
+                "诊断报告应记录一个受保护的非自有既有值");
     }
 
     @Test
@@ -260,6 +260,32 @@ class ScanPipelineTest {
         assertEquals(1, dropProtection.quarantineCount());
         assertEquals(1_000L, store.snapshotAll().get(RESULT).value(),
                 "被隔离的降价不得覆盖旧值");
+    }
+
+    @Test
+    void approveQuarantinedRemovesPendingDecision() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_drop_approve.json"));
+        store.stage(new GeneratedEmcEntry(RESULT, 1_000L, PriceSource.RECIPE, null, true, 0L));
+        LargeDropProtection dropProtection =
+                new LargeDropProtection(LargeDropProtection.Settings.defaults());
+
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 100L), item(RESULT, 0L)),
+                List.of(recipe(INGOT, RESULT)),
+                Map.of(INGOT, 100L));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, dropProtection, null, null, disabledFallback());
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1, result.quarantined());
+        assertEquals(1, dropProtection.quarantineCount());
+        var approved = pipeline.approveQuarantined(RESULT);
+        assertEquals(1, approved.size(), "审批必须返回被移除的隔离决策");
+        assertEquals(0, dropProtection.quarantineCount(), "审批后内存隔离记录必须被移除");
+        assertTrue(dropProtection.isApproved(RESULT));
+        assertTrue(pipeline.approveQuarantined(null).isEmpty(), "null 物品必须安全忽略");
     }
 
     @Test
@@ -673,7 +699,7 @@ class ScanPipelineTest {
         assertEquals(1, result.applied());
         GeneratedEmcEntry staged = store.snapshotAll().get(RESULT);
         assertNotNull(staged);
-        assertEquals(256L, staged.value(), "forge:ingots/iron 应命中默认 INGOT 锚点");
+        assertEquals(64L, staged.value(), "forge:ingots/iron 应命中保守默认 INGOT 锚点");
         assertEquals(PriceSource.TAG, staged.source());
     }
 
@@ -723,7 +749,7 @@ class ScanPipelineTest {
         assertNotNull(gear);
         assertEquals(PriceSource.RECIPE, ingot.source());
         assertEquals(PriceSource.RECIPE, gear.source());
-        assertEquals(128L, ingot.value(), "forge:ores/test 应命中默认 ORE 锚点");
+        assertEquals(32L, ingot.value(), "forge:ores/test 应命中保守默认 ORE 锚点");
         assertEquals(4L * ingot.value(), gear.value(),
                 "齿轮值必须等于 4 倍锭值，证明兜底值已沿链传播");
     }
@@ -824,7 +850,7 @@ class ScanPipelineTest {
     }
 
     @Test
-    void entireScopeWithRewriteEnabledRewritesAboveThresholdEntries() throws IOException {
+    void entireScopeWithRewriteEnabledRewritesOnlyOwnedAboveThresholdEntries() throws IOException {
         Path customEmc = writeCustomEmc("enabled_custom_emc.json");
         GeneratedEntryStore store = customEmcStore();
         OverflowResetLog resetLog = new OverflowResetLog(
@@ -837,8 +863,8 @@ class ScanPipelineTest {
 
         PipelineResult result = pipeline.solveAndApply(PipelineSnapshot.empty());
 
-        assertEquals(2, result.overflowResets());
-        assertEquals(2, resetLog.entries().size());
+        assertEquals(1, result.overflowResets(), "只有自有超限条目会被改写");
+        assertEquals(1, resetLog.entries().size());
         for (OverflowReset reset : resetLog.entries()) {
             assertEquals(OverflowScope.ENTIRE_CUSTOM_EMC, reset.scope());
             assertEquals(1_000L, reset.threshold());
@@ -853,8 +879,7 @@ class ScanPipelineTest {
         long manual = entries.get(1).getAsJsonObject().get("emc").getAsLong();
         long below = entries.get(2).getAsJsonObject().get("emc").getAsLong();
         assertTrue(owned >= 100L && owned <= 900L, "自有超限条目必须回落");
-        assertTrue(manual >= 100L && manual <= 900L,
-                "ENTIRE_CUSTOM_EMC 是显式 opt-in，非自有超限条目也应改写");
+        assertEquals(4_000L, manual, "管理员手动条目永不改写");
         assertEquals(1_000L, below, "等于阈值的条目不得改写");
         assertEquals(1L, countBackups(customEmc));
     }

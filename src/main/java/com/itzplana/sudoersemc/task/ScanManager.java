@@ -112,6 +112,39 @@ public final class ScanManager {
     }
 
     /**
+     * 当前扫描输入的指纹与 reload 代次提供器，必须在服务器线程执行。
+     *
+     * <p>实现若可通过 Forge 的 {@code AddReloadListenerEvent}/{@code TagsUpdatedEvent} 等
+     * 廉价来源维护单调递增的 reload 代次，应覆写 {@link #tracksReloadGeneration()} 与
+     * {@link #reloadGeneration()}。此时扫描只在开始时读取一次代次，采集完成、求解完成与
+     * 应用前都用代次比较，不再重复计算全量内容指纹。</p>
+     */
+    @FunctionalInterface
+    public interface FingerprintSupplier {
+
+        /**
+         * @return 当前输入的完整指纹，不能为 {@code null}
+         */
+        ScanFingerprint current();
+
+        /**
+         * 廉价、单调递增的 reload 代次。每次 datapack reload（开始与完成）都应递增。
+         *
+         * @return 当前代次
+         */
+        default long reloadGeneration() {
+            return 0L;
+        }
+
+        /**
+         * @return {@code true} 表示 {@link #reloadGeneration()} 能廉价反映 reload 变化
+         */
+        default boolean tracksReloadGeneration() {
+            return false;
+        }
+    }
+
+    /**
      * 传统回调之间传递的最小数据载体。
      *
      * @param label       快照来源或批次的中文标签
@@ -153,6 +186,15 @@ public final class ScanManager {
     /** 新扫描开始时清空管线上一轮的报告状态；可为 {@code null}。 */
     @Nullable
     private final Runnable scanStartHook;
+
+    /** 可选的输入一致性校验；{@code null} 时保持仅供单元测试使用的跳过语义。 */
+    @Nullable
+    private volatile FingerprintSupplier fingerprintSupplier;
+    private boolean reloadTracking;
+    @Nullable
+    private ScanFingerprint collectFingerprintBefore;
+    private long collectReloadGeneration;
+    private boolean inputSnapshotCaptured;
 
     private volatile ScanProgress progress = ScanProgress.idle();
     private final ScanCancellation cancellation;
@@ -330,6 +372,15 @@ public final class ScanManager {
     }
 
     /**
+     * 设置扫描输入指纹提供器。生产接线必须提供非 {@code null} 实现；测试可保持默认值。
+     *
+     * @param supplier 指纹与 reload 代次提供器，可为 {@code null}
+     */
+    public void setFingerprintSupplier(@Nullable FingerprintSupplier supplier) {
+        this.fingerprintSupplier = supplier;
+    }
+
+    /**
      * 请求开始一次新扫描。
      *
      * @return 成功开始返回 {@code true}；已有扫描在运行返回 {@code false}
@@ -344,6 +395,9 @@ public final class ScanManager {
         pipelineSnapshot = null;
         collectSession = null;
         solveOutcome = null;
+        inputSnapshotCaptured = false;
+        collectFingerprintBefore = null;
+        collectReloadGeneration = 0L;
         lastBatchNanos = 0L;
         diagnostics.reset();
         diagnostics.recordMemory();
@@ -537,9 +591,58 @@ public final class ScanManager {
         pipelineSnapshot = null;
         collectSession = null;
         solveOutcome = null;
+        inputSnapshotCaptured = false;
+        collectFingerprintBefore = null;
+        collectReloadGeneration = 0L;
         lastBatchNanos = 0L;
         diagnostics.reset();
         progress = ScanProgress.idle();
+    }
+
+    /**
+     * 在首次采集前捕获输入基线：优先使用廉价 reload 代次，否则退化为完整指纹。
+     */
+    private void captureInputsIfNeeded() {
+        if (inputSnapshotCaptured) {
+            return;
+        }
+        inputSnapshotCaptured = true;
+        FingerprintSupplier supplier = fingerprintSupplier;
+        if (supplier == null) {
+            return;
+        }
+        reloadTracking = supplier.tracksReloadGeneration();
+        if (reloadTracking) {
+            collectReloadGeneration = supplier.reloadGeneration();
+        } else {
+            collectFingerprintBefore = Objects.requireNonNull(
+                    supplier.current(), "扫描指纹不能为 null");
+        }
+    }
+
+    /**
+     * 校验扫描输入在采集/求解/应用期间没有变化。
+     *
+     * @param message 失败时写入扫描进度的中文原因
+     */
+    private void verifyInputsUnchanged(String message) {
+        FingerprintSupplier supplier = fingerprintSupplier;
+        if (supplier == null) {
+            return;
+        }
+        if (reloadTracking) {
+            long current = supplier.reloadGeneration();
+            if (current != collectReloadGeneration) {
+                throw new IllegalStateException(message
+                        + "（reload 代次 " + collectReloadGeneration + " -> " + current + "）");
+            }
+        } else {
+            ScanFingerprint current = Objects.requireNonNull(
+                    supplier.current(), "扫描指纹不能为 null");
+            if (!Objects.equals(current, collectFingerprintBefore)) {
+                throw new IllegalStateException(message);
+            }
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -547,6 +650,7 @@ public final class ScanManager {
     // ---------------------------------------------------------------------
 
     private void collectStep(int batch) {
+        captureInputsIfNeeded();
         if (snapshot == null) {
             SnapshotData collected = collector.collect();
             if (collected == null) {
@@ -573,6 +677,7 @@ public final class ScanManager {
     }
 
     private void beginSolving() {
+        verifyInputsUnchanged("快照采集期间扫描输入发生变化");
         SnapshotData data = snapshot;
         int total = data == null ? 0 : data.recipeCount();
         progress = progress.advance(ScanPhase.SOLVING, 0, total, "开始求解配方");
@@ -595,6 +700,7 @@ public final class ScanManager {
         progress = current.advance(ScanPhase.SOLVING, next, total, "求解配方 " + next + "/" + total);
         if (next >= total) {
             progress = progress.advance(ScanPhase.APPLYING, 0, 0, "开始应用结果");
+                verifyInputsUnchanged("求解完成时扫描输入发生变化");
         }
     }
 
@@ -603,6 +709,7 @@ public final class ScanManager {
         if (data == null) {
             throw new IllegalStateException("应用阶段缺少快照数据");
         }
+        verifyInputsUnchanged("应用结果前扫描输入发生变化");
         applier.apply(data);
         progress = progress.advance(ScanPhase.SAVING, 0, 0, "结果已应用，开始持久化");
     }
@@ -612,6 +719,7 @@ public final class ScanManager {
     // ---------------------------------------------------------------------
 
     private void collectPipelineStep(int batch) {
+        captureInputsIfNeeded();
         if (collectSession == null) {
             if (pipelineCollector == null) {
                 throw new IllegalStateException("分片采集回调缺失");
@@ -678,6 +786,7 @@ public final class ScanManager {
         collectSession = null;
         // 即使随后在求解/应用中失败，部分诊断报告也能拿到本轮采集的完整统计。
         stashPartialSnapshot(collected);
+        verifyInputsUnchanged("快照采集完成时扫描输入发生变化");
 
         if (solveWorker == null) {
             throw new IllegalStateException("分片求解需要 SolveWorker");
@@ -698,6 +807,7 @@ public final class ScanManager {
             if (solveOutcome.cancelled() || cancellation.isRequested()) {
                 throw new CancellationException("求解已取消");
             }
+            verifyInputsUnchanged("求解完成时扫描输入发生变化");
             progress = progress.advance(ScanPhase.APPLYING, 0,
                     solveOutcome.candidateCount(),
                     "求解完成（同步），准备应用 " + solveOutcome.candidateCount() + " 条");
@@ -733,6 +843,7 @@ public final class ScanManager {
         if (solveOutcome.cancelled() || cancellation.isRequested()) {
             throw new CancellationException("求解已取消");
         }
+        verifyInputsUnchanged("求解完成时扫描输入发生变化");
         progress = progress.advance(ScanPhase.APPLYING, 0, solveOutcome.candidateCount(),
                 "求解完成，准备应用 " + solveOutcome.candidateCount() + " 条");
     }
@@ -747,6 +858,7 @@ public final class ScanManager {
         if (pipelineApplier == null) {
             throw new IllegalStateException("分片应用回调缺失");
         }
+        verifyInputsUnchanged("应用结果前扫描输入发生变化");
         int applied = pipelineApplier.apply(pipelineSnapshot, solveOutcome);
         progress = progress.advance(ScanPhase.SAVING, 0, 0,
                 "应用 " + applied + " 条，开始持久化");
