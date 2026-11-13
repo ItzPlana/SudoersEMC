@@ -7,6 +7,9 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import com.itzplana.sudoersemc.core.GeneratedEmcEntry;
 import com.itzplana.sudoersemc.core.ItemKey;
 import com.itzplana.sudoersemc.core.OverflowScope;
@@ -18,6 +21,7 @@ import com.itzplana.sudoersemc.safety.CreativeItemProtection;
 import com.itzplana.sudoersemc.safety.LargeDropProtection;
 import com.itzplana.sudoersemc.safety.OverflowPipeline;
 import com.itzplana.sudoersemc.safety.OverflowProtection;
+import com.itzplana.sudoersemc.safety.OverflowReset;
 import com.itzplana.sudoersemc.scanner.IngredientOption;
 import com.itzplana.sudoersemc.scanner.ItemSnapshot;
 import com.itzplana.sudoersemc.scanner.RecipeInput;
@@ -38,6 +42,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Stream;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.item.Rarity;
 import org.junit.jupiter.api.Test;
@@ -70,6 +75,14 @@ class ScanPipelineTest {
     private static final ItemKey RESULT = ItemKey.of(RESULT_ID);
     private static final ItemKey DUST = ItemKey.of(DUST_ID);
     private static final ItemKey RAW = ItemKey.of(RAW_ID);
+
+    private static final ResourceLocation OWNED_OVERFLOW_ID =
+            new ResourceLocation("sudoersemc", "owned_overflow");
+    private static final ResourceLocation MANUAL_OVERFLOW_ID =
+            new ResourceLocation("sudoersemc", "manual_overflow");
+
+    private static final ItemKey OWNED_OVERFLOW = ItemKey.of(OWNED_OVERFLOW_ID);
+    private static final ItemKey MANUAL_OVERFLOW = ItemKey.of(MANUAL_OVERFLOW_ID);
 
     @TempDir
     Path tempDir;
@@ -833,6 +846,147 @@ class ScanPipelineTest {
     }
 
     @Test
+    void defaultScopeDoesNotRewriteCustomEmcFile() throws IOException {
+        Path customEmc = writeCustomEmc("default_custom_emc.json");
+        GeneratedEntryStore store = customEmcStore();
+        OverflowResetLog resetLog = new OverflowResetLog(
+                tempDir.resolve("overflow_resets_default.json"));
+        ScanPipeline pipeline = pipeline(store, null, null, null, null,
+                customEmcOverflowPipeline(resetLog), disabledFallback());
+        pipeline.setProjectECustomEmcFile(customEmc);
+
+        String before = Files.readString(customEmc);
+        PipelineResult result = pipeline.solveAndApply(PipelineSnapshot.empty());
+
+        assertEquals(0, result.overflowResets());
+        assertEquals(before, Files.readString(customEmc), "OWNED_ONLY 不得改写 ProjectE 文件");
+        assertTrue(resetLog.entries().isEmpty());
+    }
+
+    @Test
+    void entireScopeWithoutRewriteOptInDoesNotTouchCustomEmc() throws IOException {
+        Path customEmc = writeCustomEmc("blocked_custom_emc.json");
+        GeneratedEntryStore store = customEmcStore();
+        OverflowResetLog resetLog = new OverflowResetLog(
+                tempDir.resolve("overflow_resets_blocked.json"));
+        ScanPipeline pipeline = pipeline(store, null, null, null, null,
+                customEmcOverflowPipeline(resetLog), disabledFallback());
+        pipeline.setOverflowScope(OverflowScope.ENTIRE_CUSTOM_EMC);
+        pipeline.setProjectECustomEmcFile(customEmc);
+
+        String before = Files.readString(customEmc);
+        PipelineResult result = pipeline.solveAndApply(PipelineSnapshot.empty());
+
+        assertEquals(0, result.overflowResets());
+        assertEquals(before, Files.readString(customEmc),
+                "allowProjectEFileRewrite 未开启时不得改写 ProjectE 文件");
+        assertTrue(resetLog.entries().isEmpty());
+    }
+
+    @Test
+    void entireScopeWithRewriteEnabledRewritesOnlyOwnedEntries() throws IOException {
+        Path customEmc = writeCustomEmc("enabled_custom_emc.json");
+        GeneratedEntryStore store = customEmcStore();
+        Path auditFile = tempDir.resolve("overflow_resets_enabled.json");
+        OverflowResetLog resetLog = new OverflowResetLog(auditFile);
+        ScanPipeline pipeline = pipeline(store, null, null, null, null,
+                customEmcOverflowPipeline(resetLog), disabledFallback());
+        pipeline.setOverflowScope(OverflowScope.ENTIRE_CUSTOM_EMC);
+        pipeline.setProjectEFileRewriteEnabled(true);
+        pipeline.setProjectECustomEmcFile(customEmc);
+
+        PipelineResult result = pipeline.solveAndApply(PipelineSnapshot.empty());
+
+        assertEquals(1, result.overflowResets(), "只有自有超限条目会被改写");
+        assertEquals(1, resetLog.entries().size());
+        OverflowReset reset = resetLog.entries().get(0);
+        assertEquals(OverflowScope.ENTIRE_CUSTOM_EMC, reset.scope());
+        assertEquals(1_000L, reset.threshold());
+        assertTrue(reset.originalValue() > reset.threshold());
+        assertTrue(reset.resetValue() >= 100L && reset.resetValue() <= 900L);
+
+        JsonObject root = JsonParser.parseString(Files.readString(customEmc)).getAsJsonObject();
+        assertEquals("keep", root.get("note").getAsString());
+        JsonArray entries = root.getAsJsonArray("entries");
+        long owned = entries.get(0).getAsJsonObject().get("emc").getAsLong();
+        long manual = entries.get(1).getAsJsonObject().get("emc").getAsLong();
+        long below = entries.get(2).getAsJsonObject().get("emc").getAsLong();
+        assertTrue(owned >= 100L && owned <= 900L, "自有超限条目必须回落");
+        assertEquals(4_000L, manual, "管理员手动条目永不改写");
+        assertEquals(1_000L, below, "等于阈值的条目不得改写");
+        assertEquals(1L, countBackups(customEmc));
+
+        assertTrue(Files.isRegularFile(auditFile), "写盘成功后必须立即落盘审计");
+        assertTrue(Files.readString(auditFile).contains("ENTIRE_CUSTOM_EMC"));
+    }
+
+    @Test
+    void ownedScopeWithRewriteEnabledStillDoesNotTouchCustomEmc() throws IOException {
+        Path customEmc = writeCustomEmc("owned_scope_with_rewrite.json");
+        GeneratedEntryStore store = customEmcStore();
+        OverflowResetLog resetLog = new OverflowResetLog(
+                tempDir.resolve("overflow_resets_owned_with_rewrite.json"));
+        ScanPipeline pipeline = pipeline(store, null, null, null, null,
+                customEmcOverflowPipeline(resetLog), disabledFallback());
+        pipeline.setProjectEFileRewriteEnabled(true);
+        pipeline.setProjectECustomEmcFile(customEmc);
+
+        String before = Files.readString(customEmc);
+        PipelineResult result = pipeline.solveAndApply(PipelineSnapshot.empty());
+
+        assertEquals(0, result.overflowResets());
+        assertEquals(before, Files.readString(customEmc),
+                "OWNED_ONLY 下即使开启文件改写开关也不得改写 ProjectE 文件");
+        assertTrue(resetLog.entries().isEmpty());
+        assertEquals(0L, countBackups(customEmc));
+    }
+
+    @Test
+    void entireScopeWithRewriteEnabledSkipsWhenOnlyNonOwnedEntriesOverflow() throws IOException {
+        Path customEmc = tempDir.resolve("only_manual_custom_emc.json");
+        Files.writeString(customEmc, """
+                { "entries": [ { "item": "sudoersemc:manual_overflow", "emc": 4000 } ] }
+                """);
+        GeneratedEntryStore store = customEmcStore();
+        Path auditFile = tempDir.resolve("overflow_resets_only_manual.json");
+        OverflowResetLog resetLog = new OverflowResetLog(auditFile);
+        ScanPipeline pipeline = pipeline(store, null, null, null, null,
+                customEmcOverflowPipeline(resetLog), disabledFallback());
+        pipeline.setOverflowScope(OverflowScope.ENTIRE_CUSTOM_EMC);
+        pipeline.setProjectEFileRewriteEnabled(true);
+        pipeline.setProjectECustomEmcFile(customEmc);
+
+        String before = Files.readString(customEmc);
+        PipelineResult result = pipeline.solveAndApply(PipelineSnapshot.empty());
+
+        assertEquals(0, result.overflowResets());
+        assertEquals(before, Files.readString(customEmc),
+                "只有非自有超限条目时不得触碰文件");
+        assertEquals(0L, countBackups(customEmc));
+        assertTrue(resetLog.entries().isEmpty());
+        assertFalse(Files.exists(auditFile), "未发生写盘时不应产生新的审计文件");
+    }
+
+    @Test
+    void dryRunDoesNotRewriteCustomEmcFile() throws IOException {
+        Path customEmc = writeCustomEmc("dry_run_custom_emc.json");
+        OverflowResetLog resetLog = new OverflowResetLog(
+                tempDir.resolve("overflow_resets_dry_run.json"));
+        ScanPipeline pipeline = pipeline(null, null, null, null, null,
+                customEmcOverflowPipeline(resetLog), disabledFallback());
+        pipeline.setOverflowScope(OverflowScope.ENTIRE_CUSTOM_EMC);
+        pipeline.setProjectEFileRewriteEnabled(true);
+        pipeline.setProjectECustomEmcFile(customEmc);
+
+        String before = Files.readString(customEmc);
+        PipelineResult result = pipeline.solveAndApply(PipelineSnapshot.empty());
+
+        assertEquals(0, result.overflowResets());
+        assertEquals(before, Files.readString(customEmc), "干跑模式不得写入 ProjectE 文件");
+        assertTrue(resetLog.entries().isEmpty());
+    }
+
+    @Test
     void fallbackUsesCollectedRarity() {
         ItemKey epic = ItemKey.of(new ResourceLocation("sudoersemc", "epic_item"));
         ItemSnapshot epicSnapshot = ItemSnapshot.of(
@@ -911,6 +1065,69 @@ class ScanPipelineTest {
     private static FallbackPricing genericFallback(long value) {
         return FallbackPricing.withDefaults(
                 new PricingSettings(false, false, false, true, value));
+    }
+
+    /**
+     * 构造启用 ENTIRE_CUSTOM_EMC 语义的溢出管线，阈值与回落区间与测试数据对应。
+     */
+    private static OverflowPipeline customEmcOverflowPipeline(OverflowResetLog resetLog) {
+        return new OverflowPipeline(
+                new OverflowProtection(new OverflowProtection.Settings(
+                        true,
+                        1_000L,
+                        100L,
+                        900L,
+                        10,
+                        5,
+                        OverflowScope.ENTIRE_CUSTOM_EMC,
+                        true,
+                        42L)),
+                resetLog);
+    }
+
+    /**
+     * 构造一个自有条目与一个非自有条目的存储，用于验证 custom_emc.json 的归属判定。
+     */
+    private GeneratedEntryStore customEmcStore() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_custom_emc.json"));
+        store.stage(new GeneratedEmcEntry(
+                OWNED_OVERFLOW, 5L, PriceSource.RECIPE, null, true, 0L));
+        store.stage(new GeneratedEmcEntry(
+                MANUAL_OVERFLOW, 6L, PriceSource.EXISTING, null, false, 0L));
+        return store;
+    }
+
+    /**
+     * 写出一份包含自有、非自有与等于阈值条目的 ProjectE 风格 custom_emc.json。
+     */
+    private Path writeCustomEmc(String name) throws IOException {
+        Path file = tempDir.resolve(name);
+        Files.writeString(file, """
+                {
+                  "entries": [
+                    { "item": "sudoersemc:owned_overflow", "emc": 5000 },
+                    { "item": "sudoersemc:manual_overflow", "emc": 4000 },
+                    { "item": "sudoersemc:below_threshold", "emc": 1000 }
+                  ],
+                  "note": "keep"
+                }
+                """);
+        return file;
+    }
+
+    /**
+     * 统计目标文件对应的时间戳备份数量。
+     */
+    private static long countBackups(Path file) throws IOException {
+        Path parent = file.toAbsolutePath().getParent();
+        String prefix = file.getFileName() + ".";
+        try (Stream<Path> files = Files.list(parent)) {
+            return files.filter(path -> {
+                String name = path.getFileName().toString();
+                return name.startsWith(prefix) && name.endsWith(".bak");
+            }).count();
+        }
     }
 
     private static ItemSnapshot item(ItemKey key, long existingValue) {

@@ -37,7 +37,7 @@ SudoersEMC 是一个**独立实现**的 Minecraft Forge 1.20.1 模组。它扫�
 
 ## 当前状态
 
-项目按阶段线性推进，当前分支（`phase-14-ownership-audit`）包含 Phase 0–13 的组件与 Phase 14 的归属审计：
+项目按阶段线性推进，当前分支（`phase-15-overflow-scope`）包含 Phase 0–14 的组件与 Phase 15 的溢出作用域接线：
 
 | 阶段       | 内容                                                              | 状态                      |
 | ---------- | ----------------------------------------------------------------- | ------------------------- |
@@ -48,8 +48,9 @@ SudoersEMC 是一个**独立实现**的 Minecraft Forge 1.20.1 模组。它扫�
 | Phase 12   | 扫描管线集成、指纹缓存、报告与审批闭环                            | ✅ 完成                   |
 | Phase 13   | 自动扫描真实化、兜底定价链、运行时元数据注入与 owned 条目缓存判定 | ✅ 完成                   |
 | Phase 14   | 所有权审计、外部修改检测、多级自有链、溢出审计落盘与归属统计      | ✅ 完成                   |
+| Phase 15   | 溢出作用域双开关、受控 ProjectE 文件改写、只改自有超限条目        | ✅ 完成                   |
 
-**已知限制（Phase 14）**：生产接线使用 `ScanPipeline` 统一完成分片采集、后台求解、所有权分离、外部修改检测、多级自有链、统一排除、TagPricing 锚点、降价/溢出保护、审计落盘与报告生命周期；启动自动扫描由 `AutoScanPolicy` 判定。Phase 7 的 `ScanCollectionPipeline` 保留为回归实现，不参与生产接线。尚未在大型整合包与专用服务器完成端到端实机验证；`KnownItemsStore` 未接入生产管线；`entire_custom_emc` 文件改写未实现；ProjectE Integration 的映射优先级尚未在运行期验证。
+**已知限制（Phase 15）**：生产接线使用 `ScanPipeline` 统一完成分片采集、后台求解、所有权分离、外部修改检测、多级自有链、统一排除、TagPricing 锚点、降价/溢出保护、审计落盘与报告生命周期；`entire_custom_emc` 仅在同时开启文件改写开关时重置 ProjectE 文件中归 SudoersEMC 所有的超限条目，管理员手动条目永不改写。启动自动扫描由 `AutoScanPolicy` 判定。Phase 7 的 `ScanCollectionPipeline` 保留为回归实现，不参与生产接线。尚未在大型整合包与专用服务器完成端到端实机验证；`KnownItemsStore` 未接入生产管线；ProjectE Integration 的映射优先级尚未在运行期验证。
 
 Phase 1 已在专用服务器上验证：写入生效、重启后自动恢复、手动值不被覆盖、缺少 ProjectE 时优雅降级。
 
@@ -197,10 +198,12 @@ generateReports = true
 
 ### 改写范围
 
-| 取值                 | 行为                                                                                                                                          |
-| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `owned_only`（默认） | 只重置由 SudoersEMC 自己生成的条目                                                                                                            |
-| `entire_custom_emc`  | **当前未实现**：配置值会被接受并通过校验，但不会改写 ProjectE 的 `custom_emc.json`，运行时行为等同 `owned_only`（见 `CHANGELOG.md` 已知限制） |
+| 取值                 | 行为                                                                                                                                                               |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `owned_only`（默认） | 只重置由 SudoersEMC 自己生成的条目                                                                                                                                 |
+| `entire_custom_emc`  | 额外扫描 ProjectE `custom_emc.json`，但仍只重置其中归 SudoersEMC 所有的超限条目；需同时开启 `allowProjectEFileRewrite`，并会先做时间戳备份。管理员手动条目永不改写 |
+
+> 双开关只决定“是否允许写盘”，不会改变归属判定。非自有（管理员手动配置）的条目即使超过阈值也只计数并告警，永远不会被写入；`OWNED_ONLY` 下不会调用文件改写器。
 
 ---
 
@@ -228,8 +231,7 @@ generateReports = true
 
 > **接线状态（Phase 12）**：`[general]`、`[performance]` 以及扫描管线使用的 `[recipe]`、`[fallback]`、
 > `[safety]`、`[nbt]`、`[overflow]` 配置均已接入运行时；`[diagnostic].*` 参与扫描指纹与配置快照，
-> 报告落盘已由 `ScanPipeline` 接线。`[overflow].allowProjectEFileRewrite` 与 `entire_custom_emc`
-> 文件改写仍未实现，运行时行为等同 `owned_only`。
+> 报告落盘已由 `ScanPipeline` 接线。`[overflow].allowProjectEFileRewrite` 仅在 `entire_custom_emc` 且条目归 SudoersEMC 所有时允许改写 ProjectE 文件。
 
 ### 校验矩阵
 
@@ -263,12 +265,12 @@ generateReports = true
 
 以下情况不会阻止配置生效，但会记录一条警告：
 
-| 条件                                                                       | 提示                                                          |
-| -------------------------------------------------------------------------- | ------------------------------------------------------------- |
-| `overwriteScope = entire_custom_emc` 且 `allowProjectEFileRewrite = false` | ProjectE 文件改写将被跳过（当前构建即使为 `true` 也不会改写） |
-| `itemsPerTick > 5000`                                                      | 单 tick 处理量过大可能导致卡顿                                |
-| `maxRecipePasses > 100`                                                    | 扫描耗时可能显著增加                                          |
-| `overflow.enabled = false`                                                 | 超大 EMC 值不会被重置                                         |
+| 条件                                                                       | 提示                                              |
+| -------------------------------------------------------------------------- | ------------------------------------------------- |
+| `overwriteScope = entire_custom_emc` 且 `allowProjectEFileRewrite = false` | ProjectE 文件改写将被跳过；仅自有超限条目可被改写 |
+| `itemsPerTick > 5000`                                                      | 单 tick 处理量过大可能导致卡顿                    |
+| `maxRecipePasses > 100`                                                    | 扫描耗时可能显著增加                              |
+| `overflow.enabled = false`                                                 | 超大 EMC 值不会被重置                             |
 
 同一条警告在一次运行中只记录一次：`ConfigWatcher.fireReload` 对成功结果统一调用
 `logConflictWarnings`，重复重载不会刷屏。
@@ -299,15 +301,15 @@ generateReports = true
 
 ## 数据文件
 
-| 路径                                       | 说明                                                                        |
-| ------------------------------------------ | --------------------------------------------------------------------------- |
-| `config/sudoersemc/generated_entries.json` | 生成值、来源、配方、归属与时间戳                                            |
-| `config/sudoersemc/known_items.json`       | 已扫描物品目录；组件已实现，当前生产管线未使用                              |
-| `config/sudoersemc/quarantined_drops.json` | 危险降价隔离记录；生产管线与 `/sudoemc approve` 审批闭环使用                |
-| `config/sudoersemc/overflow_resets.json`   | 溢出重置审计记录；扫描管线触发溢出保护时追加写入                            |
-| `config/ProjectE/custom_emc.json`          | ProjectE 手动配置；本模组只读，`entire_custom_emc` 文件改写尚未实现         |
-| `config/sudoersemc/scan_state.json`        | 上次扫描指纹/耗时/计数；启动时加载、扫描成功后原子写入、停服时保存          |
-| `config/sudoersemc/last_report.txt`        | 最近一次诊断报告；扫描成功且 `[diagnostic].generateReports=true` 时自动写入 |
+| 路径                                       | 说明                                                                                                  |
+| ------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
+| `config/sudoersemc/generated_entries.json` | 生成值、来源、配方、归属与时间戳                                                                      |
+| `config/sudoersemc/known_items.json`       | 已扫描物品目录；组件已实现，当前生产管线未使用                                                        |
+| `config/sudoersemc/quarantined_drops.json` | 危险降价隔离记录；生产管线与 `/sudoemc approve` 审批闭环使用                                          |
+| `config/sudoersemc/overflow_resets.json`   | 溢出重置审计记录；扫描管线触发溢出保护时追加写入                                                      |
+| `config/ProjectE/custom_emc.json`          | ProjectE 手动配置；本模组只读。`entire_custom_emc` + 显式开关下仅改写自有超限条目，管理员条目永不改写 |
+| `config/sudoersemc/scan_state.json`        | 上次扫描指纹/耗时/计数；启动时加载、扫描成功后原子写入、停服时保存                                    |
+| `config/sudoersemc/last_report.txt`        | 最近一次诊断报告；扫描成功且 `[diagnostic].generateReports=true` 时自动写入                           |
 
 所有写入采用「临时文件 + 原子替换」，加载失败只告警不崩溃，遇到更高版本 schema 时拒绝覆盖。
 
@@ -338,7 +340,7 @@ generateReports = true
 
 测试覆盖：加权采样分布与权重重置、阈值边界、幂等性、持久化往返、损坏文件容错、schema 版本保护、分片扫描管线、双扫描器 API 兼容、命令层、扫描状态机、General 开关降级与停服清理。
 
-当前共 **631** 个单元/组件测试（53 个测试类），0 failure / 0 error；尚未加入专用服务器端到端测试。
+当前共 **651** 个单元/组件测试（54 个测试类），0 failure / 0 error；尚未加入专用服务器端到端测试。
 
 ---
 
@@ -363,7 +365,7 @@ SudoersEMC is an independent Minecraft Forge 1.20.1 mod that generates EMC value
 - **Overflow protection** resets values above `999999` into a weighted range of `100..999000`, with a hard per-bucket weight cap so the top of the range stays reachable without dominating. The protection components are instantiated by the runtime and applied by `ScanPipeline` before values are staged.
 - **Optional integration**: values are only intended for items ProjectE does not already price; the mapping priority against ProjectE Integration has not been runtime-verified, so "ProjectE Integration values always win" is not guaranteed. Goety ritual recipes (`goety:ritual`, `craft` type only) are evaluated when Goety is installed.
 - Runs on dedicated servers. Loads normally without ProjectE.
-- **Current status (Phase 14)**: the scan pipeline is fully wired through `ScanPipeline`, with ownership separation, external-modification detection, multi-level owned chains, overflow audit persistence and ownership diagnostics. Startup auto-scan uses `AutoScanPolicy`; the full input fingerprint remains enforced for fail-closed consistency. A legacy `ScanCollectionPipeline` remains covered by regression tests but is not part of production wiring.
+- **Current status (Phase 15)**: `entire_custom_emc` now applies only to SudoersEMC-owned entries and requires the explicit file-rewrite switch; manual ProjectE entries are never modified. The scan pipeline also performs ownership separation, external-modification detection, multi-level owned chains, overflow audit persistence and fail-closed fingerprint checks.
 
 Build with `./gradlew build`. Output: `build/libs/sudoersemc-<version>.jar`.
 

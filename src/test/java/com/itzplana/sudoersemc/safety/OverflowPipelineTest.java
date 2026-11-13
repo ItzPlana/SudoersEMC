@@ -1,11 +1,13 @@
 package com.itzplana.sudoersemc.safety;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.itzplana.sudoersemc.core.ItemKey;
 import com.itzplana.sudoersemc.core.OverflowScope;
 import com.itzplana.sudoersemc.storage.OverflowResetLog;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import net.minecraft.resources.ResourceLocation;
@@ -187,5 +189,36 @@ class OverflowPipelineTest {
         assertEquals(0, disabledPipeline.auditCount());
         assertEquals(0, disabledPipeline.resetsApplied());
         assertTrue(log.entries().isEmpty());
+    }
+
+    @Test
+    void customEmcResetIsAuditedWithEntireScope() {
+        pipeline.recordCustomEmcReset(ITEM, 1_500_000L, 500L);
+
+        assertEquals(1, pipeline.auditCount());
+        assertEquals(1, pipeline.resetsApplied());
+
+        List<OverflowReset> entries = log.entries();
+        assertEquals(1, entries.size());
+        OverflowReset audit = entries.get(0);
+        assertEquals(ITEM, audit.item());
+        assertEquals(1_500_000L, audit.originalValue());
+        assertEquals(500L, audit.resetValue());
+        assertEquals(THRESHOLD, audit.threshold());
+        assertEquals(OverflowScope.ENTIRE_CUSTOM_EMC, audit.scope());
+        assertTrue(audit.timestamp() > 0L);
+    }
+
+    @Test
+    void flushAuditPersistsImmediately() throws Exception {
+        assertFalse(Files.exists(log.file()), "构造后不应自动创建审计文件");
+
+        pipeline.recordCustomEmcReset(ITEM, 1_500_000L, 500L);
+        assertFalse(Files.exists(log.file()), "record 只写内存，不应自动落盘");
+
+        pipeline.flushAudit();
+
+        assertTrue(Files.isRegularFile(log.file()), "flushAudit 必须立即落盘");
+        assertTrue(Files.readString(log.file()).contains("ENTIRE_CUSTOM_EMC"));
     }
 }

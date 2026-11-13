@@ -112,6 +112,39 @@ public final class OverflowPipeline {
     }
 
     /**
+     * 记录一条来自 ProjectE {@code custom_emc.json} 受控改写的重置。
+     *
+     * <p>与 {@link #applyAndAudit(ItemKey, long, OverflowScope)} 不同，数值已经由
+     * {@code ProjectECustomEmcFile} 计算并写回，这里只负责生成作用域为
+     * {@link OverflowScope#ENTIRE_CUSTOM_EMC} 的审计记录。调用方只会为 SudoersEMC 自有
+     * 条目调用本方法；审计写入失败不会抛出异常。破坏性写盘成功后应立即调用
+     * {@link #flushAudit()}，不要只等待关服时的最终保存。</p>
+     *
+     * @param item          被改写的物品
+     * @param originalValue 改写前的值，必须严格大于阈值
+     * @param resetValue    写回的新值
+     */
+    public void recordCustomEmcReset(ItemKey item, long originalValue, long resetValue) {
+        if (item == null) {
+            return;
+        }
+        try {
+            OverflowReset audit = new OverflowReset(
+                    item,
+                    originalValue,
+                    resetValue,
+                    protection.settings().threshold(),
+                    OverflowScope.ENTIRE_CUSTOM_EMC,
+                    System.currentTimeMillis());
+            log.record(audit);
+            recordedResets.incrementAndGet();
+            resetsApplied.incrementAndGet();
+        } catch (RuntimeException e) {
+            LOGGER.warn("记录 ProjectE custom_emc.json 溢出重置审计失败（物品 {}）", item, e);
+        }
+    }
+
+    /**
      * 把待写入的审计记录刷新到磁盘。
      *
      * <p>由扫描应用路径在每个成功轮次后调用；没有新增记录时不会触碰磁盘。写入失败由
@@ -123,6 +156,28 @@ public final class OverflowPipeline {
         } catch (RuntimeException e) {
             LOGGER.warn("保存溢出重置审计日志失败，将在下次扫描时重试", e);
         }
+    }
+
+    /**
+     * 立即把内存中的审计记录落盘。
+     *
+     * <p>用于破坏性写盘（例如 {@code custom_emc.json} 改写）成功后的即时持久化，缩小
+     * “文件已改变但审计只存在内存”的崩溃窗口。保存失败只记录警告，不会向调用方抛出异常；
+     * 关服时的 {@code save()} 仍会作为最终兜底。</p>
+     */
+    public void flushAudit() {
+        try {
+            log.save();
+        } catch (RuntimeException e) {
+            LOGGER.warn("立即落盘溢出重置审计失败", e);
+        }
+    }
+
+    /**
+     * @return 本流水线使用的溢出策略，供文件改写等外围接线读取阈值与回落区间
+     */
+    public OverflowProtection protection() {
+        return protection;
     }
 
     /**

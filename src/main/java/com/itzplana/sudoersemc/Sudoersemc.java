@@ -239,7 +239,27 @@ public final class Sudoersemc {
         pipeline.setEmcProvider(OptionalIntegrationManager.provider().orElse(null));
         pipeline.setInputFingerprintSupplier(Sudoersemc::currentScanFingerprint);
         applyPipelineConfig(pipeline);
+
+        // 使用已经通过 ConfigValidator 校验的不可变快照，避免二次读取原始配置造成
+        // 事实来源漂移；配置未加载时该快照已是安全默认值（OWNED_ONLY + false）。
+        applyOverflowSettings(pipeline, overflowSettings);
         return pipeline;
+    }
+
+    /**
+     * 把已校验的溢出配置快照应用到扫描管线。
+     *
+     * <p>作用域与 ProjectE 文件改写开关必须同时从同一个配置快照读取，避免运行期出现
+     * “作用域已扩大但改写开关仍是旧值”的组合。生产接线只能通过本方法设置这两个值，
+     * 不得绕过配置快照直接读取 Forge 原始配置。</p>
+     *
+     * @param pipeline 扫描管线，不能为 {@code null}
+     * @param settings 已通过 ConfigValidator 校验的溢出配置快照，不能为 {@code null}
+     */
+    static void applyOverflowSettings(ScanPipeline pipeline,
+                                      OverflowProtection.Settings settings) {
+        pipeline.setOverflowScope(settings.scope());
+        pipeline.setProjectEFileRewriteEnabled(settings.allowProjectEFileRewrite());
     }
 
     /**
@@ -253,8 +273,6 @@ public final class Sudoersemc {
             pipeline.setGenerateReportsEnabled(SudoersemcConfig.DIAGNOSTIC_GENERATE_REPORTS.get());
             pipeline.setUseProjectEIntegrationBaselines(
                     SudoersemcConfig.FALLBACK_USE_PROJECTE_INTEGRATION_BASELINES.get());
-            pipeline.setOverflowScope(SudoersemcConfig.parseOverflowScope(
-                    SudoersemcConfig.OVERFLOW_OVERWRITE_SCOPE.get()));
         } catch (RuntimeException e) {
             LOGGER.warn("SudoersEMC 无法读取管线配置开关，使用管线默认值", e);
         }
