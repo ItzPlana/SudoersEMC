@@ -162,11 +162,14 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
 
     /**
      * Writes the current state if at least one entry changed since the last save.
+     *
+     * @return 没有待写内容或写入成功时返回 {@code true}；写入失败返回 {@code false}
      */
-    public void saveIfDirty() {
-        if (dirty.get()) {
-            save();
+    public boolean saveIfDirty() {
+        if (!dirty.get()) {
+            return true;
         }
+        return save();
     }
 
     /**
@@ -174,14 +177,16 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
      *
      * <p>No-op when the loaded file had an unsupported schema version, because overwriting it
      * could destroy data produced by a newer build.</p>
+     *
+     * @return 写入成功返回 {@code true}；schema 不受支持或写入失败返回 {@code false}
      */
-    public void save() {
+    public boolean save() {
         synchronized (loadSaveLock) {
             if (unsupportedSchemaVersion) {
                 LOGGER.warn(
                         "Not saving {} because it was written with unsupported schemaVersion {}",
                         file, loadedSchemaVersion);
-                return;
+                return false;
             }
             // Clear first: a stage that races with this save sets the flag again and is picked up
             // by the next save instead of being silently dropped.
@@ -203,16 +208,18 @@ public final class GeneratedEntryStore implements OwnedEntrySink, GeneratedValue
                             "Failed to save generated entries to {}: could not create a backup; "
                                     + "keeping the store dirty for a later retry",
                             file);
-                    return;
+                    return false;
                 }
                 if (!JsonFileIO.writeAtomically(file, dto)) {
                     dirty.set(true);
-                    return;
+                    return false;
                 }
                 backupPending = false;
+                return true;
             } catch (RuntimeException e) {
                 dirty.set(true);
                 LOGGER.warn("Failed to save generated entries to {}", file, e);
+                return false;
             }
         }
     }
