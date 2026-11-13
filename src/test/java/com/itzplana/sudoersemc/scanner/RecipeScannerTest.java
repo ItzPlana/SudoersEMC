@@ -5,10 +5,12 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.itzplana.sudoersemc.core.ItemKey;
 import java.util.Optional;
 import java.util.stream.Stream;
+import java.util.List;
 import net.minecraft.core.NonNullList;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.ResourceLocation;
@@ -128,6 +130,40 @@ class RecipeScannerTest {
         public Optional<? extends Recipe<?>> byKey(ResourceLocation id) {
             throw new IllegalStateException("broken recipe lookup");
         }
+    }
+
+    @Test
+    void sessionHonoursStepBudgetAndProducesSameRecipesAsScan() {
+        RecipeManager manager = new RecipeManager();
+        NonNullList<Ingredient> ingredients = NonNullList.withSize(1, Ingredient.EMPTY);
+        ingredients.set(0, Ingredient.of(Items.DIRT));
+        ShapedRecipe first = new ShapedRecipe(
+                new ResourceLocation("sudoersemc_test", "first"), "", CraftingBookCategory.MISC,
+                1, 1, ingredients, new ItemStack(Items.DIAMOND));
+        NonNullList<Ingredient> secondIngredients = NonNullList.withSize(1, Ingredient.EMPTY);
+        secondIngredients.set(0, Ingredient.of(Items.DIRT));
+        ShapedRecipe second = new ShapedRecipe(
+                new ResourceLocation("sudoersemc_test", "second"), "", CraftingBookCategory.MISC,
+                1, 1, secondIngredients, new ItemStack(Items.EMERALD));
+        manager.replaceRecipes(List.of(first, second));
+
+        RecipeScanner.RecipeScanSession session = scanner.beginSession(manager);
+        assertEquals(2, session.total());
+        assertEquals(0, session.processed());
+        assertFalse(session.isDone());
+
+        assertEquals(1, session.step(1));
+        assertEquals(1, session.processed());
+        assertFalse(session.isDone());
+        assertEquals(1, session.result().recipes().size(),
+                "部分结果只包含已扫描配方");
+
+        assertEquals(1, session.step(1));
+        assertTrue(session.isDone());
+        assertEquals(2, session.processed());
+        assertEquals(2, session.result().recipes().size());
+        assertEquals(2, scanner.scan(manager).recipes().size(),
+                "分片会话与一次性 scan 必须得到相同配方数量");
     }
 
     private static TagKey<Item> unboundTag() {

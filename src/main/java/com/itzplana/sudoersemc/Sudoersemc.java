@@ -95,6 +95,7 @@ public final class Sudoersemc {
     private static volatile OverflowResetLog overflowResetLog;
     private static volatile QuarantinedDropsStore quarantinedDropsStore;
     private static volatile CommandService commandService;
+    private static volatile MinecraftServer currentServer;
     private static volatile boolean pendingReload;
 
     public Sudoersemc() {
@@ -147,14 +148,7 @@ public final class Sudoersemc {
             scanPipeline = pipeline;
 
             scanManager = createScanManagerIfEnabled(pipeline, SudoersemcConfig.GENERAL_ENABLED::get);
-            commandService = new CommandService(
-                    scanManager,
-                    reportManager,
-                    store,
-                    stateStore,
-                    Sudoersemc::reloadConfig,
-                    Sudoersemc::approveQuarantined);
-            SudoemcCommands.setService(commandService);
+            refreshCommandService();
 
             LOGGER.info("SudoersEMC common setup complete ({} generated entries loaded)", store.size());
         });
@@ -333,13 +327,12 @@ public final class Sudoersemc {
             adaptive = true;
         }
         BatchProcessor processor = new BatchProcessor(Math.max(1, itemsPerTick), adaptive);
-        PipelineApplier applier = new PipelineApplier(pipeline);
+        ScanManager.ResultApplier applier = pipeline == null
+                ? data -> LOGGER.debug("SudoersEMC 占位调度器收到应用回调：{}", data.label())
+                : new PipelineApplier(pipeline);
         return new ScanManager(
                 processor,
-                () -> {
-                    if (pipeline == null) {
-                        throw new IllegalStateException("扫描采集失败：扫描管线未初始化");
-                    }
+                pipeline == null ? emptyCollector() : () -> {
                     MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
                     if (server == null) {
                         LOGGER.warn("SudoersEMC 扫描请求到达时服务器尚未就绪，本次扫描失败");
@@ -349,7 +342,53 @@ public final class Sudoersemc {
                 },
                 applier,
                 TICK_BUDGET_NANOS,
-                Sudoersemc::currentScanFingerprint);
+                pipeline == null ? null : Sudoersemc::currentScanFingerprint);
+    }
+
+    /**
+     * 占位采集器：立即报告完成且不访问任何游戏状态。
+     *
+     * <p>只用于服务器启动前或配置重载后给命令层提供可查询的空闲状态机；真实采集由
+     * {@link #createScanManager(ScanPipeline)} 注入的管线会话完成。</p>
+     */
+    private static ScanManager.SnapshotCollector emptyCollector() {
+        return () -> new ScanManager.CollectSession() {
+
+            @Override
+            public int itemCount() {
+                return 0;
+            }
+
+            @Override
+            public int recipeCount() {
+                return 0;
+            }
+
+            @Override
+            public int processedItems() {
+                return 0;
+            }
+
+            @Override
+            public int processedRecipes() {
+                return 0;
+            }
+
+            @Override
+            public boolean isDone() {
+                return true;
+            }
+
+            @Override
+            public ScanManager.StepResult step(int maxItems) {
+                return new ScanManager.StepResult(0, true);
+            }
+
+            @Override
+            public ScanManager.SnapshotData finish() {
+                return new ScanManager.SnapshotData("待接入真实扫描", 0, 0);
+            }
+        };
     }
 
     /**
@@ -1048,18 +1087,10 @@ public final class Sudoersemc {
                     entryStore, scanStateStore, reportManager, overflowResetLog, quarantinedDropsStore);
             ScanManager rebuilt = createScanManagerIfEnabled(
                     rebuiltPipeline, SudoersemcConfig.GENERAL_ENABLED::get);
-            CommandService rebuiltService = new CommandService(
-                    rebuilt,
-                    reportManager,
-                    entryStore,
-                    scanStateStore,
-                    Sudoersemc::reloadConfig,
-                    Sudoersemc::approveQuarantined);
             ScanManager previous = scanManager;
             scanPipeline = rebuiltPipeline;
             scanManager = rebuilt;
-            commandService = rebuiltService;
-            SudoemcCommands.setService(rebuiltService);
+            refreshCommandService();
             if (previous != null) {
                 previous.cancel();
                 previous.reset();
@@ -1070,6 +1101,25 @@ public final class Sudoersemc {
             LOGGER.warn("SudoersEMC 应用新配置失败，保留旧运行时组件", failure);
             return ReloadDecision.REJECT;
         }
+    }
+
+    /**
+     * 用当前运行时组件重新创建命令服务并重新注入命令树。
+     *
+     * <p>服务器启动、配置重载与 common setup 都会替换 {@link ScanManager}，命令服务必须跟着
+     * 重建，否则 {@code /sudoemc status} 等命令会继续读取旧调度器。审批回调必须与新调度器
+     * 一起注入，保证隔离审批闭环不因重载而失效。</p>
+     */
+    private static void refreshCommandService() {
+        CommandService service = new CommandService(
+                scanManager,
+                reportManager,
+                entryStore,
+                scanStateStore,
+                Sudoersemc::reloadConfig,
+                Sudoersemc::approveQuarantined);
+        commandService = service;
+        SudoemcCommands.setService(service);
     }
 
     private void onRegisterCommands(RegisterCommandsEvent event) {
@@ -1094,6 +1144,7 @@ public final class Sudoersemc {
     }
 
     private void onServerStarted(ServerStartedEvent event) {
+        currentServer = event.getServer();
         ScanManager manager = scanManager;
         if (manager != null) {
             manager.reset();
@@ -1112,12 +1163,14 @@ public final class Sudoersemc {
     }
 
     private void onServerStopping(ServerStoppingEvent event) {
-        resetScanManager(scanManager);
         ScanManager manager = scanManager;
         if (manager != null) {
             manager.cancel();
             manager.reset();
         }
+        scanManager = null;
+        scanPipeline = null;
+        currentServer = null;
         flushRuntimeStoresOnServerThread();
         pendingReload = false;
         // 不保留指向旧世界的命令服务；下一次 ServerStartedEvent 会重新注入。
