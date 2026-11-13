@@ -254,7 +254,9 @@ public final class Sudoersemc {
                 stateStore,
                 Sudoersemc::reloadConfig,
                 Sudoersemc::approveQuarantined,
-                Sudoersemc::requestScanSynchronized);
+                Sudoersemc::requestScanSynchronized,
+                OptionalIntegrationManager.provider().orElse(null),
+                OptionalIntegrationManager.manualValues());
         return new RuntimeComponents(pipeline, manager, service);
     }
 
@@ -1392,7 +1394,9 @@ public final class Sudoersemc {
                 scanStateStore,
                 Sudoersemc::reloadConfig,
                 Sudoersemc::approveQuarantined,
-                Sudoersemc::requestScanSynchronized);
+                Sudoersemc::requestScanSynchronized,
+                OptionalIntegrationManager.provider().orElse(null),
+                OptionalIntegrationManager.manualValues());
         commandService = service;
         SudoemcCommands.setService(service);
     }

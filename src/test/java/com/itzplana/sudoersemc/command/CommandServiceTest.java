@@ -12,17 +12,28 @@ import com.itzplana.sudoersemc.core.ItemKey;
 import com.itzplana.sudoersemc.core.PriceSource;
 import com.itzplana.sudoersemc.diagnostic.DiagnosticReport;
 import com.itzplana.sudoersemc.diagnostic.ReportManager;
+import com.itzplana.sudoersemc.integration.EmcProvider;
+import com.itzplana.sudoersemc.integration.ProjectEManualValues;
 import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
+import com.itzplana.sudoersemc.storage.QuarantinedDropsStore;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
 import com.itzplana.sudoersemc.task.BatchProcessor;
 import com.itzplana.sudoersemc.task.ScanFingerprint;
 import com.itzplana.sudoersemc.task.ScanManager;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import net.minecraft.SharedConstants;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.Bootstrap;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.world.item.ItemStack;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -40,6 +51,13 @@ class CommandServiceTest {
     @TempDir
     Path tempDir;
 
+    @BeforeAll
+    static void bootstrapMinecraft() {
+        // explain 的外部后端分支需要 BuiltInRegistries.ITEM 已初始化。
+        SharedConstants.tryDetectVersion();
+        Bootstrap.bootStrap();
+    }
+
     private static ScanManager idleManager() {
         return new ScanManager(
                 new BatchProcessor(1, false),
@@ -48,10 +66,49 @@ class CommandServiceTest {
                 1_000_000L);
     }
 
+    private QuarantinedDropsStore quarantineStoreWith(ResourceLocation itemId) {
+        QuarantinedDropsStore store = new QuarantinedDropsStore(
+                tempDir.resolve(QuarantinedDropsStore.FILE_NAME));
+        store.record(new QuarantinedDropsStore.QuarantinedDrop(
+                ItemKey.of(itemId), 100L, 10L, 0.9D,
+                "drop-exceeds-threshold", 1_730_000_000_000L, false));
+        return store;
+    }
+
     private static DiagnosticReport sampleReport() {
         return new DiagnosticReport(
                 12L, 3L, 4L, 2L, 1L, 1L, 1L, 0L, 0L, 0L, 500L, 1024L,
                 Map.of("自定义计数", 2L));
+    }
+
+    private static EmcProvider provider(boolean available, boolean hasValue, long value) {
+        return new EmcProvider() {
+            @Override
+            public boolean isAvailable() {
+                return available;
+            }
+
+            @Override
+            public boolean hasValue(ItemStack stack) {
+                return hasValue;
+            }
+
+            @Override
+            public long getValue(ItemStack stack) {
+                return value;
+            }
+
+            @Override
+            public boolean stageGeneratedValue(
+                    ItemKey key, long newValue, PriceSource source, ResourceLocation recipeId) {
+                return false;
+            }
+
+            @Override
+            public void requestRemap(MinecraftServer server) {
+                // 测试桩不执行重映射。
+            }
+        };
     }
 
     @Test
@@ -313,6 +370,53 @@ class CommandServiceTest {
     }
 
     @Test
+    void explainMissingShowsProjectEManualValue() throws IOException {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve(GeneratedEntryStore.FILE_NAME));
+        Path manualFile = tempDir.resolve("custom_emc.json");
+        Files.writeString(manualFile,
+                "{\"entries\":[{\"item\":\"minecraft:stone\",\"emc\":123}]}",
+                StandardCharsets.UTF_8);
+        ProjectEManualValues manualValues = new ProjectEManualValues(manualFile);
+        CommandService service = new CommandService(
+                null, null, store, null, null, null, null, manualValues);
+
+        CommandResult result = service.explain("minecraft:stone");
+
+        assertTrue(result.success());
+        assertTrue(result.joinLines().contains("ProjectE 手动值: 123"));
+        assertTrue(result.joinLines().contains("custom_emc.json"));
+    }
+
+    @Test
+    void explainMissingShowsExternalProviderValue() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve(GeneratedEntryStore.FILE_NAME));
+        CommandService service = new CommandService(
+                null, null, store, null, null, null, provider(true, true, 456L), null);
+
+        CommandResult result = service.explain("minecraft:stone");
+
+        assertTrue(result.success());
+        assertTrue(result.joinLines().contains("ProjectE 当前值: 456（来自外部后端）"));
+    }
+
+    @Test
+    void explainMissingExplainsUnavailableProviderValue() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve(GeneratedEntryStore.FILE_NAME));
+        CommandService service = new CommandService(
+                null, null, store, null, null, null, provider(true, false, 0L), null);
+
+        CommandResult result = service.explain("minecraft:stone");
+
+        assertFalse(result.success());
+        assertEquals(List.of(
+                "未找到 minecraft:stone 的定价记录",
+                "ProjectE 后端不可用或该物品没有 EMC 值"), result.lines());
+    }
+
+    @Test
     void explainKnownItemShowsValueAndGeneratedOwnership() {
         GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve(GeneratedEntryStore.FILE_NAME));
         assertTrue(store.stage(new GeneratedEmcEntry(
@@ -342,6 +446,100 @@ class CommandServiceTest {
 
         assertTrue(result.success());
         assertTrue(result.joinLines().contains("归属: 非 SudoersEMC 所有"));
+    }
+
+    @Test
+    void approveMarksRecordAndPersistsIt() {
+        QuarantinedDropsStore quarantineStore = quarantineStoreWith(STONE);
+        CommandService service = new CommandService(
+                null, null, null, null, null, quarantineStore);
+
+        CommandResult result = service.approve("minecraft:stone");
+
+        assertTrue(result.success());
+        assertTrue(result.joinLines().contains("已批准"));
+        assertEquals(1, quarantineStore.size());
+        assertTrue(quarantineStore.entries().get(0).approved());
+        assertFalse(quarantineStore.isDirty(), "审批后必须立即落盘");
+        assertTrue(Files.isRegularFile(quarantineStore.file()), "隔离记录文件必须存在");
+    }
+
+    @Test
+    void approveMissingRecordFails() {
+        QuarantinedDropsStore quarantineStore = new QuarantinedDropsStore(
+                tempDir.resolve(QuarantinedDropsStore.FILE_NAME));
+        CommandService service = new CommandService(
+                null, null, null, null, null, quarantineStore);
+
+        CommandResult result = service.approve("minecraft:stone");
+
+        assertFalse(result.success());
+        assertEquals(List.of("未找到 minecraft:stone 的隔离降价记录"), result.lines());
+    }
+
+    @Test
+    void approveRejectsInvalidItemId() {
+        QuarantinedDropsStore quarantineStore = quarantineStoreWith(STONE);
+        CommandService service = new CommandService(
+                null, null, null, null, null, quarantineStore);
+
+        CommandResult result = service.approve("minecraft:stone with space");
+
+        assertFalse(result.success());
+        assertEquals(List.of("无效的物品 id: minecraft:stone with space"), result.lines());
+        assertFalse(quarantineStore.entries().get(0).approved(),
+                "非法 id 不得影响已有隔离记录");
+    }
+
+    @Test
+    void approveReportsPersistenceFailure() throws IOException {
+        QuarantinedDropsStore quarantineStore = quarantineStoreWith(STONE);
+        // 用同名 .tmp 目录阻塞原子写入，模拟磁盘写入失败。
+        Path blockedTemp = tempDir.resolve(QuarantinedDropsStore.FILE_NAME + ".tmp");
+        Files.createDirectories(blockedTemp);
+        Files.writeString(blockedTemp.resolve("blocker"), "x", StandardCharsets.UTF_8);
+        CommandService service = new CommandService(
+                null, null, null, null, null, quarantineStore);
+
+        CommandResult result = service.approve("minecraft:stone");
+
+        assertFalse(result.success());
+        assertTrue(result.joinLines().contains("保存到磁盘失败"));
+        assertTrue(quarantineStore.isDirty(), "落盘失败后必须保留脏标记");
+        assertTrue(quarantineStore.entries().get(0).approved(), "内存中的审批状态仍然有效");
+    }
+
+    @Test
+    void explainShowsPersistedAlternativeCosts() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve(GeneratedEntryStore.FILE_NAME));
+        assertTrue(store.stage(new GeneratedEmcEntry(
+                ItemKey.of(STONE), 42L, PriceSource.RECIPE, STONE, true, 123L,
+                List.of(7L, 9L))));
+        CommandService service = new CommandService(null, null, store, null);
+
+        CommandResult result = service.explain("minecraft:stone");
+
+        assertTrue(result.success());
+        assertTrue(result.joinLines().contains("备选成本: 7, 9"));
+    }
+
+    @Test
+    void explainLimitsAlternativesToFiveAndExplainsTruncation() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve(GeneratedEntryStore.FILE_NAME));
+        assertTrue(store.stage(new GeneratedEmcEntry(
+                ItemKey.of(STONE), 42L, PriceSource.RECIPE, STONE, true, 123L,
+                List.of(1L, 2L, 3L, 4L, 5L, 6L, 7L))));
+        CommandService service = new CommandService(null, null, store, null);
+
+        CommandResult result = service.explain("minecraft:stone");
+
+        assertTrue(result.success());
+        String text = result.joinLines();
+        assertTrue(text.contains("备选成本: 1, 2, 3, 4, 5"));
+        assertTrue(text.contains("共 7 条"));
+        assertTrue(!text.contains("6, 7"));
     }
 
     @Test

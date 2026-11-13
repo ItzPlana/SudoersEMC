@@ -3,6 +3,7 @@ package com.itzplana.sudoersemc.command;
 import com.mojang.brigadier.Command;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.context.CommandContext;
+import com.mojang.brigadier.arguments.StringArgumentType;
 import java.util.function.Function;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
@@ -54,6 +55,9 @@ public final class SudoemcCommands {
     public static LiteralArgumentBuilder<CommandSourceStack> register() {
         return Commands.literal(ROOT_LITERAL)
                 .requires(source -> source.hasPermission(REQUIRED_PERMISSION_LEVEL))
+                .executes(SudoemcCommands::help)
+                .then(Commands.literal("help")
+                        .executes(SudoemcCommands::help))
                 .then(Commands.literal("status")
                         .executes(context -> execute(context.getSource(), CommandService::status)))
                 .then(Commands.literal("rescan-all")
@@ -65,12 +69,40 @@ public final class SudoemcCommands {
                 .then(Commands.literal("explain")
                         .then(Commands.argument("item", ResourceLocationArgument.id())
                                 .executes(SudoemcCommands::explain)))
+                .then(Commands.literal("approve")
+                        .then(Commands.argument("item", StringArgumentType.string())
+                                .executes(SudoemcCommands::approve)))
                 .then(Commands.literal("quarantine")
                         .then(Commands.literal("approve")
                                 .then(Commands.argument("item", ResourceLocationArgument.id())
                                         .executes(SudoemcCommands::approveQuarantine))))
                 .then(Commands.literal("cancel")
                         .executes(context -> execute(context.getSource(), CommandService::cancel)));
+    }
+
+    /**
+     * 输出命令帮助文本。
+     */
+    private static int help(CommandContext<CommandSourceStack> context) {
+        CommandSourceStack source = context.getSource();
+        send(source, "SudoersEMC 命令:");
+        send(source, "/sudoemc status - 查看扫描状态");
+        send(source, "/sudoemc rescan-all - 请求全量重新扫描");
+        send(source, "/sudoemc reload - 重新加载配置");
+        send(source, "/sudoemc report - 查看上一次诊断报告");
+        send(source, "/sudoemc explain <item> - 解释 EMC 定价与备选成本");
+        send(source, "/sudoemc approve <item> - 批准隔离降价记录");
+        send(source, "/sudoemc quarantine approve <item> - 批准并应用隔离降价");
+        send(source, "/sudoemc cancel - 取消当前扫描");
+        return Command.SINGLE_SUCCESS;
+    }
+
+    /**
+     * 解析 {@code approve} 的物品参数并委托给命令服务。
+     */
+    private static int approve(CommandContext<CommandSourceStack> context) {
+        String item = StringArgumentType.getString(context, "item");
+        return execute(context.getSource(), commandService -> commandService.approve(item));
     }
 
     /**

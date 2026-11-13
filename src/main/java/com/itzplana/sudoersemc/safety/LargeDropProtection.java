@@ -35,7 +35,7 @@ public final class LargeDropProtection {
 
     /** 可选持久化存储；生产环境注入后每次隔离都会同步记录。 */
     @Nullable
-    private final QuarantinedDropsStore quarantineStore;
+    private volatile QuarantinedDropsStore quarantineStore;
 
     /**
      * @param settings 保护配置；不能为 {@code null}
@@ -51,6 +51,18 @@ public final class LargeDropProtection {
     public LargeDropProtection(Settings settings, @Nullable QuarantinedDropsStore quarantineStore) {
         this.settings = Objects.requireNonNull(settings, "settings");
         this.quarantineStore = quarantineStore;
+    }
+
+    /**
+     * 运行时注入或替换隔离记录存储。
+     *
+     * <p>供 {@code ScanPipeline#setQuarantinedDropsStore} 在管线重建或测试装配时使用；
+     * 传入 {@code null} 时只保留内存隔离状态。
+     *
+     * @param newStore 隔离记录存储，允许为 {@code null}
+     */
+    public void setQuarantineStore(@Nullable QuarantinedDropsStore newStore) {
+        this.quarantineStore = newStore;
     }
 
     /**

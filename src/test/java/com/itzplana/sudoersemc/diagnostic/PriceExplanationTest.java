@@ -60,6 +60,18 @@ class PriceExplanationTest {
     }
 
     @Test
+    void factoryWithNoteRendersCustomNote() {
+        PriceExplanation explanation = PriceExplanation.of(
+                ItemKey.of(STONE), 1L, PriceSource.RECIPE, STONE_BLOCK, true,
+                "SudoersEMC 生成", List.of(2L, 3L), "仅显示前 5 条");
+
+        String text = explanation.formatText();
+
+        assertTrue(text.contains("备选成本: 2, 3"));
+        assertTrue(text.contains("备注: 仅显示前 5 条"));
+    }
+
+    @Test
     void nullNoteRendersNone() {
         PriceExplanation explanation = PriceExplanation.of(
                 ItemKey.of(STONE), 1L, PriceSource.TIER, null, true, "SudoersEMC 生成", List.of(1L));

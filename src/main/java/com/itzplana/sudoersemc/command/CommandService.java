@@ -5,7 +5,10 @@ import com.itzplana.sudoersemc.core.GeneratedEmcEntry;
 import com.itzplana.sudoersemc.core.ItemKey;
 import com.itzplana.sudoersemc.diagnostic.PriceExplanation;
 import com.itzplana.sudoersemc.diagnostic.ReportManager;
+import com.itzplana.sudoersemc.integration.EmcProvider;
+import com.itzplana.sudoersemc.integration.ProjectEManualValues;
 import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
+import com.itzplana.sudoersemc.storage.QuarantinedDropsStore;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
 import com.itzplana.sudoersemc.task.ScanManager;
 import com.itzplana.sudoersemc.task.ScanProgress;
@@ -14,7 +17,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.function.BooleanSupplier;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
 import org.jetbrains.annotations.Nullable;
 
 /**
@@ -33,7 +40,11 @@ public final class CommandService {
     private static final String SCAN_UNAVAILABLE = "扫描服务不可用";
     private static final String REPORT_UNAVAILABLE = "报告服务不可用";
     private static final String STORAGE_UNAVAILABLE = "存储服务不可用";
+    private static final String QUARANTINE_UNAVAILABLE = "隔离记录服务不可用";
     private static final String DUPLICATE_SCAN = "已有扫描在进行中，请稍后再试";
+
+    /** {@code explain} 最多展示的备选成本数量。 */
+    private static final int MAX_EXPLAIN_ALTERNATIVES = 5;
 
     private final @Nullable ScanManager scanManager;
     private final @Nullable ReportManager reportManager;
@@ -42,6 +53,9 @@ public final class CommandService {
     private final @Nullable ReloadAction reloadAction;
     private final @Nullable BooleanSupplier scanRequestAction;
     private final @Nullable QuarantineApprovalAction quarantineApprovalAction;
+    private final @Nullable QuarantinedDropsStore quarantinedDropsStore;
+    private final @Nullable EmcProvider emcProvider;
+    private final @Nullable ProjectEManualValues manualValues;
 
     /**
      * 创建不执行真实配置重载的命令服务。
@@ -74,6 +88,50 @@ public final class CommandService {
                           @Nullable ScanStateStore scanStateStore,
                           @Nullable ReloadAction reloadAction) {
         this(scanManager, reportManager, entryStore, scanStateStore, reloadAction, null, null);
+    }
+
+    /**
+     * 便于只测试审批与解释、不涉及配置重载的构造器。
+     *
+     * @param scanManager           扫描状态机，可为 {@code null}
+     * @param reportManager         诊断报告管理器，可为 {@code null}
+     * @param entryStore            已生成条目的存储，可为 {@code null}
+     * @param scanStateStore        上一次扫描状态的存储，可为 {@code null}
+     * @param reloadAction          真实配置重载动作，可为 {@code null}
+     * @param quarantinedDropsStore 隔离记录存储，可为 {@code null}
+     */
+    public CommandService(@Nullable ScanManager scanManager,
+                          @Nullable ReportManager reportManager,
+                          @Nullable GeneratedEntryStore entryStore,
+                          @Nullable ScanStateStore scanStateStore,
+                          @Nullable ReloadAction reloadAction,
+                          @Nullable QuarantinedDropsStore quarantinedDropsStore) {
+        this(scanManager, reportManager, entryStore, scanStateStore,
+                reloadAction, quarantinedDropsStore, null, null);
+    }
+
+    /**
+     * 完整构造器：同时支持直接隔离存储审批与 explain 的手动值/外部后端查询。
+     *
+     * @param scanManager           扫描状态机，可为 {@code null}
+     * @param reportManager         诊断报告管理器，可为 {@code null}
+     * @param entryStore            已生成条目的存储，可为 {@code null}
+     * @param scanStateStore        上一次扫描状态的存储，可为 {@code null}
+     * @param reloadAction          真实配置重载动作，可为 {@code null}
+     * @param quarantinedDropsStore 隔离记录存储，可为 {@code null}
+     * @param emcProvider           ProjectE（或其它后端）的 EMC 查询接口，可为 {@code null}
+     * @param manualValues          ProjectE 手动值视图，可为 {@code null}
+     */
+    public CommandService(@Nullable ScanManager scanManager,
+                          @Nullable ReportManager reportManager,
+                          @Nullable GeneratedEntryStore entryStore,
+                          @Nullable ScanStateStore scanStateStore,
+                          @Nullable ReloadAction reloadAction,
+                          @Nullable QuarantinedDropsStore quarantinedDropsStore,
+                          @Nullable EmcProvider emcProvider,
+                          @Nullable ProjectEManualValues manualValues) {
+        this(scanManager, reportManager, entryStore, scanStateStore, reloadAction,
+                null, null, quarantinedDropsStore, emcProvider, manualValues);
     }
 
     /**
@@ -111,6 +169,32 @@ public final class CommandService {
                           @Nullable ReloadAction reloadAction,
                           @Nullable QuarantineApprovalAction quarantineApprovalAction,
                           @Nullable BooleanSupplier scanRequestAction) {
+        this(scanManager, reportManager, entryStore, scanStateStore, reloadAction,
+                quarantineApprovalAction, scanRequestAction, null, null, null);
+    }
+
+    /**
+     * 生产用完整构造器：审批回调、扫描请求回调与 explain 查询接口同时注入。
+     *
+     * @param scanManager              扫描状态机，可为 {@code null}
+     * @param reportManager            诊断报告管理器，可为 {@code null}
+     * @param entryStore               已生成条目的存储，可为 {@code null}
+     * @param scanStateStore           上一次扫描状态的存储，可为 {@code null}
+     * @param reloadAction             真实配置重载动作，可为 {@code null}
+     * @param quarantineApprovalAction 隔离降价审批动作，可为 {@code null}
+     * @param scanRequestAction        扫描请求动作，可为 {@code null}
+     * @param emcProvider              ProjectE（或其它后端）的 EMC 查询接口，可为 {@code null}
+     * @param manualValues             ProjectE 手动值视图，可为 {@code null}
+     */
+    public CommandService(@Nullable ScanManager scanManager,
+                          @Nullable ReportManager reportManager,
+                          @Nullable GeneratedEntryStore entryStore,
+                          @Nullable ScanStateStore scanStateStore,
+                          @Nullable ReloadAction reloadAction,
+                          @Nullable QuarantineApprovalAction quarantineApprovalAction,
+                          @Nullable BooleanSupplier scanRequestAction,
+                          @Nullable EmcProvider emcProvider,
+                          @Nullable ProjectEManualValues manualValues) {
         this.scanManager = scanManager;
         this.reportManager = reportManager;
         this.entryStore = entryStore;
@@ -118,6 +202,34 @@ public final class CommandService {
         this.reloadAction = reloadAction;
         this.quarantineApprovalAction = quarantineApprovalAction;
         this.scanRequestAction = scanRequestAction;
+        this.quarantinedDropsStore = null;
+        this.emcProvider = emcProvider;
+        this.manualValues = manualValues;
+    }
+
+    /**
+     * 直接注入隔离存储的私有完整构造器。
+     */
+    private CommandService(@Nullable ScanManager scanManager,
+                           @Nullable ReportManager reportManager,
+                           @Nullable GeneratedEntryStore entryStore,
+                           @Nullable ScanStateStore scanStateStore,
+                           @Nullable ReloadAction reloadAction,
+                           @Nullable QuarantineApprovalAction quarantineApprovalAction,
+                           @Nullable BooleanSupplier scanRequestAction,
+                           @Nullable QuarantinedDropsStore quarantinedDropsStore,
+                           @Nullable EmcProvider emcProvider,
+                           @Nullable ProjectEManualValues manualValues) {
+        this.scanManager = scanManager;
+        this.reportManager = reportManager;
+        this.entryStore = entryStore;
+        this.scanStateStore = scanStateStore;
+        this.reloadAction = reloadAction;
+        this.quarantineApprovalAction = quarantineApprovalAction;
+        this.scanRequestAction = scanRequestAction;
+        this.quarantinedDropsStore = quarantinedDropsStore;
+        this.emcProvider = emcProvider;
+        this.manualValues = manualValues;
     }
 
     /**
@@ -231,14 +343,62 @@ public final class CommandService {
     }
 
     /**
+     * 批准某个物品当前被隔离的降价记录。
+     *
+     * <p>生产接线会注入 {@link QuarantineApprovalAction}，由模组入口完成“持久化审批 →
+     * 清理内存隔离 → 应用数值 → 落盘/重映射”的完整闭环；只注入隔离存储时退化为仅标记
+     * 审批状态并落盘，不修改任何 EMC 数值。参数必须是普通物品 id；带 NBT 的变体暂不支持。</p>
+     *
+     * @param itemId 物品 id 原文，例如 {@code minecraft:stone}
+     * @return 明确的中文结果：已批准、无此记录或 id 非法；永不抛出异常
+     */
+    public CommandResult approve(String itemId) {
+        try {
+            if (itemId == null || itemId.isBlank()) {
+                return CommandResult.failure("请提供物品 id，例如 minecraft:stone");
+            }
+            String trimmed = itemId.trim();
+            if (quarantineApprovalAction != null) {
+                CommandResult result = quarantineApprovalAction.approve(trimmed);
+                return result == null
+                        ? CommandResult.failure("隔离审批失败: NullPointerException")
+                        : result;
+            }
+
+            ResourceLocation parsed = ResourceLocation.tryParse(trimmed);
+            if (parsed == null) {
+                return CommandResult.failure("无效的物品 id: " + itemId);
+            }
+            QuarantinedDropsStore store = quarantinedDropsStore;
+            if (store == null) {
+                return CommandResult.failure(QUARANTINE_UNAVAILABLE);
+            }
+
+            ItemKey key = ItemKey.of(parsed);
+            if (!store.approve(key)) {
+                return CommandResult.failure("未找到 " + trimmed + " 的隔离降价记录");
+            }
+            // 审批语义只落盘标记，不修改生成值，也不请求重扫。
+            if (!store.saveIfDirty()) {
+                return CommandResult.failure(
+                        "已批准 " + trimmed + " 的隔离降价记录，但保存到磁盘失败；将在下次保存时重试");
+            }
+            return CommandResult.ok(
+                    "已批准 " + trimmed + " 的隔离降价记录（仅标记审批状态，不修改 EMC，也不改变后续扫描判定）");
+        } catch (RuntimeException e) {
+            return unexpectedFailure(e);
+        }
+    }
+
+    /**
      * 解释某个物品当前的 EMC 定价。
      *
      * <p>命令参数只包含物品 id，因此这里查找的是无 NBT 变体的普通条目；带变体的条目需要
-     * 由后续命令扩展提供变体信息。已生成条目中没有保存备选成本，所以解释中的备选成本固定
-     * 为空列表，并在备注中写明“无”。</p>
+     * 由后续命令扩展提供变体信息。条目存在时展示最多五条备选成本；条目不存在时尝试查询
+     * ProjectE 手动值与外部后端值，并给出对应提示。</p>
      *
      * @param itemId 物品 id 原文，例如 {@code minecraft:stone}
-     * @return 七行解释文本，或中文失败提示；永不抛出异常
+     * @return 多行解释文本，或中文失败提示；永不抛出异常
      */
     public CommandResult explain(String itemId) {
         try {
@@ -259,11 +419,18 @@ public final class CommandService {
             Map<ItemKey, GeneratedEmcEntry> snapshot = entryStore.snapshotAll();
             GeneratedEmcEntry entry = snapshot == null ? null : snapshot.get(key);
             if (entry == null) {
-                return CommandResult.failure("未找到 " + trimmed + " 的定价记录");
+                return explainMissing(parsed, trimmed);
             }
 
             boolean owned = entryStore.isOwned(key);
             String ownership = owned ? "由 SudoersEMC 生成" : "非 SudoersEMC 所有";
+            List<Long> alternatives = entry.alternativeCosts();
+            int shown = Math.min(MAX_EXPLAIN_ALTERNATIVES, alternatives.size());
+            List<Long> displayed = List.copyOf(alternatives.subList(0, shown));
+            String note = alternatives.size() > shown
+                    ? "备选成本仅显示前 " + MAX_EXPLAIN_ALTERNATIVES + " 条（共 "
+                            + alternatives.size() + " 条）"
+                    : null;
             PriceExplanation explanation = new PriceExplanation(
                     entry.item(),
                     entry.value(),
@@ -271,11 +438,84 @@ public final class CommandService {
                     entry.recipeId(),
                     owned,
                     ownership,
-                    List.of(),
-                    "无");
+                    displayed,
+                    note);
             return CommandResult.ok(splitLines(explanation.formatText()));
         } catch (RuntimeException e) {
             return unexpectedFailure(e);
+        }
+    }
+
+    /**
+     * 生成“没有生成条目”时的解释结果。
+     *
+     * <p>优先检查人工固定的 ProjectE 手动值，其次查询外部 EMC 后端。两者都没有值且没有
+     * 后端时，保持原有的“未找到定价记录”失败结果；后端存在但无法给出值时额外说明。</p>
+     *
+     * @param itemId  已解析的物品 id
+     * @param trimmed 用户输入的原始 id
+     * @return 带提示的成功结果或沿用原语义的失败结果
+     */
+    private CommandResult explainMissing(ResourceLocation itemId, String trimmed) {
+        Long manual = lookupManualValue(itemId);
+        if (manual != null) {
+            return CommandResult.ok(
+                    "未找到 " + trimmed + " 的生成记录",
+                    "ProjectE 手动值: " + manual + "（来自 custom_emc.json，SudoersEMC 不会覆盖）");
+        }
+        Long providerValue = lookupProviderValue(itemId);
+        if (providerValue != null) {
+            return CommandResult.ok(
+                    "未找到 " + trimmed + " 的生成记录",
+                    "ProjectE 当前值: " + providerValue + "（来自外部后端）");
+        }
+        if (emcProvider != null) {
+            return new CommandResult(false, List.of(
+                    "未找到 " + trimmed + " 的定价记录",
+                    "ProjectE 后端不可用或该物品没有 EMC 值"));
+        }
+        return CommandResult.failure("未找到 " + trimmed + " 的定价记录");
+    }
+
+    /**
+     * 查询 ProjectE 手动值文件中的普通物品条目。
+     */
+    private @Nullable Long lookupManualValue(ResourceLocation itemId) {
+        ProjectEManualValues values = manualValues;
+        if (values == null) {
+            return null;
+        }
+        try {
+            return values.manualValues().get(ItemKey.of(itemId));
+        } catch (RuntimeException | LinkageError failure) {
+            return null;
+        }
+    }
+
+    /**
+     * 查询外部 EMC 后端当前值。
+     */
+    private @Nullable Long lookupProviderValue(ResourceLocation itemId) {
+        EmcProvider provider = emcProvider;
+        if (provider == null) {
+            return null;
+        }
+        try {
+            if (!provider.isAvailable()) {
+                return null;
+            }
+            Item item = BuiltInRegistries.ITEM.get(itemId);
+            if (item == null || item == Items.AIR) {
+                return null;
+            }
+            ItemStack stack = new ItemStack(item);
+            if (!provider.hasValue(stack)) {
+                return null;
+            }
+            long value = provider.getValue(stack);
+            return value > 0L ? value : null;
+        } catch (RuntimeException | LinkageError failure) {
+            return null;
         }
     }
 

@@ -31,6 +31,7 @@ import com.itzplana.sudoersemc.solver.SolveResult;
 import com.itzplana.sudoersemc.solver.SolveSettings;
 import com.itzplana.sudoersemc.solver.SolveTrace;
 import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
+import com.itzplana.sudoersemc.storage.QuarantinedDropsStore;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
 import com.itzplana.sudoersemc.task.ScanFingerprint;
 import com.itzplana.sudoersemc.task.ScanManager;
@@ -284,6 +285,19 @@ public final class ScanPipeline {
     public void setMaxNbtVariantsPerItem(int maxVariantsPerItem) {
         this.maxNbtVariantsPerItem = Math.max(
                 1, Math.min(maxVariantsPerItem, VariantScanner.HARD_VARIANT_CEILING));
+    }
+
+    /**
+     * 注入隔离记录存储。
+     *
+     * <p>注入后，每当大幅降价保护判定隔离时，管线会把旧值、拟写入值、降幅、原因与时间戳
+     * 写入该存储，供管理员通过 {@code /sudoemc approve} 审批。传入 {@code null} 时只保留原有
+     * 的内存计数与日志行为。干跑模式（生成条目存储为 {@code null}）永远不会写隔离文件。</p>
+     *
+     * @param newStore 隔离记录存储，允许为 {@code null}
+     */
+    public void setQuarantinedDropsStore(@Nullable QuarantinedDropsStore newStore) {
+        dropProtection.setQuarantineStore(newStore);
     }
 
     /**
@@ -885,6 +899,8 @@ public final class ScanPipeline {
     public PipelineResult solveAndApply(@Nullable PipelineSnapshot snapshot) {
         long startedAtNanos = System.nanoTime();
         PipelineSnapshot data = snapshot == null ? PipelineSnapshot.empty() : snapshot;
+        // 持久化隔离存储已经接管审计；每轮扫描开始时清空内存列表，避免长期自动扫描无限累积。
+        dropProtection.clearQuarantine();
         ScanFingerprint inputFingerprint = captureInputFingerprint(data);
         try {
             return applyComputation(compute(data, startedAtNanos, inputFingerprint));
@@ -1078,13 +1094,19 @@ public final class ScanPipeline {
             }
 
             if (store != null) {
+                // 溢出保护已经改变数值时，求解器给出的备选成本不再与最终值可比，
+                // 继续持久化会让 /sudoemc explain 展示误导性的对比结果。
+                List<Long> alternativeCosts = finalValue == candidate.value()
+                        ? candidate.alternativeCosts()
+                        : List.of();
                 boolean staged = store.stage(new GeneratedEmcEntry(
                         candidate.item(),
                         finalValue,
                         candidate.source(),
                         candidate.recipeId(),
                         true,
-                        System.currentTimeMillis()),
+                        System.currentTimeMillis(),
+                        alternativeCosts),
                         variantRegistrationNbts.getOrDefault(candidate.item(), List.of()));
                 if (!staged) {
                     LOGGER.debug("物品 {} 的生成值未被存储接受，可能已有非 SudoersEMC 拥有的条目",
@@ -1767,11 +1789,12 @@ public final class ScanPipeline {
                     ? solveResult.traces().get(item)
                     : null;
             ResourceLocation recipeId = trace == null ? null : trace.recipeId();
+            List<Long> alternativeCosts = trace == null ? List.of() : trace.alternativeCosts();
             Candidate existing = recipeCandidates.get(item);
             if (existing == null || mergedValue < existing.value()
                     || allowIncrease || source == PriceSource.SPECIAL_VALUE) {
                 recipeCandidates.put(item,
-                        new Candidate(item, mergedValue, source, recipeId));
+                        new Candidate(item, mergedValue, source, recipeId, alternativeCosts));
             }
         }
         return changed;
@@ -2160,12 +2183,25 @@ public final class ScanPipeline {
      *
      * <p>可见性为包内可见，便于同包测试直接验证“同一物品只保留配方来源”的合并规则。</p>
      *
-     * @param item     物品身份
-     * @param value    经过求解或兜底定价得到的原始数值，保证 {@code > 0}
-     * @param source   数值来源
-     * @param recipeId 产生该值的配方，兜底定价结果为 {@code null}
+     * @param item             物品身份
+     * @param value            经过求解或兜底定价得到的原始数值，保证 {@code > 0}
+     * @param source           数值来源
+     * @param recipeId         产生该值的配方，兜底定价结果为 {@code null}
+     * @param alternativeCosts 同一轮求解中的其它配方成本；兜底来源为空列表
      */
     record Candidate(ItemKey item, long value, PriceSource source,
-                     @Nullable ResourceLocation recipeId) {
+                     @Nullable ResourceLocation recipeId, List<Long> alternativeCosts) {
+
+        Candidate {
+            alternativeCosts = alternativeCosts == null ? List.of() : List.copyOf(alternativeCosts);
+        }
+
+        /**
+         * 兼容旧测试与调用点的构造器：不携带备选成本。
+         */
+        Candidate(ItemKey item, long value, PriceSource source,
+                  @Nullable ResourceLocation recipeId) {
+            this(item, value, source, recipeId, List.of());
+        }
     }
 }
