@@ -26,7 +26,11 @@ import java.util.TreeMap;
  * @param unsupportedRecipes 当前构建无法评估的配方数量
  * @param invalidRecipes     缺少 id、输入或输出的配方数量
  * @param failedRecipes      在描述过程中抛出异常的配方数量
+ * @param recipeEnumerationFailed 是否在枚举配方 id 时整体失败；为 {@code true} 时上面的
+ *                                配方统计不可用，报告必须显示“未知”而不是伪造 0 或 1
  * @param failedRecipeDetails 失败配方的可读明细；报告层会再次做数量与长度截断
+ * @param remapGeneration    采集开始时观察到的后端重映射代次；{@link #UNKNOWN_REMAP_GENERATION}
+ *                           表示调用方未经过采集阶段（例如测试手工构造），apply 阶段不做代次比较
  */
 public record PipelineSnapshot(
         List<ItemSnapshot> items,
@@ -35,8 +39,15 @@ public record PipelineSnapshot(
         int unsupportedRecipes,
         int invalidRecipes,
         int failedRecipes,
-        List<String> failedRecipeDetails
+        boolean recipeEnumerationFailed,
+        List<String> failedRecipeDetails,
+        long remapGeneration
 ) {
+
+    /**
+     * 未知的重映射代次：手工构造的快照没有采集时点，不能据此判断是否发生过重映射。
+     */
+    public static final long UNKNOWN_REMAP_GENERATION = -1L;
 
     public PipelineSnapshot {
         items = List.copyOf(Objects.requireNonNull(items, "items"));
@@ -53,10 +64,43 @@ public record PipelineSnapshot(
             }
         }
         failedRecipeDetails = Collections.unmodifiableList(details);
+        if (remapGeneration < UNKNOWN_REMAP_GENERATION) {
+            throw new IllegalArgumentException(
+                    "remapGeneration 必须 >= " + UNKNOWN_REMAP_GENERATION + "，实际为 " + remapGeneration);
+        }
     }
 
     /**
-     * 兼容 Phase 21 及更早调用点的构造器：不携带失败配方明细。
+     * 兼容早期调用点的构造器：不携带重映射代次，视为未知。
+     */
+    public PipelineSnapshot(List<ItemSnapshot> items,
+                            List<RecipeSnapshot> recipes,
+                            Map<ItemKey, Long> existingValues,
+                            int unsupportedRecipes,
+                            int invalidRecipes,
+                            int failedRecipes,
+                            boolean recipeEnumerationFailed,
+                            List<String> failedRecipeDetails) {
+        this(items, recipes, existingValues, unsupportedRecipes, invalidRecipes, failedRecipes,
+                recipeEnumerationFailed, failedRecipeDetails, UNKNOWN_REMAP_GENERATION);
+    }
+
+    /**
+     * 兼容 Phase 22 早期调用点的构造器：不携带配方枚举失败标志。
+     */
+    public PipelineSnapshot(List<ItemSnapshot> items,
+                            List<RecipeSnapshot> recipes,
+                            Map<ItemKey, Long> existingValues,
+                            int unsupportedRecipes,
+                            int invalidRecipes,
+                            int failedRecipes,
+                            List<String> failedRecipeDetails) {
+        this(items, recipes, existingValues, unsupportedRecipes, invalidRecipes, failedRecipes,
+                false, failedRecipeDetails);
+    }
+
+    /**
+     * 兼容 Phase 21 及更早调用点的构造器：不携带枚举失败标志与失败配方明细。
      */
     public PipelineSnapshot(List<ItemSnapshot> items,
                             List<RecipeSnapshot> recipes,
@@ -65,14 +109,36 @@ public record PipelineSnapshot(
                             int invalidRecipes,
                             int failedRecipes) {
         this(items, recipes, existingValues, unsupportedRecipes, invalidRecipes, failedRecipes,
-                List.of());
+                false, List.of());
+    }
+
+    /**
+     * 返回携带指定重映射代次的副本；相同代次直接返回当前实例。
+     *
+     * @param generation 采集开始时观察到的代次，必须 >= {@link #UNKNOWN_REMAP_GENERATION}
+     * @return 携带该代次的快照
+     */
+    public PipelineSnapshot withRemapGeneration(long generation) {
+        if (generation == remapGeneration) {
+            return this;
+        }
+        return new PipelineSnapshot(
+                items,
+                recipes,
+                existingValues,
+                unsupportedRecipes,
+                invalidRecipes,
+                failedRecipes,
+                recipeEnumerationFailed,
+                failedRecipeDetails,
+                generation);
     }
 
     /**
      * @return 不含任何物品、配方与既有值的空快照
      */
     public static PipelineSnapshot empty() {
-        return new PipelineSnapshot(List.of(), List.of(), Map.of(), 0, 0, 0, List.of());
+        return new PipelineSnapshot(List.of(), List.of(), Map.of(), 0, 0, 0, false, List.of());
     }
 
     /**

@@ -2333,11 +2333,10 @@ public final class ScanPipeline {
             ProjectECustomEmcFile target = projectECustomEmcFile == null
                     ? new ProjectECustomEmcFile()
                     : new ProjectECustomEmcFile(projectECustomEmcFile);
+            // ENTIRE_CUSTOM_EMC 本身就是改写整个文件的显式 opt-in；监听器只在成功写盘后触发。
             ProjectECustomEmcFile.RewriteResult result = target.rewriteAboveThreshold(
                     overflowPipeline.protection(),
                     store::isOwned,
-                    // ENTIRE_CUSTOM_EMC 本身就是改写整个文件的显式 opt-in。
-                    true,
                     overflowPipeline::recordCustomEmcReset);
             if (result.wroteFile()) {
                 LOGGER.info("ProjectE custom_emc.json 受控改写完成：rewritten={} skipped={} notOwned={} backup={}",

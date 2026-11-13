@@ -20,7 +20,7 @@ import java.util.Map;
  * {@code extraCounters} 按名称字典序追加在固定指标之后，保证不同调用顺序下报告文本一致。</p>
  *
  * @param totalRegisteredItems    本次扫描遍历到的注册物品总数
- * @param itemsWithExistingEmc    其中已经有 EMC 值的物品数量
+ * @param itemsWithExistingEmc    受保护的非自有既有值数量（自有条目会先被分离并重新求解）
  * @param itemsSolvedByRecipe     通过配方求解得到价格的物品数量
  * @param itemsSolvedByExternalBaseline 通过外部基线（PEI/解析器）得到价格的物品数量
  * @param itemsSolvedByTag        通过标签定价得到价格的物品数量
@@ -29,7 +29,7 @@ import java.util.Map;
  * @param itemsSolvedByFallback   通过兜底规则得到价格的物品数量
  * @param unresolvedItems         最终仍未解析出价格的物品数量
  * @param quarantinedDrops        因降幅超阈值而被隔离的降价数量
- * @param failedRecipes           扫描或求解失败的配方数量
+ * @param failedRecipes           配方扫描阶段失败的配方数量；求解器异常不计入此字段
  * @param totalDurationMillis     本次扫描总耗时毫秒数
  * @param peakHeapBytes           扫描期间观察到的峰值堆内存字节数
  * @param extraCounters           额外的具名计数器；不能包含 {@code null} 键或负值
@@ -157,7 +157,8 @@ public record DiagnosticReport(
     }
 
     /**
-     * @return 所有通过定价来源求解出的物品数量之和，即配方、外部基线、标签、稀有度、层级与兜底相加
+     * @return 所有通过定价来源求解出的物品数量之和，即配方、外部基线、标签、稀有度、层级、
+     *         兜底与扫描开始时观察到的已批准条目相加
      */
     public long generatedTotal() {
         return itemsSolvedByRecipe
@@ -165,7 +166,8 @@ public record DiagnosticReport(
                 + itemsSolvedByTag
                 + itemsSolvedByRarity
                 + itemsSolvedByTier
-                + itemsSolvedByFallback;
+                + itemsSolvedByFallback
+                + counter(PriceSource.APPROVED.name(), 0L);
     }
 
     /**
@@ -173,8 +175,8 @@ public record DiagnosticReport(
      *
      * <p>顺序固定为 {@code RECIPE → EXTERNAL_BASELINE → TAG → RARITY → TIER → FALLBACK →
      * APPROVED}，与枚举声明顺序无关，这样同一份数据在任何构建中都会产生相同的键顺序。值为 0
-     * 的来源不会出现在结果里。{@code APPROVED} 的数量来自额外计数器同名键，通常由下一次扫描
-     * 观察到已批准条目后写入。</p>
+     * 的来源不会出现在结果里。{@code APPROVED} 的数量来自额外计数器同名键，由
+     * {@code ScanPipeline} 在应用阶段开始时统计生成条目存储中的 {@code APPROVED} 条目后写入。</p>
      *
      * @return 不可变的“来源名称 → 数量”映射
      */
@@ -206,13 +208,14 @@ public record DiagnosticReport(
         StringBuilder text = new StringBuilder();
         text.append("===== SudoersEMC 诊断报告 =====\n");
         appendLine(text, "注册物品总数", Long.toString(totalRegisteredItems));
-        appendLine(text, "已有 EMC", Long.toString(itemsWithExistingEmc));
+        appendLine(text, "受保护的非自有既有值", Long.toString(itemsWithExistingEmc));
         appendLine(text, "配方求解", Long.toString(itemsSolvedByRecipe));
         appendLine(text, "外部基线定价", Long.toString(itemsSolvedByExternalBaseline));
         appendLine(text, "标签定价", Long.toString(itemsSolvedByTag));
         appendLine(text, "稀有度定价", Long.toString(itemsSolvedByRarity));
         appendLine(text, "层级定价", Long.toString(itemsSolvedByTier));
         appendLine(text, "兜底定价", Long.toString(itemsSolvedByFallback));
+        appendLine(text, "已批准应用", Long.toString(counter(PriceSource.APPROVED.name(), 0L)));
         appendLine(text, "未解析物品", Long.toString(unresolvedItems));
         appendLine(text, "隔离的降价", Long.toString(quarantinedDrops));
         appendLine(text, "失败配方", Long.toString(failedRecipes));
@@ -247,6 +250,17 @@ public record DiagnosticReport(
 
     private void appendRecipeScanSection(StringBuilder text) {
         long failedTotal = Math.max(failedRecipes, counter("failedRecipes", 0L));
+
+        // 枚举失败时总数与分类计数都不可信；明确显示“不可用”，绝不伪造 0 或 1。
+        if (counter("recipeEnumerationFailed", 0L) > 0L) {
+            text.append("----- 配方扫描 -----\n");
+            appendLine(text, "配方扫描统计", "不可用（配方枚举失败）");
+            if (!failedRecipeDetails.isEmpty()) {
+                appendFailedRecipeDetails(text, failedRecipeDetails.size());
+            }
+            return;
+        }
+
         boolean hasCounters = hasAnyCounter("totalRecipes", "usableRecipes",
                 "unsupportedRecipes", "invalidRecipes", "failedRecipes");
         boolean hasDetails = !failedRecipeDetails.isEmpty();
@@ -275,7 +289,7 @@ public record DiagnosticReport(
         appendLine(text, "可用配方", Long.toString(usable));
         appendLine(text, "不支持配方", Long.toString(unsupported));
         appendLine(text, "无效配方", Long.toString(invalid));
-        appendLine(text, "失败配方", Long.toString(failedTotal));
+        appendLine(text, "扫描失败配方", Long.toString(failedTotal));
         appendFailedRecipeDetails(text, failedTotal);
     }
 

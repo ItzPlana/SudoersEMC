@@ -16,11 +16,11 @@ import org.jetbrains.annotations.Nullable;
  * 规则。调用顺序是固定的，任何一项拒绝都会阻止写入：</p>
  *
  * <ol>
- *   <li>已批准记录不重复应用；</li>
+ *   <li>已应用记录不重复应用；</li>
+ *   <li>配置关闭立即应用时拒绝（退化为仅标记审批）；</li>
  *   <li>存储不可用拒绝；</li>
- *   <li>配置关闭立即应用时拒绝；</li>
- *   <li>拟应用值必须为正；</li>
- *   <li>拟应用值不得低于最小 EMC；</li>
+ *   <li>拟应用值必须为正、低于旧值且不高于溢出阈值；</li>
+ *   <li>拟应用值不得低于最小 EMC，也不得抬高当前条目值；</li>
  *   <li>ProjectE 手动值（含判定器缺失/异常）一律 fail-closed；</li>
  *   <li>排除规则服务缺失或判定异常同样 fail-closed，被排除的物品拒绝；</li>
  *   <li>最后才写入 {@link PriceSource#APPROVED} 条目。</li>
@@ -32,10 +32,12 @@ public final class ApprovedDropApplier {
     public enum Status {
         /** 已写入生成条目存储。 */
         APPLIED,
-        /** 隔离记录此前已经批准，未重复写入。 */
+        /** 该隔离记录的降价值已经写入生成条目，未重复写入。 */
         ALREADY_APPLIED,
         /** 物品存在 ProjectE 手动值，或无法确认是否为手动值。 */
         REFUSED_MANUAL,
+        /** 拟应用值超过 overflow.threshold，必须先经过溢出保护。 */
+        REFUSED_OVERFLOW,
         /** 物品被定价排除规则命中，或排除规则服务不可用（fail-closed）。 */
         REFUSED_EXCLUDED,
         /** 配置关闭了“批准后立即应用”；调用方应退化为仅标记审批状态。 */
@@ -75,6 +77,7 @@ public final class ApprovedDropApplier {
      * @param store             生成条目存储；{@code null} 返回 {@link Status#STORAGE_UNAVAILABLE}
      * @param applyEnabled      配置开关；{@code false} 时只允许标记审批，不写入数值
      * @param minimumEmc        允许写入的最低 EMC
+     * @param overflowThreshold 允许写入的最高 EMC；超过时拒绝，由扫描的溢出保护接管
      * @param manualDetector    ProjectE 手动值判定器；{@code null} 视为不可用并 fail-closed
      * @param exclusionDetector 定价排除判定器；{@code null} 表示服务不可用，同样 fail-closed 拒绝
      * @return 结果；永不抛出异常
@@ -83,13 +86,14 @@ public final class ApprovedDropApplier {
                                @Nullable GeneratedEntryStore store,
                                boolean applyEnabled,
                                long minimumEmc,
+                               long overflowThreshold,
                                @Nullable Predicate<ItemKey> manualDetector,
                                @Nullable Predicate<ItemKey> exclusionDetector) {
         if (drop == null || drop.key() == null) {
             return refused(Status.REFUSED_INVALID, "隔离记录为空或缺少物品身份");
         }
-        if (drop.approved()) {
-            return refused(Status.ALREADY_APPLIED, "该隔离记录已批准过，未重复应用");
+        if (drop.applied()) {
+            return refused(Status.ALREADY_APPLIED, "该隔离记录已应用过，未重复应用");
         }
         // 关闭立即应用时只允许审计式批准，调用方据此仅标记审批状态；此时不需要条目存储。
         if (!applyEnabled) {
@@ -105,12 +109,37 @@ public final class ApprovedDropApplier {
             return refused(Status.REFUSED_INVALID,
                     "拟应用值无效: " + proposedValue + "（必须大于 0）");
         }
+        ItemKey key = drop.key();
+
+        // Phase 21 的历史 approved=true 记录与审计模式记录都可能 applied=false：只要生成条目
+        // 中已有同值的 APPROVED 条目，就说明数值此前已经落盘，避免重复写入。
+        GeneratedEmcEntry existing = store.get(key);
+        if (existing != null
+                && existing.source() == PriceSource.APPROVED
+                && existing.value() == proposedValue) {
+            return refused(Status.ALREADY_APPLIED,
+                    "该降价值已存在于生成条目中（来源 APPROVED），未重复应用");
+        }
+
         if (proposedValue < minimumEmc) {
             return refused(Status.REFUSED_BELOW_MIN,
                     "拟应用值 " + proposedValue + " 低于最小 EMC " + minimumEmc);
         }
-
-        ItemKey key = drop.key();
+        if (proposedValue > overflowThreshold) {
+            return refused(Status.REFUSED_OVERFLOW,
+                    "拟应用值 " + proposedValue + " 超过溢出阈值 " + overflowThreshold
+                            + "；请先调整 overflow 配置或重新扫描");
+        }
+        if (drop.previousValue() > 0L && proposedValue >= drop.previousValue()) {
+            return refused(Status.REFUSED_INVALID,
+                    "拟应用值 " + proposedValue + " 不低于隔离记录旧值 " + drop.previousValue()
+                            + "，拒绝抬高价格");
+        }
+        if (existing != null && existing.value() > 0L && proposedValue >= existing.value()) {
+            return refused(Status.REFUSED_INVALID,
+                    "拟应用值 " + proposedValue + " 不低于当前条目值 " + existing.value()
+                            + "，拒绝抬高价格");
+        }
         if (manualDetector == null) {
             return refused(Status.REFUSED_MANUAL,
                     "无法确认 ProjectE 手动值状态，拒绝自动应用（fail-closed）");

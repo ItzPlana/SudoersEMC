@@ -97,8 +97,58 @@ class QuarantinedDropsStoreTest {
         assertFalse(store.approve(null));
         assertTrue(store.approve(ItemKey.of(STONE)));
         assertTrue(store.entries().get(0).approved());
+        assertFalse(store.entries().get(0).applied(), "仅批准不得被视为已应用");
         // 已批准的条目再次审批仍然认为是“存在”，返回 true。
         assertTrue(store.approve(ItemKey.of(STONE)));
+    }
+
+    @Test
+    void markAppliedPersistsAcrossRestart() {
+        Path file = tempDir.resolve(QuarantinedDropsStore.FILE_NAME);
+        QuarantinedDropsStore store = new QuarantinedDropsStore(file);
+        store.record(drop(STONE, 100_000L, 100L, 1L));
+
+        assertFalse(store.markApplied(ItemKey.of(DIRT)), "不存在的记录不能被标记为已应用");
+        assertTrue(store.markApplied(ItemKey.of(STONE)));
+        QuarantinedDropsStore.QuarantinedDrop marked = store.entries().get(0);
+        assertTrue(marked.approved(), "标记已应用时必须同时视为已批准");
+        assertTrue(marked.applied());
+        store.save();
+
+        QuarantinedDropsStore reloaded = new QuarantinedDropsStore(file);
+        reloaded.load();
+        assertTrue(reloaded.entries().get(0).approved());
+        assertTrue(reloaded.entries().get(0).applied());
+    }
+
+    @Test
+    void legacyApprovedRecordLoadsAsNotApplied() throws IOException {
+        Path file = tempDir.resolve(QuarantinedDropsStore.FILE_NAME);
+        Files.writeString(file, """
+                {
+                  "schemaVersion": 1,
+                  "entries": [
+                    {
+                      "item": "minecraft:stone",
+                      "variant": null,
+                      "previousValue": 1000,
+                      "proposedValue": 10,
+                      "dropRatio": 0.99,
+                      "reason": "test",
+                      "timestamp": 123,
+                      "approved": true
+                    }
+                  ]
+                }
+                """, StandardCharsets.UTF_8);
+
+        QuarantinedDropsStore store = new QuarantinedDropsStore(file);
+        store.load();
+
+        assertEquals(1, store.size());
+        assertTrue(store.entries().get(0).approved(), "旧版本 approved 标记必须保留");
+        assertFalse(store.entries().get(0).applied(),
+                "旧版本没有 applied 字段，必须按“仅批准未应用”加载");
     }
 
     @Test
@@ -176,7 +226,7 @@ class QuarantinedDropsStoreTest {
         store.save();
 
         assertFalse(store.isDirty());
-        assertTrue(Files.readString(file, StandardCharsets.UTF_8).contains("\"schemaVersion\": 1"));
+        assertTrue(Files.readString(file, StandardCharsets.UTF_8).contains("\"schemaVersion\": 2"));
         assertEquals(1L, backupCount(), "首次重写空文件前也应生成 .bak");
     }
 
@@ -210,7 +260,7 @@ class QuarantinedDropsStoreTest {
         store.save();
 
         String json = Files.readString(file, StandardCharsets.UTF_8);
-        assertTrue(json.contains("\"schemaVersion\": 1"), "保存时应升级到当前 schemaVersion");
+        assertTrue(json.contains("\"schemaVersion\": 2"), "保存时应升级到当前 schemaVersion");
         assertEquals(1L, backupCount());
     }
 
@@ -242,7 +292,7 @@ class QuarantinedDropsStoreTest {
 
         store.save();
 
-        assertTrue(Files.readString(file, StandardCharsets.UTF_8).contains("\"schemaVersion\": 1"));
+        assertTrue(Files.readString(file, StandardCharsets.UTF_8).contains("\"schemaVersion\": 2"));
         assertEquals(1L, backupCount());
     }
 

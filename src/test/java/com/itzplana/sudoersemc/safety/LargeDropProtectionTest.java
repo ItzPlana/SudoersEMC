@@ -6,16 +6,22 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.itzplana.sudoersemc.core.ItemKey;
+import com.itzplana.sudoersemc.storage.QuarantinedDropsStore;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Set;
 import net.minecraft.resources.ResourceLocation;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 /**
  * {@link LargeDropProtection} 的单元测试，重点验证严格大于阈值、仅降价触发隔离、豁免顺序以及
  * 管理员批准只清除隔离记录而不改数值。
  */
 class LargeDropProtectionTest {
+
+    @TempDir
+    Path tempDir;
 
     private static final ResourceLocation DIAMOND_ID = new ResourceLocation("minecraft", "diamond");
     private static final ResourceLocation IRON_ID = new ResourceLocation("minecraft", "iron_ingot");
@@ -122,6 +128,19 @@ class LargeDropProtectionTest {
     }
 
     @Test
+    void itemExemptionCoversNbtVariants() {
+        LargeDropProtection protection = new LargeDropProtection(new LargeDropProtection.Settings(
+                true, 0.5, Set.of(), Set.of(IRON)));
+        ItemKey variant = ItemKey.of(IRON_ID, "{Damage:3}");
+
+        PriceDropDecision decision = protection.evaluate(variant, 1_000L, 1L);
+
+        assertTrue(decision.allowed(), "物品 id 豁免必须覆盖其全部 NBT 变体");
+        assertEquals("exempt-item", decision.reason());
+        assertEquals(0, protection.quarantineCount());
+    }
+
+    @Test
     void namespaceExemptionAllowsLargeDrop() {
         // 元素只使用 namespace 部分，path 是占位符；任何 minecraft 物品都应被豁免。
         LargeDropProtection protection = new LargeDropProtection(new LargeDropProtection.Settings(
@@ -180,6 +199,27 @@ class LargeDropProtectionTest {
         assertEquals(0, protection.quarantineCount());
         assertTrue(protection.quarantined().isEmpty());
         assertTrue(protection.isApproved(DIAMOND), "审批历史与待处理隔离列表相互独立");
+    }
+
+    @Test
+    void quarantinedDecisionsAreRecordedAndDeduplicatedInStore() {
+        Path file = tempDir.resolve("quarantined_drops.json");
+        QuarantinedDropsStore store = new QuarantinedDropsStore(file);
+        LargeDropProtection protection = new LargeDropProtection(settings(true, 0.5), store);
+
+        protection.evaluate(DIAMOND, 1_000L, 400L);
+        protection.evaluate(DIAMOND, 1_000L, 300L);
+
+        assertEquals(1, store.size(), "同一物品只保留最新一条隔离记录");
+        assertEquals(300L, store.entries().get(0).proposedValue());
+
+        store.saveIfDirty();
+        QuarantinedDropsStore reloaded = new QuarantinedDropsStore(file);
+        reloaded.load();
+
+        assertEquals(1, reloaded.size());
+        assertEquals(300L, reloaded.entries().get(0).proposedValue());
+        assertFalse(reloaded.entries().get(0).approved());
     }
 
     @Test

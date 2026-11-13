@@ -27,6 +27,14 @@ public final class VariantScanner {
     public static final int HARD_VARIANT_CEILING = 1000;
 
     /**
+     * 一次扫描允许生成的变体总数硬上限。
+     *
+     * <p>每个物品的上限只能约束单项；缺少全局预算时，大量不同物品同时携带 NBT
+     * 仍会让采集阶段和持久化条目无限增长。达到该预算后按物品 id 升序停止采集。</p>
+     */
+    public static final int HARD_TOTAL_VARIANT_CEILING = 10_000;
+
+    /**
      * 扫描并规范化观测到的变体。
      *
      * @param baseStack           用于确定物品注册 id 的基础堆叠，不能为空

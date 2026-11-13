@@ -48,7 +48,10 @@ import org.slf4j.LoggerFactory;
  *
  * <p><strong>写盘策略：</strong>先复制原文件到同目录临时文件，用 NightConfig 就地修改已知键，
  * 保存成功后再做时间戳备份并原子替换。任何失败都保留原文件并清理临时文件；高版本配置拒绝
- * 迁移且绝不覆盖。迁移完成后同步 Forge 内存中的 live 值与 {@code SudoersemcConfig.SCHEMA_VERSION}，
+ * 迁移且绝不覆盖。拒绝（REFUSED_NEWER）与失败（FAILED_RETAINED）路径都会在返回前尽力
+ * 创建时间戳 {@code .bak}，因为返回后 Forge 仍可能按 spec 执行 {@code correct()/save()}
+ * 并丢弃未来版本的未知键与注释。迁移完成后同步 Forge 内存中的 live 值与
+ * {@code SudoersemcConfig.SCHEMA_VERSION}，
  * 因此同一文件重复触发事件时第二次会得到 {@link Status#NO_OP}。</p>
  */
 public final class ConfigTomlMigration {
@@ -75,7 +78,8 @@ public final class ConfigTomlMigration {
      * @param status      迁移状态
      * @param fromVersion 迁移前版本；无法读取时为 {@code -1}
      * @param toVersion   迁移后版本；失败时通常等于 {@code fromVersion}
-     * @param backup      成功迁移时创建的时间戳备份路径，否则为 {@code null}
+     * @param backup      成功迁移、拒绝迁移或失败保留前尽力创建的时间戳备份路径；
+     *                    无法备份时为 {@code null}
      * @param notes       面向日志的中文说明
      */
     public record MigrationOutcome(
@@ -161,8 +165,7 @@ public final class ConfigTomlMigration {
             return doMigrate(target, ops, live);
         } catch (Throwable failure) {
             LOGGER.warn("[config] 迁移 {} 时发生未预期异常，保留原文件", target, failure);
-            return new MigrationOutcome(Status.FAILED_RETAINED, -1, -1, null,
-                    List.of("迁移异常，保留原文件"));
+            return failed(target, ops, -1, "迁移异常，保留原文件");
         } finally {
             MIGRATION_IN_PROGRESS.set(false);
         }
@@ -180,13 +183,12 @@ public final class ConfigTomlMigration {
             original = Files.readString(target, StandardCharsets.UTF_8);
         } catch (IOException failure) {
             LOGGER.warn("[config] 无法读取 {}，保留原文件", target, failure);
-            return failed(target, -1, "无法读取配置文件");
+            return failed(target, ops, -1, "无法读取配置文件");
         }
         if (original.trim().isEmpty()) {
             // 空文件通常意味着 Forge 尚未完成首次写入；不要把它当成合法 legacy 配置。
             LOGGER.warn("[config] {} 为空文件，保留原文件等待 Forge 重新生成", target);
-            return new MigrationOutcome(Status.FAILED_RETAINED, -1, -1, null,
-                    List.of("空配置文件，保留原文件"));
+            return failed(target, ops, -1, "空配置文件，保留原文件");
         }
 
         Path fileName = target.getFileName();
@@ -212,16 +214,14 @@ public final class ConfigTomlMigration {
                     LOGGER.error(
                             "[config] {} 的 schemaVersion 超出本构建可表示范围；拒绝迁移并保留原文件",
                             target);
-                    return new MigrationOutcome(Status.REFUSED_NEWER,
-                            Integer.MAX_VALUE, Integer.MAX_VALUE, null,
-                            List.of("配置版本超出当前构建可表示范围"));
+                    return refused(target, ops, Integer.MAX_VALUE, Integer.MAX_VALUE,
+                            "配置版本超出当前构建可表示范围");
                 }
                 if (versionRead.status() == VersionStatus.INVALID) {
                     LOGGER.warn(
                             "[config] {} 的 schemaVersion 非法（必须是正整数）；保留原文件等待人工修复",
                             target);
-                    return new MigrationOutcome(Status.FAILED_RETAINED, -1, -1, null,
-                            List.of("schemaVersion 非法，保留原文件"));
+                    return failed(target, ops, -1, "schemaVersion 非法，保留原文件");
                 }
                 fromVersion = versionRead.status() == VersionStatus.MISSING
                         ? ConfigMigrations.LEGACY_SCHEMA_VERSION
@@ -230,9 +230,8 @@ public final class ConfigTomlMigration {
                     LOGGER.error(
                             "[config] {} 的 schemaVersion={} 高于本构建支持的 {}；拒绝迁移并保留原文件",
                             target, fromVersion, ConfigMigrations.SCHEMA_VERSION);
-                    return new MigrationOutcome(Status.REFUSED_NEWER, fromVersion, fromVersion,
-                            null, List.of("配置版本高于当前构建支持的 "
-                                    + ConfigMigrations.SCHEMA_VERSION));
+                    return refused(target, ops, fromVersion, fromVersion,
+                            "配置版本高于当前构建支持的 " + ConfigMigrations.SCHEMA_VERSION);
                 }
                 if (fromVersion == ConfigMigrations.SCHEMA_VERSION) {
                     return new MigrationOutcome(Status.NO_OP, fromVersion, fromVersion,
@@ -249,8 +248,8 @@ public final class ConfigTomlMigration {
 
                 result = ConfigMigrations.migrate(fromVersion, logical);
                 if (result.toVersion() > ConfigMigrations.SCHEMA_VERSION) {
-                    return new MigrationOutcome(Status.REFUSED_NEWER, fromVersion,
-                            result.toVersion(), null, result.notes());
+                    return refused(target, ops, fromVersion, result.toVersion(),
+                            String.join("；", result.notes()));
                 }
 
                 for (Map.Entry<String, String> entry : LOGICAL_TO_TOML.entrySet()) {
@@ -269,7 +268,7 @@ public final class ConfigTomlMigration {
             Path backup = ops.backup(target);
             if (backup == null) {
                 LOGGER.warn("[config] 无法备份 {}，中止迁移并保留原文件", target);
-                return failed(target, fromVersion, "备份失败，保留原文件");
+                return failed(target, ops, fromVersion, "备份失败，保留原文件");
             }
 
             try {
@@ -288,7 +287,7 @@ public final class ConfigTomlMigration {
                     ConfigMigrations.SCHEMA_VERSION, backup, notes);
         } catch (Throwable failure) {
             LOGGER.warn("[config] 迁移 {} 失败，保留原文件", target, failure);
-            return failed(target, -1, "迁移失败，保留原文件");
+            return failed(target, ops, -1, "迁移失败，保留原文件");
         } finally {
             if (!replaced) {
                 deleteQuietly(ops, temp);
@@ -381,12 +380,19 @@ public final class ConfigTomlMigration {
         }
     }
 
+    /**
+     * 只接受真正的数值类型。
+     *
+     * <p>TOML 中 {@code schemaVersion = "2"} 是字符串，不是数值；Forge 的 spec 字段为
+     * {@code IntValue}，随后 {@code correct()} 会把它纠正为默认 {@code 1}。因此必须把
+     * quoted numeric 视为非法并 fail-closed，绝不能解析为未来版本后返回 {@code NO_OP}。</p>
+     */
     @Nullable
     private static BigDecimal toDecimal(Object raw) {
-        if (!(raw instanceof Number) && !(raw instanceof CharSequence)) {
+        if (!(raw instanceof Number number)) {
             return null;
         }
-        String text = raw.toString().trim();
+        String text = number.toString().trim();
         if (text.isEmpty()) {
             return null;
         }
@@ -397,10 +403,48 @@ public final class ConfigTomlMigration {
         }
     }
 
-    private static MigrationOutcome failed(Path target, int fromVersion, String note) {
+    private static MigrationOutcome refused(Path target, FileOps ops, int fromVersion,
+                                            int toVersion, String note) {
+        List<String> notes = new ArrayList<>();
+        if (note != null && !note.isBlank()) {
+            notes.add(note);
+        }
+        Path backup = backupBeforeRewrite(target, ops, notes);
+        return new MigrationOutcome(Status.REFUSED_NEWER, fromVersion, toVersion, backup, notes);
+    }
+
+    private static MigrationOutcome failed(Path target, FileOps ops, int fromVersion, String note) {
         LOGGER.warn("[config] 配置迁移未完成：{}（{}）", target, note);
-        return new MigrationOutcome(Status.FAILED_RETAINED, fromVersion, fromVersion,
-                null, List.of(note));
+        List<String> notes = new ArrayList<>();
+        if (note != null && !note.isBlank()) {
+            notes.add(note);
+        }
+        Path backup = backupBeforeRewrite(target, ops, notes);
+        return new MigrationOutcome(Status.FAILED_RETAINED, fromVersion, fromVersion, backup, notes);
+    }
+
+    /**
+     * 在拒绝/失败返回前尽力备份原文件。
+     *
+     * <p>解析前迁移返回后，Forge 仍会按 spec 执行 {@code correct()/save()}，可能丢弃未来
+     * 版本的未知键与注释。备份失败不能改变迁移状态，也不能覆盖原文件。</p>
+     */
+    @Nullable
+    private static Path backupBeforeRewrite(Path target, FileOps ops, List<String> notes) {
+        try {
+            Path backup = ops.backup(target);
+            if (backup == null) {
+                notes.add("无法创建备份，原文件保持不变");
+            } else {
+                notes.add("已备份到 " + backup.getFileName());
+                LOGGER.warn("[config] 配置迁移未完成前已备份原始配置：{}", backup);
+            }
+            return backup;
+        } catch (Throwable failure) {
+            LOGGER.warn("[config] 备份 {} 失败，继续保留原文件", target, failure);
+            notes.add("备份失败，原文件保持不变");
+            return null;
+        }
     }
 
     private static void deleteQuietly(FileOps ops, Path path) {

@@ -18,8 +18,9 @@ import org.slf4j.LoggerFactory;
  * 被大幅降价保护隔离的待审记录的持久化存储。
  *
  * <p>对应文件 {@code config/sudoersemc/quarantined_drops.json}。每次隔离都会把旧值、拟写入值、
- * 降幅、判定原因与时间戳写入这里，管理员审批后把 {@code approved} 置为 {@code true}。该文件
- * 只记录“发生过什么”，不会修改 {@link GeneratedEntryStore} 中的任何 EMC 数值。</p>
+ * 降幅、判定原因与时间戳写入这里，管理员审批后把 {@code approved} 置为 {@code true}；
+ * {@code safety.approveAppliesImmediately=true} 且降价值成功落盘时，{@code applied} 也会置为
+ * {@code true}。该文件只记录“发生过什么”，不会直接修改 {@link GeneratedEntryStore} 中的数值。</p>
  *
  * <h2>保留策略</h2>
  * <p>同一物品只保留一条记录：再次记录时用新条目替换旧条目。总量上限为
@@ -36,8 +37,11 @@ public final class QuarantinedDropsStore {
     private static final Logger LOGGER =
             LoggerFactory.getLogger("sudoersemc/storage/QuarantinedDropsStore");
 
-    /** 当前磁盘格式版本。 */
-    public static final int SCHEMA_VERSION = 1;
+    /**
+     * 当前磁盘格式版本。版本 2 新增 {@code applied} 字段；版本 1/0 仍可读取，缺失字段按
+     * {@code false} 处理。更高版本保持原文件不动并拒绝覆盖。
+     */
+    public static final int SCHEMA_VERSION = 2;
 
     /** 相对于 {@link SudoersemcPaths#dataDir()} 的文件名。 */
     public static final String FILE_NAME = "quarantined_drops.json";
@@ -68,6 +72,7 @@ public final class QuarantinedDropsStore {
      * @param reason        机器可读的判定原因，不能为 {@code null}
      * @param timestamp     隔离发生的 epoch 毫秒，必须 {@code >= 0}
      * @param approved      管理员是否已批准应用该降价
+     * @param applied       降价值是否真的已经写入 {@link GeneratedEntryStore}
      */
     public record QuarantinedDrop(
             ItemKey key,
@@ -76,7 +81,8 @@ public final class QuarantinedDropsStore {
             double dropRatio,
             String reason,
             long timestamp,
-            boolean approved
+            boolean approved,
+            boolean applied
     ) {
 
         public QuarantinedDrop {
@@ -97,12 +103,31 @@ public final class QuarantinedDropsStore {
         }
 
         /**
+         * 兼容 Phase 21/26 早期调用点的构造器：未写入任何数值，因此 {@code applied=false}。
+         */
+        public QuarantinedDrop(ItemKey key, long previousValue, long proposedValue,
+                               double dropRatio, String reason, long timestamp, boolean approved) {
+            this(key, previousValue, proposedValue, dropRatio, reason, timestamp, approved, false);
+        }
+
+        /**
          * @param newApproved 新的审批状态
          * @return 除审批状态外其余字段完全相同的副本
          */
         public QuarantinedDrop withApproved(boolean newApproved) {
             return new QuarantinedDrop(
-                    key, previousValue, proposedValue, dropRatio, reason, timestamp, newApproved);
+                    key, previousValue, proposedValue, dropRatio, reason, timestamp,
+                    newApproved, applied);
+        }
+
+        /**
+         * @param newApplied 是否已实际写入生成条目
+         * @return 除 {@code applied} 外其余字段相同的副本；置为 true 时同时视为已批准
+         */
+        public QuarantinedDrop withApplied(boolean newApplied) {
+            return new QuarantinedDrop(
+                    key, previousValue, proposedValue, dropRatio, reason, timestamp,
+                    newApplied || approved, newApplied);
         }
     }
 
@@ -186,11 +211,17 @@ public final class QuarantinedDropsStore {
         }
     }
 
-    /** 若存在尚未写盘的变更则保存。 */
-    public void saveIfDirty() {
+    /**
+     * 若存在尚未写盘的变更则保存。
+     *
+     * @return 没有待保存变更或保存成功时为 {@code true}；保存失败（包括不支持的 schema 版本）
+     *         时为 {@code false}
+     */
+    public boolean saveIfDirty() {
         if (dirty.get()) {
-            save();
+            return save();
         }
+        return true;
     }
 
     /**
@@ -198,14 +229,17 @@ public final class QuarantinedDropsStore {
      *
      * <p>不支持的更高版本会阻止写入。首次重写已存在的文件前会生成带时间戳的 {@code .bak}。
      * 写入或备份失败时保留脏标记，调用方可在下一次 {@link #saveIfDirty()} 时重试。</p>
+     *
+     * @return 写入成功或无需写入时为 {@code true}；版本不受支持、备份或写入失败时为
+     *         {@code false}
      */
-    public void save() {
+    public boolean save() {
         synchronized (lock) {
             if (unsupportedSchemaVersion) {
                 LOGGER.warn(
                         "不保存 {}：该文件由不受支持的 schemaVersion {} 写入",
                         file, loadedSchemaVersion);
-                return;
+                return false;
             }
             // 先清除脏标记：并发记录会重新置位，留给下一次保存。
             dirty.set(false);
@@ -222,16 +256,19 @@ public final class QuarantinedDropsStore {
                 if (backupPending && !JsonFileIO.backupIfExists(file)) {
                     dirty.set(true);
                     LOGGER.warn("保存隔离记录到 {} 失败：无法创建备份，保留待保存状态等待重试", file);
-                    return;
+                    return false;
                 }
                 if (!JsonFileIO.writeAtomically(file, dto)) {
                     dirty.set(true);
-                    return;
+                    LOGGER.warn("保存隔离记录到 {} 失败：原子写入未完成，保留待保存状态等待重试", file);
+                    return false;
                 }
                 backupPending = false;
+                return true;
             } catch (RuntimeException e) {
                 dirty.set(true);
                 LOGGER.warn("保存隔离记录到 {} 失败", file, e);
+                return false;
             }
         }
     }
@@ -239,9 +276,10 @@ public final class QuarantinedDropsStore {
     /**
      * 记录一条隔离降价。
      *
-     * <p>同一物品已有记录时直接替换，保证一个物品最多一条待审记录；替换不会保留旧的审批状态，
-     * 因为新隔离是一次全新的判定。写入后若超过上限，会按时间戳淘汰最旧的条目。{@code null}
-     * 会被忽略。</p>
+     * <p>同一物品已有记录时直接替换，保证一个物品最多一条待审记录。若新旧记录表示同一次
+     * 经济判定（旧值、拟写入值、降幅与原因完全相同），则保留已有审批状态，避免下一次扫描
+     * 静默清除管理员审批；拟写入值等发生变化时视为新的隔离事件，审批状态重置为未批准。
+     * 写入后若超过上限，会按时间戳淘汰最旧的条目。{@code null} 会被忽略。</p>
      *
      * @param drop 隔离记录；构造时已经完成数值校验
      */
@@ -251,6 +289,10 @@ public final class QuarantinedDropsStore {
         }
         synchronized (lock) {
             try {
+                QuarantinedDrop existing = entries.get(drop.key());
+                if (existing != null && existing.approved() && sameDecision(existing, drop)) {
+                    drop = drop.withApproved(true);
+                }
                 entries.put(drop.key(), drop);
                 trimToCapacity();
                 dirty.set(true);
@@ -258,6 +300,14 @@ public final class QuarantinedDropsStore {
                 LOGGER.warn("记录隔离降价失败：{}", drop.key(), e);
             }
         }
+    }
+
+    /** 判断两条记录是否描述同一次经济判定；时间戳与审批状态不参与比较。 */
+    private static boolean sameDecision(QuarantinedDrop left, QuarantinedDrop right) {
+        return left.previousValue() == right.previousValue()
+                && left.proposedValue() == right.proposedValue()
+                && Double.compare(left.dropRatio(), right.dropRatio()) == 0
+                && left.reason().equals(right.reason());
     }
 
     /**
@@ -306,14 +356,39 @@ public final class QuarantinedDropsStore {
     }
 
     /**
-     * 把某条隔离记录标记为已批准。与 {@link #approve(ItemKey)} 语义相同，命名更明确，
-     * 供审批后立即应用的调用点使用。
+     * 把某条隔离记录标记为“已批准但未应用”。与 {@link #approve(ItemKey)} 语义相同，命名更明确，
+     * 供审批后不立即应用的审计模式使用。
      *
      * @param key 物品身份，可为 {@code null}
      * @return 记录存在时返回 {@code true}（已是批准状态也返回 {@code true}）
      */
     public boolean markApproved(ItemKey key) {
         return approve(key);
+    }
+
+    /**
+     * 把某条隔离记录标记为“已批准且已应用”。只有生成条目确认落盘后才应调用；
+     * 该标记跨重启保留，避免历史记录或审计模式记录被误判为“已应用”。
+     *
+     * @param key 物品身份，可为 {@code null}
+     * @return 记录存在时返回 {@code true}；不存在时返回 {@code false}
+     */
+    public boolean markApplied(ItemKey key) {
+        if (key == null) {
+            return false;
+        }
+        synchronized (lock) {
+            QuarantinedDrop existing = entries.get(key);
+            if (existing == null) {
+                return false;
+            }
+            if (existing.applied() && existing.approved()) {
+                return true;
+            }
+            entries.put(key, existing.withApplied(true));
+            dirty.set(true);
+            return true;
+        }
     }
 
     /**
@@ -421,7 +496,8 @@ public final class QuarantinedDropsStore {
                     dto.dropRatio,
                     dto.reason,
                     dto.timestamp,
-                    dto.approved);
+                    dto.approved,
+                    dto.applied);
         } catch (RuntimeException e) {
             return null;
         }
@@ -445,6 +521,7 @@ public final class QuarantinedDropsStore {
         String reason;
         long timestamp;
         boolean approved;
+        boolean applied;
 
         static DropDto from(QuarantinedDrop drop) {
             DropDto dto = new DropDto();
@@ -456,6 +533,7 @@ public final class QuarantinedDropsStore {
             dto.reason = drop.reason();
             dto.timestamp = drop.timestamp();
             dto.approved = drop.approved();
+            dto.applied = drop.applied();
             return dto;
         }
     }

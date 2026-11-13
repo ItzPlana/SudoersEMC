@@ -6,8 +6,11 @@ import com.itzplana.sudoersemc.core.OwnedEntrySink;
 import com.itzplana.sudoersemc.core.PriceSource;
 import com.mojang.logging.LogUtils;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
+import moze_intel.projecte.api.ItemInfo;
 import moze_intel.projecte.api.proxy.IEMCProxy;
+import moze_intel.projecte.emc.EMCMappingHandler;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.item.ItemStack;
@@ -80,6 +83,26 @@ public final class ProjectECompat implements EmcProvider {
         }
     }
 
+    /**
+     * 查询完整 NBT 的精确 EMC 映射。
+     *
+     * <p>{@code IEMCProxy.getValue(ItemStack)} 在 NBT 未命中时会回退基础物品值，
+     * 无法区分“该 NBT 自身已有映射”与“仅继承基础物品”。这里直接查询 ProjectE 的
+     * 映射表，避免变体扫描把基础物品值误当成 NBT 专属值，也避免覆盖外部 NBT 值。</p>
+     */
+    @Override
+    public long getExactValue(ItemStack stack) {
+        if (stack == null || stack.isEmpty() || !isAvailable()) {
+            return 0L;
+        }
+        try {
+            return Math.max(0L, EMCMappingHandler.getStoredEmcValue(ItemInfo.fromStack(stack)));
+        } catch (Throwable t) {
+            degrade("EMCMappingHandler.getStoredEmcValue(ItemInfo)", t);
+            return 0L;
+        }
+    }
+
     @Override
     public boolean stageGeneratedValue(ItemKey key, long value, PriceSource source,
                                        @Nullable ResourceLocation recipeId) {
@@ -115,24 +138,33 @@ public final class ProjectECompat implements EmcProvider {
     }
 
     @Override
-    public void requestRemap(@Nullable MinecraftServer server) {
+    public boolean requestRemap(@Nullable MinecraftServer server) {
+        return requestRemapAsync(server) != null;
+    }
+
+    @Override
+    @Nullable
+    public CompletableFuture<?> requestRemapAsync(@Nullable MinecraftServer server) {
         if (server == null) {
             LOGGER.warn("Cannot request a ProjectE EMC remap: no server instance is available");
-            return;
+            return null;
         }
         if (!server.isSameThread()) {
             LOGGER.warn("Refusing to request a ProjectE EMC remap off the server thread; call requestRemap on the server thread");
-            return;
+            return null;
         }
 
         // Pick up administrator edits before the mapping pass reads them.
         manualValues.refreshIfChanged();
 
         try {
-            server.reloadResources(server.getPackRepository().getSelectedIds());
+            CompletableFuture<Void> completion =
+                    server.reloadResources(server.getPackRepository().getSelectedIds());
             LOGGER.info("Requested a ProjectE EMC remap through a server resource reload");
+            return completion;
         } catch (Throwable t) {
             LOGGER.warn("Failed to request a ProjectE EMC remap", t);
+            return CompletableFuture.failedFuture(t);
         }
     }
 

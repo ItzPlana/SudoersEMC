@@ -6,9 +6,9 @@ import com.itzplana.sudoersemc.core.ItemKey;
 import com.itzplana.sudoersemc.diagnostic.PriceExplanation;
 import com.itzplana.sudoersemc.diagnostic.ReportManager;
 import com.itzplana.sudoersemc.integration.EmcProvider;
-import com.itzplana.sudoersemc.integration.OptionalIntegrationManager;
 import com.itzplana.sudoersemc.integration.ProjectEManualValues;
 import com.itzplana.sudoersemc.safety.ApprovedDropApplier;
+import com.itzplana.sudoersemc.safety.OverflowProtection;
 import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
 import com.itzplana.sudoersemc.storage.QuarantinedDropsStore;
 import com.itzplana.sudoersemc.storage.ScanStateStore;
@@ -64,9 +64,13 @@ public final class CommandService {
     private final @Nullable QuarantinedDropsStore quarantinedDropsStore;
     private final @Nullable EmcProvider emcProvider;
     private final @Nullable ProjectEManualValues manualValues;
+    @Nullable
+    private QuarantineApprovalAction approvalAction;
+
     private final boolean approveAppliesImmediately;
     private final @Nullable Supplier<Predicate<ItemKey>> pricingExclusionSupplier;
     private final @Nullable LongSupplier minimumEmcSupplier;
+    private final @Nullable LongSupplier overflowThresholdSupplier;
 
     /**
      * 创建不执行真实配置重载的命令服务。
@@ -99,6 +103,26 @@ public final class CommandService {
                           @Nullable ScanStateStore scanStateStore,
                           @Nullable ReloadAction reloadAction) {
         this(scanManager, reportManager, entryStore, scanStateStore, reloadAction, null, null, null);
+    }
+
+    /**
+     * 兼容构造器：注入审批动作（命令层只做参数解析，审批语义由动作实现）。
+     *
+     * @param scanManager     扫描状态机，可为 {@code null}
+     * @param reportManager   诊断报告管理器，可为 {@code null}
+     * @param entryStore      已生成条目的存储，可为 {@code null}
+     * @param scanStateStore  上一次扫描状态的存储，可为 {@code null}
+     * @param reloadAction    真实配置重载动作，可为 {@code null}
+     * @param approvalAction  审批动作；{@code null} 表示不可用
+     */
+    public CommandService(@Nullable ScanManager scanManager,
+                          @Nullable ReportManager reportManager,
+                          @Nullable GeneratedEntryStore entryStore,
+                          @Nullable ScanStateStore scanStateStore,
+                          @Nullable ReloadAction reloadAction,
+                          @Nullable QuarantineApprovalAction approvalAction) {
+        this(scanManager, reportManager, entryStore, scanStateStore, reloadAction, null, null, null);
+        this.approvalAction = approvalAction;
     }
 
     /**
@@ -172,6 +196,29 @@ public final class CommandService {
                           boolean approveAppliesImmediately,
                           @Nullable Supplier<Predicate<ItemKey>> pricingExclusionSupplier,
                           @Nullable LongSupplier minimumEmcSupplier) {
+        this(scanManager, reportManager, entryStore, scanStateStore, reloadAction,
+                quarantinedDropsStore, emcProvider, manualValues, approveAppliesImmediately,
+                pricingExclusionSupplier, minimumEmcSupplier, null);
+    }
+
+    /**
+     * 完整构造器（含溢出阈值）。
+     *
+     * @param overflowThresholdSupplier 允许批准应用的最高 EMC 提供者；{@code null} 使用
+     *                                  {@link OverflowProtection#DEFAULT_THRESHOLD} 作为安全兜底
+     */
+    public CommandService(@Nullable ScanManager scanManager,
+                          @Nullable ReportManager reportManager,
+                          @Nullable GeneratedEntryStore entryStore,
+                          @Nullable ScanStateStore scanStateStore,
+                          @Nullable ReloadAction reloadAction,
+                          @Nullable QuarantinedDropsStore quarantinedDropsStore,
+                          @Nullable EmcProvider emcProvider,
+                          @Nullable ProjectEManualValues manualValues,
+                          boolean approveAppliesImmediately,
+                          @Nullable Supplier<Predicate<ItemKey>> pricingExclusionSupplier,
+                          @Nullable LongSupplier minimumEmcSupplier,
+                          @Nullable LongSupplier overflowThresholdSupplier) {
         this.scanManager = scanManager;
         this.reportManager = reportManager;
         this.entryStore = entryStore;
@@ -183,6 +230,7 @@ public final class CommandService {
         this.approveAppliesImmediately = approveAppliesImmediately;
         this.pricingExclusionSupplier = pricingExclusionSupplier;
         this.minimumEmcSupplier = minimumEmcSupplier;
+        this.overflowThresholdSupplier = overflowThresholdSupplier;
     }
 
     /**
@@ -293,12 +341,14 @@ public final class CommandService {
     /**
      * 批准某个物品当前被隔离的降价记录，并在配置允许时立即应用降价值。
      *
-     * <p>审批会先经过 {@link ApprovedDropApplier} 的全部安全规则：已批准记录不重复应用、
-     * ProjectE 手动值 fail-closed 拒绝、排除规则缺失或命中同样拒绝、低于最小 EMC 拒绝。
-     * 应用成功后写入 {@link GeneratedEntryStore}（来源 {@code APPROVED}）并请求 ProjectE
-     * 重映射；当 {@code safety.approveAppliesImmediately=false} 时退化为“只批准、不应用”的
-     * 审计模式：仅标记审批状态并落盘。本方法绝不直接改写 ProjectE 的
-     * {@code custom_emc.json}。参数必须是普通物品 id；带 NBT 的变体暂不支持。</p>
+     * <p>审批会先经过 {@link ApprovedDropApplier} 的全部安全规则：已应用记录不重复应用、
+     * ProjectE 手动值 fail-closed 拒绝、排除规则缺失或命中同样拒绝、低于最小 EMC 或高于
+     * {@code overflow.threshold} 拒绝、拟应用值不得抬高旧值/当前值。应用成功后先确认
+     * {@link GeneratedEntryStore}（来源 {@code APPROVED}）已落盘，再标记 {@code applied} 并
+     * 请求 ProjectE 重映射；写入失败会回滚并且不标记批准。当
+     * {@code safety.approveAppliesImmediately=false} 时退化为“只批准、不应用”的审计模式：
+     * 仅标记审批状态并落盘。本方法绝不直接改写 ProjectE 的 {@code custom_emc.json}。
+     * 参数必须是普通物品 id；带 NBT 的变体暂不支持。</p>
      *
      * @param itemId 物品 id 原文，例如 {@code minecraft:stone}
      * @return 明确的中文结果：已应用、已批准（仅记录状态）、已批准过、拒绝原因、无此记录或
@@ -322,6 +372,11 @@ public final class CommandService {
             }
             QuarantinedDropsStore store = quarantinedDropsStore;
             if (store == null) {
+                QuarantineApprovalAction action = approvalAction;
+                if (action != null) {
+                    CommandResult delegated = action.approve(trimmed);
+                    return delegated == null ? CommandResult.failure("审批动作返回 null") : delegated;
+                }
                 return CommandResult.failure(QUARANTINE_UNAVAILABLE);
             }
 
@@ -331,37 +386,68 @@ public final class CommandService {
                 return CommandResult.failure("未找到 " + trimmed + " 的隔离降价记录");
             }
             QuarantinedDropsStore.QuarantinedDrop drop = found.get();
-            if (drop.approved()) {
-                return CommandResult.ok(
-                        "已批准过 " + trimmed + " 的隔离降价记录（未重复应用）");
+            // 只有审计模式会在不写入数值的情况下把 approved 置位；重复批准时直接返回，
+            // 避免把“仅批准”误当成“已应用”。开启立即应用时 approved=true 的历史记录
+            // （Phase 21 或审计模式遗留）仍会继续走应用器，由 applied 字段决定是否重复写入。
+            if (!approveAppliesImmediately && drop.approved()) {
+                return CommandResult.ok("已批准过 " + trimmed
+                        + " 的隔离降价记录（仅记录审批状态，未修改 EMC）");
             }
 
+            GeneratedEmcEntry previousEntry = entryStore == null ? null : entryStore.get(key);
             ApprovedDropApplier.Result result = ApprovedDropApplier.apply(
                     drop,
                     entryStore,
                     approveAppliesImmediately,
                     resolveMinimumEmc(),
+                    resolveOverflowThreshold(),
                     manualDetector(),
                     resolveExclusionDetector());
 
             if (result.status() == ApprovedDropApplier.Status.APPLIED) {
-                if (!store.markApproved(key)) {
+                if (entryStore == null) {
+                    return CommandResult.failure(STORAGE_UNAVAILABLE);
+                }
+                // 先确认降价值真正落盘，再写 approved/applied 标记；否则重启后会留下
+                // “已批准但没有 applied 值”的永久不一致，且无法通过再次 approve 重试。
+                entryStore.saveIfDirty();
+                if (entryStore.isDirty()) {
+                    rollbackEntry(entryStore, key, previousEntry);
+                    return CommandResult.failure("生成条目写入磁盘失败，未标记批准");
+                }
+                if (!store.markApplied(key)) {
+                    rollbackEntry(entryStore, key, previousEntry);
                     return CommandResult.failure("隔离记录在应用过程中消失，未标记批准");
                 }
                 store.saveIfDirty();
-                if (entryStore != null) {
-                    entryStore.saveIfDirty();
+                boolean approvalPersisted = !store.isDirty();
+                if (!approvalPersisted) {
+                    LOGGER.warn("隔离记录 {} 的批准状态未能落盘；生成条目已应用，"
+                            + "重启后再次 approve 会自动补齐标记", key);
                 }
+                LOGGER.info("管理员批准隔离降价 {}：{} → {}（来源 APPROVED，已应用）",
+                        key, drop.previousValue(), drop.proposedValue());
                 boolean remapRequested = requestProjectERemap();
                 String appliedMessage = result.message() == null
                         ? "已应用 " + drop.proposedValue() + "（来源 APPROVED）"
                         : result.message();
-                return CommandResult.ok(appliedMessage + (remapRequested
-                        ? "，已请求 ProjectE 重映射"
-                        : "，ProjectE 不可用，将在下次启动注入"));
+                String persistedWarning = approvalPersisted
+                        ? ""
+                        : "；警告：审批状态未能落盘，重启后再次执行 approve 将自动修复";
+                return CommandResult.ok(appliedMessage
+                        + (remapRequested
+                                ? "，已请求 ProjectE 重映射"
+                                : "，ProjectE 不可用，将在下次启动注入")
+                        + persistedWarning);
             }
 
             if (result.status() == ApprovedDropApplier.Status.ALREADY_APPLIED) {
+                // 兼容崩溃窗口与旧版本记录：生成条目已是 APPROVED，但标注可能尚未落盘。
+                if (store.markApplied(key)) {
+                    store.saveIfDirty();
+                }
+                LOGGER.info("管理员重复批准隔离降价 {}：{} → {}（已应用，未重复写入）",
+                        key, drop.previousValue(), drop.proposedValue());
                 return CommandResult.ok(
                         "已批准过 " + trimmed + " 的隔离降价记录（未重复应用）");
             }
@@ -372,6 +458,12 @@ public final class CommandService {
                     return CommandResult.failure("隔离记录在审批过程中消失，未标记批准");
                 }
                 store.saveIfDirty();
+                if (store.isDirty()) {
+                    return CommandResult.failure(
+                            "审批状态写入磁盘失败；本次批准未落盘，请稍后重试");
+                }
+                LOGGER.info("管理员批准隔离降价 {}：{} → {}（审计模式，未应用）",
+                        key, drop.previousValue(), drop.proposedValue());
                 return CommandResult.ok("已批准 " + trimmed
                         + "（safety.approveAppliesImmediately=false，仅记录审批状态，未修改 EMC）");
             }
@@ -426,23 +518,61 @@ public final class CommandService {
     }
 
     /**
+     * 读取批准应用允许的最高 EMC；缺失或读取失败时回退到内置溢出阈值（fail-closed）。
+     */
+    private long resolveOverflowThreshold() {
+        LongSupplier supplier = overflowThresholdSupplier;
+        if (supplier == null) {
+            return OverflowProtection.DEFAULT_THRESHOLD;
+        }
+        try {
+            return Math.max(1L, supplier.getAsLong());
+        } catch (RuntimeException | LinkageError failure) {
+            LOGGER.warn("读取溢出阈值失败，使用默认值 " + OverflowProtection.DEFAULT_THRESHOLD, failure);
+            return OverflowProtection.DEFAULT_THRESHOLD;
+        }
+    }
+
+    /**
+     * 在“生成条目写入失败”或“隔离记录消失”时把内存与磁盘恢复到批准前的条目。
+     *
+     * @param store    生成条目存储
+     * @param key      被写入的物品
+     * @param previous 批准前的条目；{@code null} 表示此前不存在条目
+     */
+    private static void rollbackEntry(GeneratedEntryStore store, ItemKey key,
+                                      @Nullable GeneratedEmcEntry previous) {
+        try {
+            if (previous == null) {
+                store.removeOwned(key);
+            } else {
+                store.stage(previous);
+            }
+            store.saveIfDirty();
+        } catch (RuntimeException failure) {
+            LOGGER.warn("回滚生成条目 {} 失败；下一次扫描会重新求解该物品", key, failure);
+        }
+    }
+
+    /**
      * 请求 ProjectE 重映射。失败只记录日志，不影响已经落盘的生成条目。
      *
-     * @return 是否真正向可用的 ProjectE 后端发出了重映射请求
+     * @return 后端是否接受并执行了重映射请求
      */
-    private static boolean requestProjectERemap() {
+    private boolean requestProjectERemap() {
+        EmcProvider provider = emcProvider;
+        if (provider == null) {
+            return false;
+        }
         try {
-            Optional<EmcProvider> available = OptionalIntegrationManager.provider()
-                    .filter(EmcProvider::isAvailable);
-            if (available.isEmpty()) {
+            if (!provider.isAvailable()) {
                 return false;
             }
             MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
             if (server == null) {
                 return false;
             }
-            available.get().requestRemap(server);
-            return true;
+            return provider.requestRemap(server);
         } catch (RuntimeException | LinkageError failure) {
             LOGGER.warn("请求 ProjectE 重映射失败；已应用的值仍保存在生成条目存储中", failure);
             return false;
