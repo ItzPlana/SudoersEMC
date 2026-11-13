@@ -160,7 +160,10 @@ public final class ScanManager {
      * <p><strong>两种校验模式：</strong>实现若无法廉价检测 reload，{@link ScanManager} 会在
      * 采集开始、采集完成与求解完成时各取一次完整指纹（{@link #current()}）；采集期间变化会
      * 直接让扫描失败，采集后到应用前发生变化（例如 {@code /reload} 或注册表变动）会拒绝应用
-     * 过期结果并把扫描转为 {@link ScanPhase#FAILED}。</p>
+     * 过期结果并把扫描转为 {@link ScanPhase#FAILED}。APPLYING 期间只在每个 staging 批次
+     * <em>开始前</em>校验一次，并在最后一批写完后、{@link ApplyTask#commit()} 之前再校验一次
+     * 提交门；不会对同一批次前后各计算一次完整指纹。完整指纹模式每批次仍是一次全量开销，
+     * 生产接线应覆写 {@link #tracksReloadGeneration()} 使用廉价代次。</p>
      *
      * <p>实现若能通过 Forge 的 {@code AddReloadListenerEvent}/{@code TagsUpdatedEvent} 等
      * 廉价来源维护单调递增的 reload 代次，应覆写 {@link #tracksReloadGeneration()} 与
@@ -233,6 +236,10 @@ public final class ScanManager {
         /**
          * 分批写入求解结果。
          *
+         * <p>只写入，不提交。实现必须在全部条目写入后通过 {@link #isStagingComplete()} 报告
+         * 完成，但保持 {@link #isDone()} 为 {@code false}；{@link #commit()} 之前调用
+         * {@link #cancel()} 必须能回滚本任务已经写入的条目。</p>
+         *
          * @param maxItems      本 tick 最多写入的条目数
          * @param deadlineNanos 本 tick 的 {@link System#nanoTime()} 截止时间
          * @return 本 tick 尝试处理的条目数
@@ -240,7 +247,22 @@ public final class ScanManager {
         int stage(int maxItems, long deadlineNanos);
 
         /**
-         * @return 是否全部写入完成
+         * @return 全部条目是否已经写入 staging，但尚未提交
+         */
+        default boolean isStagingComplete() {
+            return isDone();
+        }
+
+        /**
+         * 提交已经全部 staging 的结果。{@link ScanManager} 只会在最后一批的后置输入校验通过后
+         * 调用；实现应在此写入“已应用”指纹、统计并执行应用完成回调。提交成功后
+         * {@link #isDone()} 应返回 {@code true}，之后的 {@link #cancel()} 不再回滚。
+         */
+        default void commit() {
+        }
+
+        /**
+         * @return 是否全部写入并成功提交
          */
         boolean isDone();
 
@@ -255,7 +277,8 @@ public final class ScanManager {
         int unresolvedCount();
 
         /**
-         * 请求取消。已写入的条目不会自动回滚。
+         * 请求取消。实现应在尚未成功 {@link #commit()} 时回滚本任务已写入的条目；已经提交的
+         * 结果不再回滚。
          */
         default void cancel() {
         }
@@ -864,9 +887,11 @@ public final class ScanManager {
      * 应用阶段：先校验快照仍然对应当前输入，再分片写入结果。
      *
      * <p>生产接线每个 tick 最多写入一批，写入过程中检查截止时间；全部写入完成后进入持久化。
-     * 分片路径在每批 staging 前后都会再次校验输入：支持廉价 reload 代次的提供器只比较代次，
-     * 因此 APPLYING 跨越多个 tick 或 {@code /reload} 落在求解完成之后时，后续批次会被拒绝并
-     * 回滚本任务已写入的条目。旧式 {@link ResultApplier} 仍然同步执行一次，以保持单元测试兼容。</p>
+     * 分片路径在每个 staging 批次开始前校验一次输入，并在最后一批写完、提交之前再校验一次：
+     * 支持廉价 reload 代次的提供器只比较代次，因此 APPLYING 跨越多个 tick 或 {@code /reload}
+     * 落在最后一批内部时，本任务不会被 {@link ApplyTask#commit()}，{@link ApplyTask#cancel()}
+     * 会回滚本任务已写入的条目。旧式 {@link ResultApplier} 仍然同步执行一次，以保持单元测试
+     * 兼容。</p>
      *
      * @return 本 tick 尝试写入的条目数；应用阶段不写入自适应样本
      */
@@ -889,11 +914,15 @@ public final class ScanManager {
         }
         int staged = 0;
         if (!task.isDone()) {
+            // 每个 staging 批次只在开始前校验一次；非 reloadTracking 实现因此不再对同一批次
+            // 前后各计算一次完整指纹。
             verifyFingerprintBeforeApply();
             staged = Math.max(0, task.stage(batch, deadlineNanos));
-            if (staged > 0) {
-                // reload 可能在 staging 批次执行期间开始；再次校验，异常会取消任务并回滚本批。
+            if (task.isStagingComplete()) {
+                // 最后一批写完后、提交前再校验一次。reload 落在本批 staging 内部时这里抛错，
+                // tickInternal -> cancelTasks -> task.cancel() 会回滚尚未 commit 的条目。
                 verifyFingerprintBeforeApply();
+                task.commit();
             }
         }
         ScanProgress current = progress;

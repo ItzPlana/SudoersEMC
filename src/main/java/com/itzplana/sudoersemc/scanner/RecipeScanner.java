@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Consumer;
 import net.minecraft.core.NonNullList;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
@@ -75,6 +76,22 @@ public final class RecipeScanner {
      * @return 新的配方扫描游标
      */
     public RecipeScanSession beginSession(RecipeManager manager) {
+        return beginSession(manager, null);
+    }
+
+    /**
+     * 开始一次可分片推进的配方扫描，并在每条配方成功描述后回调。
+     *
+     * <p>回调在生产接线中用于增量累积配方内容指纹：配方快照一产生就转换为稳定字符串，
+     * 不再等到采集结束再全量遍历。回调在服务器线程、配方扫描批次内执行，必须保持轻量；
+     * 抛出的运行时异常会让本次扫描失败。</p>
+     *
+     * @param manager    当前配方管理器
+     * @param onSnapshot 每条可用配方的回调，允许为 {@code null}
+     * @return 新的配方扫描游标
+     */
+    public RecipeScanSession beginSession(RecipeManager manager,
+                                          Consumer<RecipeSnapshot> onSnapshot) {
         Objects.requireNonNull(manager, "manager");
         List<ResourceLocation> ids;
         try {
@@ -85,7 +102,7 @@ public final class RecipeScanner {
             LOGGER.warn("Could not enumerate recipe ids", e);
             ids = List.of();
         }
-        return new RecipeScanSession(this, manager, ids);
+        return new RecipeScanSession(this, manager, ids, onSnapshot);
     }
 
     /**
@@ -96,6 +113,7 @@ public final class RecipeScanner {
         private final RecipeScanner scanner;
         private final RecipeManager manager;
         private final List<ResourceLocation> ids;
+        private final Consumer<RecipeSnapshot> onSnapshot;
         private final List<RecipeSnapshot> snapshots = new ArrayList<>();
 
         private int index;
@@ -104,10 +122,14 @@ public final class RecipeScanner {
         private int failed;
         private boolean summaryLogged;
 
-        private RecipeScanSession(RecipeScanner scanner, RecipeManager manager, List<ResourceLocation> ids) {
+        private RecipeScanSession(RecipeScanner scanner,
+                                  RecipeManager manager,
+                                  List<ResourceLocation> ids,
+                                  Consumer<RecipeSnapshot> onSnapshot) {
             this.scanner = scanner;
             this.manager = manager;
             this.ids = List.copyOf(ids);
+            this.onSnapshot = onSnapshot;
         }
 
         /**
@@ -197,8 +219,9 @@ public final class RecipeScanner {
                 return;
             }
             Recipe<?> recipe = maybeRecipe.get();
+            RecipeSnapshot snapshot;
             try {
-                RecipeSnapshot snapshot = scanner.describe(recipe, id);
+                snapshot = scanner.describe(recipe, id);
                 if (snapshot == null) {
                     unsupported++;
                     return;
@@ -207,10 +230,15 @@ public final class RecipeScanner {
                     invalid++;
                     return;
                 }
-                snapshots.add(snapshot);
             } catch (RuntimeException e) {
                 failed++;
                 LOGGER.debug("Failed to describe recipe {}; skipping it", id, e);
+                return;
+            }
+            snapshots.add(snapshot);
+            if (onSnapshot != null) {
+                // 指纹回调失败必须让本次扫描失败，不能在结果集中留下未进入指纹的配方。
+                onSnapshot.accept(snapshot);
             }
         }
 

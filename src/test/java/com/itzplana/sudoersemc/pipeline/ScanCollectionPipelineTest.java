@@ -3,6 +3,7 @@ package com.itzplana.sudoersemc.pipeline;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -22,14 +23,18 @@ import com.itzplana.sudoersemc.scanner.RecipeOutput;
 import com.itzplana.sudoersemc.scanner.RecipeSnapshot;
 import com.itzplana.sudoersemc.storage.GeneratedEntryStore;
 import com.itzplana.sudoersemc.storage.OverflowResetLog;
+import com.itzplana.sudoersemc.task.BatchProcessor;
 import com.itzplana.sudoersemc.task.ScanFingerprint;
 import com.itzplana.sudoersemc.task.ScanManager;
+import com.itzplana.sudoersemc.task.ScanPhase;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.item.ItemStack;
@@ -184,7 +189,10 @@ class ScanCollectionPipelineTest {
         assertEquals(5, task.stage(5, Long.MAX_VALUE));
         assertFalse(task.isDone());
         assertEquals(2, task.stage(5, Long.MAX_VALUE));
-        assertTrue(task.isDone());
+        assertFalse(task.isDone(), "最后一批写入后必须等待 ScanManager 的提交门，不能自行 commit");
+        assertTrue(task.isStagingComplete(), "全部条目应已写入 staging");
+        task.commit();
+        assertTrue(task.isDone(), "提交后任务才完成");
         assertEquals(12, store.size());
     }
 
@@ -213,6 +221,118 @@ class ScanCollectionPipelineTest {
 
         assertEquals(0, store.size(), "取消后必须回滚本任务已写入的条目");
         assertEquals(0, task.stage(3, Long.MAX_VALUE), "取消后不得继续 staging");
+    }
+
+    @Test
+    void incrementalFingerprintMatchesFullReference() {
+        List<String> items = List.of(
+                "minecraft:stone",
+                "minecraft:air",
+                "minecraft:iron_ingot",
+                "minecraft:stone");
+        List<RecipeSnapshot> recipes = List.of(
+                blockRecipe(9),
+                blockRecipe(4),
+                blockRecipe(9));
+        Map<String, List<String>> tags = Map.of(
+                "c:ingots", List.of("minecraft:iron_ingot", "minecraft:gold_ingot"),
+                "c:stones", List.of("minecraft:stone"),
+                "c:empty", List.of());
+        List<String> config = List.of("general.enabled=true", "performance.itemsPerTick=100");
+        List<String> baseline = List.of("projecte.available=false");
+
+        ScanFingerprint reference = ScanFingerprint.of(
+                items,
+                ScanCollectionPipeline.recipeEntries(recipes),
+                ScanCollectionPipeline.tagEntries(tags),
+                config,
+                baseline);
+
+        ScanCollectionPipeline.FingerprintAccumulator accumulator =
+                new ScanCollectionPipeline.FingerprintAccumulator();
+        // 故意用与参考实现相反的输入顺序，证明增量累加仍会得到同一排序结果。
+        for (int index = items.size() - 1; index >= 0; index--) {
+            accumulator.addItem(items.get(index));
+        }
+        for (int index = recipes.size() - 1; index >= 0; index--) {
+            accumulator.addRecipe(recipes.get(index));
+        }
+        List<Map.Entry<String, List<String>>> tagEntries = new ArrayList<>(tags.entrySet());
+        for (int index = tagEntries.size() - 1; index >= 0; index--) {
+            Map.Entry<String, List<String>> entry = tagEntries.get(index);
+            accumulator.addTag(entry.getKey(), entry.getValue());
+        }
+
+        assertEquals(reference, accumulator.finish(config, baseline).join(),
+                "增量指纹必须与旧全量实现逐字节等价（含重复值与空通道）");
+
+        ScanCollectionPipeline.FingerprintAccumulator empty =
+                new ScanCollectionPipeline.FingerprintAccumulator();
+        assertEquals(ScanFingerprint.of(List.of(), List.of(), List.of(), config, baseline),
+                empty.finish(config, baseline).join(),
+                "空指纹通道必须保持 EMPTY 语义");
+    }
+
+    @Test
+    void reloadDuringFinalStagingBatchRollsBackUncommittedValues() throws InterruptedException {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("entries-final-reload.json"));
+        AtomicInteger afterApplyCalls = new AtomicInteger();
+        AtomicReference<Runnable> reloadTrigger = new AtomicReference<>();
+
+        // 8 条配方，最后一条 provider 写入时模拟 /reload。
+        List<RecipeSnapshot> recipes = new ArrayList<>();
+        for (int index = 0; index < 8; index++) {
+            ItemKey output = ItemKey.of(
+                    new ResourceLocation("sudoersemc_test", "final_out_" + index));
+            recipes.add(RecipeSnapshot.of(
+                    new ResourceLocation("sudoersemc_test", "final_recipe_" + index),
+                    RecipeKind.SHAPELESS,
+                    List.of(new RecipeInput(IngredientOption.of(IRON_INGOT), 1)),
+                    List.of(RecipeOutput.of(output))));
+        }
+        TriggeringProvider provider = new TriggeringProvider(
+                store, 8, () -> reloadTrigger.get().run());
+        ScanCollectionPipeline pipeline = new ScanCollectionPipeline(
+                store, null, null, stateFile(), provider,
+                dropProtection(false), overflowPipeline(false, 999_999L, 100L, 999_000L),
+                afterApplyCalls::incrementAndGet);
+        reloadTrigger.set(pipeline::onDatapackReload);
+
+        // 真实 ApplyJob：所有 8 条会在一个 staging 批次内写完。
+        ScanManager.ApplyTask realTask = pipeline.beginApplySnapshot(
+                snapshot(fingerprint("minecraft:iron_ingot"),
+                        List.of(ingotSnapshot(1L)), recipes));
+
+        ScanManager manager = ScanManager.staged(
+                new BatchProcessor(8, false),
+                completedCollector(1, recipes.size()),
+                data -> realTask,
+                50_000_000L,
+                pipeline.fingerprintSupplier(() -> fingerprint("minecraft:iron_ingot")),
+                null);
+
+        assertTrue(manager.requestScan());
+        long deadline = System.nanoTime() + 10_000_000_000L;
+        while (manager.isRunning() && System.nanoTime() < deadline) {
+            manager.tick();
+            if (manager.progress().phase() == ScanPhase.SOLVING) {
+                Thread.sleep(1L);
+            }
+        }
+
+        assertEquals(ScanPhase.FAILED, manager.progress().phase(),
+                "最后一批内部 reload 必须让扫描失败");
+        assertEquals(8, provider.accepted(),
+                "reload 必须在第 8 条（最后一条）写入后触发，确保覆盖最后一批窗口");
+        assertTrue(realTask.isStagingComplete(),
+                "失败前最后一批必须已经全部写入 staging");
+        assertEquals(0, store.size(),
+                "尚未 commit 的最后一批必须被 rollbackPartialStaging 回滚");
+        assertFalse(realTask.isDone(), "后置校验失败时不得提交任务");
+        assertNull(pipeline.lastAppliedFingerprint(),
+                "后置校验失败时不得写入 lastAppliedFingerprint");
+        assertEquals(0, afterApplyCalls.get(), "后置校验失败时不得执行 afterApply");
     }
 
     @Test
@@ -436,6 +556,96 @@ class ScanCollectionPipelineTest {
                 List.of(),
                 List.of(),
                 List.of());
+    }
+
+    private static ScanManager.SnapshotCollector completedCollector(int items, int recipes) {
+        return () -> new ScanManager.CollectSession() {
+            @Override
+            public int itemCount() {
+                return items;
+            }
+
+            @Override
+            public int recipeCount() {
+                return recipes;
+            }
+
+            @Override
+            public int processedItems() {
+                return items;
+            }
+
+            @Override
+            public int processedRecipes() {
+                return recipes;
+            }
+
+            @Override
+            public boolean isDone() {
+                return true;
+            }
+
+            @Override
+            public ScanManager.StepResult step(int maxItems) {
+                return new ScanManager.StepResult(0, true);
+            }
+
+            @Override
+            public ScanManager.SnapshotData finish() {
+                return new ScanManager.SnapshotData("测试快照", items, recipes);
+            }
+        };
+    }
+
+    /**
+     * 把生成值写入 store，并在第 {@code triggerAt} 次成功写入时触发一次 reload。
+     */
+    private static final class TriggeringProvider implements EmcProvider {
+
+        private final GeneratedEntryStore sink;
+        private final int triggerAt;
+        private final Runnable trigger;
+        private int accepted;
+
+        TriggeringProvider(GeneratedEntryStore sink, int triggerAt, Runnable trigger) {
+            this.sink = sink;
+            this.triggerAt = triggerAt;
+            this.trigger = trigger;
+        }
+
+        @Override
+        public boolean isAvailable() {
+            return true;
+        }
+
+        @Override
+        public boolean hasValue(ItemStack stack) {
+            return false;
+        }
+
+        @Override
+        public long getValue(ItemStack stack) {
+            return 0L;
+        }
+
+        @Override
+        public boolean stageGeneratedValue(ItemKey key, long value, PriceSource source,
+                                           ResourceLocation recipeId) {
+            boolean staged = sink.stage(new GeneratedEmcEntry(
+                    key, value, source, recipeId, true, 0L));
+            if (staged && ++accepted == triggerAt) {
+                trigger.run();
+            }
+            return staged;
+        }
+
+        @Override
+        public void requestRemap(MinecraftServer server) {
+        }
+
+        int accepted() {
+            return accepted;
+        }
     }
 
     /**
