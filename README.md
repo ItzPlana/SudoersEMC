@@ -362,7 +362,7 @@ ProjectE 原生值与 `custom_emc.json` 中的手动值不会进入这条候选�
 ./gradlew test
 ```
 
-测试覆盖：加权采样分布与权重重置、阈值边界、幂等性、持久化往返、损坏文件容错、schema 版本保护、归属刷新、`custom_emc.json` 受控改写（备份、原子替换、未知字段保留）、配置热重载决策、NBT 变体规范化与扫描接线、兜底种子沿配方链传播（含默认 `PricingSettings`）、创造排除阻断配方与下游、固定值覆盖配方并作为下游输入、0 值既有 EMC 重新定价，以及求解轮数在报告与 `scan_state.json` 中的可观测性。当前基线共 **624 个单元测试通过**。
+测试覆盖：加权采样分布与权重重置、阈值边界、幂等性、持久化往返、损坏文件容错、schema 版本保护、归属刷新、`custom_emc.json` 受控改写（备份、原子替换、未知字段保留）、配置热重载决策、NBT 变体规范化与扫描接线、兜底种子沿配方链传播（含默认 `PricingSettings`）、创造排除阻断配方与下游、固定值覆盖配方并作为下游输入、0 值既有 EMC 重新定价，以及求解轮数在报告与 `scan_state.json` 中的可观测性。当前基线共 **722 个单元/组件测试通过（55 个测试类，0 failure / 0 error）**。
 
 ---
 
@@ -378,7 +378,7 @@ ProjectE 原生值与 `custom_emc.json` 中的手动值不会进入这条候选�
 
 ## English Summary
 
-SudoersEMC is an independent Minecraft Forge 1.20.1 mod that generates EMC values for items that ProjectE does not price. Current baseline: Phase 18 branch `phase-18-chain-creative`, **624 unit tests passing**; Phase 18 is wired, real-environment verification is still pending.
+SudoersEMC is an independent Minecraft Forge 1.20.1 mod that generates EMC values for items that ProjectE does not price. Current baseline: Phase 19 branch `phase-19-fix-exclusions`, **722 unit/component tests passing (55 test classes)**; Phase 19 is wired, real-environment verification is still pending.
 
 - **Queries** go through ProjectE's public `IEMCProxy`.
 - **Writes** use ProjectE's official `@EMCMapper` extension point (`priority = -1000`, `setValueBefore`), never ProjectE internals.

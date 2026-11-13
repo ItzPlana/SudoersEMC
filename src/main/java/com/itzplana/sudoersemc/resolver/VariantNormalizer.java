@@ -19,24 +19,36 @@ import org.jetbrains.annotations.Nullable;
  * 把物品堆叠的 NBT 规范化为确定性的 SNBT 字符串，供 {@link ItemKey#variantHash()} 使用。
  *
  * <p>规范化会递归删除所有层级中的纯展示字段（{@code display}、{@code RepairCost}、
- * {@code HideFlags}、{@code CustomModelData}、{@code EnchantmentGlintOverride}）以及
- * ProjectE 在查询时动态叠加的 {@code StoredEMC}/{@code stored_emc}，并对
- * {@code AttributeModifiers} 的每个条目移除 {@code UUID}。删除这些字段后，仅仅因为随机
- * UUID、自定义名称、提示文本或存储 EMC 不同而变化的物品会被视为同一个经济变体。</p>
+ * {@code HideFlags}、{@code CustomModelData}、{@code EnchantmentGlintOverride}），并删除
+ * 根级（物品自身）的 ProjectE {@code StoredEMC} 以及所有层级的非标准 {@code stored_emc}。
+ * 根级 {@code StoredEMC} 由 ProjectE 的 {@code StoredEMCProcessor} 在查询时按
+ * {@code IItemEmcHolder} 动态叠加，不能进入变体身份，否则每个存储值都会产生一个新变体。</p>
+ *
+ * <p>容器内容物（{@code BlockEntityTag.Items[].tag}）中的 ProjectE {@code StoredEMC}
+ * 是例外：ProjectE 的 processor 只处理被查询的物品本身，不会读取嵌套内容物；而
+ * {@code DefaultMaterialResolver} 会把该值计入容器价格。ProjectE 的
+ * {@code EMCMappingHandler.getStoredEmcValue} 对完整 {@code ItemInfo} 做精确查找，
+ * 因此容器变体键必须保留这个嵌套字段，否则生成映射永远命中不到真实容器堆叠，修复不会
+ * 生效。该值在扫描阶段是经济上不同的变体（不同存储量对应不同价值），由
+ * {@code VariantScanner} 的 {@code maxVariantsPerItem}/{@code HARD_VARIANT_CEILING}
+ * 做有界、确定性的截断。</p>
  *
  * <p>经济相关数据必须保留，包括 {@code Enchantments}、{@code StoredEnchantments}、
  * {@code Potion}/{@code CustomPotionEffects}、{@code BlockEntityTag}（容器内容）、
  * {@code Items} 与 {@code SkullOwner}。{@link #keyFor(ResourceLocation, CompoundTag)}
  * 会把可损坏物品顶层的 {@code Damage} 规范化为 {@code 0}：ProjectE 的
  * {@code DamageProcessor} 在查询时按耐久动态折价，把每个耐久值都枚举成独立变体会造成
- * 变体爆炸与重复折价；若清洗后仍有附魔等经济字段，则保留 {@code {Damage:0,...}} 以匹配
- * ProjectE 精确 NBT 的 {@code ItemInfo}，原始标签不含 {@code Damage} 时不凭空添加。
- * {@link #normalize(CompoundTag)} 不知道物品类型，因此保留 {@code Damage}，仅用于
- * 无法确定物品身份的嵌套数据；但清洗后只剩默认 {@code Damage:0} 时视为没有经济数据，
- * 避免配方输出 {@code {Damage:0}} 生成伪变体。所有复合标签的键都会按字典序排序，因此相同的
- * 标签无论插入顺序如何都会得到完全相同的字符串。返回值是合法的 SNBT，可直接交给
- * {@code TagParser.parseTag}。清洗后没有任何剩余字段，或只剩默认 {@code Damage:0} 时
- * 返回 {@code null}，表示普通物品。</p>
+ * 变体爆炸与重复折价；若清洗后仍有附魔等经济字段，则保留 {@code {Damage:0,...}}。
+ * <strong>已知限制：</strong>真实堆叠的 {@code Damage>0} 且带其它 NBT 时，其精确
+ * {@code ItemInfo} 是 {@code {Damage:d,...}}，与这里生成的 {@code {Damage:0,...}}
+ * 并不相等；ProjectE 会安全地回退到无 NBT 基础价并执行 {@code DamageProcessor}，
+ * 不会误用其它变体的价格。这是为避免每耐久一个变体而有意接受的限制，不是遗漏。
+ * 原始标签不含 {@code Damage} 时不凭空添加，以匹配 ProjectE 的无伤害形状。</p>
+ *
+ * <p>{@link #normalize(CompoundTag)} 不知道物品类型，因此保留 {@code Damage}，仅用于
+ * 无法确定物品身份的嵌套数据。所有复合标签的键都会按字典序排序，因此相同的标签无论插入
+ * 顺序如何都会得到完全相同的字符串。返回值是合法的 SNBT，可直接交给
+ * {@code TagParser.parseTag}。清洗后没有任何剩余字段时返回 {@code null}，表示普通物品。</p>
  *
  * <p>已知限制：{@code Enchantments}/{@code StoredEnchantments}/{@code AttributeModifiers}
  * 等语义无序列表仍按原有顺序参与哈希；列表顺序不同的等价物品会得到不同变体。</p>
@@ -49,14 +61,14 @@ public final class VariantNormalizer {
             "HideFlags",
             "CustomModelData",
             "EnchantmentGlintOverride",
-            // ProjectE 的 StoredEMCProcessor 在查询阶段按 IItemEmcHolder 动态叠加；
-            // 连续存储量不能进入变体身份，否则每个存储值都会产生一个新变体。
-            "StoredEMC",
+            // 非 ProjectE 的小写约定；ProjectE 只认根级 "StoredEMC"，
+            // 且根级 StoredEMC 由 StoredEMCProcessor 在查询时处理。
             "stored_emc"
     );
 
     private static final String ATTRIBUTE_MODIFIERS = "AttributeModifiers";
     private static final String DAMAGE = "Damage";
+    private static final String STORED_EMC = "StoredEMC";
     private static final String UUID = "UUID";
 
     private VariantNormalizer() {
@@ -68,8 +80,7 @@ public final class VariantNormalizer {
      * <p>该方法不会修改传入的标签；返回的字符串可安全地长期保存。嵌套的复合标签与列表
      * 也会递归清洗，因此容器内容中物品的自定义名称不会影响容器变体的身份。</p>
      *
-     * <p>该方法不知道物品类型，因此不会剥离非默认的 {@code Damage}；但清洗后只剩默认
-     * {@code Damage:0} 时按无经济数据处理并返回 {@code null}。构建可损坏物品的变体身份
+     * <p>该方法不知道物品类型，因此不会剥离 {@code Damage}；构建可损坏物品的变体身份
      * 请使用 {@link #keyFor(ResourceLocation, CompoundTag)}。</p>
      *
      * @param tag 原始物品标签，允许为 {@code null}
@@ -79,7 +90,7 @@ public final class VariantNormalizer {
         if (tag == null || tag.isEmpty()) {
             return null;
         }
-        CompoundTag sanitized = sanitizeCompound(tag, false);
+        CompoundTag sanitized = sanitizeCompound(tag, false, true);
         if (sanitized.isEmpty() || isOnlyDefaultDamage(sanitized)) {
             return null;
         }
@@ -93,8 +104,7 @@ public final class VariantNormalizer {
      *
      * <p>配方输出常把 {@code {Damage:0}} 当作“无 NBT”写回；默认伤害值不携带任何经济信息，
      * 若保留会为普通物品生成伪变体 {@code variantHash={Damage:0}}。只有标签中仅有该字段且
-     * 数值为 0 时才视为空；若还存在附魔、容器内容等经济字段，仍保留 {@code Damage}，
-     * 维持与旧版本一致的变体身份。</p>
+     * 数值为 0 时才视为空；若还存在附魔、容器内容等经济字段，仍保留 {@code Damage}。</p>
      */
     private static boolean isOnlyDefaultDamage(CompoundTag sanitized) {
         if (sanitized.size() != 1) {
@@ -110,9 +120,15 @@ public final class VariantNormalizer {
      * <p>可损坏物品（例如剑、工具）的顶层 {@code Damage} 会被规范化为 {@code 0}：ProjectE 的
      * {@code DamageProcessor} 在 EMC 查询时按剩余耐久折价。若把每个耐久值都作为独立变体写入
      * 映射，既会占满变体上限，又会在查询时被再次折价。清洗后若还有附魔等其它经济字段，则保留
-     * {@code {Damage:0,...}} 以与 ProjectE 实际生成的 {@code ItemInfo} 对齐；原始标签不含
-     * {@code Damage} 时保持 ProjectE 的无伤害形状（其 {@code ItemInfo} 按完整 NBT 精确匹配），
-     * 若只剩默认伤害则返回普通物品键。</p>
+     * {@code {Damage:0,...}}。原始标签不含 {@code Damage} 时保持 ProjectE 的无伤害形状。</p>
+     *
+     * <p><strong>有意限制：</strong>实际 {@code Damage>0} 且带其它 NBT 的堆叠，其精确
+     * {@code ItemInfo} 与 {@code {Damage:0,...}} 不相等，生成映射不会命中；ProjectE 会回退到
+     * 基础价并执行 {@code DamageProcessor}。这避免了每耐久一个变体，也不会把不同损坏程度
+     * 错误合并到同一变体价格；代价是这类堆叠无法使用变体溢价。</p>
+     *
+     * <p>容器内容物中的嵌套 {@code StoredEMC} 会被保留（根级 {@code StoredEMC} 仍委托给
+     * ProjectE），以保证容器映射键与真实堆叠的完整 {@code ItemInfo} 精确相等。</p>
      *
      * @param itemId 物品注册 id
      * @param tag    原始物品标签，允许为 {@code null}
@@ -134,7 +150,7 @@ public final class VariantNormalizer {
         boolean hadDamage = tag != null && tag.contains(DAMAGE);
         CompoundTag sanitized = tag == null || tag.isEmpty()
                 ? new CompoundTag()
-                : sanitizeCompound(tag, true);
+                : sanitizeCompound(tag, true, true);
         if (sanitized.isEmpty()) {
             return ItemKey.of(itemId);
         }
@@ -144,15 +160,21 @@ public final class VariantNormalizer {
         if (hadDamage) {
             sanitized.putInt(DAMAGE, 0);
         }
+        if (isOnlyDefaultDamage(sanitized)) {
+            return ItemKey.of(itemId);
+        }
         StringBuilder out = new StringBuilder();
         writeCompound(sanitized, out);
         return ItemKey.of(itemId, out.toString());
     }
 
-    private static CompoundTag sanitizeCompound(CompoundTag source, boolean stripTopLevelDamage) {
+    private static CompoundTag sanitizeCompound(CompoundTag source, boolean stripTopLevelDamage,
+                                                boolean stripTopLevelStoredEmc) {
         CompoundTag result = new CompoundTag();
         for (String key : source.getAllKeys()) {
-            if (STRIPPED_KEYS.contains(key) || (stripTopLevelDamage && DAMAGE.equals(key))) {
+            if (STRIPPED_KEYS.contains(key)
+                    || (stripTopLevelStoredEmc && STORED_EMC.equals(key))
+                    || (stripTopLevelDamage && DAMAGE.equals(key))) {
                 continue;
             }
             Tag value = source.get(key);
@@ -180,7 +202,7 @@ public final class VariantNormalizer {
             for (int i = 0; i < list.size(); i++) {
                 Tag element = list.get(i);
                 if (element instanceof CompoundTag entry) {
-                    CompoundTag sanitized = sanitizeCompound(entry, false);
+                    CompoundTag sanitized = sanitizeCompound(entry, false, false);
                     sanitized.remove(UUID);
                     result.add(sanitized);
                 } else {
@@ -190,7 +212,7 @@ public final class VariantNormalizer {
             return result;
         }
         if (tag instanceof CompoundTag compound) {
-            CompoundTag sanitized = sanitizeCompound(compound, false);
+            CompoundTag sanitized = sanitizeCompound(compound, false, false);
             sanitized.remove(UUID);
             return sanitized;
         }
@@ -199,7 +221,7 @@ public final class VariantNormalizer {
 
     private static Tag sanitizeTag(Tag tag) {
         if (tag instanceof CompoundTag compound) {
-            return sanitizeCompound(compound, false);
+            return sanitizeCompound(compound, false, false);
         }
         if (tag instanceof ListTag list) {
             ListTag result = new ListTag();
