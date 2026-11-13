@@ -20,13 +20,20 @@ import net.minecraft.resources.ResourceLocation;
  * 的命名空间出现在 {@link Settings#creativeOnlyNamespaces()} 中。绝不能因为“算不出价值”就
  * 假定物品是创造专属的。</p>
  *
- * <p>判定顺序固定：保护禁用、显式排除、创造专属命名空间、特殊固定值、无解兜底、普通物品。
- * 显式排除优先于特殊固定值，因此管理员可以用排除规则覆盖误配置的固定值。</p>
+ * <p>判定顺序固定：显式排除、创造专属命名空间（仅保护启用时）、特殊固定值、保护禁用、
+ * 无解兜底、普通物品。显式排除优先于特殊固定值，因此管理员可以用排除规则覆盖误配置的
+ * 固定值。</p>
+ *
+ * <p>显式排除与特殊固定值不随 {@code protectCreativeOnlyItems} 总开关关闭而失效：管理员
+ * 关闭该开关时只放弃“创造专属命名空间”的自动识别，明确的排除项与固定值仍然生效。</p>
  */
 public final class CreativeItemProtection {
 
     /** 合法命名空间：小写字母、数字、下划线、连字符与点。 */
     private static final Pattern NAMESPACE_PATTERN = Pattern.compile("[a-z0-9_.-]+");
+
+    /** 合法资源路径：小写字母、数字、下划线、连字符、点与斜杠。 */
+    private static final Pattern PATH_PATTERN = Pattern.compile("[a-z0-9_./-]+");
 
     private final Settings settings;
 
@@ -54,9 +61,14 @@ public final class CreativeItemProtection {
     /**
      * 把配置字符串解析为 {@link Settings}，并收集被忽略的非法条目。
      *
-     * <p>解析规则：排除项与命名空间条目必须是合法的 {@code namespace:path} / 命名空间；
-     * 特殊值必须是 {@code namespace:path=正整数}，非正数按非法条目处理；非法条目不会中断
-     * 解析，只会进入 {@link ParsedSettings#skippedEntries()}。</p>
+     * <p>解析规则：</p>
+     * <ul>
+     *   <li>排除项与命名空间条目必须是合法的 {@code namespace:path} / 命名空间；</li>
+     *   <li>特殊值必须是 {@code namespace:path=正整数}，非正数按非法条目处理；</li>
+     *   <li>非法条目不会中断解析，只会进入 {@link ParsedSettings#skippedEntries()}。</li>
+     * </ul>
+     *
+     * <p>该方法不读取任何 Forge 配置对象，调用方负责读取原始字符串列表并汇总警告。</p>
      *
      * @param enabled               是否启用保护
      * @param rawExclusions         原始排除项列表，允许为 {@code null}
@@ -110,14 +122,34 @@ public final class CreativeItemProtection {
         return new ParsedSettings(settings, skippedEntries);
     }
 
+    /**
+     * 解析一个完整的物品 id。
+     *
+     * @return 合法 id；空白或格式错误时返回 {@code null}
+     */
     private static ResourceLocation parseItemId(String raw) {
         if (raw == null) {
             return null;
         }
         String value = raw.trim();
-        return value.isEmpty() ? null : ResourceLocation.tryParse(value);
+        int separator = value.indexOf(':');
+        if (separator <= 0 || separator != value.lastIndexOf(':')
+                || separator == value.length() - 1) {
+            return null;
+        }
+        String namespace = value.substring(0, separator);
+        String path = value.substring(separator + 1);
+        if (!isValidNamespace(namespace) || !isValidPath(path)) {
+            return null;
+        }
+        return ResourceLocation.tryParse(value);
     }
 
+    /**
+     * 解析 {@code namespace:path=正整数} 形式的特殊值。
+     *
+     * @return 解析结果；格式错误或数值非正时返回 {@code null}
+     */
     private static ParsedSpecialValue parseSpecialValue(String raw) {
         if (raw == null) {
             return null;
@@ -143,12 +175,27 @@ public final class CreativeItemProtection {
         return new ParsedSpecialValue(itemId, parsedValue);
     }
 
+    /**
+     * @return 是否为合法的 Minecraft 命名空间
+     */
     private static boolean isValidNamespace(String namespace) {
         return namespace != null
                 && !namespace.isEmpty()
                 && NAMESPACE_PATTERN.matcher(namespace).matches();
     }
 
+    /**
+     * @return 是否为合法的资源路径（与 {@code ConfigValidator} 的规则保持一致）
+     */
+    private static boolean isValidPath(String path) {
+        return path != null
+                && !path.isEmpty()
+                && PATH_PATTERN.matcher(path).matches();
+    }
+
+    /**
+     * 特殊值解析中间结果。
+     */
     private record ParsedSpecialValue(ResourceLocation itemId, long value) {
     }
 
@@ -210,19 +257,19 @@ public final class CreativeItemProtection {
      */
     public Decision decide(ItemKey item, boolean hasRecipe, boolean hasTagPricing) {
         Objects.requireNonNull(item, "item");
-        if (!settings.enabled()) {
-            return new Decision(true, 0L, "protection-disabled");
-        }
         ResourceLocation itemId = item.itemId();
         if (settings.explicitExclusions().contains(itemId)) {
             return new Decision(false, 0L, "explicit-exclusion");
         }
-        if (settings.creativeOnlyNamespaces().contains(itemId.getNamespace())) {
+        if (settings.enabled() && settings.creativeOnlyNamespaces().contains(itemId.getNamespace())) {
             return new Decision(false, 0L, "creative-only-namespace");
         }
         Long specialValue = settings.specialValues().get(itemId);
         if (specialValue != null) {
             return new Decision(true, specialValue, "special-value");
+        }
+        if (!settings.enabled()) {
+            return new Decision(true, 0L, "protection-disabled");
         }
         if (!hasRecipe && !hasTagPricing) {
             return new Decision(true, 0L, "unsolvable-fallback");

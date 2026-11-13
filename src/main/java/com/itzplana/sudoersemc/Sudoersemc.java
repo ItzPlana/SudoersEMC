@@ -210,8 +210,13 @@ public final class Sudoersemc {
                 auditLog);
         LargeDropProtection dropProtection =
                 new LargeDropProtection(snapshot.dropProtectionSettings(), dropsStore);
-        CreativeItemProtection creativeProtection =
-                new CreativeItemProtection(snapshot.creativeProtectionSettings());
+        CreativeItemProtection.Settings creativeSettings = snapshot.creativeProtectionSettings();
+        if (!creativeSettings.enabled()) {
+            LOGGER.warn("SudoersEMC 创造物品保护已关闭：creativeNamespaces 不再生效，"
+                    + "创造专属物品可能获得 EMC 值；creativeItemExclusions 与 "
+                    + "creativeItemSpecialValues 仍然生效");
+        }
+        CreativeItemProtection creativeProtection = new CreativeItemProtection(creativeSettings);
         FallbackPricing fallbackPricing = FallbackPricing.withDefaults(snapshot.pricingSettings());
 
         ScanPipeline pipeline = new ScanPipeline(

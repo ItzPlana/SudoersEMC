@@ -40,6 +40,8 @@ import org.junit.jupiter.api.Test;
 class RecipeScannerTest {
 
     private static final ResourceLocation RECIPE_ID = new ResourceLocation("sudoersemc_test", "recipe");
+    private static final ResourceLocation DIAMOND_SWORD_ID =
+            new ResourceLocation("minecraft", "diamond_sword");
     private static final ResourceLocation STONE_ID = new ResourceLocation("minecraft", "stone");
     private final RecipeScanner scanner = new RecipeScanner();
 
@@ -215,6 +217,24 @@ class RecipeScannerTest {
 
         assertNotNull(output);
         assertNull(output.outputNbt(), "空标签不应产生空的 SNBT 字符串");
+    }
+
+    @Test
+    void emptySnbtLiteralIsNormalizedToNull() {
+        RecipeOutput compact = RecipeOutput.of(ItemKey.of(DIAMOND_SWORD_ID), 1, "{}");
+        assertNull(compact.outputNbt(), "SNBT \"{}\" 必须归一为 null");
+        assertFalse(compact.hasOutputNbt(), "空 SNBT 不得被视为携带 NBT");
+
+        RecipeOutput spaced = RecipeOutput.of(ItemKey.of(DIAMOND_SWORD_ID), 1, "{ } ");
+        assertNull(spaced.outputNbt(), "带空白的空标签也必须归一为 null");
+    }
+
+    @Test
+    void nonEmptySnbtIsPreservedByRecipeOutput() {
+        RecipeOutput output = RecipeOutput.of(ItemKey.of(DIAMOND_SWORD_ID), 1, "{Damage:3}");
+
+        assertEquals("{Damage:3}", output.outputNbt(), "非空 SNBT 必须原样保留");
+        assertFalse(output.outputNbt().isBlank());
     }
 
     @Test

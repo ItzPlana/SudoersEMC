@@ -18,8 +18,13 @@ public record RecipeOutput(ItemKey item, int count, @Nullable String outputNbt) 
         if (count < 1) {
             throw new IllegalArgumentException("Recipe output count must be >= 1, got " + count);
         }
-        if (outputNbt != null && outputNbt.isBlank()) {
-            outputNbt = null;
+        if (outputNbt != null) {
+            // SNBT "{}"、"{ }" 等空白形式都表示空标签；统一归一为 null，
+            // 避免下游把空标签当成真实变体生成 variantHash。
+            String compact = outputNbt.replaceAll("\\s+", "");
+            if (compact.isEmpty() || "{}".equals(compact)) {
+                outputNbt = null;
+            }
         }
     }
 

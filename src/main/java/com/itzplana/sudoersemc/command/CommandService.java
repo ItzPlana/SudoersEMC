@@ -327,7 +327,7 @@ public final class CommandService {
 
     /**
      * 追加“上次扫描”相关的两行。没有状态存储或从未成功记录过扫描时统一显示“无记录”，
-     * 避免把默认的 0 毫秒误读为一次真实扫描。
+     * 避免把默认的 0 毫秒误读为一次真实扫描。旧版本状态文件没有求解轮数字段时省略该后缀。
      */
     private void appendLastScanLines(List<String> lines) {
         if (scanStateStore == null || scanStateStore.lastScanEpochMillis() <= 0L) {
@@ -336,8 +336,10 @@ public final class CommandService {
             return;
         }
         lines.add("上次扫描: " + scanStateStore.lastScanDurationMillis() + " ms");
+        int solverRounds = scanStateStore.lastSolverRounds();
+        String roundsSuffix = solverRounds > 0 ? "，求解轮数 " + solverRounds : "";
         lines.add("上次结果: 已定价 " + scanStateStore.lastSolvedCount()
-                + " 项，未解析 " + scanStateStore.lastUnresolvedCount() + " 项");
+                + " 项，未解析 " + scanStateStore.lastUnresolvedCount() + " 项" + roundsSuffix);
     }
 
     /**

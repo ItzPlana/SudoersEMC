@@ -77,6 +77,18 @@ class VariantNormalizerTest {
     }
 
     @Test
+    void defaultZeroDamageOnlyNormalisesToNull() {
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 0);
+
+        assertNull(VariantNormalizer.normalize(tag),
+                "只含默认 Damage:0 的标签不得生成伪变体");
+        assertEquals(ItemKey.of(SUDOERSEMC_TOKEN),
+                VariantNormalizer.keyFor(SUDOERSEMC_TOKEN, tag),
+                "非可损物品的默认 Damage:0 也必须归为普通物品");
+    }
+
+    @Test
     void enchantmentsArePreservedIncludingNestedStructure() {
         CompoundTag enchantment = new CompoundTag();
         enchantment.putString("id", "minecraft:sharpness");
@@ -303,6 +315,16 @@ class VariantNormalizerTest {
 
         assertEquals(ItemKey.of(DIAMOND_SWORD_ID),
                 VariantNormalizer.keyFor(DIAMOND_SWORD_ID, tag));
+    }
+
+    @Test
+    void keyForTreatsZeroDamageAsPlainItemForNonDamageableItem() {
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 0);
+
+        assertEquals(ItemKey.of(SUDOERSEMC_TOKEN),
+                VariantNormalizer.keyFor(SUDOERSEMC_TOKEN, tag),
+                "非可损物品只含 Damage:0 时不得产生 variantHash");
     }
 
     @Test

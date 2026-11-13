@@ -5,6 +5,7 @@ import com.itzplana.sudoersemc.safety.CreativeItemProtection;
 import com.itzplana.sudoersemc.safety.LargeDropProtection;
 import com.itzplana.sudoersemc.safety.OverflowProtection;
 import com.itzplana.sudoersemc.solver.SolveSettings;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -95,7 +96,10 @@ public record RuntimeConfigSnapshot(
                 "owned_only",
                 false,
                 100,
-                0.5D);
+                0.5D,
+                List.of(),
+                List.of(),
+                List.of());
         return new RuntimeConfigSnapshot(
                 0L,
                 values,

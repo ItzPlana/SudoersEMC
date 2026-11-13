@@ -8,6 +8,7 @@ import java.util.TreeMap;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
+import net.minecraft.nbt.NumericTag;
 import net.minecraft.nbt.StringTag;
 import net.minecraft.nbt.Tag;
 import net.minecraft.resources.ResourceLocation;
@@ -90,12 +91,27 @@ public final class VariantNormalizer {
             return null;
         }
         CompoundTag sanitized = sanitizeCompound(tag, false, true);
-        if (sanitized.isEmpty()) {
+        if (sanitized.isEmpty() || isOnlyDefaultDamage(sanitized)) {
             return null;
         }
         StringBuilder out = new StringBuilder();
         writeCompound(sanitized, out);
         return out.toString();
+    }
+
+    /**
+     * 判断清洗后的标签是否只剩默认的 {@code Damage:0}。
+     *
+     * <p>配方输出常把 {@code {Damage:0}} 当作“无 NBT”写回；默认伤害值不携带任何经济信息，
+     * 若保留会为普通物品生成伪变体 {@code variantHash={Damage:0}}。只有标签中仅有该字段且
+     * 数值为 0 时才视为空；若还存在附魔、容器内容等经济字段，仍保留 {@code Damage}。</p>
+     */
+    private static boolean isOnlyDefaultDamage(CompoundTag sanitized) {
+        if (sanitized.size() != 1) {
+            return false;
+        }
+        Tag damage = sanitized.get(DAMAGE);
+        return damage instanceof NumericTag numeric && numeric.getAsDouble() == 0.0D;
     }
 
     /**
@@ -143,6 +159,9 @@ public final class VariantNormalizer {
         // 把 Damage 统一归一到 0 只消除“每耐久一个变体”，不会凭空改变 ItemInfo 的形状。
         if (hadDamage) {
             sanitized.putInt(DAMAGE, 0);
+        }
+        if (isOnlyDefaultDamage(sanitized)) {
+            return ItemKey.of(itemId);
         }
         StringBuilder out = new StringBuilder();
         writeCompound(sanitized, out);

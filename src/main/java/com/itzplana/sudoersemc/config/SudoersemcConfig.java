@@ -60,6 +60,7 @@ public final class SudoersemcConfig {
     public static final ForgeConfigSpec.BooleanValue FALLBACK_USE_TAG_PRICING;
     public static final ForgeConfigSpec.BooleanValue FALLBACK_USE_RARITY_PRICING;
     public static final ForgeConfigSpec.BooleanValue FALLBACK_USE_PROJECTE_INTEGRATION_BASELINES;
+    public static final ForgeConfigSpec.LongValue FALLBACK_MIN_EMC;
 
     public static final ForgeConfigSpec.BooleanValue SAFETY_LARGE_DROP_PROTECTION;
     public static final ForgeConfigSpec.DoubleValue SAFETY_MAX_ALLOWED_DROP_RATIO;
@@ -143,6 +144,10 @@ public final class SudoersemcConfig {
                         "Phase 15 wires this switch into ScanPipeline; the actual baseline",
                         "data source is introduced in Phase 25. False explicitly passes 0.")
                 .define("useProjectEIntegrationBaselines", true);
+        FALLBACK_MIN_EMC = BUILDER.comment(
+                        "Minimum EMC value for fallback pricing; lower candidates are discarded.",
+                        "Also passed to the recipe solver as its minimum output value.")
+                .defineInRange("minEmc", 1L, 0L, Long.MAX_VALUE);
         BUILDER.pop();
 
         // [safety]
@@ -369,6 +374,7 @@ public final class SudoersemcConfig {
             // One read per key. Runtime components must never consult the live spec again.
             int itemsPerTick = PERFORMANCE_ITEMS_PER_TICK.get();
             int maxRecipePasses = RECIPE_MAX_RECIPE_PASSES.get();
+            long minEmc = FALLBACK_MIN_EMC.get();
             boolean allowRecipeValueIncrease = RECIPE_ALLOW_RECIPE_VALUE_INCREASE.get();
             boolean overflowEnabled = OVERFLOW_ENABLED.get();
             long overflowThreshold = OVERFLOW_THRESHOLD.get();
@@ -384,6 +390,17 @@ public final class SudoersemcConfig {
             double maxAllowedDropRatio = SAFETY_MAX_ALLOWED_DROP_RATIO.get();
             boolean largeDropProtection = SAFETY_LARGE_DROP_PROTECTION.get();
             boolean protectCreativeOnlyItems = SAFETY_PROTECT_CREATIVE_ONLY_ITEMS.get();
+            List<String> creativeExclusions = List.copyOf(SAFETY_CREATIVE_ITEM_EXCLUSIONS.get());
+            List<String> creativeSpecialValues =
+                    List.copyOf(SAFETY_CREATIVE_ITEM_SPECIAL_VALUES.get());
+            List<String> creativeNamespaces = List.copyOf(SAFETY_CREATIVE_NAMESPACES.get());
+            CreativeItemProtection.ParsedSettings parsedCreative = CreativeItemProtection.parseSettings(
+                    protectCreativeOnlyItems, creativeExclusions, creativeSpecialValues,
+                    creativeNamespaces);
+            if (!parsedCreative.skippedEntries().isEmpty()) {
+                LOGGER.warn("[config] 创造物品保护配置有 {} 条无效条目已被忽略：{}",
+                        parsedCreative.skippedEntries().size(), parsedCreative.skippedEntries());
+            }
             boolean useTagPricing = FALLBACK_USE_TAG_PRICING.get();
             boolean useRarityPricing = FALLBACK_USE_RARITY_PRICING.get();
             boolean useFallbackForUnsolvable = FALLBACK_USE_FALLBACK_FOR_UNSOLVABLE.get();
@@ -396,7 +413,7 @@ public final class SudoersemcConfig {
             ConfigValidator.Values values = new ConfigValidator.Values(
                     itemsPerTick,
                     maxRecipePasses,
-                    SolveSettings.DEFAULT_MINIMUM_EMC,
+                    minEmc,
                     overflowEnabled,
                     overflowThreshold,
                     resetMin,
@@ -406,7 +423,10 @@ public final class SudoersemcConfig {
                     overwriteScope,
                     allowProjectEFileRewrite,
                     maxNbtVariantsPerItem,
-                    maxAllowedDropRatio);
+                    maxAllowedDropRatio,
+                    creativeExclusions,
+                    creativeSpecialValues,
+                    creativeNamespaces);
             ConfigValidationResult validation = ConfigValidator.validate(values);
             lastValidationResult = validation;
             if (!validation.valid()) {
@@ -433,11 +453,7 @@ public final class SudoersemcConfig {
                             maxAllowedDropRatio,
                             Set.of(),
                             Set.of()),
-                    new CreativeItemProtection.Settings(
-                            protectCreativeOnlyItems,
-                            Set.of(),
-                            Map.of(),
-                            Set.of()),
+                    parsedCreative.settings(),
                     new PricingSettings(
                             useTagPricing,
                             useRarityPricing,
@@ -447,7 +463,7 @@ public final class SudoersemcConfig {
                     new SolveSettings(
                             Math.max(1, maxRecipePasses),
                             allowRecipeValueIncrease,
-                            SolveSettings.DEFAULT_MINIMUM_EMC,
+                            minEmc,
                             SolveSettings.DEFAULT_MAX_ALTERNATIVE_COSTS),
                     itemsPerTick,
                     adaptiveBatchSizing,
@@ -474,9 +490,8 @@ public final class SudoersemcConfig {
     /**
      * Builds a plain-Java validation snapshot from the current Forge values.
      *
-     * <p>{@code minEmc} is not a configuration key in this phase: the solver lower bound is the
-     * hard-coded {@link SolveSettings#DEFAULT_MINIMUM_EMC}. Exposing it as a config option is a
-     * later-phase concern; the validator field stays so the rule can be reused once it is wired.</p>
+     * <p>{@code minEmc} 来自 {@code fallback.minEmc}，同时作为兜底定价下限与求解器最小输出值。
+     * 三个创造物品保护列表只做原始读取；格式校验警告由 {@link ConfigValidator} 汇总。</p>
      *
      * @throws IllegalStateException when the config has not been loaded yet
      */
@@ -487,7 +502,7 @@ public final class SudoersemcConfig {
         return new ConfigValidator.Values(
                 PERFORMANCE_ITEMS_PER_TICK.get(),
                 RECIPE_MAX_RECIPE_PASSES.get(),
-                SolveSettings.DEFAULT_MINIMUM_EMC,
+                FALLBACK_MIN_EMC.get(),
                 OVERFLOW_ENABLED.get(),
                 OVERFLOW_THRESHOLD.get(),
                 OVERFLOW_RESET_MIN.get(),
@@ -497,7 +512,10 @@ public final class SudoersemcConfig {
                 OVERFLOW_OVERWRITE_SCOPE.get(),
                 OVERFLOW_ALLOW_PROJECTE_FILE_REWRITE.get(),
                 NBT_MAX_NBT_VARIANTS_PER_ITEM.get(),
-                SAFETY_MAX_ALLOWED_DROP_RATIO.get());
+                SAFETY_MAX_ALLOWED_DROP_RATIO.get(),
+                List.copyOf(SAFETY_CREATIVE_ITEM_EXCLUSIONS.get()),
+                List.copyOf(SAFETY_CREATIVE_ITEM_SPECIAL_VALUES.get()),
+                List.copyOf(SAFETY_CREATIVE_NAMESPACES.get()));
     }
 
     /**

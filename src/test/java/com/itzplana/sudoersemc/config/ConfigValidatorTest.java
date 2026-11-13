@@ -136,6 +136,48 @@ class ConfigValidatorTest {
     }
 
     @Test
+    void validCreativeProtectionEntriesProduceNoWarnings() {
+        ConfigValidationResult result = ConfigValidator.validate(base()
+                .creativeItemExclusions("minecraft:bedrock", "create:creative_crate")
+                .creativeItemSpecialValues("minecraft:diamond=12345", "minecraft:emerald=1")
+                .creativeNamespaces("create", "goety")
+                .build());
+
+        assertTrue(result.valid());
+        assertEquals(List.of(), result.warnings());
+    }
+
+    @Test
+    void malformedCreativeProtectionEntriesProduceWarnings() {
+        ConfigValidationResult result = ConfigValidator.validate(base()
+                .creativeItemExclusions("not a valid id", "minecraft:ok")
+                .creativeItemSpecialValues("minecraft:diamond=0", "minecraft:emerald=abc",
+                        "minecraft:gold_ingot=5")
+                .creativeNamespaces("UPPERCASE", "create")
+                .build());
+
+        assertTrue(result.valid(), "非法条目只应警告，不应让整份配置失效");
+        assertEquals(List.of(
+                "safety.creativeItemExclusions 条目 'not a valid id' 不是合法的 namespace:path，将被忽略",
+                "safety.creativeItemSpecialValues 条目 'minecraft:diamond=0' 必须为 namespace:path=正整数，将被忽略",
+                "safety.creativeItemSpecialValues 条目 'minecraft:emerald=abc' 必须为 namespace:path=正整数，将被忽略",
+                "safety.creativeNamespaces 条目 'UPPERCASE' 不是合法的命名空间，将被忽略"),
+                result.warnings());
+    }
+
+    @Test
+    void crossFieldValidationIncludesCreativeProtectionWarnings() {
+        ConfigValidationResult result = ConfigValidator.validateCrossField(base()
+                .creativeItemExclusions("missing_namespace")
+                .build());
+
+        assertTrue(result.valid());
+        assertEquals(List.of(
+                "safety.creativeItemExclusions 条目 'missing_namespace' 不是合法的 namespace:path，将被忽略"),
+                result.warnings());
+    }
+
+    @Test
     void crossFieldValidationRejectsOutOfRangeNbtVariantLimit() {
         assertTrue(ConfigValidator.validateCrossField(base().build()).valid());
 
@@ -382,6 +424,9 @@ class ConfigValidatorTest {
         private boolean allowProjectEFileRewrite = false;
         private int maxNbtVariantsPerItem = 100;
         private double maxAllowedDropRatio = 0.5D;
+        private List<String> creativeItemExclusions = List.of();
+        private List<String> creativeItemSpecialValues = List.of();
+        private List<String> creativeNamespaces = List.of();
 
         ValuesBuilder itemsPerTick(int value) {
             this.itemsPerTick = value;
@@ -448,6 +493,21 @@ class ConfigValidatorTest {
             return this;
         }
 
+        ValuesBuilder creativeItemExclusions(String... values) {
+            this.creativeItemExclusions = List.of(values);
+            return this;
+        }
+
+        ValuesBuilder creativeItemSpecialValues(String... values) {
+            this.creativeItemSpecialValues = List.of(values);
+            return this;
+        }
+
+        ValuesBuilder creativeNamespaces(String... values) {
+            this.creativeNamespaces = List.of(values);
+            return this;
+        }
+
         ConfigValidator.Values build() {
             return new ConfigValidator.Values(
                     itemsPerTick,
@@ -462,7 +522,10 @@ class ConfigValidatorTest {
                     overwriteScope,
                     allowProjectEFileRewrite,
                     maxNbtVariantsPerItem,
-                    maxAllowedDropRatio);
+                    maxAllowedDropRatio,
+                    creativeItemExclusions,
+                    creativeItemSpecialValues,
+                    creativeNamespaces);
         }
     }
 }

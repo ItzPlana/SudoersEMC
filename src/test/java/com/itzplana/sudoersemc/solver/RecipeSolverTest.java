@@ -71,6 +71,24 @@ class RecipeSolverTest {
     }
 
     @Test
+    void deniedItemIsNotPublishedAndCannotFeedDownstreamRecipes() {
+        ItemKey ore = item("denied_ore");
+        ItemKey ingot = item("denied_ingot");
+        ItemKey gear = item("denied_gear");
+        List<RecipeSnapshot> recipes = List.of(
+                recipe("a_ingot", RecipeKind.FURNACE, List.of(in(ore)), List.of(out(ingot, 1))),
+                recipe("b_gear", RecipeKind.SHAPED, List.of(in(ingot, 4)), List.of(out(gear, 1))));
+
+        SolveContext context = new SolveContext(Map.of(ore, 100L), Set.of(ingot));
+        SolveResult result = SOLVER.solve(recipes, context, REGISTRY, SolveSettings.defaults());
+
+        assertFalse(result.values().containsKey(ingot), "被排除物品不得发布生成值");
+        assertFalse(result.values().containsKey(gear), "被排除物品不得作为下游配方输入");
+        assertTrue(result.unresolvedItems().contains(gear));
+        assertEquals(0L, context.emcOf(ingot), "被排除物品的查找值必须为 0");
+    }
+
+    @Test
     void multiStageChainNeedsOnePassPerStage() {
         ItemKey stone = item("stone");
         ItemKey plank = item("plank");
