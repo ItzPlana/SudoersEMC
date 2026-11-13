@@ -11,6 +11,7 @@ import com.itzplana.sudoersemc.core.PriceSource;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import net.minecraft.resources.ResourceLocation;
 import org.junit.jupiter.api.Test;
 
@@ -254,38 +255,36 @@ class OwnershipManagerTest {
     }
 
     @Test
-    void unknownCurrentValueIsUnknownAndNeverReleased() {
+    void detectExternalModificationsHonorsConsideredSet() {
         InMemorySink sink = new InMemorySink();
         FakeReader reader = new FakeReader();
         sink.put(entry(IRON, 100L, true));
-        sink.put(entry(GOLD, 200L, true));
-        reader.set(IRON, 100L);
-        // GOLD 没有当前值：按 EmcValueReader 契约返回 0，代表无法确定。
+        sink.put(entry(DIAMOND, 300L, true));
+        reader.set(IRON, 90L);
+        reader.set(DIAMOND, 350L);
 
-        OwnershipManager manager = new OwnershipManager(sink, reader);
+        List<ItemKey> drifted = new OwnershipManager(sink, reader)
+                .detectExternalModifications(Set.of(DIAMOND));
 
-        assertEquals(OwnershipState.OWNED_BY_US, manager.classify(IRON));
-        assertEquals(OwnershipState.UNKNOWN, manager.classify(GOLD));
-        assertTrue(manager.detectExternalModifications().isEmpty(),
-                "当前值未知不能被当作外部修改");
-        assertEquals(0, manager.migrateOwnership());
-        assertTrue(sink.get(GOLD).owned(), "未知当前值绝不能导致误释放所有权");
-        assertEquals(OwnershipState.UNKNOWN, manager.snapshotStates().get(GOLD));
+        assertEquals(List.of(DIAMOND), drifted,
+                "未纳入本轮比较集合的物品不得被误判为外部修改");
     }
 
     @Test
-    void migrateOwnershipReadsStoreSnapshotOnce() {
+    void migrateOwnershipHonorsConsideredSet() {
         InMemorySink sink = new InMemorySink();
         FakeReader reader = new FakeReader();
         sink.put(entry(IRON, 100L, true));
-        sink.put(entry(GOLD, 200L, true));
         sink.put(entry(DIAMOND, 300L, true));
         reader.set(IRON, 90L);
-        reader.set(GOLD, 200L);
         reader.set(DIAMOND, 350L);
 
-        assertEquals(2, new OwnershipManager(sink, reader).migrateOwnership());
-        assertEquals(1, sink.snapshotCalls, "迁移应只读取一次快照，避免逐条重新快照");
+        int released = new OwnershipManager(sink, reader)
+                .migrateOwnership(Set.of(DIAMOND));
+
+        assertEquals(1, released);
+        assertTrue(sink.get(IRON).owned(), "集合外的条目必须保持所有权");
+        assertFalse(sink.get(DIAMOND).owned());
     }
 
     private static GeneratedEmcEntry entry(ItemKey item, long value, boolean owned) {
@@ -295,7 +294,6 @@ class OwnershipManagerTest {
     private static final class InMemorySink implements OwnedEntrySink {
 
         private final Map<ItemKey, GeneratedEmcEntry> entries = new HashMap<>();
-        private int snapshotCalls;
         private boolean failOnSnapshot;
         private boolean failOnStage;
 
@@ -330,7 +328,6 @@ class OwnershipManagerTest {
 
         @Override
         public Map<ItemKey, GeneratedEmcEntry> snapshotAll() {
-            snapshotCalls++;
             if (failOnSnapshot) {
                 throw new IllegalStateException("simulated snapshot failure");
             }

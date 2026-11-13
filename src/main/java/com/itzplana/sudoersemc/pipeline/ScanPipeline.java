@@ -18,7 +18,9 @@ import com.itzplana.sudoersemc.safety.LargeDropProtection;
 import com.itzplana.sudoersemc.safety.OverflowPipeline;
 import com.itzplana.sudoersemc.safety.OwnershipManager;
 import com.itzplana.sudoersemc.safety.PriceDropDecision;
+import com.itzplana.sudoersemc.safety.OwnershipManager;
 import com.itzplana.sudoersemc.scanner.ItemScanner;
+import com.itzplana.sudoersemc.scanner.GoetyRitualReader;
 import com.itzplana.sudoersemc.scanner.ItemSnapshot;
 import com.itzplana.sudoersemc.scanner.RecipeInput;
 import com.itzplana.sudoersemc.scanner.RecipeOutput;
@@ -53,6 +55,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicReference;
@@ -76,6 +79,11 @@ import org.slf4j.LoggerFactory;
  *
  * <p>一次完整扫描分为两个阶段：</p>
  * <ol>
+ *   <li>{@link #collect(MinecraftServer)} 在服务器线程读取物品注册表与配方管理器，产出不可变的
+ *       {@link PipelineSnapshot}；</li>
+ *   <li>{@link #solveAndApply(PipelineSnapshot)} 只做计算与存储写入；它自身不直接读取注册表，
+ *       但注入的 ProjectE 手工值判定器在解析标签条目时可能访问物品注册表与标签管理器，
+ *       因此该方法必须由服务器线程调用。</li>
  *   <li>{@link #beginCollection(MinecraftServer)} 返回按批推进的采集会话，物品与配方都不会在
  *       单个 tick 内全量遍历；长时间运行或测试仍可使用一次性的 {@link #collect(MinecraftServer)}；</li>
  *   <li>求解与写入拆成两步：{@link #startStashedSolve()} 把纯计算提交到工作线程，服务器线程
@@ -153,9 +161,14 @@ public final class ScanPipeline {
     private volatile boolean generateReportsEnabled = true;
     private volatile boolean nbtVariantsEnabled = true;
     private volatile int maxNbtVariantsPerItem = 100;
+    private volatile boolean scanContainerRemainders = true;
+    private volatile boolean creditContainerRemainders = true;
+    private volatile boolean priceSecondaryOutputs = false;
+    private volatile boolean preserveExternallyModifiedValues = true;
+    private volatile Supplier<Predicate<ItemKey>> manualValueDetectorSupplier = () -> item -> false;
 
     private final AtomicReference<PipelineSnapshot> stashedSnapshot = new AtomicReference<>();
-    private final RecipeSolver recipeSolver = new RecipeSolver();
+    private volatile RecipeSolver recipeSolver = new RecipeSolver();
     private final EvaluatorRegistry evaluatorRegistry = EvaluatorRegistry.defaults();
 
     /** 协作式取消检查；默认永不取消，由调度器注入共享令牌。 */
@@ -167,6 +180,13 @@ public final class ScanPipeline {
     private volatile PipelineSnapshot lastSnapshotForReport;
     private volatile int lastSolverCacheHits;
     private volatile int lastSolverCacheMisses;
+    private volatile int lastOwnershipExternalModifications;
+    private volatile int lastOwnershipReleased;
+    /**
+     * 跨实例共享的重映射确认状态。配置重载会重建整个管线，失败保护不能随旧实例丢失；
+     * 生产环境由 {@code Sudoersemc} 注入同一个 tracker，测试默认使用独立实例。
+     */
+    private volatile RemapTracker remapTracker = new RemapTracker();
     private final AtomicReference<CompletableFuture<Computation>> pendingSolve = new AtomicReference<>();
 
     private volatile EmcProvider emcProvider;
@@ -286,6 +306,113 @@ public final class ScanPipeline {
     }
 
     /**
+     * 设置是否在配方扫描阶段读取容器返还物（桶、空瓶等）。
+     */
+    public void setScanContainerRemaindersEnabled(boolean enabled) {
+        this.scanContainerRemainders = enabled;
+    }
+
+    /**
+     * 设置是否允许容器返还物抵扣配方成本。
+     *
+     * <p>关闭后扫描仍可记录返还物（用于诊断/指纹），但求解器不会从净成本中扣除。</p>
+     */
+    public void setCreditContainerRemaindersEnabled(boolean enabled) {
+        if (this.creditContainerRemainders != enabled) {
+            this.creditContainerRemainders = enabled;
+            rebuildRecipeSolver();
+        }
+    }
+
+    /**
+     * 设置多输出配方是否为副产物发布单位价值。
+     *
+     * <p>默认关闭：整条配方的净成本只由主产物承担，副产物不会稀释主产物价格。开启后
+     * 成本按所有输出单位均摊，同一物品在一次求解中仍只会发布一次值。</p>
+     */
+    public void setPriceSecondaryOutputsEnabled(boolean enabled) {
+        if (this.priceSecondaryOutputs != enabled) {
+            this.priceSecondaryOutputs = enabled;
+            rebuildRecipeSolver();
+        }
+    }
+
+    /**
+     * 设置外部/手工值保护策略。
+     *
+     * <p>默认 {@code true}：检测到 owned 条目被外部改动（ProjectE 手动值、其它模组或管理员
+     * 直接写值）时释放所有权并保留外部值；{@code false} 时退回 Phase 14 的“自有条目总是刷新”
+     * 语义。该开关只影响检测，不会让被保护的值重新进入自动定价。</p>
+     */
+    public void setPreserveExternallyModifiedValues(boolean enabled) {
+        this.preserveExternallyModifiedValues = enabled;
+    }
+
+    /**
+     * 注入共享的重映射确认状态。配置重载重建管线时必须复用同一个实例，
+     * 否则一次失败的重映射保护会在新管线的首轮丢失。
+     *
+     * @param tracker 共享 tracker，允许为 {@code null}（恢复为独立实例）
+     */
+    public void setRemapTracker(@Nullable RemapTracker tracker) {
+        this.remapTracker = tracker == null ? new RemapTracker() : tracker;
+    }
+
+    /**
+     * 记录一次已请求的后端 EMC 重映射，并在完成后解除“外部修改检测暂停”状态。
+     *
+     * <p>重映射是异步的：完成前后端仍可能返回 SudoersEMC 写入前的旧值。如果此时把旧值
+     * 当作外部修改，会误释放所有权；由于存储拒绝覆盖非自有条目，错误释放后这些物品无法
+     * 自动重新接管。因此完成信号落地前只检测 ProjectE 手工值，不比较后端漂移。</p>
+     *
+     * <p>传入 {@code null} 表示后端无法报告完成信号，此时保持现有检测行为不变。</p>
+     *
+     * @param completion 重映射完成信号，允许为 {@code null}
+     */
+    public void trackRemapCompletion(@Nullable CompletableFuture<?> completion) {
+        remapTracker.track(completion);
+    }
+
+    /**
+     * @return 是否存在尚未确认完成的后端重映射
+     */
+    private boolean remapConfirmationPending(PipelineSnapshot snapshot) {
+        long generation = snapshot == null
+                ? PipelineSnapshot.UNKNOWN_REMAP_GENERATION
+                : snapshot.remapGeneration();
+        return remapTracker.confirmationPending(generation);
+    }
+
+    /**
+     * 注入手工值判定器来源。来源在每次应用阶段调用一次，返回的判定器会被复用于本轮全部物品。
+     * 传入 {@code null} 恢复“没有任何手工值”的默认行为。
+     */
+    public void setManualValueDetectorSupplier(
+            @Nullable Supplier<Predicate<ItemKey>> supplier) {
+        this.manualValueDetectorSupplier = supplier == null
+                ? () -> item -> false
+                : supplier;
+    }
+
+    /**
+     * 便捷重载：直接注入一个手工值判定器。
+     */
+    public void setManualValueDetector(@Nullable Predicate<ItemKey> detector) {
+        Predicate<ItemKey> effective = detector == null ? item -> false : detector;
+        setManualValueDetectorSupplier(() -> effective);
+    }
+
+    /**
+     * 按当前评估策略重建求解器。重建会丢弃评估缓存，但保留已累计的命中/未命中计数器。
+     */
+    private synchronized void rebuildRecipeSolver() {
+        recipeSolver = new RecipeSolver(new EvaluationPolicy(
+                EvaluationPolicy.DEFAULT_MINIMUM_EMC,
+                creditContainerRemainders,
+                priceSecondaryOutputs));
+    }
+
+    /**
      * 注入与 {@link com.itzplana.sudoersemc.task.ScanManager} 共享的诊断采样器。
      *
      * <p>注入后报告可以读取整个扫描跨 tick 的耗时、P95 与峰值堆内存；传入 {@code null}
@@ -377,7 +504,9 @@ public final class ScanPipeline {
                 }
             }, Set.of(), Set.of());
             List<ItemSnapshot> items = identityScanner.scan(this::isCancelled);
-            RecipeScanner recipeScanner = RecipeScanner.withGoety().orElseGet(RecipeScanner::new);
+            RecipeScanner recipeScanner = RecipeScanner.withGoety(scanContainerRemainders)
+                    .orElseGet(() -> new RecipeScanner(
+                            GoetyRitualReader.unavailable(), scanContainerRemainders));
             List<RecipeSnapshot> recipes =
                     recipeScanner.scan(server.getRecipeManager(), this::isCancelled).recipes();
             return fingerprintFor(items, recipes,
@@ -619,6 +748,67 @@ String detail = "扫描采集失败：服务器尚未就绪";
     }
 
     /**
+     * 为单个 NBT 变体补读后端的精确既有值。
+     *
+     * <p>{@link ItemScanner} 只查询无 NBT 的默认堆叠，变体快照默认没有既有值。若不补读，
+     * owned 变体的外部修改永远不会进入外部修改检测，非自有变体的后端值也会被配方定价覆盖。
+     * 查询必须使用 {@link ItemScanner.EmcQuery#getExactValue} 口径：ProjectE 的
+     * {@code hasValue/getValue} 会在 NBT 未命中时回退基础物品值并叠加 Damage / Enchantment /
+     * StoredEMC 等处理器，不能作为“该变体自身已有值”的依据；返回 {@code 0} 视为无既有值。
+     * 后端不可用、无法还原变体或查询失败时原样返回。</p>
+     *
+     * @param snapshot 变体快照
+     * @param query    EMC 查询，必须与基础扫描使用同一后端
+     * @return 携带既有值的新快照，或原快照
+     */
+    static ItemSnapshot readVariantExistingValue(ItemSnapshot snapshot, ItemScanner.EmcQuery query) {
+        if (snapshot == null || !snapshot.key().hasVariant() || query == null) {
+            return snapshot;
+        }
+        ItemStack stack = variantStack(snapshot.key());
+        if (stack == null) {
+            return snapshot;
+        }
+        try {
+            // ProjectE 的 hasValue/getValue 在 NBT 未命中时会回退基础物品值并叠加
+            // Damage/Enchantment/StoredEMC 等处理器，不能据此认定该变体自身已有值；
+            // 只有精确 NBT 映射才与 store 写入值同口径。
+            long value = Math.max(0L, query.getExactValue(stack));
+            if (value <= 0L) {
+                return snapshot;
+            }
+            return ItemSnapshot.of(snapshot.key(), true, value,
+                    snapshot.tagPaths(), snapshot.rarity());
+        } catch (RuntimeException failure) {
+            LOGGER.debug("读取 NBT 变体 {} 的后端 EMC 失败，按无既有值处理", snapshot.key(), failure);
+            return snapshot;
+        }
+    }
+
+    /**
+     * 把变体键还原为带 NBT 的物品堆叠；无法解析时返回 {@code null}。
+     */
+    @Nullable
+    private static ItemStack variantStack(ItemKey key) {
+        if (key == null || !key.hasVariant()) {
+            return null;
+        }
+        Item item = BuiltInRegistries.ITEM.get(key.itemId());
+        if (item == null || item == Items.AIR) {
+            return null;
+        }
+        try {
+            CompoundTag tag = TagParser.parseTag(key.variantHash());
+            ItemStack stack = new ItemStack(item);
+            stack.setTag(tag);
+            return stack;
+        } catch (Exception failure) {
+            LOGGER.debug("无法把变体 {} 还原为 ItemStack，跳过既有值读取", key, failure);
+            return null;
+        }
+    }
+
+    /**
      * 创建一个真正的分片采集会话，供 {@link ScanManager} 跨 tick 推进。
      *
      * <p>会话先按批遍历物品注册表，再按批描述配方；每个 {@link ScanManager.CollectSession#step(int)}
@@ -752,6 +942,17 @@ String detail = "扫描采集失败：服务器尚未就绪";
     PipelineSnapshot collectSnapshotData(List<ItemSnapshot> items,
                                          RecipeScanner.ScanResult scanResult,
                                          @Nullable ItemScanner.EmcQuery emcQuery) {
+        return collectSnapshotData(items, scanResult, emcQuery, remapTracker.generation());
+    }
+
+    /**
+     * 带采集代次的组装入口：代次必须在读取任何后端值之前捕获，
+     * 才能在 apply 阶段识别“采集结束后、应用开始前完成的重映射”。
+     */
+    PipelineSnapshot collectSnapshotData(List<ItemSnapshot> items,
+                                         RecipeScanner.ScanResult scanResult,
+                                         @Nullable ItemScanner.EmcQuery emcQuery,
+                                         long remapGeneration) {
         Objects.requireNonNull(items, "items");
         Objects.requireNonNull(scanResult, "scanResult");
         List<ItemSnapshot> variantItems = collectVariantSnapshots(
@@ -766,38 +967,50 @@ String detail = "扫描采集失败：服务器尚未就绪";
         }
 
         Map<ItemKey, Long> existingValues = new TreeMap<>();
+        List<ItemSnapshot> resolvedItems = new ArrayList<>(allItems.size());
         int inspected = 0;
         for (ItemSnapshot item : allItems) {
             if (inspected++ % EXISTING_VALUE_CANCEL_CHECK_INTERVAL == 0 && isCancelled()) {
-                return partialSnapshot(allItems, scanResult.recipes());
+                return partialSnapshot(allItems, scanResult.recipes(), remapGeneration);
             }
-            if (item.hasExistingEmc()) {
-                existingValues.put(item.key(), item.existingValue());
+            // 基础扫描只查询无 NBT 的默认堆叠；变体必须单独回读后端值，
+            // 否则 owned 变体的外部修改永远不会进入外部修改检测。
+            ItemSnapshot resolved = item;
+            if (!item.hasExistingEmc() && item.key().hasVariant()) {
+                resolved = readVariantExistingValue(item, emcQuery);
             }
+            if (resolved.hasExistingEmc()) {
+                existingValues.put(resolved.key(), resolved.existingValue());
+            }
+            resolvedItems.add(resolved);
         }
-return new PipelineSnapshot(
-                allItems,
+
+        return new PipelineSnapshot(
+                List.copyOf(resolvedItems),
                 scanResult.recipes(),
                 existingValues,
                 scanResult.unsupported(),
                 scanResult.invalid(),
                 scanResult.failed(),
                 scanResult.enumerationFailed(),
-                scanResult.failedRecipeDetails());
+                scanResult.failedRecipeDetails(),
+                remapGeneration);
     }
 
     /**
      * 构造取消时的部分快照：物品/配方保持已采集部分，既有值只从当前物品列表重新推导。
      */
     private static PipelineSnapshot partialSnapshot(List<ItemSnapshot> items,
-                                                    List<RecipeSnapshot> recipes) {
+                                                    List<RecipeSnapshot> recipes,
+                                                    long remapGeneration) {
         Map<ItemKey, Long> existingValues = new TreeMap<>();
         for (ItemSnapshot item : items) {
             if (item.hasExistingEmc()) {
                 existingValues.put(item.key(), item.existingValue());
             }
         }
-        return new PipelineSnapshot(items, recipes, existingValues, 0, 0, 0, false, List.of());
+        return new PipelineSnapshot(items, recipes, existingValues, 0, 0, 0, false, List.of(),
+                remapGeneration);
     }
 
     /**
@@ -1160,7 +1373,20 @@ int totalBudget = VariantScanner.HARD_TOTAL_VARIANT_CEILING;
      */
     static OwnershipSeparation separateOwnedEntries(List<ItemSnapshot> items,
                                                     Predicate<ItemKey> owned) {
-        return separateOwnedEntries(items, owned, () -> false);
+        return separateOwnedEntries(items, owned, Map.of(), () -> false);
+    }
+
+    /**
+     * 带“外部保留值”的归属分离。
+     *
+     * <p>非自有条目优先采用采集阶段观察到的既有值；如果后端没有报告该值（例如 ProjectE 未安装，
+     * 但手工文件或所有权迁移要求保留旧值），则使用 {@code preservedExternalValues} 中的值作为种子。
+     * 自有条目仍会被重建为无既有值，保持 Phase 14 的刷新语义。</p>
+     */
+    static OwnershipSeparation separateOwnedEntries(List<ItemSnapshot> items,
+                                                    Predicate<ItemKey> owned,
+                                                    Map<ItemKey, Long> preservedExternalValues) {
+        return separateOwnedEntries(items, owned, preservedExternalValues, () -> false);
     }
 
     /**
@@ -1170,6 +1396,19 @@ int totalBudget = VariantScanner.HARD_TOTAL_VARIANT_CEILING;
     static OwnershipSeparation separateOwnedEntries(List<ItemSnapshot> items,
                                                     Predicate<ItemKey> owned,
                                                     BooleanSupplier cancellation) {
+        return separateOwnedEntries(items, owned, Map.of(), cancellation);
+    }
+
+    /**
+     * 核心重载：同时支持外部保留值种子与协作式取消检查。
+     */
+    static OwnershipSeparation separateOwnedEntries(List<ItemSnapshot> items,
+                                                    Predicate<ItemKey> owned,
+                                                    Map<ItemKey, Long> preservedExternalValues,
+                                                    BooleanSupplier cancellation) {
+        Map<ItemKey, Long> preserved = preservedExternalValues == null
+                ? Map.of()
+                : preservedExternalValues;
         List<ItemSnapshot> separated = new ArrayList<>(items.size());
         Map<ItemKey, Long> existingValues = new TreeMap<>();
         Set<ItemKey> ownedItems = new TreeSet<>();
@@ -1192,6 +1431,20 @@ int totalBudget = VariantScanner.HARD_TOTAL_VARIANT_CEILING;
             separated.add(item);
             if (item.hasExistingEmc()) {
                 existingValues.put(key, item.existingValue());
+            } else {
+                Long preservedValue = preserved.get(key);
+                if (preservedValue != null && preservedValue > 0L) {
+                    existingValues.put(key, preservedValue);
+                }
+            }
+        }
+        // 已成功释放所有权的条目即使不在本轮物品快照中，也要保留其最后已知值作为种子，
+        // 避免下一轮被配方或兜底定价重新接管。
+        for (Map.Entry<ItemKey, Long> entry : preserved.entrySet()) {
+            ItemKey key = entry.getKey();
+            Long value = entry.getValue();
+            if (key != null && value != null && value > 0L) {
+                existingValues.putIfAbsent(key, value);
             }
         }
         return new OwnershipSeparation(separated, existingValues, refreshedOwned, ownedItems);
@@ -1204,47 +1457,177 @@ int totalBudget = VariantScanner.HARD_TOTAL_VARIANT_CEILING;
      * 所有由持久化存储决定。这样即使调用方直接构造带既有值的快照，也会在写入前正确刷新
      * 自有条目；干跑模式没有存储，保持原始语义不变。</p>
      *
+     * <p>在刷新之前先检测外部修改：owned 条目的持久化值与后端当前值不同，或物品被 ProjectE
+     * 手工文件覆盖时，默认释放所有权并保留外部值。未被外部修改的 owned 条目仍然按 Phase 14
+     * 语义刷新。</p>
+     *
      * @param snapshot 采集结果，不能为 {@code null}
-     * @return 分离后的快照与自有物品键；无需刷新时快照返回原实例
+     * @return 分离后的快照、外部修改计数与本次刷新数量
      */
-    private AppliedSeparation applyOwnershipSeparation(PipelineSnapshot snapshot) {
+    private OwnershipApplication applyOwnershipSeparation(PipelineSnapshot snapshot) {
         if (store == null) {
-            return new AppliedSeparation(snapshot, Set.of(), 0);
+            return new OwnershipApplication(snapshot, 0, 0, Set.of(), 0);
         }
+        OwnershipDetection detection = detectAndReleaseExternalModifications(snapshot);
         OwnershipSeparation separation = separateOwnedEntries(
-                snapshot.items(), store::isOwned, this::isCancelled);
-        if (separation.refreshedOwned() == 0) {
-            return new AppliedSeparation(snapshot, separation.ownedItems(), 0);
+                snapshot.items(),
+                key -> !detection.protectedItems().contains(key) && store.isOwned(key),
+                detection.preservedValues(),
+                this::isCancelled);
+        // 合并既有值：先保留本轮物品列表之外仍然有效的既有值（例如空物品快照或部分扫描），
+        // 再移除被刷新的自有条目，最后叠加分离阶段产生的外部保留值。直接使用分离结果会丢掉
+        // 不在物品列表中的既有值，从而让本可继续求解的配方失去输入。
+        Map<ItemKey, Long> mergedExistingValues = new TreeMap<>(snapshot.existingValues());
+        for (ItemKey owned : separation.ownedItems()) {
+            mergedExistingValues.remove(owned);
         }
-        LOGGER.debug("SudoersEMC 归属分离刷新了 {} 个自有条目，本轮将重新求解其数值",
-                separation.refreshedOwned());
-        return new AppliedSeparation(
-                new PipelineSnapshot(
-                        separation.items(),
-                        snapshot.recipes(),
-                        separation.existingValues(),
-                        snapshot.unsupportedRecipes(),
-                        snapshot.invalidRecipes(),
-                        snapshot.failedRecipes(),
-                        snapshot.recipeEnumerationFailed(),
-                        snapshot.failedRecipeDetails()),
-                separation.ownedItems(),
-                separation.refreshedOwned());
+        mergedExistingValues.putAll(separation.existingValues());
+        boolean changed = separation.refreshedOwned() > 0
+                || !mergedExistingValues.equals(snapshot.existingValues());
+        if (!changed) {
+            return new OwnershipApplication(snapshot, detection.detected(), detection.released(),
+                    detection.protectedItems(), separation.refreshedOwned());
+        }
+        if (separation.refreshedOwned() > 0) {
+            LOGGER.debug("SudoersEMC 归属分离刷新了 {} 个自有条目，本轮将重新求解其数值",
+                    separation.refreshedOwned());
+        }
+        PipelineSnapshot updated = new PipelineSnapshot(
+                separation.items(),
+                snapshot.recipes(),
+                mergedExistingValues,
+                snapshot.unsupportedRecipes(),
+                snapshot.invalidRecipes(),
+                snapshot.failedRecipes(),
+                snapshot.recipeEnumerationFailed(),
+                snapshot.failedRecipeDetails(),
+                snapshot.remapGeneration());
+        return new OwnershipApplication(updated, detection.detected(), detection.released(),
+                detection.protectedItems(), separation.refreshedOwned());
     }
 
     /**
-     * 归属分离的应用结果。
+     * 检测 owned 条目的外部修改并释放其所有权，同时保留外部值或最后已知值。
      *
-     * @param snapshot       分离后的快照
-     * @param ownedItems     本轮扫描中归 SudoersEMC 所有的物品键
-     * @param refreshedOwned 被清除既有值的自有条目数量
+     * <p>两种信号会被视为外部修改：</p>
+     * <ul>
+     *   <li>持久化记录为 {@code owned=true}，但后端当前值（本轮采集到的既有值）与记录值不同；</li>
+     *   <li>物品被 ProjectE 手工文件覆盖，无论数值是否恰好相同。</li>
+     * </ul>
+     *
+     * <p>只比较本轮后端实际报告过值的物品，避免把“未扫描/被忽略”误判为外部删除。手工值通过
+     * 注入的判定器识别，不依赖该物品是否出现在既有值映射中。</p>
      */
-    private record AppliedSeparation(PipelineSnapshot snapshot, Set<ItemKey> ownedItems,
-                                     int refreshedOwned) {
-
-        AppliedSeparation {
-            ownedItems = Collections.unmodifiableSet(new TreeSet<>(ownedItems));
+    private OwnershipDetection detectAndReleaseExternalModifications(PipelineSnapshot snapshot) {
+        if (!preserveExternallyModifiedValues) {
+            return new OwnershipDetection(0, 0, Map.of(), Set.of());
         }
+        Map<ItemKey, GeneratedEmcEntry> entries;
+        try {
+            entries = store.snapshotAll();
+        } catch (RuntimeException failure) {
+            LOGGER.warn("SudoersEMC 读取归属快照失败，本轮跳过外部修改检测", failure);
+            return new OwnershipDetection(0, 0, Map.of(), Set.of());
+        }
+        if (entries == null || entries.isEmpty()) {
+            return new OwnershipDetection(0, 0, Map.of(), Set.of());
+        }
+
+        Map<ItemKey, Long> observed = snapshot.existingValues();
+        Set<ItemKey> considered = new TreeSet<>(observed.keySet());
+        Set<ItemKey> manualItems = new TreeSet<>();
+        Predicate<ItemKey> manualDetector = manualDetector();
+        if (manualDetector != null) {
+            for (Map.Entry<ItemKey, GeneratedEmcEntry> mapEntry : entries.entrySet()) {
+                GeneratedEmcEntry entry = mapEntry.getValue();
+                if (entry == null || !entry.owned()) {
+                    continue;
+                }
+                ItemKey item = entry.item() == null ? mapEntry.getKey() : entry.item();
+                if (item != null && isManuallySet(manualDetector, item)) {
+                    manualItems.add(item);
+                }
+            }
+        }
+
+        OwnershipManager manager = new OwnershipManager(store, new MapEmcValueReader(observed));
+        List<ItemKey> drifted;
+        if (remapConfirmationPending(snapshot)) {
+            // 重映射尚未确认完成时，后端可能仍返回我们写入前的旧值；
+            // 此时比较漂移会误释放所有权，因此只保留手工值检测。
+            LOGGER.debug("SudoersEMC 的后端重映射尚未确认完成，本轮跳过 owned 条目的漂移检测");
+            drifted = List.of();
+        } else {
+            try {
+                drifted = manager.detectExternalModifications(considered);
+            } catch (RuntimeException failure) {
+                LOGGER.warn("SudoersEMC 检测外部修改失败，本轮保留现有归属", failure);
+                drifted = List.of();
+            }
+        }
+
+        Set<ItemKey> candidates = new TreeSet<>(drifted);
+        candidates.addAll(manualItems);
+        int detected = 0;
+        int released = 0;
+        Map<ItemKey, Long> preservedValues = new TreeMap<>();
+        Set<ItemKey> protectedItems = new TreeSet<>();
+        for (ItemKey item : candidates) {
+            GeneratedEmcEntry entry = entries.get(item);
+            if (entry == null || !entry.owned()) {
+                continue;
+            }
+            detected++;
+            protectedItems.add(item);
+            Long observedValue = observed.get(item);
+            long preservedValue = preservedExternalValue(observedValue, entry.value());
+            // 即使所有权释放写入失败，也保留外部值并阻止本轮覆盖；失败只影响后续
+            // 扫描是否还能看到 owned 标记，不影响本轮的经济安全。
+            if (preservedValue > 0L) {
+                preservedValues.put(item, preservedValue);
+            }
+            if (manager.releaseOwnership(item)) {
+                released++;
+            }
+        }
+        if (detected > 0) {
+            LOGGER.info("SudoersEMC 检测到 {} 个 owned 条目被外部修改，已释放 {} 个所有权并保留外部值",
+                    detected, released);
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug("SudoersEMC 外部修改条目：{}", candidates);
+            }
+        }
+        return new OwnershipDetection(detected, released, preservedValues, protectedItems);
+    }
+
+    private Predicate<ItemKey> manualDetector() {
+        try {
+            return manualValueDetectorSupplier.get();
+        } catch (RuntimeException failure) {
+            LOGGER.warn("SudoersEMC 读取手工值判定器失败，本轮跳过手工值检测", failure);
+            return null;
+        }
+    }
+
+    private static boolean isManuallySet(Predicate<ItemKey> detector, ItemKey item) {
+        try {
+            return detector.test(item);
+        } catch (RuntimeException failure) {
+            return false;
+        }
+    }
+
+    /**
+     * 选择释放所有权时要保留的外部值。
+     *
+     * <p>后端明确报告的 {@code 0} 是有效观测；只有未观测（{@code null}）才回退到最后已知值。</p>
+     *
+     * @param observedValue  本轮后端观测值，未观测时为 {@code null}
+     * @param lastKnownValue 持久化条目中的最后已知值
+     * @return 应保留的值
+     */
+    static long preservedExternalValue(@Nullable Long observedValue, long lastKnownValue) {
+        return observedValue != null ? observedValue : lastKnownValue;
     }
 
     /**
@@ -1265,10 +1648,50 @@ int totalBudget = VariantScanner.HARD_TOTAL_VARIANT_CEILING;
         }
     }
 
+    record OwnershipDetection(int detected, int released, Map<ItemKey, Long> preservedValues,
+                              Set<ItemKey> protectedItems) {
+
+        OwnershipDetection {
+            preservedValues = Collections.unmodifiableMap(
+                    new TreeMap<>(preservedValues == null ? Map.of() : preservedValues));
+            protectedItems = protectedItems == null
+                    ? Set.of()
+                    : Collections.unmodifiableSet(new TreeSet<>(protectedItems));
+        }
+    }
+
+    /** 应用阶段归属处理结果。 */
+    record OwnershipApplication(PipelineSnapshot snapshot, int detected, int released,
+                                Set<ItemKey> protectedItems, int refreshedOwned) {
+
+        OwnershipApplication {
+            protectedItems = protectedItems == null
+                    ? Set.of()
+                    : Collections.unmodifiableSet(new TreeSet<>(protectedItems));
+        }
+    }
+
+    /** 从本轮采集快照读取当前值的只读后端。 */
+    private static final class MapEmcValueReader implements OwnershipManager.EmcValueReader {
+
+        private final Map<ItemKey, Long> values;
+
+        MapEmcValueReader(Map<ItemKey, Long> values) {
+            this.values = values == null ? Map.of() : values;
+        }
+
+        @Override
+        public long currentValue(ItemKey item) {
+            Long value = values.get(item);
+            return value == null ? 0L : value;
+        }
+    }
+
     /**
      * 求解快照并为可定价物品写入生成值。
      *
-     * <p>本方法不访问注册表，只使用快照中的纯数据。处理顺序固定为：</p>
+     * <p>本方法自身不直接读取注册表，只使用快照中的纯数据；但手工值判定器可能通过标签解析
+     * 间接访问注册表，因此必须由服务器线程调用。处理顺序固定为：</p>
      * <ol>
      *   <li>以已有 EMC 与创造保护固定值为初始种子，最多执行 {@link #MAX_SOLVE_ROUNDS} 轮
      *       “配方求解 → 兜底补种”循环：循环内只给没有配方的叶子物品补种，把兜底值沿配方链
@@ -1305,6 +1728,8 @@ int totalBudget = VariantScanner.HARD_TOTAL_VARIANT_CEILING;
         PipelineSnapshot data = snapshot == null ? PipelineSnapshot.empty() : snapshot;
 fullReportWritten = false;
         lastSnapshotForReport = data;
+        lastOwnershipExternalModifications = 0;
+        lastOwnershipReleased = 0;
         // 显式调用求解说明调用方已经拿到了可用快照，旧的采集失败标志不再适用。
         lastCollectFailure = null;
         // 持久化隔离存储已经接管审计；每轮扫描开始时清空内存列表，避免长期自动扫描无限累积。
@@ -1414,9 +1839,11 @@ fullReportWritten = false;
      */
     private Computation compute(PipelineSnapshot snapshot, long startedAtNanos,
                                 ScanFingerprint inputFingerprint) {
-        Set<ItemKey> externallyModified = detectExternallyModifiedOwnership(snapshot);
-        AppliedSeparation separation = applyOwnershipSeparation(snapshot, externallyModified);
-        PipelineSnapshot data = separation.snapshot();
+        OwnershipApplication ownership = applyOwnershipSeparation(snapshot);
+        PipelineSnapshot data = ownership.snapshot();
+        lastOwnershipExternalModifications = ownership.detected();
+        lastOwnershipReleased = ownership.released();
+        Set<ItemKey> externallyModified = ownership.protectedItems();
         long minimumEmc = solveSettings.minimumEmc();
 
         long cacheHitsBefore = recipeSolver.cacheHits();
@@ -1457,7 +1884,17 @@ fullReportWritten = false;
         addFallbackCandidates(data, seeds, fallbackCandidates, Set.of());
 
         List<Candidate> candidates =
-                selectFinalCandidates(recipeCandidates, fallbackCandidates, minimumEmc);
+                selectFinalCandidates(recipeCandidates, fallbackCandidates, minimumEmc,
+                        this::isCancelled);
+        if (!ownership.protectedItems().isEmpty()) {
+            List<Candidate> filtered = new ArrayList<>(candidates.size());
+            for (Candidate candidate : candidates) {
+                if (!ownership.protectedItems().contains(candidate.item())) {
+                    filtered.add(candidate);
+                }
+            }
+            candidates = List.copyOf(filtered);
+        }
         int solvedByRecipe = 0;
         int solvedByFallback = 0;
         for (Candidate candidate : candidates) {
@@ -1471,7 +1908,7 @@ fullReportWritten = false;
         lastSolverCacheHits = (int) Math.max(0L, recipeSolver.cacheHits() - cacheHitsBefore);
         lastSolverCacheMisses = (int) Math.max(0L, recipeSolver.cacheMisses() - cacheMissesBefore);
         return new Computation(data, lastSolveResult, List.copyOf(candidates),
-                solvedByRecipe, solvedByFallback, separation.refreshedOwned(),
+                solvedByRecipe, solvedByFallback, ownership.refreshedOwned(),
                 externallyModified, inputFingerprint, startedAtNanos);
     }
 
@@ -1485,8 +1922,6 @@ fullReportWritten = false;
         Set<ItemKey> variantItems = variantItemKeys(data.items());
         Map<ItemKey, List<String>> variantRegistrationNbts =
                 collectVariantRegistrationNbts(data.recipes(), variantItems);
-
-        releaseExternallyModifiedOwnership(computation.externallyModified());
 
         Map<ItemKey, GeneratedEmcEntry> previousEntries =
                 store == null ? Map.of() : store.snapshotAll();
@@ -1561,7 +1996,8 @@ fullReportWritten = false;
             long auditDropped = overflowPipeline == null ? 0L : overflowPipeline.auditDroppedCount();
             Map<String, Long> extraCounters = buildExtraCounters(data, solveResult,
                     quarantined, overflowResets, durationMillis, store != null,
-                    0, lastSolverRoundCount, computation.refreshedOwned(),
+                    0, lastSolverRoundCount, lastOwnershipExternalModifications,
+                    lastOwnershipReleased, computation.refreshedOwned(),
                     auditDropped, staleOwned, diagnostics);
             extraCounters.put("scanCancelled", 1L);
             return new PipelineResult(
@@ -1604,7 +2040,8 @@ fullReportWritten = false;
                 lastSolverRoundCount);
         Map<String, Long> extraCounters = buildExtraCounters(data, solveResult,
                 quarantined, overflowResets, durationMillis, appliedToStore,
-                retiredEntries, lastSolverRoundCount, computation.refreshedOwned(),
+                retiredEntries, lastSolverRoundCount, lastOwnershipExternalModifications,
+                lastOwnershipReleased, computation.refreshedOwned(),
                 auditDropped, staleOwned, diagnostics);
         PipelineResult result = new PipelineResult(
                 computation.solvedByRecipe(),
@@ -1663,69 +2100,6 @@ fullReportWritten = false;
             LOGGER.warn("SudoersEMC 检测外部修改失败，本轮保留现有归属", failure);
             return Set.of();
         }
-    }
-
-    /**
-     * 在服务器线程释放被外部修改条目的所有权。
-     *
-     * <p>迁移只改变 {@code owned} 标记，不修改数值；失败时保留原归属并记录警告。</p>
-     *
-     * @return 成功释放所有权的条目数量
-     */
-    private int releaseExternallyModifiedOwnership(Set<ItemKey> externallyModified) {
-        if (store == null || externallyModified == null || externallyModified.isEmpty()) {
-            return 0;
-        }
-        OwnershipManager manager = new OwnershipManager(store, item -> 0L);
-        int released = 0;
-        for (ItemKey item : externallyModified) {
-            try {
-                if (manager.releaseOwnership(item)) {
-                    released++;
-                }
-            } catch (RuntimeException failure) {
-                LOGGER.warn("释放外部修改条目的所有权失败：{}", item, failure);
-            }
-        }
-        if (released > 0) {
-            LOGGER.info("SudoersEMC 检测到 {} 个外部修改条目，已释放 {} 个条目的所有权",
-                    externallyModified.size(), released);
-        }
-        return released;
-    }
-
-    /**
-     * 在应用阶段执行归属分离。
-     *
-     * <p>分离放在应用阶段而不是采集阶段：采集只如实记录后端观察到的状态，是否归 SudoersEMC
-     * 所有由持久化存储决定。外部修改的条目在本轮被当作受保护的既有值，绝不参与重新求解。</p>
-     */
-    private AppliedSeparation applyOwnershipSeparation(PipelineSnapshot snapshot,
-                                                       Set<ItemKey> externallyModified) {
-        if (store == null) {
-            return new AppliedSeparation(snapshot, Set.of(), 0);
-        }
-        Set<ItemKey> protectedItems = externallyModified == null ? Set.of() : externallyModified;
-        OwnershipSeparation separation = separateOwnedEntries(snapshot.items(),
-                key -> store.isOwned(key) && !protectedItems.contains(key),
-                this::isCancelled);
-        if (separation.refreshedOwned() == 0) {
-            return new AppliedSeparation(snapshot, separation.ownedItems(), 0);
-        }
-        LOGGER.debug("SudoersEMC 归属分离刷新了 {} 个自有条目，本轮将重新求解其数值",
-                separation.refreshedOwned());
-        return new AppliedSeparation(
-                new PipelineSnapshot(
-                        separation.items(),
-                        snapshot.recipes(),
-                        separation.existingValues(),
-                        snapshot.unsupportedRecipes(),
-                        snapshot.invalidRecipes(),
-                        snapshot.failedRecipes(),
-                        snapshot.recipeEnumerationFailed(),
-                        snapshot.failedRecipeDetails()),
-                separation.ownedItems(),
-                separation.refreshedOwned());
     }
 
     /**
@@ -2692,7 +3066,8 @@ SolveContext context = new SolveContext(seeds, deniedItems);
             long durationMillis = Math.max(0L, selected.elapsedSinceResetMillis());
             PipelineResult partial = PipelineResult.zeroed(durationMillis);
             Map<String, Long> counters = buildExtraCounters(data, skippedSolveResult(), 0, 0,
-                    durationMillis, store != null, 0, 0, 0, 0L, 0, selected);
+                    durationMillis, store != null, 0, 0,
+                    lastOwnershipExternalModifications, lastOwnershipReleased, 0, 0L, 0, selected);
             counters.put("partialReport", 1L);
             counters.put("scanCancelled", cancelled ? 1L : 0L);
             counters.put("scanFailed", cancelled ? 0L : 1L);
@@ -2717,9 +3092,35 @@ SolveContext context = new SolveContext(seeds, deniedItems);
                                                          long durationMillis,
                                                          boolean appliedToStore,
                                                          int retiredEntries, int solverRounds,
+                                                         int ownershipExternalModifications,
+                                                         int ownershipReleased,
                                                          int refreshedOwned,
                                                          long auditDropped, int staleOwned,
                                                          @Nullable ScanDiagnostics telemetry) {
+        ScanDiagnostics selected = telemetry == null ? new ScanDiagnostics() : telemetry;
+        selected.recordMemory();
+
+        long shapedRecipes = 0L;
+        long shapelessRecipes = 0L;
+        long multiOutputRecipes = 0L;
+        long containerRemainderRecipes = 0L;
+        for (RecipeSnapshot recipe : snapshot.recipes()) {
+            if (recipe == null) {
+                continue;
+            }
+            if (recipe.kind() == com.itzplana.sudoersemc.scanner.RecipeKind.SHAPED) {
+                shapedRecipes++;
+            } else if (recipe.kind() == com.itzplana.sudoersemc.scanner.RecipeKind.SHAPELESS) {
+                shapelessRecipes++;
+            }
+            if (recipe.hasMultipleOutputs()) {
+                multiOutputRecipes++;
+            }
+            if (recipe.hasContainerRemainders()) {
+                containerRemainderRecipes++;
+            }
+        }
+
         Map<String, Long> counters = new LinkedHashMap<>();
         if (snapshot.recipeEnumerationFailed()) {
             // 枚举整体失败时总数与分类计数都未知，不能伪造一条失败配方。
@@ -2743,6 +3144,12 @@ SolveContext context = new SolveContext(seeds, deniedItems);
         counters.put("quarantinedDrops", (long) quarantined);
         counters.put("overflowResets", (long) overflowResets);
         counters.put("retiredEntries", (long) retiredEntries);
+        counters.put("shapedRecipes", shapedRecipes);
+        counters.put("shapelessRecipes", shapelessRecipes);
+        counters.put("multiOutputRecipes", multiOutputRecipes);
+        counters.put("containerRemainderRecipes", containerRemainderRecipes);
+        counters.put("ownershipExternalModifications", (long) ownershipExternalModifications);
+        counters.put("ownershipReleasedEntries", (long) ownershipReleased);
         counters.put("ownedRefreshed", (long) refreshedOwned);
         counters.put("overflowAuditDropped", auditDropped);
         counters.put("staleOwnedEntries", (long) staleOwned);
@@ -2924,6 +3331,88 @@ SolveContext context = new SolveContext(seeds, deniedItems);
         Candidate(ItemKey item, long value, PriceSource source,
                   @Nullable ResourceLocation recipeId) {
             this(item, value, source, recipeId, List.of());
+        }
+    }
+
+    /**
+     * 跨 {@link ScanPipeline} 实例共享的重映射确认状态。
+     *
+     * <p>配置重载会重建管线；若状态留在管线实例上，一次失败的重映射保护会在新管线的
+     * 首轮丢失。把状态抽到可注入的 tracker 后，生产环境在重建之间复用同一实例，
+     * 而单元测试仍可使用独立实例，避免测试间相互污染。</p>
+     *
+     * <p>代次在每次重映射完成（无论成功或失败）时推进，并与采集快照一起带入 apply。
+     * 只要采集开始后发生过重映射完成，本轮 observed 值就可能来自写入前，必须跳过漂移检测。</p>
+     */
+    public static final class RemapTracker {
+
+        private final AtomicReference<CompletableFuture<?>> inFlight = new AtomicReference<>();
+        private final AtomicLong generation = new AtomicLong();
+        private final Object stateLock = new Object();
+        private boolean unconfirmed;
+
+        /**
+         * 记录一次重映射请求；完成时推进代次并更新确认状态。
+         *
+         * @param completion 完成信号，允许为 {@code null}（无法确认时不改变状态）
+         */
+        public void track(@Nullable CompletableFuture<?> completion) {
+            if (completion == null) {
+                return;
+            }
+            synchronized (stateLock) {
+                inFlight.set(completion);
+            }
+            completion.whenComplete((ignored, failure) -> {
+                synchronized (stateLock) {
+                    if (inFlight.get() != completion) {
+                        // 已被更新的重映射请求取代，旧结果不得改变当前状态。
+                        return;
+                    }
+                    // 先推进代次再清除在途标记：任何在此前采集的快照都会被视为过期。
+                    generation.incrementAndGet();
+                    inFlight.set(null);
+                    unconfirmed = failure != null;
+                    if (failure != null) {
+                        LOGGER.warn("SudoersEMC 的 ProjectE 重映射未成功完成，下一轮继续跳过外部修改释放",
+                                failure);
+                    }
+                }
+            });
+        }
+
+        /**
+         * @return 当前重映射代次
+         */
+        public long generation() {
+            return generation.get();
+        }
+
+        /**
+         * 判断某次采集的快照是否必须跳过漂移检测。
+         *
+         * @param snapshotGeneration 采集开始时记录到的代次；未知代次传
+         *                           {@link PipelineSnapshot#UNKNOWN_REMAP_GENERATION}
+         * @return 仍有在途重映射、上次重映射失败，或采集后发生过重映射完成时返回 {@code true}
+         */
+        public boolean confirmationPending(long snapshotGeneration) {
+            synchronized (stateLock) {
+                if (inFlight.get() != null || unconfirmed) {
+                    return true;
+                }
+                return snapshotGeneration >= 0L && snapshotGeneration != generation.get();
+            }
+        }
+
+        /**
+         * 清空跨服务器会话的重映射状态。
+         */
+        public void reset() {
+            synchronized (stateLock) {
+                inFlight.set(null);
+                unconfirmed = false;
+                generation.incrementAndGet();
+            }
         }
     }
 }

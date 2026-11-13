@@ -230,4 +230,46 @@ class StandardRecipeEvaluatorTest {
         assertFalse(result.valid());
         assertEquals("no-output", result.reason());
     }
+
+    @Test
+    void remainderCreditCanBeDisabled() {
+        ItemKey input = item("credit_disabled_in");
+        ItemKey output = item("credit_disabled_out");
+        ItemKey remainder = item("credit_disabled_remainder");
+        RecipeSnapshot snapshot = new RecipeSnapshot(
+                new ResourceLocation("test", "credit_disabled"), RecipeKind.SHAPELESS,
+                List.of(input(input, 1)), List.of(new RecipeOutput(output, 1)),
+                List.of(new RecipeOutput(remainder, 1)), false, Map.of());
+        EvaluationPolicy noCredit =
+                new EvaluationPolicy(EvaluationPolicy.DEFAULT_MINIMUM_EMC, false, false);
+
+        RecipeEvaluation result = evaluator.evaluate(
+                snapshot, lookup(Map.of(input, 100L, remainder, 30L)), noCredit);
+
+        assertTrue(result.valid());
+        assertEquals(100L, result.outputUnitEmc(),
+                "关闭 creditRemainders 后返还物不得抵扣成本");
+    }
+
+    @Test
+    void multiOutputSplitCreditsRemaindersBeforeDividing() {
+        ItemKey input = item("split_credit_in");
+        ItemKey primary = item("split_credit_primary");
+        ItemKey byproduct = item("split_credit_byproduct");
+        ItemKey remainder = item("split_credit_remainder");
+        RecipeSnapshot snapshot = new RecipeSnapshot(
+                new ResourceLocation("test", "split_credit"), RecipeKind.SHAPELESS,
+                List.of(input(input, 1)),
+                List.of(new RecipeOutput(primary, 1), new RecipeOutput(byproduct, 4)),
+                List.of(new RecipeOutput(remainder, 1)), false, Map.of());
+        EvaluationPolicy split =
+                new EvaluationPolicy(EvaluationPolicy.DEFAULT_MINIMUM_EMC, true, true);
+
+        RecipeEvaluation result = evaluator.evaluate(
+                snapshot, lookup(Map.of(input, 100L, remainder, 30L)), split);
+
+        assertTrue(result.valid());
+        // (100 - 30) / (1 + 4) = 14, remainders are credited exactly once.
+        assertEquals(14L, result.outputUnitEmc());
+    }
 }

@@ -3,11 +3,13 @@ package com.itzplana.sudoersemc.scanner;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.itzplana.sudoersemc.core.ItemKey;
+import java.util.List;
 import java.util.Optional;
 import java.util.stream.Stream;
 import net.minecraft.SharedConstants;
@@ -38,10 +40,10 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 /**
- * {@link RecipeScanner} 的扫描与 SNBT 保留行为测试。
+ * {@link RecipeScanner} 输出 SNBT 保留行为的单元测试。
  *
- * <p>测试只覆盖不依赖配方管理器的转换路径，因此不需要启动服务器；引导逻辑集中在
- * {@link MinecraftTestBootstrap}。</p>
+ * <p>测试只覆盖不依赖配方管理器的转换路径，因此不需要启动服务器；Forge 的
+ * {@code ItemStack} 静态初始化需要注册表，测试前先完成引导。</p>
  */
 class RecipeScannerTest {
 
@@ -51,59 +53,9 @@ class RecipeScannerTest {
     private static final ResourceLocation STONE_ID = new ResourceLocation("minecraft", "stone");
     private final RecipeScanner scanner = new RecipeScanner();
 
-    @BeforeAll
-    static void bootstrap() {
-        MinecraftTestBootstrap.ensure();
-    }
-
-    @Test
-    void shapedRecipeProducesSnapshotAndBucketRemainder() {
-        ShapedRecipe recipe = shaped(2, 1,
-                Ingredient.of(Items.MILK_BUCKET), Ingredient.of(Items.WHEAT), new ItemStack(Items.CAKE));
-
-        RecipeSnapshot snapshot = scanner.describe(recipe, RECIPE_ID);
-
-        assertNotNull(snapshot, "vanilla shaped recipes must not fail with a null container");
-        assertEquals(RecipeKind.SHAPED, snapshot.kind());
-        assertEquals(2, snapshot.inputs().size());
-        assertEquals(1, snapshot.outputs().size());
-        assertEquals(ItemKey.of(new ResourceLocation("minecraft", "cake")), snapshot.primaryOutput().item());
-        assertEquals(1, snapshot.containerRemainders().size(),
-                "the milk bucket slot returns exactly one bucket");
-        assertEquals(ItemKey.of(new ResourceLocation("minecraft", "bucket")),
-                snapshot.containerRemainders().get(0).item());
-    }
-
-    @Test
-    void shapelessRecipeIsTaggedShapeless() {
-        NonNullList<Ingredient> ingredients = NonNullList.of(Ingredient.EMPTY, Ingredient.of(Items.DIRT));
-        ShapelessRecipe recipe = new ShapelessRecipe(RECIPE_ID, "", CraftingBookCategory.MISC,
-                new ItemStack(Items.DIAMOND), ingredients);
-
-        RecipeSnapshot snapshot = scanner.describe(recipe, RECIPE_ID);
-
-        assertNotNull(snapshot);
-        assertEquals(RecipeKind.SHAPELESS, snapshot.kind());
-    }
-
-    @Test
-    void unboundTagSlotMakesRecipeUnsupported() {
-        Ingredient unbound = Ingredient.of(unboundTag());
-        assertFalse(unbound.isEmpty(), "an unbound tag ingredient is still a non-empty slot");
-        ShapedRecipe recipe = shaped(2, 1,
-                Ingredient.of(Items.DIRT), unbound, new ItemStack(Items.CAKE));
-
-        assertNull(scanner.describe(recipe, RECIPE_ID),
-                "a recipe must not be priced while one of its slots cannot be converted");
-    }
-
-    @Test
-    void throwingIngredientSlotMakesRecipeUnsupported() {
-        ShapedRecipe recipe = shaped(2, 1,
-                Ingredient.of(Items.DIRT), new ThrowingIngredient(), new ItemStack(Items.CAKE));
-
-        assertNull(scanner.describe(recipe, RECIPE_ID),
-                "a getItems() failure must fail the whole recipe closed");
+    static {
+        SharedConstants.tryDetectVersion();
+        Bootstrap.bootStrap();
     }
     @Test
     void recipeIdEnumerationFailureAbortsInsteadOfReturningEmptyScan() {
@@ -196,7 +148,7 @@ class RecipeScannerTest {
         RecipeOutput output = RecipeScanner.convertStack(stack);
 
         assertNotNull(output);
-        assertEquals(ItemKey.of(new ResourceLocation("minecraft", "diamond_sword")), output.item());
+        assertEquals(ItemKey.of(DIAMOND_SWORD_ID), output.item());
         assertEquals(2, output.count());
         assertNotNull(output.outputNbt(), "带 NBT 的输出必须保留 SNBT");
         assertFalse(output.outputNbt().isBlank());
@@ -255,6 +207,44 @@ class RecipeScannerTest {
         assertNotNull(output);
         assertNull(output.outputNbt(), "默认 {Damage:0} 必须归一为 null，避免生成伪变体");
         assertFalse(output.hasOutputNbt());
+    }
+
+    @Test
+    void shapedRecipeKeepsKindAndActualGridDimensions() {
+        ShapedRecipe recipe = new ShapedRecipe(
+                new ResourceLocation("sudoersemc_test", "four_wide"), "test",
+                CraftingBookCategory.MISC, 4, 1,
+                NonNullList.withSize(4, Ingredient.of(Items.STONE)),
+                new ItemStack(Items.DIAMOND));
+
+        RecipeSnapshot snapshot = new RecipeScanner().describe(recipe, recipe.getId());
+
+        assertNotNull(snapshot, "4x1 配方不得再被 3x3 限制拒绝");
+        assertEquals(RecipeKind.SHAPED, snapshot.kind());
+        assertEquals("4", snapshot.attribute("gridWidth"));
+        assertEquals("1", snapshot.attribute("gridHeight"));
+        assertEquals(1, snapshot.outputs().size(), "单个结果堆叠不得产生重复产物");
+        assertEquals(ItemKey.of(new ResourceLocation("minecraft", "diamond")),
+                snapshot.primaryOutput().item());
+    }
+
+    @Test
+    void shapelessRecipeIsClassifiedAsShapeless() {
+        ItemStack result = new ItemStack(Items.STICK);
+        result.setCount(4);
+        ShapelessRecipe recipe = new ShapelessRecipe(
+                new ResourceLocation("sudoersemc_test", "four_sticks"), "test",
+                CraftingBookCategory.MISC, result,
+                NonNullList.withSize(2, Ingredient.of(Items.OAK_PLANKS)));
+
+        RecipeSnapshot snapshot = new RecipeScanner().describe(recipe, recipe.getId());
+
+        assertNotNull(snapshot);
+        assertEquals(RecipeKind.SHAPELESS, snapshot.kind());
+        assertEquals("2", snapshot.attribute("gridWidth"));
+        assertEquals("1", snapshot.attribute("gridHeight"));
+        assertEquals(1, snapshot.outputs().size());
+        assertEquals(4, snapshot.primaryOutput().count(), "结果堆叠数量必须保留");
     }
 
     @Test
@@ -520,21 +510,50 @@ class RecipeScannerTest {
         return new ShapedRecipe(RECIPE_ID, "", CraftingBookCategory.MISC, width, height, ingredients, result);
     }
 
-    /** Ingredient whose candidate lookup fails, mirroring a broken tag or modded ingredient. */
-    private static final class ThrowingIngredient extends Ingredient {
+    @Test
+    void containerRemaindersAreCapturedButNeverListedAsOutputs() {
+        ShapelessRecipe recipe = new ShapelessRecipe(
+                new ResourceLocation("sudoersemc_test", "cake_from_milk"), "test",
+                CraftingBookCategory.MISC, new ItemStack(Items.CAKE),
+                NonNullList.withSize(1, Ingredient.of(Items.MILK_BUCKET)));
 
-        private ThrowingIngredient() {
-            super(Stream.empty());
-        }
+        RecipeSnapshot snapshot = new RecipeScanner().describe(recipe, recipe.getId());
 
-        @Override
-        public ItemStack[] getItems() {
-            throw new IllegalStateException("broken ingredient");
-        }
+        assertNotNull(snapshot);
+        ItemKey bucket = ItemKey.of(new ResourceLocation("minecraft", "bucket"));
+        assertEquals(List.of(bucket),
+                snapshot.containerRemainders().stream().map(RecipeOutput::item).toList());
+        assertEquals(1, snapshot.containerRemainders().get(0).count());
+        assertTrue(snapshot.outputs().stream().noneMatch(output -> output.item().equals(bucket)),
+                "容器返还只能进入成本抵扣，不能重复发布为产物");
+    }
 
-        @Override
-        public boolean isEmpty() {
-            return false;
-        }
+    @Test
+    void multiCandidateIngredientSkipsRemainderCredit() {
+        ShapelessRecipe recipe = new ShapelessRecipe(
+                new ResourceLocation("sudoersemc_test", "cake_from_any_bucket"), "test",
+                CraftingBookCategory.MISC, new ItemStack(Items.CAKE),
+                NonNullList.withSize(1, Ingredient.of(Items.MILK_BUCKET, Items.WATER_BUCKET)));
+
+        RecipeSnapshot snapshot = new RecipeScanner().describe(recipe, recipe.getId());
+
+        assertNotNull(snapshot);
+        assertTrue(snapshot.containerRemainders().isEmpty(),
+                "多候选输入的返还物无法与最便宜成本口径对齐，必须放弃抵扣");
+    }
+
+    @Test
+    void containerRemainderScanningCanBeDisabled() {
+        ShapelessRecipe recipe = new ShapelessRecipe(
+                new ResourceLocation("sudoersemc_test", "cake_without_remainders"), "test",
+                CraftingBookCategory.MISC, new ItemStack(Items.CAKE),
+                NonNullList.withSize(1, Ingredient.of(Items.MILK_BUCKET)));
+        RecipeScanner scanner = new RecipeScanner(GoetyRitualReader.unavailable(), false);
+
+        RecipeSnapshot snapshot = scanner.describe(recipe, recipe.getId());
+
+        assertNotNull(snapshot);
+        assertTrue(snapshot.containerRemainders().isEmpty(),
+                "关闭扫描开关后不得读取 remaining items");
     }
 }

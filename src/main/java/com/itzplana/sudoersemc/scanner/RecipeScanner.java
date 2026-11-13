@@ -19,10 +19,12 @@ import net.minecraft.world.item.crafting.Ingredient;
 import net.minecraft.world.item.crafting.Recipe;
 import net.minecraft.world.item.crafting.RecipeManager;
 import net.minecraft.world.item.crafting.SmeltingRecipe;
-import net.minecraft.world.item.crafting.ShapelessRecipe;
 import net.minecraft.world.item.crafting.SmokingRecipe;
 import net.minecraft.world.item.crafting.StonecutterRecipe;
+import net.minecraft.world.inventory.TransientCraftingContainer;
 import net.minecraft.world.item.crafting.CraftingRecipe;
+import net.minecraft.world.item.crafting.ShapedRecipe;
+import net.minecraft.world.item.crafting.ShapelessRecipe;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -47,9 +49,10 @@ public final class RecipeScanner {
     static final int MAX_FAILED_DETAILS = 50;
 
     private final GoetyRitualReader goetyReader;
+    private final boolean scanContainerRemainders;
 
     public RecipeScanner() {
-        this(GoetyRitualReader.unavailable());
+        this(GoetyRitualReader.unavailable(), true);
     }
 
     /**
@@ -57,7 +60,16 @@ public final class RecipeScanner {
      *                    when Goety is not installed
      */
     public RecipeScanner(GoetyRitualReader goetyReader) {
+        this(goetyReader, true);
+    }
+
+    /**
+     * @param goetyReader            optional Goety reflection bridge
+     * @param scanContainerRemainders whether crafting remainders (buckets, bottles, ...) should be read
+     */
+    public RecipeScanner(GoetyRitualReader goetyReader, boolean scanContainerRemainders) {
         this.goetyReader = Objects.requireNonNull(goetyReader, "goetyReader");
+        this.scanContainerRemainders = scanContainerRemainders;
     }
 
     /** 每扫描多少条配方检查一次取消信号。 */
@@ -445,15 +457,15 @@ public final class RecipeScanner {
 
     private RecipeSnapshot describeSingleOutput(ResourceLocation id, RecipeKind kind,
                                                 NonNullList<Ingredient> ingredients, ItemStack result) {
-        ConvertedIngredients converted = convertIngredients(ingredients, false);
-        if (converted == null || converted.inputs().isEmpty()) {
+        List<RecipeInput> inputs = convertIngredients(ingredients);
+        if (inputs == null || inputs.isEmpty()) {
             return null;
         }
-        RecipeOutput output = convertStack(result);
-        if (output == null) {
+        List<RecipeOutput> outputs = convertStacks(List.of(result));
+        if (outputs.isEmpty()) {
             return null;
         }
-        return RecipeSnapshot.of(id, kind, converted.inputs(), List.of(output));
+        return RecipeSnapshot.of(id, kind, inputs, outputs);
     }
 
     private RecipeSnapshot describeCrafting(CraftingRecipe recipe, ResourceLocation id) {
@@ -462,48 +474,118 @@ public final class RecipeScanner {
             // cost rule and are intentionally excluded from automatic pricing.
             return null;
         }
-        if (!recipe.canCraftInDimensions(3, 3)) {
+        NonNullList<Ingredient> ingredients = recipe.getIngredients();
+        List<RecipeInput> inputs = convertIngredients(ingredients);
+        if (inputs == null || inputs.isEmpty()) {
             return null;
         }
-        RecipeKind kind = recipe instanceof ShapelessRecipe ? RecipeKind.SHAPELESS : RecipeKind.SHAPED;
-        // Vanilla Recipe#getRemainingItems dereferences its container argument, and ShapedRecipe /
-        // ShapelessRecipe do not override it. Deriving remainders from the ingredient choices keeps
-        // the scan container-free; any unreadable slot makes the whole recipe unsupported.
-        ConvertedIngredients converted = convertIngredients(recipe.getIngredients(), true);
-        if (converted == null || converted.inputs().isEmpty()) {
+
+        RecipeKind kind;
+        int width;
+        int height;
+        if (recipe instanceof ShapedRecipe shaped) {
+            kind = RecipeKind.SHAPED;
+            width = Math.max(1, shaped.getWidth());
+            height = Math.max(1, shaped.getHeight());
+        } else if (recipe instanceof ShapelessRecipe shapeless) {
+            kind = RecipeKind.SHAPELESS;
+            width = Math.max(1, shapeless.getIngredients().size());
+            height = 1;
+        } else {
+            // Unknown generic crafting recipe: preserve the previous shaped classification while
+            // still accepting grids larger than 3x3.
+            kind = RecipeKind.SHAPED;
+            width = Math.max(1, ingredients.size());
+            height = 1;
+        }
+        if (!fitsCraftingGrid(recipe, width, height)) {
             return null;
         }
+
         ItemStack result;
         try {
             result = recipe.getResultItem(null);
         } catch (RuntimeException e) {
             return null;
         }
-        RecipeOutput output = convertStack(result);
-        if (output == null) {
+        // Reuse the shared stack conversion path so output counts and NBT handling stay identical
+        // to every other recipe family. A single result stack may still have count > 1; that count
+        // is divided in the evaluator, never duplicated here.
+        List<RecipeOutput> outputs = convertStacks(List.of(result));
+        if (outputs.isEmpty()) {
             return null;
         }
-        return new RecipeSnapshot(id, kind, converted.inputs(), List.of(output),
-                converted.remainders(), false, java.util.Map.of());
+
+        List<RecipeOutput> remainders = scanContainerRemainders
+                ? containerRemainderOutputs(recipe, ingredients, width, height)
+                : List.of();
+        return new RecipeSnapshot(id, kind, inputs, outputs, remainders, false,
+                java.util.Map.of(
+                        "gridWidth", Integer.toString(width),
+                        "gridHeight", Integer.toString(height)));
+    }
+
+    /**
+     * 判断配方能否放入其实际声明的合成网格。
+     *
+     * <p>旧实现无条件要求 3x3，会丢弃模组提供的 4x1、4x4 等工作台配方。这里先保留 3x3
+     * 兼容路径，再按配方自己声明的 width×height 检查，绝不把“大于 3x3”直接当成非法。</p>
+     */
+    private static boolean fitsCraftingGrid(CraftingRecipe recipe, int width, int height) {
+        try {
+            if (recipe.canCraftInDimensions(3, 3)) {
+                return true;
+            }
+            return width > 0 && height > 0 && recipe.canCraftInDimensions(width, height);
+        } catch (RuntimeException failure) {
+            LOGGER.debug("配方网格判断失败，按不可合成处理", failure);
+            return false;
+        }
+    }
+
+    /**
+     * 使用配方输入的代表性物品构造临时合成网格，并读取 remaining items。
+     *
+     * <p>标签输入可能有多个候选；求解器按“最便宜候选”计算成本，而返还物只能按一个具体候选读取。
+     * 为了保持成本与抵扣口径一致，只要任一输入槽存在多个候选就放弃本配方的返还物抵扣。
+     * 计算结果只用于成本抵扣，不会发布为产物。无法计算余量时返回空列表，配方仍然参与定价。</p>
+     */
+    private static List<RecipeOutput> containerRemainderOutputs(CraftingRecipe recipe,
+                                                               NonNullList<Ingredient> ingredients,
+                                                               int width, int height) {
+        try {
+            int size = Math.max(1, ingredients.size());
+            NonNullList<ItemStack> items = NonNullList.withSize(size, ItemStack.EMPTY);
+            for (int index = 0; index < size; index++) {
+                Ingredient ingredient = index < ingredients.size() ? ingredients.get(index) : null;
+                if (ingredient == null || ingredient.isEmpty()) {
+                    continue;
+                }
+                ItemStack[] stacks = ingredient.getItems();
+                if (stacks.length != 1 || stacks[0].isEmpty()
+                        || IngredientStacks.isEmptyTagPlaceholder(stacks[0])) {
+                    // 多候选标签的首个候选可能不同于求解器选中的最便宜输入，
+                    // 返还物无法与成本口径对齐，直接放弃本配方的返还物抵扣。
+                    return List.of();
+                }
+                items.set(index, stacks[0].copyWithCount(1));
+            }
+            TransientCraftingContainer container = new TransientCraftingContainer(
+                    null, Math.max(1, width), Math.max(1, height), items);
+            return convertStacks(recipe.getRemainingItems(container));
+        } catch (RuntimeException failure) {
+            LOGGER.debug("无法计算配方 {} 的容器返还物，按无余量处理", recipe.getId(), failure);
+            return List.of();
+        }
     }
 
     /**
      * Converts Minecraft ingredients. Tag ingredients become multi-choice options so the evaluator
      * can pick the cheapest member.
-     *
-     * <p>Fail-closed: if a non-empty slot cannot be read (an exception, an unbound tag, or no usable
-     * candidates) the whole recipe is reported as unsupported instead of being priced with missing
-     * inputs. Container remainders are only credited when every candidate for a slot returns the
-     * same remainder item, because the scan cannot know which candidate the player will use.</p>
-     *
-     * @param collectRemainders whether to derive container remainders for this recipe family
-     * @return the conversion, or {@code null} when the recipe cannot be described safely
      */
     @Nullable
-    private static ConvertedIngredients convertIngredients(NonNullList<Ingredient> ingredients,
-                                                            boolean collectRemainders) {
-        List<RecipeInput> inputs = new ArrayList<>();
-        List<RecipeOutput> remainders = new ArrayList<>();
+    private static List<RecipeInput> convertIngredients(NonNullList<Ingredient> ingredients) {
+        List<RecipeInput> converted = new ArrayList<>();
         for (Ingredient ingredient : ingredients) {
             if (ingredient == null || ingredient.isEmpty()) {
                 continue;
@@ -515,58 +597,21 @@ public final class RecipeScanner {
                 return null;
             }
             List<ItemKey> candidates = new ArrayList<>(stacks.length);
-            ItemKey commonRemainder = null;
-            boolean remainderAmbiguous = false;
             for (ItemStack stack : stacks) {
                 if (stack.isEmpty() || IngredientStacks.isEmptyTagPlaceholder(stack)) {
                     continue;
                 }
-                ResourceLocation itemId = BuiltInRegistries.ITEM.getKey(stack.getItem());
-                if (itemId != null) {
-                    candidates.add(ItemKey.of(itemId));
-                }
-                if (collectRemainders) {
-                    if (stack.hasCraftingRemainingItem()) {
-                        ItemStack remainder = stack.getCraftingRemainingItem();
-                        ResourceLocation remainderId = remainder.isEmpty()
-                                ? null
-                                : BuiltInRegistries.ITEM.getKey(remainder.getItem());
-                        if (remainderId == null) {
-                            remainderAmbiguous = true;
-                        } else {
-                            ItemKey remainderKey = ItemKey.of(remainderId);
-                            if (commonRemainder == null) {
-                                commonRemainder = remainderKey;
-                            } else if (!commonRemainder.equals(remainderKey)) {
-                                remainderAmbiguous = true;
-                            }
-                        }
-                    } else {
-                        // Another candidate would not return a container, so crediting one would
-                        // understate the recipe cost.
-                        remainderAmbiguous = true;
-                    }
+                ResourceLocation id = BuiltInRegistries.ITEM.getKey(stack.getItem());
+                if (id != null) {
+                    candidates.add(ItemKey.of(id));
                 }
             }
             if (candidates.isEmpty()) {
                 return null;
             }
-            inputs.add(RecipeInput.of(new IngredientOption(candidates)));
-            if (collectRemainders && !remainderAmbiguous && commonRemainder != null) {
-                remainders.add(RecipeOutput.of(commonRemainder));
-            }
+            converted.add(RecipeInput.of(new IngredientOption(candidates)));
         }
-        return new ConvertedIngredients(inputs, remainders);
-    }
-
-    /**
-     * Result of a fail-closed ingredient conversion. Callers must reject an empty {@code inputs}
-     * list as unsupported.
-     *
-     * @param inputs     consumed slots
-     * @param remainders container returns that are unambiguous across every candidate
-     */
-    private record ConvertedIngredients(List<RecipeInput> inputs, List<RecipeOutput> remainders) {
+        return converted;
     }
 
     /**
@@ -642,6 +687,20 @@ public final class RecipeScanner {
             LOGGER.debug("序列化配方输出 NBT 失败，按无 NBT 处理", failure);
             return null;
         }
+    }
+
+    private static List<RecipeOutput> convertStacks(@Nullable Iterable<ItemStack> stacks) {
+        if (stacks == null) {
+            return List.of();
+        }
+        List<RecipeOutput> converted = new ArrayList<>();
+        for (ItemStack stack : stacks) {
+            RecipeOutput output = convertStack(stack);
+            if (output != null) {
+                converted.add(output);
+            }
+        }
+        return converted;
     }
 
     /**
@@ -743,6 +802,16 @@ public final class RecipeScanner {
 
     /** Convenience accessor used by the pipeline. */
     public static Optional<RecipeScanner> withGoety() {
-        return GoetyRitualReader.available() ? Optional.of(new RecipeScanner(GoetyRitualReader.create())) : Optional.empty();
+        return withGoety(true);
+    }
+
+    /**
+     * @param scanContainerRemainders 是否读取 crafting remaining items
+     * @return 已接入 Goety 的扫描器；Goety 不可用时为空
+     */
+    public static Optional<RecipeScanner> withGoety(boolean scanContainerRemainders) {
+        return GoetyRitualReader.available()
+                ? Optional.of(new RecipeScanner(GoetyRitualReader.create(), scanContainerRemainders))
+                : Optional.empty();
     }
 }

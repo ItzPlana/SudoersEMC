@@ -7,6 +7,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.function.Supplier;
+import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 
 /**
  * 纯 Java 的配置校验逻辑。
@@ -67,7 +69,11 @@ public final class ConfigValidator {
             List<String> creativeItemExclusions,
             List<String> creativeItemSpecialValues,
             List<String> creativeNamespaces,
-            String recipeSelectionStrategy
+            String recipeSelectionStrategy,
+            List<String> dropProtectionExemptNamespaces,
+            List<String> dropProtectionExemptItems,
+            List<String> creativeOnlyItemPatterns,
+            List<String> autoDetectCreativeOnlyNamespaces
     ) {
 
         public Values {
@@ -76,6 +82,10 @@ public final class ConfigValidator {
             creativeNamespaces = copyList(creativeNamespaces);
             recipeSelectionStrategy = recipeSelectionStrategy == null
                     ? "lowest_cost" : recipeSelectionStrategy;
+            dropProtectionExemptNamespaces = copyList(dropProtectionExemptNamespaces);
+            dropProtectionExemptItems = copyList(dropProtectionExemptItems);
+            creativeOnlyItemPatterns = copyList(creativeOnlyItemPatterns);
+            autoDetectCreativeOnlyNamespaces = copyList(autoDetectCreativeOnlyNamespaces);
         }
 
         /**
@@ -102,6 +112,33 @@ public final class ConfigValidator {
                     allowProjectEFileRewrite, maxNbtVariantsPerItem, maxAllowedDropRatio,
                     creativeItemExclusions, creativeItemSpecialValues, creativeNamespaces,
                     "lowest_cost");
+        }
+
+        /**
+         * 兼容 Phase 24 自动识别/豁免字段引入前的调用点。
+         */
+        public Values(int itemsPerTick,
+                      int maxRecipePasses,
+                      long minEmc,
+                      boolean overflowEnabled,
+                      long overflowThreshold,
+                      long resetMin,
+                      long resetMax,
+                      int bucketCount,
+                      int weightCap,
+                      String overwriteScope,
+                      boolean allowProjectEFileRewrite,
+                      int maxNbtVariantsPerItem,
+                      double maxAllowedDropRatio,
+                      List<String> creativeItemExclusions,
+                      List<String> creativeItemSpecialValues,
+                      List<String> creativeNamespaces,
+                      String recipeSelectionStrategy) {
+            this(itemsPerTick, maxRecipePasses, minEmc, overflowEnabled, overflowThreshold,
+                    resetMin, resetMax, bucketCount, weightCap, overwriteScope,
+                    allowProjectEFileRewrite, maxNbtVariantsPerItem, maxAllowedDropRatio,
+                    creativeItemExclusions, creativeItemSpecialValues, creativeNamespaces,
+                    recipeSelectionStrategy, List.of(), List.of(), List.of(), List.of());
         }
 
         private static List<String> copyList(List<String> source) {
@@ -217,6 +254,30 @@ public final class ConfigValidator {
                         + "' 不是合法的命名空间，将被忽略");
             }
         }
+        for (String raw : values.dropProtectionExemptNamespaces()) {
+            if (!isValidNamespace(raw)) {
+                warnings.add("safety.dropProtectionExemptNamespaces 条目 '" + display(raw)
+                        + "' 不是合法的命名空间，将被忽略");
+            }
+        }
+        for (String raw : values.dropProtectionExemptItems()) {
+            if (!isValidItemId(raw)) {
+                warnings.add("safety.dropProtectionExemptItems 条目 '" + display(raw)
+                        + "' 不是合法的 namespace:path，将被忽略");
+            }
+        }
+        for (String raw : values.creativeOnlyItemPatterns()) {
+            if (!isValidRegex(raw)) {
+                warnings.add("safety.creativeOnlyItemPatterns 条目 '" + display(raw)
+                        + "' 不是合法的正则表达式，将被忽略");
+            }
+        }
+        for (String raw : values.autoDetectCreativeOnlyNamespaces()) {
+            if (!isValidNamespace(raw)) {
+                warnings.add("safety.autoDetectCreativeOnlyNamespaces 条目 '" + display(raw)
+                        + "' 不是合法的命名空间，将被忽略");
+            }
+        }
     }
 
     /**
@@ -278,6 +339,21 @@ public final class ConfigValidator {
             }
         }
         return true;
+    }
+
+    /**
+     * @return 是否为可编译的正则表达式
+     */
+    private static boolean isValidRegex(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return false;
+        }
+        try {
+            Pattern.compile(raw.trim());
+            return true;
+        } catch (PatternSyntaxException failure) {
+            return false;
+        }
     }
 
     /**

@@ -8,6 +8,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+import java.util.regex.Pattern;
 import net.minecraft.resources.ResourceLocation;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
@@ -25,6 +26,8 @@ import org.slf4j.LoggerFactory;
  */
 public final class LargeDropProtection {
 
+    /** 合法命名空间：小写字母、数字、下划线、连字符与点。 */
+    private static final Pattern NAMESPACE_PATTERN = Pattern.compile("[a-z0-9_.-]+");
     private static final Logger LOGGER =
             LoggerFactory.getLogger("sudoersemc/safety/LargeDropProtection");
 
@@ -73,7 +76,7 @@ public final class LargeDropProtection {
      *                             该值才会隔离
      * @param exemptNamespaces     按命名空间整体豁免的物品来源；集合元素的 {@code path} 部分
      *                             会被忽略，只有 {@code namespace} 参与匹配
-     * @param exemptItems          按物品精确豁免的条目
+     * @param exemptItems          按物品 id 豁免的条目；匹配时忽略变体，覆盖该物品的全部 NBT 变体
      */
     public record Settings(
             boolean enabled,
@@ -96,6 +99,95 @@ public final class LargeDropProtection {
         public static Settings defaults() {
             return new Settings(true, 0.5, Set.of(), Set.of());
         }
+    }
+
+    /**
+     * 原始配置解析结果。
+     *
+     * @param settings       解析后的保护配置
+     * @param skippedEntries 无法解析的命名空间或物品条目，保持配置顺序
+     */
+    public record ParsedSettings(Settings settings, List<String> skippedEntries) {
+
+        public ParsedSettings {
+            Objects.requireNonNull(settings, "settings");
+            skippedEntries = skippedEntries == null ? List.of() : List.copyOf(skippedEntries);
+        }
+    }
+
+    /**
+     * 把配置字符串解析为 {@link Settings}，并收集被忽略的非法条目。
+     *
+     * <p>命名空间条目必须是小写的合法命名空间；物品条目必须是完整的
+     * {@code namespace:path}。非法条目不会中断解析，只会进入
+     * {@link ParsedSettings#skippedEntries()}，由调用方汇总为一条警告。</p>
+     *
+     * <p>解析顺序固定为命名空间在前、物品在后，因此非法条目的报告顺序与配置书写顺序
+     * 一致。</p>
+     *
+     * @param enabled       是否启用大幅降价保护
+     * @param maxDropRatio  允许的最大降幅，必须在 {@code (0.0, 1.0]} 内
+     * @param rawNamespaces 原始命名空间豁免列表，允许为 {@code null}
+     * @param rawItems      原始物品豁免列表，允许为 {@code null}
+     * @return 解析结果；永不为 {@code null}
+     */
+    public static ParsedSettings parseSettings(boolean enabled, double maxDropRatio,
+                                               List<? extends String> rawNamespaces,
+                                               List<? extends String> rawItems) {
+        Set<ResourceLocation> namespaces = new LinkedHashSet<>();
+        List<String> skippedEntries = new ArrayList<>();
+
+        if (rawNamespaces != null) {
+            for (String raw : rawNamespaces) {
+                String namespace = raw == null ? "" : raw.trim();
+                if (isValidNamespace(namespace)) {
+                    // 只有命名空间部分参与匹配；path 使用固定占位值。
+                    namespaces.add(new ResourceLocation(namespace, "all_items"));
+                } else {
+                    skippedEntries.add(raw == null ? "" : raw);
+                }
+            }
+        }
+
+        Set<ItemKey> items = new LinkedHashSet<>();
+        if (rawItems != null) {
+            for (String raw : rawItems) {
+                ItemKey item = parseItemKey(raw);
+                if (item == null) {
+                    skippedEntries.add(raw == null ? "" : raw);
+                } else {
+                    items.add(item);
+                }
+            }
+        }
+
+        return new ParsedSettings(
+                new Settings(enabled, maxDropRatio, namespaces, items), skippedEntries);
+    }
+
+    /**
+     * @return 合法 {@code namespace:path} 对应的物品身份；格式错误时返回 {@code null}
+     */
+    private static ItemKey parseItemKey(String raw) {
+        if (raw == null) {
+            return null;
+        }
+        String value = raw.trim();
+        int separator = value.indexOf(':');
+        if (separator <= 0 || separator != value.lastIndexOf(':')) {
+            return null;
+        }
+        ResourceLocation id = ResourceLocation.tryParse(value);
+        return id == null ? null : ItemKey.of(id);
+    }
+
+    /**
+     * @return 是否为合法的小写命名空间
+     */
+    private static boolean isValidNamespace(String namespace) {
+        return namespace != null
+                && !namespace.isEmpty()
+                && NAMESPACE_PATTERN.matcher(namespace).matches();
     }
 
     /**
@@ -123,7 +215,10 @@ public final class LargeDropProtection {
             return PriceDropDecision.allowed(
                     previousValue, proposedValue, 0.0, "protection-disabled");
         }
-        if (settings.exemptItems().contains(item)) {
+        // 配置只接受无变体的 namespace:path，而运行时物品键可能携带 variantHash。
+        // 因此精确豁免必须按物品 id 匹配，才能同时覆盖基础物品与其全部 NBT 变体。
+        if (settings.exemptItems().contains(item)
+                || settings.exemptItems().contains(ItemKey.of(item.itemId()))) {
             return PriceDropDecision.exempt(previousValue, proposedValue, 0.0, "exempt-item");
         }
         if (isNamespaceExempt(item)) {

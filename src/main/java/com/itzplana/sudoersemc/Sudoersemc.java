@@ -42,6 +42,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.BooleanSupplier;
 import java.util.Collections;
 import java.util.Optional;
@@ -60,6 +61,7 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.crafting.Ingredient;
 import net.minecraft.world.item.crafting.Recipe;
 import net.minecraft.world.item.crafting.RecipeManager;
+import net.minecraftforge.common.ForgeConfigSpec;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.RegisterCommandsEvent;
 import net.minecraftforge.event.TickEvent;
@@ -128,6 +130,12 @@ public final class Sudoersemc {
     private static volatile long appliedSnapshotGeneration;
 
     private static volatile ReloadDecision lastReloadDecision = ReloadDecision.REJECT;
+
+    /**
+     * 跨配置重载共享的重映射确认状态。ScanPipeline 会随配置重建，但“上次重映射失败”
+     * 或“仍在途”的保护不能丢，否则新管线首轮可能把写入前的旧值误判为外部修改。
+     */
+    private static final ScanPipeline.RemapTracker REMAP_TRACKER = new ScanPipeline.RemapTracker();
 
     public Sudoersemc() {
         IEventBus modEventBus = FMLJavaModLoadingContext.get().getModEventBus();
@@ -237,6 +245,22 @@ public final class Sudoersemc {
         // 否则仅修改配置或升级 ProjectE 时不会触发重新求解。
         pipeline.setConfigFingerprintSupplier(SudoersemcConfig::scanFingerprintEntries);
         pipeline.setBaselineFingerprintSupplier(Sudoersemc::baselineFingerprintEntries);
+        pipeline.setRemapTracker(REMAP_TRACKER);
+        // Phase 24：容器返还与副产物定价、外部修改保护、手工值判定器都必须随每次重建注入。
+        pipeline.setScanContainerRemaindersEnabled(readBoolean(
+                "recipe.scanContainerRemainders",
+                SudoersemcConfig.RECIPE_SCAN_CONTAINER_REMAINDERS, true));
+        pipeline.setCreditContainerRemaindersEnabled(readBoolean(
+                "recipe.creditContainerRemainders",
+                SudoersemcConfig.RECIPE_CREDIT_CONTAINER_REMAINDERS, true));
+        pipeline.setPriceSecondaryOutputsEnabled(readBoolean(
+                "recipe.priceSecondaryOutputs",
+                SudoersemcConfig.RECIPE_PRICE_SECONDARY_OUTPUTS, false));
+        pipeline.setPreserveExternallyModifiedValues(readBoolean(
+                "safety.preserveExternallyModifiedValues",
+                SudoersemcConfig.SAFETY_PRESERVE_EXTERNALLY_MODIFIED_VALUES, true));
+        pipeline.setManualValueDetectorSupplier(
+                () -> OptionalIntegrationManager.manualValues().snapshotPredicate());
         applyPipelineConfig(pipeline);
 
         applyOverflowSettings(pipeline, snapshot.overflowSettings());
@@ -341,7 +365,10 @@ public final class Sudoersemc {
                     enabled,
                     List.copyOf(SudoersemcConfig.SAFETY_CREATIVE_ITEM_EXCLUSIONS.get()),
                     List.copyOf(SudoersemcConfig.SAFETY_CREATIVE_ITEM_SPECIAL_VALUES.get()),
-                    List.copyOf(SudoersemcConfig.SAFETY_CREATIVE_NAMESPACES.get()));
+                    List.copyOf(SudoersemcConfig.SAFETY_CREATIVE_NAMESPACES.get()),
+                    SudoersemcConfig.SAFETY_AUTO_DETECT_CREATIVE_ONLY_ITEMS.get(),
+                    List.copyOf(SudoersemcConfig.SAFETY_CREATIVE_ONLY_ITEM_PATTERNS.get()),
+                    List.copyOf(SudoersemcConfig.SAFETY_AUTO_DETECT_CREATIVE_ONLY_NAMESPACES.get()));
             if (!parsed.skippedEntries().isEmpty()) {
                 LOGGER.warn("SudoersEMC 创造物品保护配置有 {} 条无效条目已被忽略：{}",
                         parsed.skippedEntries().size(), parsed.skippedEntries());
@@ -350,10 +377,35 @@ public final class Sudoersemc {
         } catch (RuntimeException e) {
             LOGGER.warn("SudoersEMC 无法读取创造物品保护配置，默认启用保护", e);
             return new CreativeItemProtection(new CreativeItemProtection.Settings(
-                    true, Set.of(), Map.of(), Set.of()));
+                    true, Set.of(), Map.of(), Set.of(),
+                    true, Set.copyOf(CreativeItemProtection.defaultAutoDetectPatterns()), Set.of()));
         }
     }
 
+
+    /**
+     * 读取一个布尔配置开关；读取失败时记录警告并返回给定默认值。
+     */
+    private static boolean readBoolean(String key, ForgeConfigSpec.BooleanValue value, boolean fallback) {
+        try {
+            return value.get();
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法读取 {} 配置，使用默认值 {}", key, fallback, e);
+            return fallback;
+        }
+    }
+
+    /**
+     * 读取一个整数配置值；读取失败时记录警告并返回给定默认值。
+     */
+    private static int readInt(String key, ForgeConfigSpec.IntValue value, int fallback) {
+        try {
+            return value.get();
+        } catch (RuntimeException e) {
+            LOGGER.warn("SudoersEMC 无法读取 {} 配置，使用默认值 {}", key, fallback, e);
+            return fallback;
+        }
+    }
 
     /**
      * 把配置中的最大允许降幅夹到 {@link LargeDropProtection.Settings} 接受的 {@code (0.0, 1.0]} 区间。
@@ -611,11 +663,14 @@ public final class Sudoersemc {
      */
     private static void flushRuntimeStoresAndRemap() {
         MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
-        if (server != null) {
+        ScanPipeline pipeline = scanPipeline;
+        if (server != null && pipeline != null) {
             try {
-                OptionalIntegrationManager.provider()
-                        .ifPresent(provider -> provider.requestRemap(server));
+                OptionalIntegrationManager.provider().ifPresent(provider ->
+                        pipeline.trackRemapCompletion(provider.requestRemapAsync(server)));
             } catch (RuntimeException e) {
+                // 同步请求失败同样视为“未确认”：保留保守状态，避免下一轮误释放所有权。
+                pipeline.trackRemapCompletion(CompletableFuture.failedFuture(e));
                 LOGGER.warn("SudoersEMC 请求 ProjectE 重映射失败，已生成条目仍会保存", e);
             }
         }
@@ -1602,6 +1657,8 @@ public final class Sudoersemc {
         currentServer = null;
         flushRuntimeStoresOnServerThread();
         pendingReload = false;
+        // 服务器会话结束：清空在途 future 与失败标记，避免跨世界泄漏保护状态。
+        REMAP_TRACKER.reset();
         pendingReloadFromCommand = false;
         // 不保留指向旧世界的命令服务；下一次 ServerStartedEvent 会重新注入。
         SudoemcCommands.setService(null);
