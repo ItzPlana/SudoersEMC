@@ -72,9 +72,11 @@ import org.slf4j.LoggerFactory;
  * 运行时环境的情况下验证管线主干。</p>
  *
  * <p><strong>异常契约：</strong>{@link #collect(MinecraftServer)} 在服务器未就绪或采集失败时
- * 抛出 {@link IllegalStateException}，由 {@code ScanManager} 转为 {@code FAILED}，绝不把失败
- * 伪装成“成功的空扫描”；{@link #solveAndApply(PipelineSnapshot)} 仍不向调用方抛出异常，
- * 任何未预期失败记录日志后返回全零结果，保证服务器主循环不被单次扫描拖垮。</p>
+ * 抛出 {@link IllegalStateException}；{@link #solveAndApply(PipelineSnapshot)} 在求解或应用
+ * 过程遇到运行时异常时记录日志并转换为 {@link IllegalStateException}；
+ * {@link #applyCompletedSolve()} 在后台求解失败、被取消或没有待处理结果时同样抛出
+ * {@link IllegalStateException}。这些异常由 {@code ScanManager} 转为 {@code FAILED}，绝不把
+ * 失败伪装成“成功的空扫描”或全零结果，避免服务器主循环被静默的错误状态污染。</p>
  */
 public final class ScanPipeline {
 
@@ -1159,24 +1161,29 @@ public final class ScanPipeline {
     /**
      * 计算本次扫描的完整输入指纹。
      *
-     * <p>生产接线会注入完整指纹提供器（物品、配方、标签与配置通道）；未注入或提供器失败时
-     * 退回仅基于快照的指纹，保证单元测试与降级路径仍可更新状态。提供器必须在服务器线程调用，
-     * 因此本方法只在求解启动阶段（服务器线程）执行。</p>
+     * <p>生产接线会注入完整指纹提供器（物品、配方内容、标签成员、配置与基线通道）；提供器
+     * 未注入时才退回仅基于快照的指纹，供不接触游戏状态的单元测试使用。已注入提供器但调用失败
+     * 或返回 {@code null} 时抛出 {@link IllegalStateException}，绝不把不完整指纹写入扫描状态或
+     * 用于采集前后一致性校验。提供器必须在服务器线程调用，因此本方法只在求解启动阶段执行。</p>
+     *
+     * @throws IllegalStateException 指纹提供器失败或返回 {@code null} 时
      */
     private ScanFingerprint captureInputFingerprint(PipelineSnapshot snapshot) {
         Supplier<ScanFingerprint> supplier = inputFingerprintSupplier;
-        if (supplier != null) {
-            try {
-                ScanFingerprint fingerprint = supplier.get();
-                if (fingerprint != null) {
-                    return fingerprint;
-                }
-                LOGGER.warn("扫描输入指纹提供器返回 null，退回快照指纹");
-            } catch (RuntimeException failure) {
-                LOGGER.warn("计算扫描输入指纹失败，退回快照指纹", failure);
-            }
+        if (supplier == null) {
+            return fingerprint(snapshot);
         }
-        return fingerprint(snapshot);
+        ScanFingerprint fingerprint;
+        try {
+            fingerprint = supplier.get();
+        } catch (RuntimeException failure) {
+            LOGGER.error("计算扫描输入指纹失败，拒绝使用不完整指纹继续扫描", failure);
+            throw new IllegalStateException("计算扫描输入指纹失败", failure);
+        }
+        if (fingerprint == null) {
+            throw new IllegalStateException("计算扫描输入指纹失败：提供器返回 null");
+        }
+        return fingerprint;
     }
 
     /**

@@ -9,10 +9,12 @@ import com.itzplana.sudoersemc.config.SudoersemcConfig;
 import com.itzplana.sudoersemc.core.GeneratedEmcEntry;
 import com.itzplana.sudoersemc.core.ItemKey;
 import com.itzplana.sudoersemc.core.PriceSource;
+import com.itzplana.sudoersemc.core.OwnedEntrySink;
 import com.itzplana.sudoersemc.diagnostic.ReportManager;
 import com.itzplana.sudoersemc.diagnostic.SmokeTestHook;
 import com.itzplana.sudoersemc.integration.GeneratedEmcMapper;
 import com.itzplana.sudoersemc.integration.OptionalIntegrationManager;
+import com.itzplana.sudoersemc.integration.ProjectEManualValues;
 import com.itzplana.sudoersemc.pipeline.PipelineSnapshot;
 import com.itzplana.sudoersemc.pipeline.ScanPipeline;
 import com.itzplana.sudoersemc.pricing.FallbackPricing;
@@ -35,11 +37,23 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.BooleanSupplier;
+import java.util.Collections;
+import java.util.Optional;
+import java.util.function.Function;
+import java.util.stream.Stream;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.tags.TagKey;
 import net.minecraft.world.item.Item;
+import net.minecraft.core.NonNullList;
+import net.minecraft.core.Registry;
+import net.minecraft.core.RegistryAccess;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.crafting.Ingredient;
+import net.minecraft.world.item.crafting.Recipe;
+import net.minecraft.world.item.crafting.RecipeManager;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.RegisterCommandsEvent;
 import net.minecraftforge.event.TickEvent;
@@ -50,6 +64,11 @@ import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.event.lifecycle.FMLCommonSetupEvent;
 import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
 import net.minecraftforge.server.ServerLifecycleHooks;
+import net.minecraftforge.fml.ModList;
+import net.minecraftforge.forgespi.language.IModInfo;
+import net.minecraftforge.registries.ForgeRegistries;
+import net.minecraftforge.registries.tags.ITag;
+import net.minecraftforge.registries.tags.ITagManager;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 
@@ -453,6 +472,34 @@ public final class Sudoersemc {
      * @return 命令回执
      */
     private static CommandResult approveQuarantined(String itemId) {
+        return approveQuarantined(
+                itemId,
+                entryStore,
+                quarantinedDropsStore,
+                scanPipeline,
+                Sudoersemc::flushRuntimeStoresAndRemap);
+    }
+
+    /**
+     * 审批闭环的可注入实现，生产入口与端到端测试共用同一段逻辑。
+     *
+     * <p>顺序固定：读取持久化记录 → 校验现有条目归属 → 持久化 {@code approved} → 清理内存隔离
+     * → 以 {@link PriceSource#APPROVED} 暂存新值 → 执行落盘/重映射回调。{@code stage} 失败时
+     * 已经写入的 {@code approved} 会保留并落盘，命令返回失败；管理员可以再次执行同一审批命令
+     * 完成幂等重试，不会因为第一次失败而重新隔离或丢失待应用值。</p>
+     *
+     * @param itemId     物品 id 原文
+     * @param store      生成值存储；{@code null} 时只批准记录、不应用数值
+     * @param dropsStore 隔离记录存储，不能为 {@code null}
+     * @param pipeline   扫描管线，用于清理内存隔离列表；可为 {@code null}
+     * @param flush      应用成功后的落盘/重映射动作，不能为 {@code null}
+     * @return 命令回执
+     */
+    static CommandResult approveQuarantined(String itemId,
+                                            @Nullable OwnedEntrySink store,
+                                            @Nullable QuarantinedDropsStore dropsStore,
+                                            @Nullable ScanPipeline pipeline,
+                                            Runnable flush) {
         if (itemId == null || itemId.isBlank()) {
             return CommandResult.failure("请提供物品 id，例如 minecraft:stone");
         }
@@ -462,7 +509,6 @@ public final class Sudoersemc {
         }
         ItemKey key = ItemKey.of(itemIdValue);
 
-        QuarantinedDropsStore dropsStore = quarantinedDropsStore;
         if (dropsStore == null) {
             return CommandResult.failure("隔离记录服务不可用");
         }
@@ -477,9 +523,8 @@ public final class Sudoersemc {
             return CommandResult.failure("未找到 " + itemIdValue + " 的隔离记录");
         }
 
-        GeneratedEntryStore store = entryStore;
         if (store != null) {
-            GeneratedEmcEntry existing = store.get(key);
+            GeneratedEmcEntry existing = store.snapshotAll().get(key);
             if (existing != null && !existing.owned()) {
                 return CommandResult.failure(
                         "无法应用 " + itemIdValue + "：现有条目不属于 SudoersEMC");
@@ -489,7 +534,6 @@ public final class Sudoersemc {
             return CommandResult.failure("批准隔离记录失败: " + itemIdValue);
         }
 
-        ScanPipeline pipeline = scanPipeline;
         int removedFromMemory = pipeline == null ? 0 : pipeline.approveQuarantined(key).size();
 
         if (store == null) {
@@ -506,11 +550,12 @@ public final class Sudoersemc {
                 true,
                 System.currentTimeMillis()));
         if (!staged) {
+            // approved 已在 stage 前持久化：保留记录并落盘，允许管理员再次执行同一命令重试。
             dropsStore.saveIfDirty();
             return CommandResult.failure("无法写入已批准的数值: " + itemIdValue);
         }
 
-        flushRuntimeStoresAndRemap();
+        flush.run();
         return CommandResult.ok(
                 "已批准 " + itemIdValue + " 的隔离降价",
                 "旧值: " + drop.previousValue() + " -> 新值: " + drop.proposedValue(),
@@ -626,8 +671,9 @@ public final class Sudoersemc {
      * 判断启动缓存是否可以复用。
      *
      * <p>只有“已记录成功扫描时间 + 存在生成条目 + 当前完整输入指纹与持久化指纹一致”三个条件
-     * 同时满足时才允许跳过启动扫描。指纹覆盖物品、配方、标签与影响定价的配置通道，因此模组、
-     * 配方或配置变化后不会误用旧缓存。</p>
+     * 同时满足时才允许跳过启动扫描。指纹覆盖物品 id、配方 id 与内容、标签名称与成员、影响定价的
+     * 全部配置通道，以及 ProjectE 手工值/模组与数据包基线，因此模组、配方、标签或配置变化后
+     * 不会误用旧缓存。</p>
      *
      * @param stateStore 扫描状态存储，可为 {@code null}
      * @param store      生成值存储，可为 {@code null}
@@ -649,9 +695,10 @@ public final class Sudoersemc {
     /**
      * 计算当前服务器世界可观察到的完整扫描输入指纹。
      *
-     * <p>必须在服务器线程调用。物品 id、配方 id、物品标签与影响定价的配置值共同组成指纹；
-     * 任何一个通道变化都会让启动缓存与采集一致性校验失败，从而触发重新扫描或拒绝过期结果。
-     * 服务器未就绪时抛出异常，由调用方选择保守路径。</p>
+     * <p>必须在服务器线程调用。指纹由五个通道组成：物品 id；配方 id 与内容（类型、序列化器、
+     * 输入候选、输出）；标签名称与成员；影响定价的全部配置值；ProjectE 手工值内容、模组版本、
+     * 已选数据包与外部基线接线状态。任何一个通道变化都会让启动缓存与采集一致性校验失败，
+     * 从而触发重新扫描或拒绝过期结果。服务器未就绪时抛出异常，由调用方选择保守路径。</p>
      *
      * @return 当前输入指纹
      * @throws IllegalStateException 服务器或配方管理器尚未就绪时抛出
@@ -668,7 +715,11 @@ public final class Sudoersemc {
     }
 
     /**
-     * 从给定服务器实例捕获输入指纹。物品与标签来自注册表，配方来自当前 RecipeManager。
+     * 从给定服务器实例捕获输入指纹。
+     *
+     * <p>物品来自注册表；配方通道包含 id 与影响定价的内容；标签通道包含名称与成员；基线通道
+     * 还记录已选数据包。单个配方或标签读取失败时写入稳定的错误标记而不是静默省略；配方 id
+     * 枚举失败代表整个输入不可读取，直接抛出异常让调用方保守重扫。</p>
      */
     static ScanFingerprint captureScanFingerprint(@Nullable MinecraftServer server) {
         List<String> itemIds = new ArrayList<>();
@@ -676,20 +727,245 @@ public final class Sudoersemc {
             itemIds.add(id.toString());
         }
 
-        List<String> recipeIds = new ArrayList<>();
-        if (server != null && server.getRecipeManager() != null) {
-            for (ResourceLocation id : server.getRecipeManager().getRecipeIds().toList()) {
-                recipeIds.add(id.toString());
+        RecipeManager recipeManager = server == null ? null : server.getRecipeManager();
+        RegistryAccess registries = server == null ? null : server.registryAccess();
+
+        List<String> baselineValues = new ArrayList<>(baselineFingerprintValues());
+        if (server != null) {
+            try {
+                List<String> selectedPacks = new ArrayList<>(server.getPackRepository().getSelectedIds());
+                Collections.sort(selectedPacks);
+                baselineValues.add("datapacks=" + String.join(",", selectedPacks));
+            } catch (RuntimeException failure) {
+                baselineValues.add("datapacks-unavailable");
             }
         }
 
-        List<String> tagIds = new ArrayList<>();
-        for (TagKey<Item> tag : BuiltInRegistries.ITEM.getTagNames().toList()) {
-            tagIds.add(tag.location().toString());
+        return ScanFingerprint.of(
+                itemIds,
+                recipeContentEntries(recipeManager, registries),
+                tagContentEntries(),
+                configFingerprintValues(),
+                baselineValues);
+    }
+
+    /**
+     * 配方内容通道：每个配方条目包含 id、类型、序列化器、特殊标记、输入候选与输出。
+     *
+     * <p>同一配方 id 在数据包或模组更新后内容变化时，条目随之变化，从而让启动缓存与
+     * 采集前后校验失效。配方 id 枚举失败属于整体输入不可读取，抛出异常而不是返回空列表。</p>
+     *
+     * @param manager    配方管理器，可为 {@code null}
+     * @param registries 注册表访问，用于解析配方输出；可为 {@code null}
+     * @return 每个配方一条稳定字符串
+     */
+    static List<String> recipeContentEntries(@Nullable RecipeManager manager,
+                                             @Nullable RegistryAccess registries) {
+        if (manager == null) {
+            return List.of();
+        }
+        List<ResourceLocation> ids;
+        try {
+            ids = manager.getRecipeIds().sorted().toList();
+        } catch (RuntimeException failure) {
+            throw new IllegalStateException("无法枚举配方 id 以计算扫描指纹", failure);
         }
 
-        return ScanFingerprint.of(itemIds, recipeIds, tagIds, configFingerprintValues(),
-                List.of("phase-12"));
+        List<String> entries = new ArrayList<>(ids.size());
+        for (ResourceLocation id : ids) {
+            entries.add(recipeContentEntry(manager, id, registries));
+        }
+        return List.copyOf(entries);
+    }
+
+    private static String recipeContentEntry(RecipeManager manager, ResourceLocation id,
+                                             @Nullable RegistryAccess registries) {
+        try {
+            Optional<? extends Recipe<?>> maybeRecipe = manager.byKey(id);
+            if (maybeRecipe.isEmpty()) {
+                return id + "|missing";
+            }
+            Recipe<?> recipe = maybeRecipe.get();
+            StringBuilder entry = new StringBuilder(192);
+            entry.append(id).append('|')
+                    .append(registryKey(BuiltInRegistries.RECIPE_TYPE, recipe.getType())).append('|')
+                    .append(registryKey(BuiltInRegistries.RECIPE_SERIALIZER, recipe.getSerializer())).append('|')
+                    .append(recipe.isSpecial() ? "special" : "normal").append('|');
+            NonNullList<Ingredient> ingredients = recipe.getIngredients();
+            for (int i = 0; i < ingredients.size(); i++) {
+                if (i > 0) {
+                    entry.append(';');
+                }
+                entry.append(ingredientContent(ingredients.get(i)));
+            }
+            entry.append("=>").append(stackContent(recipe.getResultItem(registries)));
+            return entry.toString();
+        } catch (RuntimeException failure) {
+            // 单条配方读取失败时扫描器同样会跳过它；稳定错误标记仍能在内容恢复时触发重扫。
+            return id + "|error:" + failure.getClass().getName();
+        }
+    }
+
+    private static <T> String registryKey(Registry<T> registry, @Nullable T value) {
+        if (value == null) {
+            return "null";
+        }
+        ResourceLocation id = registry.getKey(value);
+        return id == null ? value.getClass().getName() : id.toString();
+    }
+
+    private static String ingredientContent(@Nullable Ingredient ingredient) {
+        if (ingredient == null || ingredient.isEmpty()) {
+            return "empty";
+        }
+        ItemStack[] stacks;
+        try {
+            stacks = ingredient.getItems();
+        } catch (RuntimeException failure) {
+            return "error:" + failure.getClass().getName();
+        }
+        List<String> options = new ArrayList<>();
+        if (stacks != null) {
+            for (ItemStack stack : stacks) {
+                if (stack != null && !stack.isEmpty()) {
+                    options.add(stackContent(stack));
+                }
+            }
+        }
+        if (options.isEmpty()) {
+            return "empty";
+        }
+        Collections.sort(options);
+        return String.join("/", options);
+    }
+
+    private static String stackContent(@Nullable ItemStack stack) {
+        if (stack == null || stack.isEmpty()) {
+            return "empty";
+        }
+        ResourceLocation id = BuiltInRegistries.ITEM.getKey(stack.getItem());
+        String itemId = id == null ? stack.getItem().getClass().getName() : id.toString();
+        CompoundTag tag = stack.getTag();
+        return itemId + "x" + stack.getCount() + (tag == null ? "" : tag.toString());
+    }
+
+    /**
+     * 生产标签内容通道：标签名称 + 已绑定成员排序后的列表；未绑定标签使用固定标记。
+     */
+    static List<String> tagContentEntries() {
+        ITagManager<Item> tagManager;
+        try {
+            if (ForgeRegistries.ITEMS == null) {
+                return List.of("tags-unavailable");
+            }
+            tagManager = ForgeRegistries.ITEMS.tags();
+        } catch (RuntimeException | LinkageError failure) {
+            return List.of("tags-unavailable");
+        }
+        if (tagManager == null) {
+            return List.of("tags-unavailable");
+        }
+        ITagManager<Item> manager = tagManager;
+        return tagContentEntries(BuiltInRegistries.ITEM.getTagNames(), tagKey -> {
+            ITag<Item> tag = manager.getTag(tagKey);
+            return tag == null || !tag.isBound() ? null : tag;
+        });
+    }
+
+    /**
+     * 标签内容通道的可测试实现。
+     *
+     * @param tagNames 标签名称流
+     * @param members  按标签返回成员；返回 {@code null} 表示标签未绑定
+     * @return 每个标签一条稳定字符串
+     */
+    static List<String> tagContentEntries(Stream<TagKey<Item>> tagNames,
+                                          Function<TagKey<Item>, ? extends Iterable<Item>> members) {
+        List<String> entries = new ArrayList<>();
+        for (TagKey<Item> tagKey : tagNames.toList()) {
+            Iterable<Item> tagMembers;
+            try {
+                tagMembers = members.apply(tagKey);
+            } catch (RuntimeException failure) {
+                entries.add(tagKey.location() + "|lookup-error:" + failure.getClass().getName());
+                continue;
+            }
+            entries.add(tagContentEntry(tagKey, tagMembers));
+        }
+        return List.copyOf(entries);
+    }
+
+    private static String tagContentEntry(TagKey<Item> tagKey, @Nullable Iterable<Item> members) {
+        if (members == null) {
+            return tagKey.location() + "|unbound";
+        }
+        List<String> ids = new ArrayList<>();
+        try {
+            for (Item item : members) {
+                if (item == null) {
+                    continue;
+                }
+                ResourceLocation id = BuiltInRegistries.ITEM.getKey(item);
+                if (id != null) {
+                    ids.add(id.toString());
+                }
+            }
+        } catch (RuntimeException failure) {
+            return tagKey.location() + "|error:" + failure.getClass().getName();
+        }
+        Collections.sort(ids);
+        return tagKey.location() + "|" + String.join(",", ids);
+    }
+
+    /**
+     * 基线通道：ProjectE 手工值文件内容与条目、外部基线接线状态、全部模组版本。
+     *
+     * <p>手工值文件内容摘要覆盖 tag 条目值等无法从 {@code Map} 表示的细节；模组版本确保
+     * 模组更新即使用 id 与配方文本恰好相同也不会复用旧缓存。</p>
+     */
+    static List<String> baselineFingerprintValues() {
+        List<String> values = new ArrayList<>();
+        values.add("baseline-schema=phase-12-content-v2");
+        values.add("external-baseline=phase-12-not-wired");
+        try {
+            ProjectEManualValues manualValues = OptionalIntegrationManager.manualValues();
+            values.add("projecte-manual-content=" + manualValues.contentFingerprint());
+            for (Map.Entry<ItemKey, Long> entry : manualValues.manualValues().entrySet()) {
+                values.add("projecte-manual-item=" + entry.getKey() + "=" + entry.getValue());
+            }
+            for (ResourceLocation tagId : manualValues.manualTagIds()) {
+                values.add("projecte-manual-tag=#" + tagId);
+            }
+        } catch (RuntimeException failure) {
+            values.add("projecte-manual-unavailable");
+        }
+        try {
+            values.add("projecte-provider=" + OptionalIntegrationManager.provider()
+                    .filter(provider -> provider.isAvailable())
+                    .map(provider -> provider.getClass().getName())
+                    .orElse("unavailable"));
+        } catch (RuntimeException failure) {
+            values.add("projecte-provider-unavailable");
+        }
+        values.addAll(modVersionFingerprintValues());
+        return List.copyOf(values);
+    }
+
+    private static List<String> modVersionFingerprintValues() {
+        try {
+            ModList modList = ModList.get();
+            if (modList == null) {
+                return List.of("mods-unavailable");
+            }
+            List<String> mods = new ArrayList<>();
+            for (IModInfo info : modList.getMods()) {
+                mods.add(info.getModId() + "=" + info.getVersion());
+            }
+            Collections.sort(mods);
+            return List.of("mods=" + String.join(",", mods));
+        } catch (RuntimeException | LinkageError failure) {
+            return List.of("mods-unavailable");
+        }
     }
 
     /**
@@ -719,6 +995,11 @@ public final class Sudoersemc {
             values.add("overflow.resetMin=" + SudoersemcConfig.OVERFLOW_RESET_MIN.get());
             values.add("overflow.resetMax=" + SudoersemcConfig.OVERFLOW_RESET_MAX.get());
             values.add("overflow.scope=" + SudoersemcConfig.OVERFLOW_OVERWRITE_SCOPE.get());
+            values.add("overflow.bucketCount=" + SudoersemcConfig.OVERFLOW_BUCKET_COUNT.get());
+            values.add("overflow.weightCap=" + SudoersemcConfig.OVERFLOW_WEIGHT_CAP.get());
+            values.add("overflow.randomSeed=" + SudoersemcConfig.OVERFLOW_RANDOM_SEED.get());
+            values.add("overflow.allowProjecteFileRewrite="
+                    + SudoersemcConfig.OVERFLOW_ALLOW_PROJECTE_FILE_REWRITE.get());
             values.add("nbt.variants=" + SudoersemcConfig.NBT_SCAN_NBT_VARIANTS.get());
             values.add("nbt.maxVariants=" + SudoersemcConfig.NBT_MAX_NBT_VARIANTS_PER_ITEM.get());
         } catch (RuntimeException failure) {

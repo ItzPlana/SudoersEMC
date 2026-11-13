@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 
 import com.itzplana.sudoersemc.core.GeneratedEmcEntry;
 import com.itzplana.sudoersemc.core.ItemKey;
@@ -23,7 +24,23 @@ import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Stream;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.SharedConstants;
+import net.minecraft.core.NonNullList;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.server.Bootstrap;
+import net.minecraft.tags.TagKey;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.crafting.CraftingBookCategory;
+import net.minecraft.world.item.crafting.Ingredient;
+import net.minecraft.world.item.crafting.Recipe;
+import net.minecraft.world.item.crafting.RecipeManager;
+import net.minecraft.world.item.crafting.ShapedRecipe;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -178,5 +195,90 @@ class SudoersemcLifecycleTest {
                 "失败详情应保留可诊断原因，实际为 " + manager.progress().detail());
         assertEquals(0, store.size(),
                 "compute 失败不得写入任何生成值");
+    }
+
+    @BeforeAll
+    static void bootstrapMinecraft() {
+        SharedConstants.tryDetectVersion();
+        Bootstrap.bootStrap();
+    }
+
+    @Test
+    void cacheIsRejectedWhenRecipeContentChangesWithoutIdChange() {
+        ResourceLocation recipeId = new ResourceLocation("sudoersemc_test", "same_id_recipe");
+        RecipeManager before = new FixedRecipeManager(
+                shapedRecipe(recipeId, Items.DIRT, Items.DIAMOND));
+        RecipeManager after = new FixedRecipeManager(
+                shapedRecipe(recipeId, Items.STONE, Items.DIAMOND));
+
+        List<String> beforeRecipes = Sudoersemc.recipeContentEntries(before, null);
+        List<String> afterRecipes = Sudoersemc.recipeContentEntries(after, null);
+
+        assertEquals(1, beforeRecipes.size());
+        assertEquals(1, afterRecipes.size());
+        assertTrue(beforeRecipes.get(0).startsWith(recipeId + "|"));
+        assertTrue(afterRecipes.get(0).startsWith(recipeId + "|"),
+                "配方 id 必须保持不变，变化的是内容");
+        assertNotEquals(beforeRecipes, afterRecipes, "同 id 配方内容变化必须改变配方通道");
+
+        ScanFingerprint saved = ScanFingerprint.of(
+                List.of("minecraft:diamond"), beforeRecipes, List.of("forge:ingots"),
+                List.of("config=1"), List.of("baseline=1"));
+        ScanFingerprint changed = ScanFingerprint.of(
+                List.of("minecraft:diamond"), afterRecipes, List.of("forge:ingots"),
+                List.of("config=1"), List.of("baseline=1"));
+
+        ScanStateStore stateStore = new ScanStateStore(tempDir.resolve("content_state.json"));
+        GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("content_entries.json"));
+        store.stage(new GeneratedEmcEntry(
+                ItemKey.of(new ResourceLocation("minecraft", "diamond")),
+                1L, PriceSource.FALLBACK, null, true, 0L));
+        stateStore.update(saved, 10L, 1, 0);
+
+        assertTrue(Sudoersemc.hasReusableScanCache(stateStore, store, saved),
+                "内容相同的指纹应允许复用");
+        assertFalse(Sudoersemc.hasReusableScanCache(stateStore, store, changed),
+                "同 id 配方内容变化后不得复用启动缓存");
+    }
+
+    @Test
+    void cacheIsRejectedWhenTagMembershipChangesWithoutTagNameChange() {
+        TagKey<Item> tag = TagKey.create(Registries.ITEM,
+                new ResourceLocation("sudoersemc_test", "same_tag"));
+        List<String> before = Sudoersemc.tagContentEntries(
+                Stream.of(tag), ignored -> List.of(Items.DIRT));
+        List<String> after = Sudoersemc.tagContentEntries(
+                Stream.of(tag), ignored -> List.of(Items.DIRT, Items.STONE));
+
+        assertEquals(1, before.size());
+        assertEquals(1, after.size());
+        assertTrue(before.get(0).startsWith(tag.location() + "|"));
+        assertTrue(after.get(0).startsWith(tag.location() + "|"));
+        assertNotEquals(before, after, "同 id 标签成员变化必须改变标签通道");
+    }
+
+    private static ShapedRecipe shapedRecipe(ResourceLocation id, Item ingredient, Item result) {
+        NonNullList<Ingredient> ingredients = NonNullList.withSize(1, Ingredient.EMPTY);
+        ingredients.set(0, Ingredient.of(ingredient));
+        return new ShapedRecipe(id, "", CraftingBookCategory.MISC, 1, 1, ingredients,
+                new ItemStack(result));
+    }
+
+    private static final class FixedRecipeManager extends RecipeManager {
+        private final Recipe<?> recipe;
+
+        private FixedRecipeManager(Recipe<?> recipe) {
+            this.recipe = recipe;
+        }
+
+        @Override
+        public Stream<ResourceLocation> getRecipeIds() {
+            return Stream.of(recipe.getId());
+        }
+
+        @Override
+        public Optional<? extends Recipe<?>> byKey(ResourceLocation id) {
+            return recipe.getId().equals(id) ? Optional.of(recipe) : Optional.empty();
+        }
     }
 }

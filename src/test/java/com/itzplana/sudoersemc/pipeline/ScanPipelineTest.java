@@ -109,6 +109,26 @@ class ScanPipelineTest {
     }
 
     @Test
+    void fingerprintSupplierFailureAbortsInsteadOfWritingIncompleteState() {
+        ScanStateStore stateStore = new ScanStateStore(
+                tempDir.resolve("scan_state_fingerprint_failure.json"));
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_fingerprint_failure.json"));
+        ScanPipeline pipeline = pipeline(store, stateStore, null, null, null, null, disabledFallback());
+        pipeline.setInputFingerprintSupplier(() -> {
+            throw new IllegalStateException("broken fingerprint supplier");
+        });
+
+        PipelineSnapshot snapshot = snapshot(List.of(item(RESULT, 0L)), List.of(), Map.of());
+
+        assertThrows(IllegalStateException.class, () -> pipeline.solveAndApply(snapshot),
+                "生产指纹提供器失败时必须上抛，而不是退回不完整指纹");
+        assertEquals(0L, stateStore.lastScanEpochMillis(),
+                "指纹计算失败时不得写入扫描状态");
+        assertEquals(0, store.size(), "指纹计算失败时不得写入生成值");
+    }
+
+    @Test
     void failedCollectionDoesNotRecordCompletedScanState() {
         ScanStateStore stateStore = new ScanStateStore(tempDir.resolve("scan_state_failure.json"));
         ScanPipeline pipeline = pipeline(null, stateStore, null, null, null, null, disabledFallback());
