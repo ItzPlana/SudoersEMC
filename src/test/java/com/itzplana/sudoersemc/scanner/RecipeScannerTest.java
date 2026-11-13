@@ -13,21 +13,27 @@ import java.util.stream.Stream;
 import net.minecraft.SharedConstants;
 import java.util.List;
 import net.minecraft.core.NonNullList;
+import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.TagParser;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.tags.TagKey;
+import net.minecraft.world.inventory.CraftingContainer;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.crafting.CraftingBookCategory;
+import net.minecraft.world.item.crafting.CraftingRecipe;
 import net.minecraft.world.item.crafting.Ingredient;
 import net.minecraft.world.item.crafting.Recipe;
 import net.minecraft.world.item.crafting.RecipeManager;
+import net.minecraft.world.item.crafting.RecipeSerializer;
+import net.minecraft.world.item.crafting.RecipeType;
 import net.minecraft.world.item.crafting.ShapedRecipe;
 import net.minecraft.world.item.crafting.ShapelessRecipe;
+import net.minecraft.world.level.Level;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -238,6 +244,20 @@ class RecipeScannerTest {
     }
 
     @Test
+    void defaultDamageZeroTagSerialisesToNullSnbt() {
+        ItemStack stack = new ItemStack(Items.DIAMOND_SWORD);
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 0);
+        stack.setTag(tag);
+
+        RecipeOutput output = RecipeScanner.convertStack(stack);
+
+        assertNotNull(output);
+        assertNull(output.outputNbt(), "默认 {Damage:0} 必须归一为 null，避免生成伪变体");
+        assertFalse(output.hasOutputNbt());
+    }
+
+    @Test
     void zeroDamageOnlyTagIsNormalizedToPlainItem() {
         ItemStack stack = new ItemStack(Items.STONE);
         CompoundTag tag = new CompoundTag();
@@ -249,6 +269,140 @@ class RecipeScannerTest {
         assertNotNull(output);
         assertNull(output.outputNbt(), "仅 Damage:0 不应生成配方输出 NBT");
         assertEquals(ItemKey.of(STONE_ID), output.item(), "仅 Damage:0 不应产生伪变体身份");
+    }
+
+    @Test
+    void longDamageAboveIntRangeKeepsRecipeVariant() {
+        CompoundTag tag = new CompoundTag();
+        tag.putLong("Damage", 4294967296L);
+        ItemStack stack = new ItemStack(Items.STONE);
+        stack.setTag(tag);
+
+        RecipeOutput output = RecipeScanner.convertStack(stack);
+
+        assertNotNull(output);
+        assertEquals(ItemKey.of(STONE_ID, "{Damage:4294967296L}"), output.item(),
+                "LongTag 2^32 不能被 getInt() 截断后丢失变体");
+        assertEquals(tag.toString(), output.outputNbt(),
+                "非零 long 伤害必须保留原始 SNBT");
+    }
+
+    @Test
+    void fractionalDamageKeepsRecipeVariant() {
+        CompoundTag tag = new CompoundTag();
+        tag.putDouble("Damage", 0.5D);
+        ItemStack stack = new ItemStack(Items.STONE);
+        stack.setTag(tag);
+
+        RecipeOutput output = RecipeScanner.convertStack(stack);
+
+        assertNotNull(output);
+        assertEquals(ItemKey.of(STONE_ID, "{Damage:0.5d}"), output.item(),
+                "0.5 不能被 getInt() 截断为 0 后误判为默认伤害");
+        assertEquals(tag.toString(), output.outputNbt(),
+                "非零小数伤害必须保留原始 SNBT");
+    }
+
+    @Test
+    void zeroDamageOfEveryNumericTypeIsDroppedFromRecipeOutput() {
+        assertZeroDamageDropped((byte) 0);
+        assertZeroDamageDropped((short) 0);
+        assertZeroDamageDropped(0);
+        assertZeroDamageDropped(0L);
+        assertZeroDamageDropped(0.0F);
+        assertZeroDamageDropped(0.0D);
+    }
+
+    @Test
+    void linkageErrorDuringRecipeLookupCountsAsFailed() {
+        RecipeManager manager = new RecipeManager() {
+
+            @Override
+            public Stream<ResourceLocation> getRecipeIds() {
+                return Stream.of(RECIPE_ID);
+            }
+
+            @Override
+            public Optional<? extends Recipe<?>> byKey(ResourceLocation id) {
+                throw new NoClassDefFoundError("broken recipe class");
+            }
+        };
+
+        RecipeScanner.ScanResult result = scanner.scan(manager);
+
+        assertEquals(0, result.recipes().size());
+        assertEquals(1, result.failed(), "单条配方链接失败必须计入 failed");
+        assertEquals(1, result.total());
+    }
+
+    @Test
+    void linkageErrorWhileDescribingRecipeCountsAsFailed() {
+        Recipe<CraftingContainer> brokenResult = new CraftingRecipe() {
+
+            @Override
+            public boolean matches(CraftingContainer container, Level level) {
+                return false;
+            }
+
+            @Override
+            public ItemStack assemble(CraftingContainer container, RegistryAccess access) {
+                return ItemStack.EMPTY;
+            }
+
+            @Override
+            public boolean canCraftInDimensions(int width, int height) {
+                return true;
+            }
+
+            @Override
+            public ItemStack getResultItem(RegistryAccess access) {
+                throw new NoClassDefFoundError("broken recipe result");
+            }
+
+            @Override
+            public ResourceLocation getId() {
+                return RECIPE_ID;
+            }
+
+            @Override
+            public RecipeSerializer<?> getSerializer() {
+                return null;
+            }
+
+            @Override
+            public RecipeType<?> getType() {
+                return RecipeType.CRAFTING;
+            }
+
+            @Override
+            public CraftingBookCategory category() {
+                return CraftingBookCategory.MISC;
+            }
+
+            @Override
+            public NonNullList<Ingredient> getIngredients() {
+                return NonNullList.of(Ingredient.EMPTY, Ingredient.of(Items.DIRT));
+            }
+        };
+
+        RecipeManager manager = new RecipeManager() {
+
+            @Override
+            public Stream<ResourceLocation> getRecipeIds() {
+                return Stream.of(RECIPE_ID);
+            }
+
+            @Override
+            public Optional<? extends Recipe<?>> byKey(ResourceLocation id) {
+                return Optional.of(brokenResult);
+            }
+        };
+
+        RecipeScanner.ScanResult result = scanner.scan(manager);
+
+        assertEquals(0, result.recipes().size());
+        assertEquals(1, result.failed(), "单条配方描述时的 LinkageError 必须计入 failed");
+        assertEquals(1, result.total());
     }
 
     @Test
@@ -269,6 +423,37 @@ class RecipeScannerTest {
         assertEquals(tag.toString(), output.outputNbt(),
                 "注册 ProjectE 仍需要包含 display 的原始 SNBT");
     }
+
+    /**
+     * 数值为 0 的 {@code Damage} 不论标签类型都必须归一为无变体、无 NBT。
+     */
+    private static void assertZeroDamageDropped(Number value) {
+        CompoundTag tag = new CompoundTag();
+        if (value instanceof Byte byteValue) {
+            tag.putByte("Damage", byteValue);
+        } else if (value instanceof Short shortValue) {
+            tag.putShort("Damage", shortValue);
+        } else if (value instanceof Integer intValue) {
+            tag.putInt("Damage", intValue);
+        } else if (value instanceof Long longValue) {
+            tag.putLong("Damage", longValue);
+        } else if (value instanceof Float floatValue) {
+            tag.putFloat("Damage", floatValue);
+        } else {
+            tag.putDouble("Damage", value.doubleValue());
+        }
+        ItemStack stack = new ItemStack(Items.STONE);
+        stack.setTag(tag);
+
+        RecipeOutput output = RecipeScanner.convertStack(stack);
+
+        assertNotNull(output);
+        assertEquals(ItemKey.of(STONE_ID), output.item(),
+                "数值为 0 的 Damage 不得产生变体身份：" + tag);
+        assertNull(output.outputNbt(),
+                "数值为 0 的 Damage 不得保留为配方输出 NBT：" + tag);
+    }
+
 
     private static TagKey<Item> unboundTag() {
         return TagKey.create(Registries.ITEM, new ResourceLocation("sudoersemc_test", "unbound"));

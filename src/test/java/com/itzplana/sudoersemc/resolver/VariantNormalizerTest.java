@@ -23,17 +23,17 @@ import org.junit.jupiter.api.Test;
 class VariantNormalizerTest {
 
     static {
-        // keyFor 会查询物品注册表以判断物品是否可损坏，因此测试前必须先完成引导。
+        // keyFor 通过 BuiltInRegistries 查找物品，测试前必须先完成原版注册表引导。
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
     }
-
-    private static final ResourceLocation SUDOERSEMC_TOKEN =
+private static final ResourceLocation SUDOERSEMC_TOKEN =
             new ResourceLocation("sudoersemc", "token");
     private static final ResourceLocation DIAMOND_SWORD_ID =
             new ResourceLocation("minecraft", "diamond_sword");
     private static final ResourceLocation SHULKER_BOX_ID =
             new ResourceLocation("minecraft", "shulker_box");
+
 
     @Test
     void displayOnlyTagNormalisesToNull() {
@@ -194,8 +194,10 @@ class VariantNormalizerTest {
         CompoundTag first = new CompoundTag();
         first.putInt("Damage", 1);
         first.putString("Potion", "minecraft:healing");
+        first.putLong("stored_emc", 7L);
 
         CompoundTag second = new CompoundTag();
+        second.putLong("stored_emc", 7L);
         second.putString("Potion", "minecraft:healing");
         second.putInt("Damage", 1);
 
@@ -295,26 +297,20 @@ class VariantNormalizerTest {
 
         CompoundTag damage = new CompoundTag();
         damage.putInt("Damage", 3);
+
         assertEquals(ItemKey.of(SUDOERSEMC_TOKEN, "{Damage:3}"),
                 VariantNormalizer.keyFor(SUDOERSEMC_TOKEN, damage));
     }
 
     @Test
-    void keyForStripsDamageForDamageableItems() {
-        CompoundTag tag = new CompoundTag();
-        tag.putInt("Damage", 17);
-
-        assertEquals(ItemKey.of(DIAMOND_SWORD_ID),
-                VariantNormalizer.keyFor(DIAMOND_SWORD_ID, tag));
-    }
-
-    @Test
-    void keyForTreatsZeroDamageAsPlainItem() {
+    void defaultDamageZeroOnlyNormalisesToNull() {
         CompoundTag tag = new CompoundTag();
         tag.putInt("Damage", 0);
 
-        assertEquals(ItemKey.of(DIAMOND_SWORD_ID),
-                VariantNormalizer.keyFor(DIAMOND_SWORD_ID, tag));
+        assertNull(VariantNormalizer.normalize(tag),
+                "默认 {Damage:0} 只表示未受损，必须视为无变体");
+        assertEquals(ItemKey.of(SUDOERSEMC_TOKEN),
+                VariantNormalizer.keyFor(SUDOERSEMC_TOKEN, tag));
     }
 
     @Test
@@ -454,14 +450,118 @@ class VariantNormalizerTest {
     @Test
     void normalizeDoesNotMutateInput() {
         CompoundTag display = new CompoundTag();
-        display.putString("Name", "{\"text\":\"custom\"}");
+        display.putString("Name", "{\"text\":\"名称\"}");
+
         CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 0);
         tag.put("display", display);
-        tag.putInt("Damage", 7);
-        CompoundTag before = tag.copy();
+        CompoundTag copy = tag.copy();
 
-        VariantNormalizer.normalize(tag);
+        assertNull(VariantNormalizer.normalize(tag));
+        assertEquals(copy, tag, "normalize 不得修改输入标签");
+    }
 
-        assertEquals(before, tag);
+    @Test
+    void defaultDamageZeroIsStillRecognisedAfterDisplayStripping() {
+        CompoundTag display = new CompoundTag();
+        display.putString("Name", "{\"text\":\"名称\"}");
+
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 0);
+        tag.put("display", display);
+
+        assertNull(VariantNormalizer.normalize(tag));
+    }
+
+    @Test
+    void defaultDamageIsKeptWhenOtherEconomicKeysArePresent() {
+        CompoundTag tag = new CompoundTag();
+        tag.putInt("Damage", 0);
+        tag.putLong("Marker", 64L);
+
+        assertEquals("{Damage:0,Marker:64L}", VariantNormalizer.normalize(tag),
+                "存在其它经济字段时 Damage 必须作为组合变体的一部分保留");
+    }
+
+    @Test
+    void longDamageAboveIntRangeIsNotTruncatedToZero() {
+        CompoundTag tag = new CompoundTag();
+        tag.putLong("Damage", 4294967296L);
+
+        assertEquals("{Damage:4294967296L}", VariantNormalizer.normalize(tag),
+                "LongTag 2^32 不能被 getAsInt() 截断为 0");
+    }
+
+    @Test
+    void fractionalDamageIsNotTruncatedToZero() {
+        CompoundTag tag = new CompoundTag();
+        tag.putDouble("Damage", 0.5D);
+
+        assertEquals("{Damage:0.5d}", VariantNormalizer.normalize(tag),
+                "0.5 不能因整数转换被误判为默认伤害");
+    }
+
+    @Test
+    void zeroDamageOfEveryNumericTypeIsStillDropped() {
+        CompoundTag byteDamage = new CompoundTag();
+        byteDamage.putByte("Damage", (byte) 0);
+        CompoundTag shortDamage = new CompoundTag();
+        shortDamage.putShort("Damage", (short) 0);
+        CompoundTag intDamage = new CompoundTag();
+        intDamage.putInt("Damage", 0);
+        CompoundTag longDamage = new CompoundTag();
+        longDamage.putLong("Damage", 0L);
+        CompoundTag floatDamage = new CompoundTag();
+        floatDamage.putFloat("Damage", 0.0F);
+        CompoundTag doubleDamage = new CompoundTag();
+        doubleDamage.putDouble("Damage", 0.0D);
+
+        assertNull(VariantNormalizer.normalize(byteDamage));
+        assertNull(VariantNormalizer.normalize(shortDamage));
+        assertNull(VariantNormalizer.normalize(intDamage));
+        assertNull(VariantNormalizer.normalize(longDamage));
+        assertNull(VariantNormalizer.normalize(floatDamage));
+        assertNull(VariantNormalizer.normalize(doubleDamage));
+    }
+
+    @Test
+    void defaultDamageHelperUsesNumericExactZeroAcrossTagTypes() {
+        CompoundTag zeroByte = new CompoundTag();
+        zeroByte.putByte("Damage", (byte) 0);
+        CompoundTag zeroLong = new CompoundTag();
+        zeroLong.putLong("Damage", 0L);
+        CompoundTag zeroFloat = new CompoundTag();
+        zeroFloat.putFloat("Damage", 0.0F);
+        CompoundTag zeroDouble = new CompoundTag();
+        zeroDouble.putDouble("Damage", 0.0D);
+        CompoundTag nonZeroLong = new CompoundTag();
+        nonZeroLong.putLong("Damage", 4294967296L);
+        CompoundTag nonZeroDouble = new CompoundTag();
+        nonZeroDouble.putDouble("Damage", 0.5D);
+        CompoundTag otherKey = new CompoundTag();
+        otherKey.putInt("Damage", 0);
+        otherKey.putInt("Marker", 1);
+
+        assertTrue(VariantNormalizer.isDefaultDamageOnly(zeroByte));
+        assertTrue(VariantNormalizer.isDefaultDamageOnly(zeroLong));
+        assertTrue(VariantNormalizer.isDefaultDamageOnly(zeroFloat));
+        assertTrue(VariantNormalizer.isDefaultDamageOnly(zeroDouble));
+        assertFalse(VariantNormalizer.isDefaultDamageOnly(nonZeroLong),
+                "2^32 不能被整数截断为 0");
+        assertFalse(VariantNormalizer.isDefaultDamageOnly(nonZeroDouble),
+                "0.5 不能被整数截断为 0");
+        assertFalse(VariantNormalizer.isDefaultDamageOnly(otherKey),
+                "存在其它经济字段时不得视为默认伤害");
+        assertFalse(VariantNormalizer.isDefaultDamageOnly(null));
+    }
+
+    @Test
+    void keyForKeepsNonZeroFractionalDamageVariant() {
+        CompoundTag tag = new CompoundTag();
+        tag.putDouble("Damage", 0.5D);
+
+        assertEquals(ItemKey.of(SUDOERSEMC_TOKEN, "{Damage:0.5d}"),
+                VariantNormalizer.keyFor(SUDOERSEMC_TOKEN, tag),
+                "非零小数伤害必须保留为独立变体键");
     }
 }
