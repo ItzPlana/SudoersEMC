@@ -25,12 +25,16 @@ import org.junit.jupiter.api.Test;
  * {@link ScanManager} 状态机与回调异常处理验证。
  *
  * <p>所有用例都使用固定批量 1（需要快速完成时使用较大批量），以便准确观察每个 tick 的
- * 阶段推进。完整流程通过 while 循环驱动，并设置保护上限，避免状态机卡死时测试无限运行。</p>
+ * 阶段推进。完整流程由 {@link #awaitScanFinished(ScanManager)} 驱动：每次 tick 之间短暂
+ * 让出 CPU，并设置截止时间，避免依赖 runner 速度，也避免状态机卡死时测试无限运行。</p>
  */
 class ScanManagerTest {
 
     private static final long TICK_BUDGET_NANOS = 1_000_000L;
-    private static final int TICK_GUARD = 100;
+    /** 等待扫描结束的默认超时，避免慢 runner 上无限等待。 */
+    private static final long SCAN_TIMEOUT_SECONDS = 10L;
+    /** tick 之间的让渡时间，给 SolveWorker 等异步线程留出调度机会。 */
+    private static final long TICK_PAUSE_MILLIS = 2L;
 
     private static ScanManager.SnapshotData data(int itemCount, int recipeCount) {
         return new ScanManager.SnapshotData("主世界", itemCount, recipeCount);
@@ -87,11 +91,7 @@ class ScanManagerTest {
                 snapshot -> applications.incrementAndGet());
 
         assertTrue(manager.requestScan());
-        int ticks = 0;
-        while (manager.isRunning() && ticks < TICK_GUARD) {
-            manager.tick();
-            ticks++;
-        }
+        int ticks = awaitScanFinished(manager);
 
         assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
         assertFalse(manager.isRunning());
@@ -148,11 +148,7 @@ class ScanManagerTest {
                 });
 
         manager.requestScan();
-        int ticks = 0;
-        while (manager.isRunning() && ticks < TICK_GUARD) {
-            manager.tick();
-            ticks++;
-        }
+        awaitScanFinished(manager);
 
         assertEquals(ScanPhase.FAILED, manager.progress().phase());
         assertTrue(manager.progress().detail().contains("应用失败"));
@@ -196,11 +192,7 @@ class ScanManagerTest {
                 () -> data(0, 0), snapshot -> { });
 
         manager.requestScan();
-        int ticks = 0;
-        while (manager.isRunning() && ticks < TICK_GUARD) {
-            manager.tick();
-            ticks++;
-        }
+        int ticks = awaitScanFinished(manager);
 
         assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
         assertTrue(ticks <= 5, "无物品无配方时应在少量 tick 内完成");
@@ -212,9 +204,7 @@ class ScanManagerTest {
                 () -> data(0, 0), snapshot -> { });
 
         manager.requestScan();
-        while (manager.isRunning()) {
-            manager.tick();
-        }
+        awaitScanFinished(manager);
         assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
 
         assertTrue(manager.requestScan());
@@ -247,11 +237,7 @@ class ScanManagerTest {
 
         assertSame(diagnostics, manager.diagnostics());
         manager.requestScan();
-        int ticks = 0;
-        while (manager.isRunning() && ticks < TICK_GUARD) {
-            manager.tick();
-            ticks++;
-        }
+        awaitScanFinished(manager);
 
         assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
         assertTrue(diagnostics.tickCount() > 0, "每个 tick 都应留下耗时样本");
@@ -377,17 +363,15 @@ class ScanManagerTest {
 
         manager.requestScan();
         int collectingTicks = 0;
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(SCAN_TIMEOUT_SECONDS);
         while (manager.progress().phase() == ScanPhase.COLLECTING_SNAPSHOT
-                && collectingTicks < TICK_GUARD) {
+                && System.nanoTime() < deadline) {
             manager.tick();
             collectingTicks++;
         }
 
         assertTrue(collectingTicks >= 3, "小批量下采集必须跨至少 3 个 tick");
-        while (manager.isRunning() && collectingTicks < TICK_GUARD) {
-            manager.tick();
-            collectingTicks++;
-        }
+        awaitScanFinished(manager);
         assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
         assertEquals(1, applied.get(), "应用回调只能执行一次");
         worker.shutdownNow();
@@ -422,11 +406,7 @@ class ScanManagerTest {
         assertEquals(ScanPhase.COLLECTING_SNAPSHOT, manager.progress().phase());
         generation.incrementAndGet();
 
-        int ticks = 0;
-        while (manager.isRunning() && ticks < TICK_GUARD) {
-            manager.tick();
-            ticks++;
-        }
+        awaitScanFinished(manager);
 
         assertEquals(ScanPhase.FAILED, manager.progress().phase());
         assertTrue(manager.progress().detail().contains("reload 代次"),
@@ -455,11 +435,7 @@ class ScanManagerTest {
         assertEquals(ScanPhase.COLLECTING_SNAPSHOT, manager.progress().phase());
         current.set(fingerprint("minecraft:dirt"));
 
-        int ticks = 0;
-        while (manager.isRunning() && ticks < TICK_GUARD) {
-            manager.tick();
-            ticks++;
-        }
+        awaitScanFinished(manager);
 
         assertEquals(ScanPhase.FAILED, manager.progress().phase());
         assertTrue(manager.progress().detail().contains("快照采集完成时扫描输入发生变化"),
@@ -480,22 +456,19 @@ class ScanManagerTest {
                 pipelineSession(1, 0, new AtomicInteger()), applied);
 
         manager.requestScan();
-        boolean sawSolvingDetail = false;
-        int ticks = 0;
-        while (manager.isRunning() && ticks < TICK_GUARD) {
-            manager.tick();
-            ticks++;
+        AtomicInteger solvingDetailSamples = new AtomicInteger();
+        awaitScanFinished(manager, () -> {
             if (manager.progress().phase() == ScanPhase.SOLVING
                     && manager.progress().detail().contains("工作线程")) {
-                sawSolvingDetail = true;
+                solvingDetailSamples.incrementAndGet();
             }
-        }
+        });
 
         assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
         assertTrue(solverThread.get() != null
                 && solverThread.get().contains(SolveWorker.THREAD_NAME),
                 "纯求解必须在 sudoersemc-solver 线程执行，实际为 " + solverThread.get());
-        assertTrue(sawSolvingDetail, "SOLVING 进度必须标明工作线程");
+        assertTrue(solvingDetailSamples.get() > 0, "SOLVING 进度必须标明工作线程");
         assertEquals(1, applied.get());
         worker.shutdownNow();
     }
@@ -510,11 +483,7 @@ class ScanManagerTest {
                 pipelineSession(1, 0, new AtomicInteger()), applied);
 
         manager.requestScan();
-        int ticks = 0;
-        while (manager.isRunning() && ticks < TICK_GUARD) {
-            manager.tick();
-            ticks++;
-        }
+        awaitScanFinished(manager);
 
         assertEquals(ScanPhase.FAILED, manager.progress().phase());
         assertTrue(manager.progress().detail().contains("求解爆炸"),
@@ -567,11 +536,7 @@ class ScanManagerTest {
                 pipelineSession(1, 0, new AtomicInteger()), applied);
 
         manager.requestScan();
-        int ticks = 0;
-        while (manager.isRunning() && ticks < TICK_GUARD) {
-            manager.tick();
-            ticks++;
-        }
+        awaitScanFinished(manager);
 
         assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
         assertFalse(solverThread.get() != null
@@ -606,11 +571,7 @@ class ScanManagerTest {
                 pipelineSession(1, 0, new AtomicInteger()), applied);
 
         manager.requestScan();
-        int ticks = 0;
-        while (manager.isRunning() && ticks < TICK_GUARD) {
-            manager.tick();
-            ticks++;
-        }
+        awaitScanFinished(manager);
 
         assertEquals(ScanPhase.FAILED, manager.progress().phase(),
                 "SolveOutcome.failed() 必须以 FAILED 结束，不能继续 APPLYING");
@@ -627,11 +588,7 @@ class ScanManagerTest {
                 pipelineSession(1, 0, new AtomicInteger()), applied);
 
         manager.requestScan();
-        int ticks = 0;
-        while (manager.isRunning() && ticks < TICK_GUARD) {
-            manager.tick();
-            ticks++;
-        }
+        awaitScanFinished(manager);
 
         assertEquals(ScanPhase.CANCELLED, manager.progress().phase(),
                 "SolveOutcome.cancelled() 必须以 CANCELLED 结束");
@@ -648,11 +605,7 @@ class ScanManagerTest {
                 pipelineSession(1, 0, new AtomicInteger()), applied);
 
         manager.requestScan();
-        int ticks = 0;
-        while (manager.isRunning() && ticks < TICK_GUARD) {
-            manager.tick();
-            ticks++;
-        }
+        awaitScanFinished(manager);
 
         assertEquals(ScanPhase.FAILED, manager.progress().phase(),
                 "内联求解返回 failed 时必须以 FAILED 结束");
@@ -669,11 +622,7 @@ class ScanManagerTest {
                 pipelineSession(1, 0, new AtomicInteger()), applied);
 
         manager.requestScan();
-        int ticks = 0;
-        while (manager.isRunning() && ticks < TICK_GUARD) {
-            manager.tick();
-            ticks++;
-        }
+        awaitScanFinished(manager);
 
         assertEquals(ScanPhase.CANCELLED, manager.progress().phase(),
                 "内联求解返回 cancelled 时必须以 CANCELLED 结束");
@@ -819,11 +768,7 @@ class ScanManagerTest {
                 TICK_BUDGET_NANOS, new ScanDiagnostics(), null, new ScanCancellation());
 
         manager.requestScan();
-        int ticks = 0;
-        while (manager.isRunning() && ticks < TICK_GUARD) {
-            manager.tick();
-            ticks++;
-        }
+        awaitScanFinished(manager);
 
         assertEquals(ScanPhase.COMPLETED, manager.progress().phase());
         assertEquals(2L, processor.batchesProcessed(),
@@ -971,6 +916,56 @@ class ScanManagerTest {
         assertFalse(manager.isCancelRequested(), "reset 必须清除取消标志");
         assertTrue(interrupted.await(2L, TimeUnit.SECONDS), "reset 必须取消并中断工作线程");
         worker.shutdownNow();
+    }
+
+    /**
+     * 反复 tick 直到扫描结束，并在每次 tick 之间短暂让出 CPU。
+     *
+     * <p>tick 本身不会等待工作线程：连续空转时慢 runner 上可能跑满 tick 上限而扫描仍处于
+     * {@link ScanPhase#SOLVING}。这里使用截止时间而不是固定 tick 数，确保异步求解有时间把
+     * 结果交回，同时避免状态机卡死时测试无限运行。</p>
+     *
+     * @param manager 待驱动的扫描调度器
+     * @return 实际调用的 tick 次数
+     */
+    private static int awaitScanFinished(ScanManager manager) {
+        return awaitScanFinished(manager, () -> { });
+    }
+
+    /**
+     * 反复 tick 直到扫描结束，每次 tick 后执行观察回调。
+     *
+     * @param manager   待驱动的扫描调度器
+     * @param afterTick 每次 tick 后的观察动作，可为空
+     * @return 实际调用的 tick 次数
+     */
+    private static int awaitScanFinished(ScanManager manager, Runnable afterTick) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(SCAN_TIMEOUT_SECONDS);
+        int ticks = 0;
+        while (manager.isRunning() && System.nanoTime() < deadline) {
+            manager.tick();
+            ticks++;
+            afterTick.run();
+            if (manager.isRunning()) {
+                pauseForWorker();
+            }
+        }
+        assertFalse(manager.isRunning(), "扫描应在 " + SCAN_TIMEOUT_SECONDS
+                + " 秒内结束，当前阶段 " + manager.progress().phase()
+                + "，detail=" + manager.progress().detail());
+        return ticks;
+    }
+
+    /**
+     * 短暂让出 CPU，使工作线程有机会完成 {@code Future} 并让下一次 tick 观察到结果。
+     */
+    private static void pauseForWorker() {
+        try {
+            Thread.sleep(TICK_PAUSE_MILLIS);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("等待扫描结束时测试线程被中断", interrupted);
+        }
     }
 
     private static SolveOutcome emptyOutcome() {
