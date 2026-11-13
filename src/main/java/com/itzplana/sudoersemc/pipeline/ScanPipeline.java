@@ -41,6 +41,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.item.ItemStack;
@@ -71,9 +72,11 @@ import org.slf4j.LoggerFactory;
  * 运行时环境的情况下验证管线主干。</p>
  *
  * <p><strong>异常契约：</strong>{@link #collect(MinecraftServer)} 在服务器未就绪或采集失败时
- * 抛出 {@link IllegalStateException}，由 {@code ScanManager} 转为 {@code FAILED}，绝不把失败
- * 伪装成“成功的空扫描”；{@link #solveAndApply(PipelineSnapshot)} 仍不向调用方抛出异常，
- * 任何未预期失败记录日志后返回全零结果，保证服务器主循环不被单次扫描拖垮。</p>
+ * 抛出 {@link IllegalStateException}；{@link #solveAndApply(PipelineSnapshot)} 在求解或应用
+ * 过程遇到运行时异常时记录日志并转换为 {@link IllegalStateException}；
+ * {@link #applyCompletedSolve()} 在后台求解失败、被取消或没有待处理结果时同样抛出
+ * {@link IllegalStateException}。这些异常由 {@code ScanManager} 转为 {@code FAILED}，绝不把
+ * 失败伪装成“成功的空扫描”或全零结果，避免服务器主循环被静默的错误状态污染。</p>
  */
 public final class ScanPipeline {
 
@@ -110,6 +113,16 @@ public final class ScanPipeline {
     private volatile boolean solveRecipesEnabled = true;
     private volatile boolean generateReportsEnabled = true;
     private volatile boolean useProjectEIntegrationBaselines = true;
+
+    /**
+     * 完整扫描输入指纹提供器，必须在服务器线程调用。
+     *
+     * <p>生产接线由 {@code Sudoersemc} 注入物品注册表、配方 id、标签与配置摘要；注入后，
+     * 扫描状态文件会保存完整输入指纹，启动缓存只有在该指纹完全匹配时才会复用。未注入时
+     * 退回基于本次快照的指纹，仅用于不接触游戏状态的单元测试。</p>
+     */
+    @Nullable
+    private volatile Supplier<ScanFingerprint> inputFingerprintSupplier;
     private volatile int lastSolvedCount;
     private volatile int lastUnresolvedCount;
     private volatile long lastDurationMillis;
@@ -210,6 +223,18 @@ public final class ScanPipeline {
      */
     public void setUseProjectEIntegrationBaselines(boolean enabled) {
         this.useProjectEIntegrationBaselines = enabled;
+    }
+
+    /**
+     * 注册完整扫描输入指纹提供器。
+     *
+     * <p>提供器在服务器线程的求解启动阶段调用一次，其返回值会随扫描状态一起持久化。
+     * 启动缓存判定必须使用同一套指纹通道，否则模组、配方或配置变化后仍可能误用旧值。</p>
+     *
+     * @param supplier 指纹提供器；{@code null} 时退回基于本次快照的指纹
+     */
+    public void setInputFingerprintSupplier(@Nullable Supplier<ScanFingerprint> supplier) {
+        this.inputFingerprintSupplier = supplier;
     }
 
     /**
@@ -458,15 +483,22 @@ public final class ScanPipeline {
      * <p>存储为 {@code null} 时进入干跑模式：计数与报告照常生成，但不会产生任何持久化写入。</p>
      *
      * @param snapshot 采集结果，允许为 {@code null}
-     * @return 汇总结果；任何未预期异常都会转为全零结果
+     * @return 汇总结果
+     * @throws IllegalStateException 求解或应用过程抛出运行时异常时
      */
     public PipelineResult solveAndApply(@Nullable PipelineSnapshot snapshot) {
         long startedAtNanos = System.nanoTime();
         PipelineSnapshot data = snapshot == null ? PipelineSnapshot.empty() : snapshot;
+        ScanFingerprint inputFingerprint = captureInputFingerprint(data);
         try {
-            return applyComputation(compute(data, startedAtNanos));
-        } catch (Throwable failure) {
-            return failedResult(startedAtNanos, failure);
+            return applyComputation(compute(data, startedAtNanos, inputFingerprint));
+        } catch (RuntimeException failure) {
+            long durationMillis = elapsedMillis(startedAtNanos);
+            lastSolvedCount = 0;
+            lastUnresolvedCount = 0;
+            lastDurationMillis = durationMillis;
+            LOGGER.error("SudoersEMC 扫描管线求解与应用失败", failure);
+            throw new IllegalStateException("扫描管线求解与应用失败", failure);
         }
     }
 
@@ -490,8 +522,9 @@ public final class ScanPipeline {
             return false;
         }
         long startedAtNanos = System.nanoTime();
+        ScanFingerprint inputFingerprint = captureInputFingerprint(snapshot);
         pendingSolve.set(CompletableFuture.supplyAsync(
-                () -> compute(snapshot, startedAtNanos), SOLVER_EXECUTOR));
+                () -> compute(snapshot, startedAtNanos, inputFingerprint), SOLVER_EXECUTOR));
         return true;
     }
 
@@ -506,25 +539,34 @@ public final class ScanPipeline {
     /**
      * 在服务器线程应用已完成的异步求解结果。
      *
-     * <p>求解失败、被取消或没有待处理结果时返回全零结果，不更新扫描状态，也不写报告。</p>
+     * <p>该方法只在后台求解成功时返回结果。没有待处理结果、求解被取消、求解线程抛出异常或
+     * 返回 {@code null} 时都会抛出 {@link IllegalStateException}，由调用方把扫描转为
+     * {@link com.itzplana.sudoersemc.task.ScanPhase#FAILED}；绝不会用全零结果伪装成功，
+     * 从而避免 {@code ScanManager} 进入 COMPLETED。</p>
      *
      * @return 本次应用的结果
+     * @throws IllegalStateException 后台求解失败、被取消或没有待处理结果时抛出
      */
     public PipelineResult applyCompletedSolve() {
         CompletableFuture<Computation> future = pendingSolve.getAndSet(null);
-        long startedAtNanos = System.nanoTime();
         if (future == null) {
-            return PipelineResult.zeroed(0L);
+            throw new IllegalStateException("应用求解结果失败：没有待处理的后台求解");
         }
+        Computation computation;
         try {
-            Computation computation = future.join();
-            if (computation == null) {
-                return PipelineResult.zeroed(0L);
-            }
-            return applyComputation(computation);
+            computation = future.join();
         } catch (RuntimeException failure) {
-            return failedResult(startedAtNanos, failure);
+            String detail = failure.getMessage();
+            if (detail == null || detail.isBlank()) {
+                detail = failure.getClass().getSimpleName();
+            }
+            LOGGER.error("SudoersEMC 后台求解失败", failure);
+            throw new IllegalStateException("后台求解失败：" + detail, failure);
         }
+        if (computation == null) {
+            throw new IllegalStateException("应用求解结果失败：后台求解返回 null");
+        }
+        return applyComputation(computation);
     }
 
     /**
@@ -540,7 +582,8 @@ public final class ScanPipeline {
     /**
      * 纯计算阶段：归属分离、配方求解与候选构建。不得访问注册表、配方管理器或文件系统。
      */
-    private Computation compute(PipelineSnapshot snapshot, long startedAtNanos) {
+    private Computation compute(PipelineSnapshot snapshot, long startedAtNanos,
+                                ScanFingerprint inputFingerprint) {
         Set<ItemKey> externallyModified = detectExternallyModifiedOwnership(snapshot);
         PipelineSnapshot data = applyOwnershipSeparation(snapshot, externallyModified);
         SolveContext context = new SolveContext(data.existingValues());
@@ -557,7 +600,7 @@ public final class ScanPipeline {
         int solvedByRecipe = addRecipeCandidates(solveResult, candidates);
         int solvedByFallback = addFallbackCandidates(data, solveResult, candidates);
         return new Computation(data, solveResult, List.copyOf(candidates),
-                solvedByRecipe, solvedByFallback, externallyModified, startedAtNanos);
+                solvedByRecipe, solvedByFallback, externallyModified, inputFingerprint, startedAtNanos);
     }
 
     /**
@@ -626,7 +669,7 @@ public final class ScanPipeline {
         lastDurationMillis = durationMillis;
 
         boolean appliedToStore = store != null;
-        updateScanState(data, durationMillis, applied, unresolved);
+        updateScanState(computation.inputFingerprint(), durationMillis, applied, unresolved);
         writeDiagnosticReport(data, solveResult, applied, quarantined, overflowResets,
                 durationMillis, appliedToStore, sourceCounts);
 
@@ -640,18 +683,6 @@ public final class ScanPipeline {
                 durationMillis,
                 appliedToStore,
                 sourceCounts);
-    }
-
-    /**
-     * 把一次失败统一转换为全零结果，并清空最近一次运行的统计字段。
-     */
-    private PipelineResult failedResult(long startedAtNanos, Throwable failure) {
-        long durationMillis = elapsedMillis(startedAtNanos);
-        lastSolvedCount = 0;
-        lastUnresolvedCount = 0;
-        lastDurationMillis = durationMillis;
-        LOGGER.error("SudoersEMC 扫描管线求解与应用失败，本轮返回全零结果", failure);
-        return PipelineResult.zeroed(durationMillis);
     }
 
     /**
@@ -798,6 +829,7 @@ public final class ScanPipeline {
             int solvedByRecipe,
             int solvedByFallback,
             Set<ItemKey> externallyModified,
+            ScanFingerprint inputFingerprint,
             long startedAtNanos
     ) {
 
@@ -829,6 +861,22 @@ public final class ScanPipeline {
     }
 
     /**
+     * 批准某个物品当前的内存隔离决策。
+     *
+     * <p>命令层在批准持久化记录后调用本方法，确保 {@link LargeDropProtection#approve} 有生产
+     * 调用方；返回的决策只用于诊断与回执，数值应用由命令层依据持久化记录完成。</p>
+     *
+     * @param item 被批准物品；{@code null} 会被忽略
+     * @return 本次从内存隔离列表移除的决策，按加入顺序排列
+     */
+    public List<PriceDropDecision> approveQuarantined(@Nullable ItemKey item) {
+        if (item == null) {
+            return List.of();
+        }
+        return dropProtection.approve(item);
+    }
+
+    /**
      * 把求解器产出的配方值转换为候选条目。
      *
      * <p>求解器生成值具有权威性：这些物品不会再进入兜底定价链，来源固定为
@@ -841,8 +889,20 @@ public final class ScanPipeline {
         int added = 0;
         for (Map.Entry<ItemKey, Long> entry : solveResult.values().entrySet()) {
             ItemKey item = entry.getKey();
-            if (isExcludedFromPricing(item)) {
-                LOGGER.debug("物品 {} 被排除规则命中，跳过配方候选", item);
+            if (isTierExcluded(item)) {
+                LOGGER.debug("物品 {} 被层级规则排除，跳过配方候选", item);
+                continue;
+            }
+            CreativeItemProtection.Decision decision = creativeDecision(item);
+            if (decision == null || !decision.priceable()) {
+                LOGGER.debug("物品 {} 被创造物品保护排除，跳过配方候选", item);
+                continue;
+            }
+            // 固定值必须在配方路径生效：配置注释承诺 specialValue 覆盖正常求解，不能因为
+            // 求解器先产出了配方值就被 addFallbackCandidates 的“已有求解值”条件跳过。
+            if (decision.specialValue() > 0L) {
+                candidates.add(new Candidate(item, decision.specialValue(), PriceSource.TIER, null));
+                added++;
                 continue;
             }
             long value = entry.getValue();
@@ -942,16 +1002,43 @@ public final class ScanPipeline {
         if (item == null) {
             return false;
         }
+        if (isTierExcluded(item)) {
+            return true;
+        }
+        CreativeItemProtection.Decision decision = creativeDecision(item);
+        return decision == null || !decision.priceable();
+    }
+
+    /**
+     * 判断层级规则是否明确排除该物品。
+     *
+     * <p>{@link TierPricing#price} 返回 {@code Optional.of(0L)} 表示排除；判定异常时按排除处理。</p>
+     */
+    private boolean isTierExcluded(ItemKey item) {
+        if (item == null) {
+            return false;
+        }
         try {
             Optional<Long> tierValue = tierPricing.price(item);
-            if (tierValue.isPresent() && tierValue.get() <= 0L) {
-                return true;
-            }
-            CreativeItemProtection.Decision decision = creativeProtection.decide(item, true, true);
-            return !decision.priceable();
+            return tierValue.isPresent() && tierValue.get() <= 0L;
         } catch (RuntimeException failure) {
-            LOGGER.warn("排除规则判定失败，按排除处理：{}", item, failure);
+            LOGGER.warn("层级排除规则判定失败，按排除处理：{}", item, failure);
             return true;
+        }
+    }
+
+    /**
+     * 执行创造物品保护判定。
+     *
+     * @return 判定结果；判定异常时返回 {@code null}，调用方必须按“排除”处理
+     */
+    @Nullable
+    private CreativeItemProtection.Decision creativeDecision(ItemKey item) {
+        try {
+            return creativeProtection.decide(item, true, true);
+        } catch (RuntimeException failure) {
+            LOGGER.warn("创造物品保护判定失败，按排除处理：{}", item, failure);
+            return null;
         }
     }
 
@@ -1005,13 +1092,13 @@ public final class ScanPipeline {
     /**
      * 更新增量扫描状态。状态存储自身不会抛出异常，这里仍捕获运行时异常以保护结果返回路径。
      */
-    private void updateScanState(PipelineSnapshot snapshot, long durationMillis,
+    private void updateScanState(@Nullable ScanFingerprint inputFingerprint, long durationMillis,
                                  int solvedCount, int unresolvedCount) {
-        if (stateStore == null) {
+        if (stateStore == null || inputFingerprint == null) {
             return;
         }
         try {
-            stateStore.update(fingerprint(snapshot), durationMillis, solvedCount, unresolvedCount);
+            stateStore.update(inputFingerprint, durationMillis, solvedCount, unresolvedCount);
         } catch (RuntimeException failure) {
             LOGGER.warn("更新扫描状态失败，本轮结果仍然有效", failure);
         }
@@ -1072,7 +1159,35 @@ public final class ScanPipeline {
     }
 
     /**
-     * 计算扫描指纹：物品 id、配方 id 升序摘要；标签、配置与基线通道本轮为空。
+     * 计算本次扫描的完整输入指纹。
+     *
+     * <p>生产接线会注入完整指纹提供器（物品、配方内容、标签成员、配置与基线通道）；提供器
+     * 未注入时才退回仅基于快照的指纹，供不接触游戏状态的单元测试使用。已注入提供器但调用失败
+     * 或返回 {@code null} 时抛出 {@link IllegalStateException}，绝不把不完整指纹写入扫描状态或
+     * 用于采集前后一致性校验。提供器必须在服务器线程调用，因此本方法只在求解启动阶段执行。</p>
+     *
+     * @throws IllegalStateException 指纹提供器失败或返回 {@code null} 时
+     */
+    private ScanFingerprint captureInputFingerprint(PipelineSnapshot snapshot) {
+        Supplier<ScanFingerprint> supplier = inputFingerprintSupplier;
+        if (supplier == null) {
+            return fingerprint(snapshot);
+        }
+        ScanFingerprint fingerprint;
+        try {
+            fingerprint = supplier.get();
+        } catch (RuntimeException failure) {
+            LOGGER.error("计算扫描输入指纹失败，拒绝使用不完整指纹继续扫描", failure);
+            throw new IllegalStateException("计算扫描输入指纹失败", failure);
+        }
+        if (fingerprint == null) {
+            throw new IllegalStateException("计算扫描输入指纹失败：提供器返回 null");
+        }
+        return fingerprint;
+    }
+
+    /**
+     * 计算扫描指纹：物品 id、配方 id 升序摘要；标签、配置与基线通道在快照降级路径中为空。
      */
     private static ScanFingerprint fingerprint(PipelineSnapshot snapshot) {
         List<String> itemIds = new ArrayList<>(snapshot.items().size());

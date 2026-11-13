@@ -34,6 +34,7 @@ import com.itzplana.sudoersemc.task.ScanPhase;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -94,6 +95,38 @@ class ScanPipelineTest {
 
         assertTrue(failure.getMessage().contains("扫描采集失败"),
                 "采集失败必须带可诊断信息，不能静默返回空快照");
+    }
+
+    @Test
+    void solveAndApplyPropagatesRuntimeFailures() {
+        ScanPipeline pipeline = pipeline(null, null, null, null, null, null, disabledFallback());
+        Map<ItemKey, Long> corruptExistingValues = new HashMap<>();
+        corruptExistingValues.put(RESULT, null);
+        PipelineSnapshot snapshot = new PipelineSnapshot(
+                List.of(item(RESULT, 0L)), List.of(), corruptExistingValues, 0, 0, 0);
+
+        assertThrows(IllegalStateException.class, () -> pipeline.solveAndApply(snapshot),
+                "同步求解路径也必须上抛失败，而不是返回全零结果");
+    }
+
+    @Test
+    void fingerprintSupplierFailureAbortsInsteadOfWritingIncompleteState() {
+        ScanStateStore stateStore = new ScanStateStore(
+                tempDir.resolve("scan_state_fingerprint_failure.json"));
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_fingerprint_failure.json"));
+        ScanPipeline pipeline = pipeline(store, stateStore, null, null, null, null, disabledFallback());
+        pipeline.setInputFingerprintSupplier(() -> {
+            throw new IllegalStateException("broken fingerprint supplier");
+        });
+
+        PipelineSnapshot snapshot = snapshot(List.of(item(RESULT, 0L)), List.of(), Map.of());
+
+        assertThrows(IllegalStateException.class, () -> pipeline.solveAndApply(snapshot),
+                "生产指纹提供器失败时必须上抛，而不是退回不完整指纹");
+        assertEquals(0L, stateStore.lastScanEpochMillis(),
+                "指纹计算失败时不得写入扫描状态");
+        assertEquals(0, store.size(), "指纹计算失败时不得写入生成值");
     }
 
     @Test
@@ -444,6 +477,31 @@ class ScanPipelineTest {
         assertEquals(0, result.solvedByRecipe(),
                 "外部值必须作为种子保护，不得被配方重新定价");
         assertEquals(0, result.applied());
+    }
+
+    @Test
+    void creativeSpecialValueOverridesResolvedRecipeValue() {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_special_recipe.json"));
+        CreativeItemProtection protection = new CreativeItemProtection(
+                new CreativeItemProtection.Settings(
+                        true, Set.of(), Map.of(RESULT_ID, 999L), Set.of()));
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(INGOT, 5L), item(RESULT, 0L)),
+                List.of(recipe(INGOT, RESULT)),
+                Map.of(INGOT, 5L));
+        ScanPipeline pipeline = pipeline(
+                store, null, null, null, protection, null, disabledFallback());
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1, result.applied());
+        GeneratedEmcEntry staged = store.snapshotAll().get(RESULT);
+        assertNotNull(staged, "specialValue 必须在配方候选路径生成写入");
+        assertEquals(999L, staged.value(),
+                "固定值必须覆盖求解器产出的配方值");
+        assertEquals(PriceSource.TIER, staged.source());
+        assertNull(staged.recipeId(), "固定值不应关联配方 id");
     }
 
     @Test
