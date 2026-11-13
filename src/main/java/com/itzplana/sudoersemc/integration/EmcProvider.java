@@ -61,23 +61,12 @@ public interface EmcProvider {
 
     /**
      * Requests a backend EMC recalculation. Must be called on the server thread.
+     *
+     * @return {@code true} 只有在请求确实被后端接受时才返回 true；缺少服务器实例、调用线程
+     *         不合法或后端拒绝时返回 false
      */
-    void requestRemap(MinecraftServer server);
+    boolean requestRemap(MinecraftServer server);
 
-    /**
-     * 请求一次后端 EMC 重映射，并返回“写入已生效”的完成信号。
-     *
-     * <p>默认实现退化为同步请求且无法报告完成（返回 {@code null}），调用方应把
-     * {@code null} 视为“无法确认”，不要据此放宽外部修改检测。实现方若能提供资源重载的
-     * {@link CompletableFuture}，应覆盖本方法，让调用方在重映射完成前跳过外部修改释放，
-     * 避免把 SudoersEMC 自己刚写入、但后端尚未重映射的值误判为外部修改。</p>
-     *
-     * <p>Must be called on the server thread.</p>
-     *
-     * @param server 当前服务器，允许为 {@code null}
-     * @return 重映射完成信号；无法提供完成信号时返回 {@code null}
-     */
-    @Nullable
     default CompletableFuture<?> requestRemapAsync(@Nullable MinecraftServer server) {
         requestRemap(server);
         return null;

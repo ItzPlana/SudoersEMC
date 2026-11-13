@@ -73,7 +73,7 @@ class GeneratedEntryStoreTest {
     }
 
     @Test
-    void schemaVersionTwoRoundTripPreservesAlternativeCosts() throws IOException {
+    void currentSchemaRoundTripPreservesAlternativeCosts() throws IOException {
         Path file = tempDir.resolve(GeneratedEntryStore.FILE_NAME);
         GeneratedEntryStore store = new GeneratedEntryStore(file);
         long timestamp = 1_730_000_000_000L;
@@ -84,8 +84,8 @@ class GeneratedEntryStoreTest {
         store.save();
 
         String json = Files.readString(file, StandardCharsets.UTF_8);
-        assertEquals(2, GeneratedEntryStore.SCHEMA_VERSION);
-        assertTrue(json.contains("\"schemaVersion\": 2"));
+        assertEquals(3, GeneratedEntryStore.SCHEMA_VERSION);
+        assertTrue(json.contains("\"schemaVersion\": 3"));
         assertTrue(json.contains("\"alternatives\""));
 
         GeneratedEntryStore reloaded = new GeneratedEntryStore(file);
@@ -398,5 +398,62 @@ class GeneratedEntryStoreTest {
         Path temp = file.resolveSibling(file.getFileName() + ".tmp");
         Files.deleteIfExists(temp.resolve("blocker"));
         Files.deleteIfExists(temp);
+    }
+
+    @Test
+    void approvedSourceRoundTripsThroughDisk() throws IOException {
+        Path file = tempDir.resolve(GeneratedEntryStore.FILE_NAME);
+        GeneratedEntryStore store = new GeneratedEntryStore(file);
+        long timestamp = 1_730_000_000_000L;
+
+        assertTrue(store.stage(new GeneratedEmcEntry(
+                ItemKey.of(STONE), 10L, PriceSource.APPROVED, null, true, timestamp)));
+        store.save();
+
+        String json = Files.readString(file, StandardCharsets.UTF_8);
+        assertTrue(json.contains("\"source\": \"APPROVED\""));
+        assertTrue(json.contains("\"schemaVersion\": 3"),
+                "APPROVED 来源要求当前 schema 为 3，旧构建必须整体拒绝加载");
+
+        GeneratedEntryStore reloaded = new GeneratedEntryStore(file);
+        reloaded.load();
+
+        GeneratedEmcEntry stone = reloaded.snapshotAll().get(ItemKey.of(STONE));
+        assertNotNull(stone);
+        assertEquals(10L, stone.value());
+        assertEquals(PriceSource.APPROVED, stone.source());
+        assertTrue(stone.owned());
+        assertTrue(stone.alternativeCosts().isEmpty());
+    }
+
+    @Test
+    void legacyFileWithoutApprovedSourceStillLoads() throws IOException {
+        Path file = tempDir.resolve(GeneratedEntryStore.FILE_NAME);
+        String content = """
+                {
+                  "schemaVersion": 2,
+                  "entries": [
+                    {
+                      "item": "minecraft:stone",
+                      "variant": null,
+                      "value": 7,
+                      "source": "RECIPE",
+                      "recipe": null,
+                      "owned": true,
+                      "timestamp": 4,
+                      "alternatives": []
+                    }
+                  ]
+                }
+                """;
+        Files.writeString(file, content, StandardCharsets.UTF_8);
+
+        GeneratedEntryStore store = new GeneratedEntryStore(file);
+        assertDoesNotThrow(store::load);
+
+        GeneratedEmcEntry stone = store.snapshotAll().get(ItemKey.of(STONE));
+        assertNotNull(stone);
+        assertEquals(PriceSource.RECIPE, stone.source());
+        assertEquals(7L, stone.value());
     }
 }

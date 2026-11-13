@@ -120,6 +120,19 @@ class DiagnosticReportTest {
     }
 
     @Test
+    void approvedCounterParticipatesInTotalAndBreakdown() {
+        DiagnosticReport report = new DiagnosticReport(
+                0L, 0L, 10L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L,
+                Map.of(PriceSource.APPROVED.name(), 4L));
+
+        assertEquals(14L, report.generatedTotal());
+        assertEquals(4L, report.sourceBreakdown().get(PriceSource.APPROVED.name()));
+        assertTrue(report.formatText().lines().anyMatch(
+                        line -> line.startsWith("已批准应用") && line.endsWith(": 4")),
+                "诊断报告必须输出已批准应用计数");
+    }
+
+    @Test
     void negativeCountersAreRejected() {
         assertThrows(IllegalArgumentException.class, () -> new DiagnosticReport(
                 -1L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, Map.of()));

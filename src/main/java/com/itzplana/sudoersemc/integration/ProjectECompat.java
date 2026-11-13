@@ -138,8 +138,8 @@ public final class ProjectECompat implements EmcProvider {
     }
 
     @Override
-    public void requestRemap(@Nullable MinecraftServer server) {
-        requestRemapAsync(server);
+    public boolean requestRemap(@Nullable MinecraftServer server) {
+        return requestRemapAsync(server) != null;
     }
 
     @Override

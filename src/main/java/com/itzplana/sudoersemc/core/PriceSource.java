@@ -17,10 +17,13 @@ public enum PriceSource {
     RARITY,
     /** Computed from an explicit tier rule. */
     TIER,
-    /** Generic configurable fallback value. */
-    FALLBACK,
     /** Explicit fixed value from {@code safety.creativeItemSpecialValues}. */
     SPECIAL_VALUE,
-    /** Administrator explicitly approved a previously quarantined large price drop. */
+    /** Generic configurable fallback value. */
+    FALLBACK,
+    /**
+     * Value written after an administrator approved a quarantined drop via
+     * {@code /sudoemc approve}; the proposed (lower) value is applied unchanged.
+     */
     APPROVED
 }

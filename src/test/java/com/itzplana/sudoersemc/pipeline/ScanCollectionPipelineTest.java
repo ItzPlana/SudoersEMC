@@ -640,7 +640,8 @@ class ScanCollectionPipelineTest {
         }
 
         @Override
-        public void requestRemap(MinecraftServer server) {
+        public boolean requestRemap(MinecraftServer server) {
+            return true;
         }
 
         int accepted() {
@@ -678,7 +679,8 @@ class ScanCollectionPipelineTest {
         }
 
         @Override
-        public void requestRemap(MinecraftServer server) {
+        public boolean requestRemap(MinecraftServer server) {
+            return true;
         }
     }
 }

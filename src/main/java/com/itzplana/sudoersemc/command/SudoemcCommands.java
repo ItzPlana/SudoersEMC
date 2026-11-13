@@ -11,20 +11,23 @@ import net.minecraft.commands.arguments.ResourceLocationArgument;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
 import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * {@code /sudoemc} 命令的 Brigadier 注册薄层。
  *
  * <p>本类只负责参数解析、权限检查和文本输出，所有业务判断都委托给 {@link CommandService}。
  * 所有子命令都要求权限等级 2（管理员）。状态查询与 {@code explain} 只访问内存，
- * {@code report} 读取缓存的报告文本；{@code reload} 由管理员显式触发，会同步重读配置文件；
- * {@code quarantine approve} 是隔离降价的审批入口。全量扫描只是提交请求，由
- * {@code ScanManager} 在后续 tick 中分片执行。</p>
+ * {@code report} 读取缓存的报告文本；{@code reload} 由管理员显式触发，会同步重读配置文件。
+ * 全量扫描只是提交请求，由 {@code ScanManager} 在后续 tick 中分片执行。</p>
  *
  * <p>命令服务由模组入口在初始化阶段通过 {@link #setService(CommandService)} 注入。未注入时
  * 每个子命令都会输出“命令服务尚未初始化”并返回 0，而不是抛出空指针异常。</p>
  */
 public final class SudoemcCommands {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger("sudoersemc/command/SudoemcCommands");
 
     /** 命令根节点名称。 */
     public static final String ROOT_LITERAL = "sudoemc";
@@ -74,8 +77,8 @@ public final class SudoemcCommands {
                                 .executes(SudoemcCommands::approve)))
                 .then(Commands.literal("quarantine")
                         .then(Commands.literal("approve")
-                                .then(Commands.argument("item", ResourceLocationArgument.id())
-                                        .executes(SudoemcCommands::approveQuarantine))))
+                                .then(Commands.argument("item", StringArgumentType.greedyString())
+                                        .executes(SudoemcCommands::approve))))
                 .then(Commands.literal("cancel")
                         .executes(context -> execute(context.getSource(), CommandService::cancel)));
     }
@@ -91,27 +94,9 @@ public final class SudoemcCommands {
         send(source, "/sudoemc reload - 重新加载配置");
         send(source, "/sudoemc report - 查看上一次诊断报告");
         send(source, "/sudoemc explain <item> - 解释 EMC 定价与备选成本");
-        send(source, "/sudoemc approve <item> - 批准隔离降价记录");
-        send(source, "/sudoemc quarantine approve <item> - 批准并应用隔离降价");
+        send(source, "/sudoemc approve <item> - 批准隔离降价记录（默认立即应用降价值）");
         send(source, "/sudoemc cancel - 取消当前扫描");
         return Command.SINGLE_SUCCESS;
-    }
-
-    /**
-     * 解析 {@code approve} 的物品参数并委托给命令服务。
-     */
-    private static int approve(CommandContext<CommandSourceStack> context) {
-        String item = StringArgumentType.getString(context, "item");
-        return execute(context.getSource(), commandService -> commandService.approve(item));
-    }
-
-    /**
-     * 解析 {@code quarantine approve} 的物品参数并委托给命令服务。
-     */
-    private static int approveQuarantine(CommandContext<CommandSourceStack> context) {
-        ResourceLocation item = ResourceLocationArgument.getId(context, "item");
-        return execute(context.getSource(),
-                commandService -> commandService.approveQuarantine(item.toString()));
     }
 
     /**
@@ -120,6 +105,16 @@ public final class SudoemcCommands {
     private static int explain(CommandContext<CommandSourceStack> context) {
         ResourceLocation item = ResourceLocationArgument.getId(context, "item");
         return execute(context.getSource(), commandService -> commandService.explain(item.toString()));
+    }
+
+    /**
+     * 解析 {@code approve} 的物品参数并委托给命令服务。
+     */
+    private static int approve(CommandContext<CommandSourceStack> context) {
+        String item = StringArgumentType.getString(context, "item");
+        // 审计要求：记录谁批准了哪条隔离记录；前后值与结果由 CommandService 记录。
+        LOGGER.info("管理员 {} 执行 /sudoemc approve {}", context.getSource().getTextName(), item);
+        return execute(context.getSource(), commandService -> commandService.approve(item));
     }
 
     /**

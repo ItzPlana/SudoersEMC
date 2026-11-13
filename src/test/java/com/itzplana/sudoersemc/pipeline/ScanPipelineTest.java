@@ -10,6 +10,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.itzplana.sudoersemc.command.CommandResult;
+import com.itzplana.sudoersemc.command.CommandService;
 import com.itzplana.sudoersemc.core.GeneratedEmcEntry;
 import com.itzplana.sudoersemc.core.ItemKey;
 import com.itzplana.sudoersemc.core.OverflowScope;
@@ -17,6 +19,7 @@ import com.itzplana.sudoersemc.core.PriceSource;
 import com.itzplana.sudoersemc.diagnostic.DebugLog;
 import com.itzplana.sudoersemc.core.VariantRegistration;
 import com.itzplana.sudoersemc.diagnostic.ReportManager;
+import com.itzplana.sudoersemc.integration.ProjectEManualValues;
 import com.itzplana.sudoersemc.pricing.FallbackPricing;
 import com.itzplana.sudoersemc.pricing.PricingSettings;
 import com.itzplana.sudoersemc.safety.CreativeItemProtection;
@@ -401,15 +404,14 @@ class ScanPipelineTest {
     }
 
     @Test
-    void approvedQuarantineIsPreservedWhenSameDropIsReevaluated() {
+    void approvedDropBecomesBaselineOnNextScan() {
         GeneratedEntryStore store = new GeneratedEntryStore(
-                tempDir.resolve("generated_drop_approved.json"));
+                tempDir.resolve("generated_approve_rescan.json"));
         store.stage(new GeneratedEmcEntry(RESULT, 1_000L, PriceSource.RECIPE, null, true, 0L));
         QuarantinedDropsStore quarantineStore = new QuarantinedDropsStore(
                 tempDir.resolve(QuarantinedDropsStore.FILE_NAME));
         LargeDropProtection dropProtection =
                 new LargeDropProtection(LargeDropProtection.Settings.defaults());
-
         PipelineSnapshot snapshot = snapshot(
                 List.of(item(INGOT, 100L), item(RESULT, 0L)),
                 List.of(recipe(INGOT, RESULT)),
@@ -418,16 +420,34 @@ class ScanPipelineTest {
                 store, null, null, dropProtection, null, null, disabledFallback());
         pipeline.setQuarantinedDropsStore(quarantineStore);
 
-        assertEquals(1, pipeline.solveAndApply(snapshot).quarantined());
-        assertTrue(quarantineStore.approve(RESULT));
+        PipelineResult first = pipeline.solveAndApply(snapshot);
+        assertEquals(1, first.quarantined());
+        assertEquals(1_000L, store.get(RESULT).value(), "隔离后旧值必须保留");
+
+        CommandService service = new CommandService(
+                null, null, store, null, null, quarantineStore,
+                null,
+                new ProjectEManualValues(tempDir.resolve("ProjectE").resolve("custom_emc.json")),
+                true, () -> key -> false, () -> 1L, () -> 999_999L);
+        CommandResult approved = service.approve(RESULT_ID.toString());
+
+        assertTrue(approved.success(), approved.joinLines());
+        GeneratedEmcEntry approvedEntry = store.get(RESULT);
+        assertNotNull(approvedEntry);
+        assertEquals(100L, approvedEntry.value());
+        assertEquals(PriceSource.APPROVED, approvedEntry.source());
+        assertTrue(quarantineStore.entries().get(0).applied());
 
         PipelineResult second = pipeline.solveAndApply(snapshot);
-
-        assertEquals(1, second.quarantined(), "审批只做审计，下一次扫描仍执行降价保护");
-        assertTrue(quarantineStore.entries().get(0).approved(),
-                "相同经济判定再次隔离时不得清除审批标记");
-        assertEquals(1_000L, store.snapshotAll().get(RESULT).value(), "审批不得修改 EMC");
+        assertEquals(0, second.quarantined(), "同值候选不应被再次隔离");
+        assertEquals(1, second.applied());
+        assertEquals(1L, second.extraCounter(PriceSource.APPROVED.name(), 0L),
+                "重扫必须统计到上一轮落盘的 APPROVED 条目");
+        assertEquals(100L, store.get(RESULT).value());
+        assertEquals(PriceSource.RECIPE, store.get(RESULT).source(),
+                "重扫会按正常定价重新求解并覆盖 APPROVED 来源（已知边界）");
     }
+
 
     @Test
     void priceDropWithinThresholdIsApplied() {
@@ -665,6 +685,31 @@ class ScanPipelineTest {
         assertEquals(2L, result.sourceTotal());
         assertEquals(1L, result.sourceBreakdown().get(PriceSource.RECIPE.name()));
         assertEquals(1L, result.sourceBreakdown().get(PriceSource.FALLBACK.name()));
+    }
+
+    @Test
+    void approvedEntriesAreReportedInDiagnostics() throws IOException {
+        GeneratedEntryStore store = new GeneratedEntryStore(
+                tempDir.resolve("generated_approved.json"));
+        assertTrue(store.stage(new GeneratedEmcEntry(
+                RESULT, 10L, PriceSource.APPROVED, null, true, 0L)));
+        ReportManager reports = new ReportManager(tempDir);
+        // 让 RESULT 作为已有 EMC 保留，避免被陈旧条目清理删除。
+        PipelineSnapshot snapshot = snapshot(
+                List.of(item(RESULT, 10L)), List.of(), Map.of(RESULT, 10L));
+        ScanPipeline pipeline = pipeline(
+                store, null, reports, null, null, null, disabledFallback());
+
+        PipelineResult result = pipeline.solveAndApply(snapshot);
+
+        assertEquals(1L, result.extraCounters().get(PriceSource.APPROVED.name()),
+                "诊断计数器必须记录扫描开始时仍生效的 APPROVED 条目");
+        assertEquals(0L, result.sourceTotal(),
+                "APPROVED 是上一轮遗留来源，不属于本轮求解来源计数");
+        String report = Files.readString(reports.reportFile());
+        assertTrue(report.lines().anyMatch(
+                        line -> line.startsWith("已批准应用") && line.endsWith(": 1")),
+                "报告必须输出已批准应用计数:\n" + report);
     }
 
     @Test

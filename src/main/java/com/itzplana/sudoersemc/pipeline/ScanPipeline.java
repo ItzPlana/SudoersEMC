@@ -2030,6 +2030,12 @@ fullReportWritten = false;
 
         Map<ItemKey, GeneratedEmcEntry> previousEntries =
                 store == null ? Map.of() : store.snapshotAll();
+        int approvedAtStart = 0;
+        for (GeneratedEmcEntry entry : previousEntries.values()) {
+            if (entry != null && entry.source() == PriceSource.APPROVED) {
+                approvedAtStart++;
+            }
+        }
         int staleOwned = countStaleOwned(previousEntries, data, candidates);
         int overflowBefore = overflowPipeline == null ? 0 : overflowPipeline.resetsApplied();
 
@@ -2149,6 +2155,8 @@ fullReportWritten = false;
                 lastOwnershipReleased, computation.refreshedOwned(),
                 auditDropped, staleOwned, diagnostics);
         addExternalBaselineCounters(extraCounters, 0L);
+        // APPROVED 是上一轮遗留来源，不属于本轮求解来源计数，但必须进入诊断计数器。
+        extraCounters.put(PriceSource.APPROVED.name(), (long) approvedAtStart);
         PipelineResult result = new PipelineResult(
                 computation.solvedByRecipe(),
                 computation.solvedByFallback(),
@@ -2551,7 +2559,7 @@ SolveContext context = new SolveContext(seeds, deniedItems);
      * @param item 待判定物品身份
      * @return {@code true} 表示该物品不得进入配方候选
      */
-    private boolean isExcludedFromPricing(ItemKey item) {
+    public boolean isExcludedFromPricing(ItemKey item) {
         if (item == null) {
             return false;
         }

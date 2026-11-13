@@ -101,6 +101,7 @@ public final class SudoersemcConfig {
     public static final ForgeConfigSpec.ConfigValue<List<? extends String>>
             SAFETY_AUTO_DETECT_CREATIVE_ONLY_NAMESPACES;
     public static final ForgeConfigSpec.BooleanValue SAFETY_PRESERVE_EXTERNALLY_MODIFIED_VALUES;
+    public static final ForgeConfigSpec.BooleanValue SAFETY_APPROVE_APPLIES_IMMEDIATELY;
 
     public static final ForgeConfigSpec.BooleanValue OVERFLOW_ENABLED;
     public static final ForgeConfigSpec.LongValue OVERFLOW_THRESHOLD;
@@ -255,6 +256,11 @@ public final class SudoersemcConfig {
                         "Preserve values changed externally or pinned by ProjectE's manual file.",
                         "Default true releases ownership instead of overwriting those values.")
                 .define("preserveExternallyModifiedValues", true);
+        SAFETY_APPROVE_APPLIES_IMMEDIATELY = BUILDER.comment(
+                        "Apply a quarantined value immediately when an administrator approves it",
+                        "with /sudoemc approve. When false, approve only marks the record and",
+                        "leaves generated EMC unchanged.")
+                .define("approveAppliesImmediately", true);
         BUILDER.pop();
 
         // [overflow]
