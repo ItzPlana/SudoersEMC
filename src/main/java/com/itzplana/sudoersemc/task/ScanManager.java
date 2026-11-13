@@ -25,6 +25,12 @@ import java.util.Objects;
  * {@code System.nanoTime()} 截止时间传入任务/会话，实现方应尽快返回，但单元素处理本身无法
  * 被抢占，因此该预算是最佳努力而不是硬实时保证。</p>
  *
+ * <p><strong>reload 代次：</strong>{@link FingerprintSupplier} 若声明
+ * {@link FingerprintSupplier#tracksReloadGeneration()}，扫描只在开始时读取一次廉价代次，
+ * 采集完成、求解完成与 APPLYING 的每个批次都只比较代次；因此 {@code /reload} 落在求解完成
+ * 之后或 staging 中途时会立即取消应用并回滚本任务已写入的条目，不会把旧配方价格继续写入
+ * EMC。实现仍可选择完整指纹模式，代价是每次校验都要在服务器线程重新计算指纹。</p>
+ *
  * <p><strong>线程约定：</strong>快照采集（{@link SnapshotCollector} 与 {@link CollectSession}）、
  * 结果应用（{@link ResultApplier}/{@link StagedResultApplier} 的服务器线程部分）与指纹提供器
  * （{@link FingerprintSupplier}）必须在服务器线程执行，因为真实实现会读取 Minecraft 注册表、
@@ -147,20 +153,46 @@ public final class ScanManager {
     }
 
     /**
-     * 当前扫描输入的指纹提供器，必须在服务器线程执行。
+     * 当前扫描输入的指纹与 reload 代次提供器，必须在服务器线程执行。
      *
-     * <p>启用后，{@link ScanManager} 会在采集开始时与采集完成时各取一次指纹，并在求解完成、
-     * 开始应用前再取一次：采集期间发生变化会直接让扫描失败；采集后到应用前发生变化（例如
-     * {@code /reload} 或注册表变动）会拒绝应用过期结果并把扫描转为 {@link ScanPhase#FAILED}。
-     * 未提供该回调时跳过一致性校验，仅用于不接触游戏状态的单元测试或过渡接线。</p>
+     * <p>未提供该回调时跳过一致性校验，仅用于不接触游戏状态的单元测试或过渡接线。</p>
+     *
+     * <p><strong>两种校验模式：</strong>实现若无法廉价检测 reload，{@link ScanManager} 会在
+     * 采集开始、采集完成与求解完成时各取一次完整指纹（{@link #current()}）；采集期间变化会
+     * 直接让扫描失败，采集后到应用前发生变化（例如 {@code /reload} 或注册表变动）会拒绝应用
+     * 过期结果并把扫描转为 {@link ScanPhase#FAILED}。</p>
+     *
+     * <p>实现若能通过 Forge 的 {@code AddReloadListenerEvent}/{@code TagsUpdatedEvent} 等
+     * 廉价来源维护单调递增的 reload 代次，应覆写 {@link #tracksReloadGeneration()} 与
+     * {@link #reloadGeneration()}。此时 {@link ScanManager} 只在扫描开始时读取一次代次，
+     * 采集完成、求解完成以及 APPLYING 的每个批次都用代次比较，不再在服务器线程重复计算
+     * 全量内容指纹。完整内容指纹由采集结束时的快照提供，供持久化与下次启动的增量判断使用。</p>
      */
     @FunctionalInterface
     public interface FingerprintSupplier {
 
         /**
-         * @return 当前输入的指纹，不能为 {@code null}
+         * @return 当前输入的完整指纹，不能为 {@code null}
          */
         ScanFingerprint current();
+
+        /**
+         * 廉价、单调递增的 reload 代次。每次 datapack reload（开始与完成）都应递增；
+         * 只在 {@link #tracksReloadGeneration()} 返回 {@code true} 时由扫描器使用。
+         *
+         * @return 当前代次
+         */
+        default long reloadGeneration() {
+            return 0L;
+        }
+
+        /**
+         * @return {@code true} 表示 {@link #reloadGeneration()} 能廉价反映 reload 变化，
+         *         扫描器可跳过采集完成/求解完成/APPLYING 期间的全量指纹计算
+         */
+        default boolean tracksReloadGeneration() {
+            return false;
+        }
     }
 
     /**
@@ -304,6 +336,9 @@ public final class ScanManager {
         /**
          * 轮询后台写入。不得阻塞等待磁盘。
          *
+         * <p>后台写入失败时必须抛出 {@link RuntimeException}；{@link ScanManager} 会捕获并把
+         * 扫描转为 {@link ScanPhase#FAILED}，不得在持久化失败后报告 {@code COMPLETED}。</p>
+         *
          * @param deadlineNanos 本 tick 的 {@link System#nanoTime()} 截止时间
          * @return 写入是否已经完成
          */
@@ -369,6 +404,7 @@ public final class ScanManager {
     private final FingerprintSupplier fingerprintSupplier;
     private final SaveHandler saveHandler;
     private final StagedSaveHandler stagedSaveHandler;
+    private final boolean reloadTracking;
 
     private volatile ScanProgress progress = ScanProgress.idle();
     private volatile boolean cancelRequested;
@@ -377,6 +413,7 @@ public final class ScanManager {
     private CollectSession collectSession;
     private ScanFingerprint collectFingerprintBefore;
     private ScanFingerprint collectedFingerprint;
+    private long collectReloadGeneration;
     private ApplyTask applyTask;
     private SaveTask saveTask;
     private long lastBatchNanos;
@@ -465,6 +502,8 @@ public final class ScanManager {
         this.fingerprintSupplier = fingerprintSupplier;
         this.saveHandler = saveHandler;
         this.stagedSaveHandler = stagedSaveHandler;
+        this.reloadTracking = fingerprintSupplier != null
+                && fingerprintSupplier.tracksReloadGeneration();
     }
 
     /**
@@ -511,6 +550,7 @@ public final class ScanManager {
         collectSession = null;
         collectFingerprintBefore = null;
         collectedFingerprint = null;
+        collectReloadGeneration = 0L;
         lastBatchNanos = 0L;
         long now = System.currentTimeMillis();
         progress = new ScanProgress(ScanPhase.COLLECTING_SNAPSHOT, 0, 0, now, now, "等待采集快照");
@@ -646,6 +686,7 @@ public final class ScanManager {
         collectSession = null;
         collectFingerprintBefore = null;
         collectedFingerprint = null;
+        collectReloadGeneration = 0L;
         lastBatchNanos = 0L;
         progress = ScanProgress.idle();
     }
@@ -655,20 +696,26 @@ public final class ScanManager {
      *
      * <p>会话在 {@link CollectSession#step(int, long)} 中按 {@code batch} 上限处理有限工作量，
      * 并在每个元素之间检查截止时间；{@link ScanManager} 不会在一次 tick 内循环调用到完成，
-     * 因此多物品扫描必然跨越多个 tick。采集开始时取一次指纹，会话完成后取第二次指纹并比较；
+     * 因此多物品扫描必然跨越多个 tick。支持廉价 reload 代次的提供器只在扫描开始时读取一次
+     * 代次，采集完成时比较代次；其余实现仍按旧行为在采集开始/完成时各取一次完整指纹并比较。
      * 两次不一致说明采集期间输入已经变化，本次快照不可信，直接让扫描失败。</p>
      *
      * @return 本 tick 实际处理的元素数量，用于自适应批量记账
      */
     private int collectStep(int batch, long deadlineNanos) {
         if (collectSession == null) {
-            ScanFingerprint before = currentFingerprint();
+            if (reloadTracking) {
+                // 完整内容指纹由采集结束时的 CollectedSnapshot 提供；这里只记录廉价代次。
+                collectReloadGeneration = fingerprintSupplier.reloadGeneration();
+                collectFingerprintBefore = null;
+            } else {
+                collectFingerprintBefore = currentFingerprint();
+            }
             CollectSession session = collector.begin();
             if (session == null) {
                 throw new IllegalStateException("快照采集器返回 null 会话");
             }
             collectSession = session;
-            collectFingerprintBefore = before;
             publishCollectProgress(batch);
         }
 
@@ -728,11 +775,16 @@ public final class ScanManager {
         if (session == null) {
             throw new IllegalStateException("采集阶段缺少会话");
         }
-        ScanFingerprint after = currentFingerprint();
-        if (collectFingerprintBefore != null
-                && !collectFingerprintBefore.equalsFingerprint(after)) {
-            collectSession = null;
-            throw new IllegalStateException("快照采集期间扫描输入发生变化，已放弃本次结果");
+        if (reloadTracking) {
+            verifyReloadGenerationUnchanged("快照采集期间扫描输入发生变化");
+        } else {
+            ScanFingerprint after = currentFingerprint();
+            if (collectFingerprintBefore != null
+                    && !collectFingerprintBefore.equalsFingerprint(after)) {
+                collectSession = null;
+                throw new IllegalStateException("快照采集期间扫描输入发生变化，已放弃本次结果");
+            }
+            collectedFingerprint = after;
         }
         SnapshotData collected = session.finish();
         if (collected == null) {
@@ -740,7 +792,6 @@ public final class ScanManager {
             throw new IllegalStateException("快照采集器返回 null 快照");
         }
         snapshot = collected;
-        collectedFingerprint = after;
         collectSession = null;
         collectFingerprintBefore = null;
         progress = progress.advance(ScanPhase.COLLECTING_SNAPSHOT, collected.itemCount(),
@@ -813,7 +864,9 @@ public final class ScanManager {
      * 应用阶段：先校验快照仍然对应当前输入，再分片写入结果。
      *
      * <p>生产接线每个 tick 最多写入一批，写入过程中检查截止时间；全部写入完成后进入持久化。
-     * 旧式 {@link ResultApplier} 仍然同步执行一次，以保持单元测试兼容。</p>
+     * 分片路径在每批 staging 前后都会再次校验输入：支持廉价 reload 代次的提供器只比较代次，
+     * 因此 APPLYING 跨越多个 tick 或 {@code /reload} 落在求解完成之后时，后续批次会被拒绝并
+     * 回滚本任务已写入的条目。旧式 {@link ResultApplier} 仍然同步执行一次，以保持单元测试兼容。</p>
      *
      * @return 本 tick 尝试写入的条目数；应用阶段不写入自适应样本
      */
@@ -836,7 +889,12 @@ public final class ScanManager {
         }
         int staged = 0;
         if (!task.isDone()) {
+            verifyFingerprintBeforeApply();
             staged = Math.max(0, task.stage(batch, deadlineNanos));
+            if (staged > 0) {
+                // reload 可能在 staging 批次执行期间开始；再次校验，异常会取消任务并回滚本批。
+                verifyFingerprintBeforeApply();
+            }
         }
         ScanProgress current = progress;
         if (staged > 0) {
@@ -886,10 +944,17 @@ public final class ScanManager {
     }
 
     /**
-     * 应用前重新读取指纹，拒绝使用采集后已经过期的快照。
+     * 应用前重新校验输入，拒绝使用采集后已经过期的快照。
+     *
+     * <p>支持廉价 reload 代次的提供器只比较代次，避免在服务器线程重复计算全量内容指纹；
+     * 其余实现保持完整指纹比较。</p>
      */
     private void verifyFingerprintBeforeApply() {
         if (fingerprintSupplier == null) {
+            return;
+        }
+        if (reloadTracking) {
+            verifyReloadGenerationUnchanged("扫描输入在采集后发生变化");
             return;
         }
         ScanFingerprint current = currentFingerprint();
@@ -897,6 +962,21 @@ public final class ScanManager {
             throw new IllegalStateException(
                     "扫描输入在采集后发生变化（可能发生了 /reload 或注册表变更），"
                             + "已拒绝应用过期结果；请重新扫描");
+        }
+    }
+
+    /**
+     * 比较扫描开始时的 reload 代次与当前值；变化说明期间发生了 {@code /reload}
+     * 或等价的注册表/数据包重载。
+     *
+     * @param message 失败信息前缀，便于区分采集期间与应用期间
+     */
+    private void verifyReloadGenerationUnchanged(String message) {
+        long current = fingerprintSupplier.reloadGeneration();
+        if (current != collectReloadGeneration) {
+            throw new IllegalStateException(
+                    message + "（可能发生了 /reload 或注册表变更），"
+                            + "已放弃本次扫描结果；请重新扫描");
         }
     }
 

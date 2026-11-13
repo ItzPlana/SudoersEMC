@@ -44,7 +44,9 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 import net.minecraft.core.Holder;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
@@ -75,10 +77,12 @@ import org.slf4j.LoggerFactory;
  * {@link OverflowPipeline} 溢出重置，并通过 {@link EmcProvider#stageGeneratedValue} 写入，
  * 从而保留 ProjectE 手工值保护。</p>
  *
- * <p><strong>指纹：</strong>物品通道使用注册表 id；配方通道使用配方 id 与完整内容
- * （类型、输入候选与数量、输出、容器残留、催化剂与属性）；标签通道使用标签 id 与其成员
- * 物品。仅保留 id、修改配方 JSON 或标签成员都会改变指纹，采集/求解/应用前的比较因此能拒绝
- * 过期快照。</p>
+ * <p><strong>指纹与 reload 代次：</strong>物品通道使用注册表 id；配方通道使用配方 id 与完整
+ * 内容（类型、输入候选与数量、输出、容器残留、催化剂与属性）；标签通道使用标签 id 与其成员
+ * 物品。仅保留 id、修改配方 JSON 或标签成员都会改变完整指纹。完整指纹只在服务器启动判断
+ * 增量扫描时计算一次；扫描期间由 {@link #onDatapackReload()} 维护的廉价代次负责校验，
+ * 采集结束时的 {@code CollectedSnapshot.fingerprint} 直接复用已转换好的配方快照，
+ * 不再调用 {@code RecipeScanner.scan()} 全量遍历配方，因此不会在服务器线程产生长 tick。</p>
  *
  * <p><strong>增量扫描：</strong>扫描成功后会把本次指纹写入
  * {@code config/sudoersemc/scan_state.json}。服务器启动时若当前指纹与文件中的指纹一致且
@@ -130,6 +134,12 @@ public final class ScanCollectionPipeline {
     private StateFile state;
     private boolean stateLoaded;
     private volatile CompletableFuture<Void> pendingSave;
+
+    /**
+     * datapack/reload 代次。扫描开始时读取一次，APPLYING 期间只比较这个原子计数，
+     * 不在服务器线程重复计算全量内容指纹。
+     */
+    private final AtomicLong reloadGenerationCounter = new AtomicLong();
 
     private volatile ScanFingerprint lastAppliedFingerprint;
     private volatile long lastDurationMillis;
@@ -236,12 +246,59 @@ public final class ScanCollectionPipeline {
     /**
      * 创建生产指纹提供器。
      *
+     * <p>该实现声明支持廉价 reload 代次：{@link ScanManager} 在扫描开始时只读取一次
+     * {@link #reloadGeneration()}，采集完成、求解完成与 APPLYING 的每个批次都只比较代次。
+     * 完整内容指纹不再在扫描过程中重复计算；采集结束时的 {@code CollectedSnapshot.fingerprint}
+     * 由已经转换好的配方快照生成，供持久化与下次启动的增量判断使用。</p>
+     *
      * @param server 当前服务器，不能为 {@code null}
-     * @return 在服务器线程计算注册表/配方内容/标签成员/配置/基线指纹的回调
+     * @return 提供完整指纹与廉价 reload 代次的回调
      */
     public ScanManager.FingerprintSupplier fingerprintSupplier(MinecraftServer server) {
         Objects.requireNonNull(server, "server");
-        return () -> computeFingerprint(server);
+        return fingerprintSupplier(() -> computeFingerprint(server));
+    }
+
+    /**
+     * 测试/嵌入式入口：用给定的完整指纹回调构造与生产接线相同的 reload 代次提供器。
+     *
+     * @param fullFingerprint 完整指纹回调，不能为 {@code null}
+     * @return 支持廉价 reload 代次的提供器
+     */
+    ScanManager.FingerprintSupplier fingerprintSupplier(Supplier<ScanFingerprint> fullFingerprint) {
+        Objects.requireNonNull(fullFingerprint, "fullFingerprint");
+        return new ScanManager.FingerprintSupplier() {
+            @Override
+            public ScanFingerprint current() {
+                return fullFingerprint.get();
+            }
+
+            @Override
+            public long reloadGeneration() {
+                return reloadGenerationCounter.get();
+            }
+
+            @Override
+            public boolean tracksReloadGeneration() {
+                return true;
+            }
+        };
+    }
+
+    /**
+     * 记录一次 datapack/reload。Forge 的 {@code AddReloadListenerEvent}（reload 开始）与
+     * {@code TagsUpdatedEvent}（资源重载完成）都会调用这里；代次在 reload 窗口两端各递增一次，
+     * 因此扫描无论从哪个时点开始，采集/求解/应用阶段都能检测到输入变化。
+     */
+    public void onDatapackReload() {
+        reloadGenerationCounter.incrementAndGet();
+    }
+
+    /**
+     * @return 当前 reload 代次，供诊断与测试读取
+     */
+    public long reloadGeneration() {
+        return reloadGenerationCounter.get();
     }
 
     /**
@@ -368,7 +425,11 @@ public final class ScanCollectionPipeline {
             state = dto;
             stateLoaded = true;
         }
-        CompletableFuture<Void> future = CompletableFuture.runAsync(() -> writeState(dto), WORKER);
+        CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+            if (!writeState(dto)) {
+                throw new IllegalStateException("扫描状态持久化失败: " + stateFile);
+            }
+        }, WORKER);
         pendingSave = future;
         return new ScanManager.SaveTask() {
             private volatile boolean cancelled;
@@ -383,7 +444,12 @@ public final class ScanCollectionPipeline {
                     if (!future.isDone()) {
                         return false;
                     }
-                    joinQuietly(future);
+                    try {
+                        future.join();
+                    } catch (CompletionException e) {
+                        done = true;
+                        throw unwrap(e);
+                    }
                     done = true;
                 }
                 return true;
@@ -418,7 +484,9 @@ public final class ScanCollectionPipeline {
             state = dto;
             stateLoaded = true;
         }
-        writeState(dto);
+        if (!writeState(dto)) {
+            LOGGER.warn("Synchronous scan-state persistence failed for {}", stateFile);
+        }
     }
 
     private StateFile buildState(ScanFingerprint fingerprint) {
@@ -432,11 +500,23 @@ public final class ScanCollectionPipeline {
         return dto;
     }
 
-    private void writeState(StateFile dto) {
-        JsonFileIO.writeAtomically(stateFile, dto);
-        if (store != null) {
-            store.saveIfDirty();
+    /**
+     * 同步写入扫描状态与生成值。
+     *
+     * @return 两个文件都成功写入（或无需写入）时返回 {@code true}
+     */
+    private boolean writeState(StateFile dto) {
+        // 先写生成值，再写状态指纹：任何一步失败都保留旧指纹，下次启动会重新扫描，
+        // 不会出现“指纹已更新但条目未落盘”导致增量扫描跳过的情况。
+        if (store != null && !store.saveIfDirty()) {
+            LOGGER.warn("Could not persist generated entries to {}", store.file());
+            return false;
         }
+        if (!JsonFileIO.writeAtomically(stateFile, dto)) {
+            LOGGER.warn("Could not persist scan state to {}", stateFile);
+            return false;
+        }
+        return true;
     }
 
     /**
@@ -496,6 +576,7 @@ public final class ScanCollectionPipeline {
 
         List<String> recipes;
         if (collectedRecipes != null) {
+            // 采集结束路径：复用已经转换好的配方快照，避免在服务器线程再次全量 scan。
             recipes = recipeEntries(collectedRecipes);
         } else if (recipeScanner != null) {
             try {

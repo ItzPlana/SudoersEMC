@@ -273,6 +273,62 @@ class ScanCollectionPipelineTest {
     }
 
     @Test
+    void datapackReloadBumpsGeneration() {
+        ScanCollectionPipeline pipeline = pipeline(null);
+
+        long before = pipeline.reloadGeneration();
+        pipeline.onDatapackReload();
+        pipeline.onDatapackReload();
+
+        assertEquals(before + 2L, pipeline.reloadGeneration(),
+                "reload 开始与完成事件都必须推进代次");
+    }
+
+    @Test
+    void fingerprintSupplierExposesReloadGeneration() {
+        ScanCollectionPipeline pipeline = pipeline(null);
+        ScanManager.FingerprintSupplier supplier =
+                pipeline.fingerprintSupplier(() -> fingerprint("minecraft:iron_ingot"));
+
+        assertTrue(supplier.tracksReloadGeneration(),
+                "生产指纹提供器必须声明支持廉价 reload 代次");
+        long before = supplier.reloadGeneration();
+        pipeline.onDatapackReload();
+
+        assertEquals(before + 1L, supplier.reloadGeneration(),
+                "指纹提供器必须读取管线的 reload 代次");
+        assertEquals(fingerprint("minecraft:iron_ingot"), supplier.current());
+    }
+
+    @Test
+    void saveTaskSurfacesStateFileWriteFailure() throws Exception {
+        GeneratedEntryStore store = new GeneratedEntryStore(tempDir.resolve("entries.json"));
+        Files.createDirectory(stateFile());
+        ScanCollectionPipeline pipeline = pipeline(store);
+        pipeline.applySnapshot(snapshot(fingerprint("minecraft:iron_ingot"), 9L));
+
+        RuntimeException failure = awaitSaveFailure(pipeline.stagedSaveHandler().beginSave());
+
+        assertTrue(failure != null, "scan_state.json 写入失败必须通过 SaveTask.advance 抛出");
+        assertTrue(failure.getMessage() != null && failure.getMessage().contains("持久化失败"));
+    }
+
+    @Test
+    void saveTaskSurfacesStoreWriteFailure() throws Exception {
+        Path storePath = tempDir.resolve("entries-as-directory");
+        Files.createDirectory(storePath);
+        GeneratedEntryStore store = new GeneratedEntryStore(storePath);
+        ScanCollectionPipeline pipeline = pipeline(store);
+        pipeline.applySnapshot(snapshot(fingerprint("minecraft:iron_ingot"), 9L));
+        assertTrue(store.isDirty(), "staging 后 store 应处于待写状态");
+
+        RuntimeException failure = awaitSaveFailure(pipeline.stagedSaveHandler().beginSave());
+
+        assertTrue(failure != null, "generated_entries.json 写入失败必须通过 SaveTask.advance 抛出");
+        assertTrue(failure.getMessage() != null && failure.getMessage().contains("持久化失败"));
+    }
+
+    @Test
     void collectedSnapshotRejectsNegativeCounters() {
         assertThrows(IllegalArgumentException.class,
                 () -> new ScanCollectionPipeline.CollectedSnapshot(
@@ -321,6 +377,27 @@ class ScanCollectionPipelineTest {
             }
         }
         assertTrue(task.isSolveComplete(), "后台求解未在 10 秒内完成");
+    }
+
+    /**
+     * 轮询 SaveTask 直到完成或失败。
+     *
+     * @return 任务抛出的异常；在 10 秒内既未完成也未失败时返回 {@code null}
+     */
+    private static RuntimeException awaitSaveFailure(ScanManager.SaveTask task)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + 10_000_000_000L;
+        while (System.nanoTime() < deadline) {
+            try {
+                if (task.advance(deadline)) {
+                    return null;
+                }
+            } catch (RuntimeException e) {
+                return e;
+            }
+            Thread.sleep(1L);
+        }
+        return null;
     }
 
     private static ItemSnapshot ingotSnapshot(long value) {
