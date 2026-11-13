@@ -118,6 +118,11 @@ public final class SudoersemcConfig {
     public static final ForgeConfigSpec.BooleanValue DIAGNOSTIC_DEBUG_LOGGING;
     public static final ForgeConfigSpec.BooleanValue DIAGNOSTIC_GENERATE_REPORTS;
 
+    /**
+     * 配置 schema 版本（根级键）。默认值必须是旧的 legacy 版本：Forge 会为缺失键写入默认值，
+     * 如果默认值等于当前版本，旧配置将永远被误判为“已迁移”。上限必须是
+     * {@link Integer#MAX_VALUE}，绝不能截断未来版本。
+     */
     public static final ForgeConfigSpec.IntValue SCHEMA_VERSION;
 
     static {
@@ -311,13 +316,13 @@ public final class SudoersemcConfig {
                 .define("generateReports", true);
         BUILDER.pop();
 
-        // Root-level schema version. A missing key is treated as legacy v1 by
-        // ConfigFileMigration; newly generated files start at the current version.
+        // Root-level schema version. Deliberately defined after every section has been popped.
+        // Default = legacy version so that existing files without the key are migrated exactly once.
         SCHEMA_VERSION = BUILDER.comment(
                         "配置 schema 版本，请勿手动修改。当前构建支持 "
                                 + ConfigMigrations.SCHEMA_VERSION + "。")
                 .defineInRange("schemaVersion",
-                        ConfigMigrations.SCHEMA_VERSION,
+                        ConfigMigrations.LEGACY_SCHEMA_VERSION,
                         0,
                         Integer.MAX_VALUE);
     }

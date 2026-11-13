@@ -1,9 +1,12 @@
 package com.itzplana.sudoersemc.resolver;
 
+import com.itzplana.sudoersemc.diagnostic.DebugLog;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.OptionalLong;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicLong;
 import net.minecraft.world.item.ItemStack;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -23,6 +26,7 @@ public final class ResolverRegistry {
     private static final Logger LOGGER = LoggerFactory.getLogger("sudoersemc/resolver/ResolverRegistry");
 
     private final List<NbtMaterialResolver> resolvers = new CopyOnWriteArrayList<>();
+    private final AtomicLong resolveCalls = new AtomicLong();
 
     /**
      * 按顺序注册一个解析器。
@@ -33,6 +37,49 @@ public final class ResolverRegistry {
     public void register(NbtMaterialResolver resolver) {
         Objects.requireNonNull(resolver, "resolver");
         resolvers.add(resolver);
+    }
+
+    /**
+     * 按顺序注册一个解析器，同一实例只注册一次。
+     *
+     * <p>第三方模组可能在构造器与 common setup 各注册一次；去重避免同一个解析器被重复调用。
+     * 方法对注册操作加锁，保证“检查 + 添加”在并发注册时也是原子的。</p>
+     *
+     * @param resolver 解析器实例
+     * @return {@code true} 表示本次新增，{@code false} 表示已存在
+     * @throws NullPointerException 当 {@code resolver} 为 {@code null}
+     */
+    public synchronized boolean registerIfAbsent(NbtMaterialResolver resolver) {
+        Objects.requireNonNull(resolver, "resolver");
+        if (resolvers.contains(resolver)) {
+            return false;
+        }
+        return resolvers.add(resolver);
+    }
+
+    /**
+     * @return 当前注册的解析器数量
+     */
+    public int size() {
+        return resolvers.size();
+    }
+
+    /**
+     * 返回稳定的注册表指纹：按注册顺序排列的 {@code resolver[index]:<class>} 列表。
+     *
+     * <p>解析结果取决于注册顺序（第一个返回值大于 0 的解析器获胜），因此顺序变化必须
+     * 改变扫描基线指纹并触发重扫；新增/移除 resolver 同样会改变指纹。</p>
+     *
+     * @return 不可变、按注册顺序排列的指纹条目
+     */
+    public List<String> fingerprintEntries() {
+        List<String> entries = new ArrayList<>(resolvers.size());
+        int index = 0;
+        for (NbtMaterialResolver resolver : resolvers) {
+            entries.add("resolver[" + index + "]:" + resolver.getClass().getName());
+            index++;
+        }
+        return List.copyOf(entries);
     }
 
     /**
@@ -48,18 +95,42 @@ public final class ResolverRegistry {
         if (stack == null || stack.isEmpty() || resolvers.isEmpty()) {
             return OptionalLong.empty();
         }
+        long callIndex = 0L;
+        if (DebugLog.isEnabled()) {
+            callIndex = resolveCalls.incrementAndGet();
+        }
         for (NbtMaterialResolver resolver : resolvers) {
             try {
                 if (!resolver.supports(stack)) {
                     continue;
                 }
                 OptionalLong value = resolver.resolve(stack);
-                if (value != null && value.isPresent()) {
+                if (value != null && value.isPresent() && value.getAsLong() > 0L) {
+                    if (DebugLog.isEnabled()) {
+                        final long index = callIndex;
+                        DebugLog.headOrSampled("resolver", index, 20L, 500L,
+                                () -> "hit item=" + stack.getItem()
+                                        + " resolver=" + resolver.getClass().getName()
+                                        + " value=" + value.getAsLong());
+                    }
                     return value;
+                }
+if (value != null && value.isPresent() && DebugLog.isEnabled()) {
+                    final long index = callIndex;
+                    DebugLog.headOrSampled("resolver", index, 20L, 500L,
+                            () -> "ignored non-positive value=" + value.getAsLong()
+                                    + " resolver=" + resolver.getClass().getName());
                 }
             } catch (RuntimeException t) {
                 LOGGER.warn("NBT 材料解析器 {} 处理物品 {} 时抛出异常，已跳过",
                         resolver.getClass().getName(), stack.getItem(), t);
+                if (DebugLog.isEnabled()) {
+                    final long index = callIndex;
+                    DebugLog.headOrSampled("resolver", index, 20L, 500L,
+                            () -> "error resolver=" + resolver.getClass().getName()
+                                    + " item=" + stack.getItem()
+                                    + " message=" + t.getClass().getSimpleName());
+                }
             }
         }
         return OptionalLong.empty();

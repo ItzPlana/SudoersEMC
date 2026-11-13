@@ -14,6 +14,7 @@ import com.itzplana.sudoersemc.core.GeneratedEmcEntry;
 import com.itzplana.sudoersemc.core.ItemKey;
 import com.itzplana.sudoersemc.core.OverflowScope;
 import com.itzplana.sudoersemc.core.PriceSource;
+import com.itzplana.sudoersemc.diagnostic.DebugLog;
 import com.itzplana.sudoersemc.core.VariantRegistration;
 import com.itzplana.sudoersemc.diagnostic.ReportManager;
 import com.itzplana.sudoersemc.pricing.FallbackPricing;
@@ -49,6 +50,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
@@ -145,6 +147,24 @@ class ScanPipelineTest {
         assertTrue(result.appliedToStore());
         assertEquals(0, store.size());
         assertFalse(store.isDirty());
+    }
+
+    @Test
+    void debugSummaryIsWiredIntoScanCompletion() {
+        DebugLog.setEnabled(true);
+        try {
+            DebugLog.log("scan-summary-test", "hello");
+
+            Optional<String> summary = ScanPipeline.debugSummary();
+
+            assertTrue(summary.isPresent(), "开启调试日志后扫描结束应能取到 summary");
+            assertTrue(summary.get().contains("scan-summary-test"));
+            assertTrue(summary.get().contains("total=1"));
+            assertTrue(summary.get().contains("emitted=1"));
+        } finally {
+            DebugLog.setEnabled(false);
+        }
+        assertTrue(ScanPipeline.debugSummary().isEmpty(), "关闭调试日志后不得输出 summary");
     }
 
     @Test
