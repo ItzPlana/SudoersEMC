@@ -70,6 +70,9 @@ dependencies {
     if (!project.hasProperty('withoutProjectE')) {
         runtimeOnly fg.deobf("curse.maven:projecte-226410:${projecte_file_id}")
     }
+    // End-to-end mapping-key regression tests use ProjectE's NSSItem/ItemInfo directly.
+    // The same artifact is already resolved for compileOnly/runtimeOnly above.
+    testImplementation fg.deobf("curse.maven:projecte-226410:${projecte_file_id}")
 
     testImplementation platform('org.junit:junit-bom:5.10.2')
     testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
