@@ -83,8 +83,9 @@ public final class JsonFileIO {
      *
      * @param file destination
      * @param data object to serialize; must not be {@code null}
-     * @return {@code true} when the document was written and moved into place; {@code false} when
-     *         the arguments are invalid or any write/serialization step failed
+     * @return {@code true} when the document was written and moved into place（文件已成功写入）；
+     *         {@code false} when the arguments are invalid or any write/serialization step failed
+     *         （参数非法或写入/序列化失败）
      */
     public static boolean writeAtomically(Path file, Object data) {
         if (file == null || data == null) {
